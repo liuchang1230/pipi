@@ -1,0 +1,41 @@
+{
+  "name": "pipi",
+  "version": "0.1.0",
+  "description": "Desktop AI app fully compatible with pi agent and its extensions",
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc -p tsconfig.node.json --noEmit",
+    "typecheck:web": "tsc -p tsconfig.web.json --noEmit",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web"
+  },
+  "dependencies": {
+    "@electron/rebuild": "^4.2.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "highlight.js": "^11.11.1",
+    "node-pty": "^1.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
+    "ssh2": "^1.17.0",
+    "ssh2-sftp-client": "^12.1.1",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@types/ssh2-sftp-client": "^9.0.6",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.5.8",
+    "electron-vite": "^2.3.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}

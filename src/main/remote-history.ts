@@ -1,0 +1,64 @@
+import { app } from "electron";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+export interface RemoteHistoryEntry {
+  id: string;
+  host: string;
+  user: string;
+  port: number;
+  password?: string;
+  path?: string;
+  updatedAt: number;
+}
+
+function historyPath(): string {
+  return join(app.getPath("userData"), "remote-history.json");
+}
+
+function readHistory(): RemoteHistoryEntry[] {
+  const file = historyPath();
+  if (!existsSync(file)) return [];
+  try {
+    const raw = JSON.parse(readFileSync(file, "utf8"));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeHistory(list: RemoteHistoryEntry[]): void {
+  const file = historyPath();
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(list, null, 2), "utf8");
+}
+
+export function listRemoteHistory(): RemoteHistoryEntry[] {
+  return readHistory().sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export function saveRemoteHistory(entry: { host: string; user: string; port?: number; password?: string; path?: string }): RemoteHistoryEntry {
+  const list = readHistory();
+  const port = entry.port ?? 22;
+  const now = Date.now();
+  const existing = list.find((i) => i.host === entry.host && i.user === entry.user && i.port === port);
+  if (existing) {
+    existing.password = entry.password;
+    existing.path = entry.path;
+    existing.updatedAt = now;
+    writeHistory(list);
+    return existing;
+  }
+  const item: RemoteHistoryEntry = {
+    id: `remote-history-${now}`,
+    host: entry.host,
+    user: entry.user,
+    port,
+    password: entry.password,
+    path: entry.path,
+    updatedAt: now,
+  };
+  list.push(item);
+  writeHistory(list);
+  return item;
+}
