@@ -15,6 +15,8 @@ export interface FileReadResult {
   error?: string;
 }
 
+export type FileOpResult = { ok: true } | { ok: false; error: string };
+
 export interface TabSummary {
   id: string;
   cwd: string;
@@ -120,6 +122,7 @@ declare global {
           continueRecent?: boolean;
           title?: string;
           remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean };
+          wsl?: { distro: string; path?: string };
         }) => Promise<string>;
         close: (id: string) => Promise<boolean>;
         activate: (id: string) => Promise<boolean>;
@@ -132,13 +135,17 @@ declare global {
       onTabData: (id: string, callback: (data: string) => void) => () => void;
       onTabExit: (id: string, callback: (code: number) => void) => () => void;
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
-      onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean }) => void) => () => void;
+      onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;
       theme: {
         setMode: (mode: "dark" | "light") => Promise<boolean>;
       };
       file: {
         list: (tabId?: string, dirPath?: string, rootPath?: string) => Promise<FileNode[]>;
-        read: (tabId: string | undefined, relPath: string) => Promise<FileReadResult>;
+        read: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileReadResult>;
+        write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string) => Promise<FileOpResult>;
+        mkdir: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
+        delete: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
+        rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string) => Promise<FileOpResult>;
       };
       onAutoFollow: (callback: (ev: AutoFollowEvent) => void) => () => void;
       onAutoFollowStatus: (callback: (status: AutoFollowStatus) => void) => () => void;
@@ -150,6 +157,7 @@ declare global {
         list: () => Promise<ProjectListItem[]>;
         addLocal: (cwd: string) => Promise<ProjectListItem>;
         addRemote: (remote: { host: string; user: string; port?: number; path: string; password?: string }) => Promise<ProjectListItem>;
+        addWsl: (distro: string, path: string) => Promise<ProjectListItem>;
         delete: (id: string) => Promise<boolean>;
       };
       session: {
@@ -159,6 +167,7 @@ declare global {
         delete: (path: string, tabId?: string) => Promise<{ ok: boolean; error?: string }>;
         rename: (path: string, name: string) => Promise<{ ok: boolean; error?: string }>;
         onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[] }) => void) => () => void;
+        onLocalUpdated: (callback: (payload: { cwd: string; sessions: SessionListItem[] }) => void) => () => void;
         setRemoteHydrationPaused: (tabId: string, remoteCwd: string, paused: boolean) => Promise<boolean>;
         prioritizeRemote: (tabId: string, remoteCwd: string, priority?: number) => Promise<boolean>;
       };
@@ -172,12 +181,17 @@ declare global {
         addRemote: (input: { remote: RemoteTarget; baseUrl: string; apiKey?: string; model: string; provider: string; availableModels?: string[] }) => Promise<{ ok: boolean; provider: string }>;
         deleteRemote: (input: { remote: RemoteTarget; provider: string }) => Promise<boolean>;
         discoverRemote: (input: { remote: RemoteTarget; baseUrl: string; apiKey?: string }) => Promise<string[]>;
+        transplantToWsl: (distro: string) => Promise<{ ok: boolean; error?: string; copied: string[] }>;
+        transplantToRemote: (remote: RemoteTarget) => Promise<{ ok: boolean; error?: string; copied: string[] }>;
       };
       remote: {
         setBrowsePath: (tabId: string, path: string) => Promise<boolean>;
         getBrowsePath: (tabId: string) => Promise<string | null>;
-        getInfo: (tabId: string) => Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean } | null>;
+        getInfo: (tabId: string) => Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; isWsl?: boolean } | null>;
         listHistory: () => Promise<RemoteHistoryItem[]>;
+      };
+      wsl: {
+        listDistros: () => Promise<Array<{ name: string; default: boolean; running: boolean; version: number }>>;
       };
       selectDir: () => Promise<string | null>;
     };

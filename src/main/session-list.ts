@@ -57,59 +57,110 @@ interface RawEntry {
   message?: { role: string; content: unknown };
 }
 
+interface ParseState {
+  firstMessage: string;
+  messageCount: number;
+  name: string | null;
+  sessionId: string;
+}
+
+function createParseState(): ParseState {
+  return { firstMessage: "", messageCount: 0, name: null, sessionId: "" };
+}
+
+/** Evaluate one JSONL line against a ParseState (shared by sync + async parses). */
+function applyParseLine(state: ParseState, line: string): void {
+  let e: RawEntry;
+  try {
+    e = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (e.type === "session") {
+    if (e.name) state.name = e.name;
+    let raw: { id?: string };
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      raw = {};
+    }
+    if (raw.id) state.sessionId = raw.id;
+  } else if (e.type === "session_info") {
+    if (e.name) state.name = e.name;
+  } else if (e.type === "message") {
+    state.messageCount++;
+    if (!state.firstMessage && e.message?.role === "user") {
+      const c = e.message.content;
+      if (typeof c === "string") state.firstMessage = c;
+      else if (Array.isArray(c)) {
+        const t = c.find((b: any) => b.type === "text")?.text;
+        if (t) state.firstMessage = t;
+      }
+    }
+  }
+}
+
+function finalizeParse(state: ParseState, content: string, filePath: string, meta?: { mtime?: number; size?: number }): SessionEntry | null {
+  let sessionId = state.sessionId;
+  if (!sessionId) {
+    const base = filePath.replace(/\\/g, "/").split("/").pop() ?? "";
+    const m = base.match(/_([0-9a-f-]+)\.jsonl$/i);
+    if (m) sessionId = m[1];
+  }
+  return {
+    path: filePath,
+    sessionId,
+    mtime: meta?.mtime ?? 0,
+    size: meta?.size ?? Buffer.byteLength(content, "utf8"),
+    messageCount: state.messageCount,
+    firstMessage: state.firstMessage.slice(0, 100),
+    name: state.name,
+  };
+}
+
 export function parseSessionText(content: string, filePath: string, meta?: { mtime?: number; size?: number }): SessionEntry | null {
   try {
-    const lines = content.split("\n").filter((l) => l.trim());
-    let firstMessage = "";
-    let messageCount = 0;
-    let name: string | null = null;
-    let sessionId = "";
-    for (const line of lines) {
-      let e: RawEntry;
-      try {
-        e = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (e.type === "session") {
-        if (e.name) name = e.name;
-        const raw = JSON.parse(line);
-        if (raw.id) sessionId = raw.id;
-      } else if (e.type === "session_info") {
-        if (e.name) name = e.name;
-      } else if (e.type === "message") {
-        messageCount++;
-        if (!firstMessage && e.message?.role === "user") {
-          const c = e.message.content;
-          if (typeof c === "string") firstMessage = c;
-          else if (Array.isArray(c)) {
-            const t = c.find((b: any) => b.type === "text")?.text;
-            if (t) firstMessage = t;
-          }
-        }
-      }
+    const state = createParseState();
+    for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      applyParseLine(state, line);
     }
-    if (!sessionId) {
-      const base = filePath.replace(/\\/g, "/").split("/").pop() ?? "";
-      const m = base.match(/_([0-9a-f-]+)\.jsonl$/i);
-      if (m) sessionId = m[1];
+    return finalizeParse(state, content, filePath, meta);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cooperative variant of parseSessionText: yields to the event loop every
+ * `yieldEvery` lines so a multi-MB session file never blocks the main process
+ * long enough to stall IPC (terminal streaming included).
+ */
+export async function parseSessionTextAsync(
+  content: string,
+  filePath: string,
+  meta?: { mtime?: number; size?: number },
+  yieldEvery = 400,
+): Promise<SessionEntry | null> {
+  try {
+    const lines = content.split("\n");
+    const state = createParseState();
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      if (i > 0 && i % yieldEvery === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      applyParseLine(state, line);
     }
-    return {
-      path: filePath,
-      sessionId,
-      mtime: meta?.mtime ?? 0,
-      size: meta?.size ?? Buffer.byteLength(content, "utf8"),
-      messageCount,
-      firstMessage: firstMessage.slice(0, 100),
-      name,
-    };
+    return finalizeParse(state, content, filePath, meta);
   } catch {
     return null;
   }
 }
 
 /** Parse one session file's metadata. */
-function parseSessionFile(filePath: string): SessionEntry | null {
+export function parseSessionFile(filePath: string): SessionEntry | null {
   try {
     const st = statSync(filePath);
     const content = readFileSync(filePath, "utf8");

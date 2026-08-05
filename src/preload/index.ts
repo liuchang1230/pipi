@@ -7,6 +7,8 @@ export interface FileReadResult {
   error?: string;
 }
 
+export type FileOpResult = { ok: true } | { ok: false; error: string };
+
 export interface TabSummary {
   id: string;
   cwd: string;
@@ -19,6 +21,8 @@ export interface TabSummary {
   remotePort?: number;
   /** Whether this tab runs the pi TUI (local tabs always; remote unless startPi:false). */
   pi: boolean;
+  isWsl?: boolean;
+  wslDistro?: string;
 }
 
 export interface SessionListItem {
@@ -64,7 +68,7 @@ export interface RemoteTarget {
 const api = {
   // --- Tabs / terminal ---
   tab: {
-    create: (opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; title?: string; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean } }): Promise<string> =>
+    create: (opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; title?: string; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean }; wsl?: { distro: string; path?: string } }): Promise<string> =>
       ipcRenderer.invoke("tab:create", opts),
     close: (id: string): Promise<boolean> => ipcRenderer.invoke("tab:close", id),
     activate: (id: string): Promise<boolean> => ipcRenderer.invoke("tab:activate", id),
@@ -103,8 +107,8 @@ const api = {
     ipcRenderer.on("tabs:update", handler);
     return () => ipcRenderer.removeListener("tabs:update", handler);
   },
-  onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean }) => void): (() => void) => {
-    const handler = (_e: Electron.IpcRendererEvent, payload: { id: string; cwd: string; isRemote?: boolean }) =>
+  onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, payload: { id: string; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) =>
       callback(payload);
     ipcRenderer.on("tabs:active", handler);
     return () => ipcRenderer.removeListener("tabs:active", handler);
@@ -114,8 +118,16 @@ const api = {
   file: {
     list: (tabId?: string, dirPath?: string, rootPath?: string): Promise<unknown> =>
       ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath }),
-    read: (tabId: string | undefined, relPath: string): Promise<FileReadResult> =>
-      ipcRenderer.invoke("file:read", { tabId, relPath }),
+    read: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileReadResult> =>
+      ipcRenderer.invoke("file:read", { tabId, relPath, rootPath }),
+    write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:write", { tabId, relPath, content, rootPath }),
+    mkdir: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:mkdir", { tabId, relPath, rootPath }),
+    delete: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:delete", { tabId, relPath, rootPath }),
+    rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:rename", { tabId, relPath, newName, rootPath }),
   },
   onAutoFollow: (callback: (ev: { path: string; kind: "read" | "write" }) => void): (() => void) => {
     const handler = (_e: Electron.IpcRendererEvent, ev: { path: string; kind: "read" | "write" }) => callback(ev);
@@ -141,6 +153,7 @@ const api = {
     addRemote: (remote: { host: string; user: string; port?: number; path: string; password?: string }): Promise<any> =>
       ipcRenderer.invoke("project:add-remote", remote),
     delete: (id: string): Promise<boolean> => ipcRenderer.invoke("project:delete", id),
+    addWsl: (distro: string, path: string): Promise<any> => ipcRenderer.invoke("project:add-wsl", distro, path),
   },
 
   model: {
@@ -159,6 +172,10 @@ const api = {
       ipcRenderer.invoke("model:delete-remote", input),
     discoverRemote: (input: { remote: RemoteTarget; baseUrl: string; apiKey?: string }): Promise<string[]> =>
       ipcRenderer.invoke("model:discover-remote", input),
+    transplantToWsl: (distro: string): Promise<{ ok: boolean; error?: string; copied: string[] }> =>
+      ipcRenderer.invoke("model:transplant-to-wsl", distro),
+    transplantToRemote: (remote: RemoteTarget): Promise<{ ok: boolean; error?: string; copied: string[] }> =>
+      ipcRenderer.invoke("model:transplant-to-remote", remote),
   },
 
   // --- Session list (sidebar) ---
@@ -169,6 +186,11 @@ const api = {
       ipcRenderer.invoke("session:list-projects"),
     listRemote: (tabId: string, remoteCwd?: string): Promise<RemoteSessionListResult> =>
       ipcRenderer.invoke("session:list-remote", tabId, remoteCwd),
+    onLocalUpdated: (callback: (payload: { cwd: string; sessions: SessionListItem[] }) => void): (() => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, payload: { cwd: string; sessions: SessionListItem[] }) => callback(payload);
+      ipcRenderer.on("session:local-updated", handler);
+      return () => ipcRenderer.removeListener("session:local-updated", handler);
+    },
     delete: (path: string, tabId?: string): Promise<{ ok: boolean; error?: string }> =>
       ipcRenderer.invoke("session:delete", { path, tabId }),
     rename: (path: string, name: string): Promise<{ ok: boolean; error?: string }> =>
@@ -189,9 +211,14 @@ const api = {
       ipcRenderer.invoke("remote:set-browse-path", tabId, path),
     getBrowsePath: (tabId: string): Promise<string | null> =>
       ipcRenderer.invoke("remote:get-browse-path", tabId),
-    getInfo: (tabId: string): Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean } | null> =>
+    getInfo: (tabId: string): Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; isWsl?: boolean } | null> =>
       ipcRenderer.invoke("remote:get-info", tabId),
     listHistory: (): Promise<any[]> => ipcRenderer.invoke("remote:list-history"),
+  },
+
+  wsl: {
+    listDistros: (): Promise<Array<{ name: string; default: boolean; running: boolean; version: number }>> =>
+      ipcRenderer.invoke("wsl:list-distros"),
   },
 
   // --- Project directory picker ---

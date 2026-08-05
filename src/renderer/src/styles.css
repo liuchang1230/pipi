@@ -228,6 +228,40 @@ html, body, #root {
 .tree-icon { font-size: 12px; flex-shrink: 0; }
 .tree-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
+/* Right-click context menu (file tree) */
+.ctx-menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+}
+.ctx-menu {
+  position: fixed;
+  z-index: 201;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.ctx-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-menu-item:hover { background: rgba(255, 255, 255, 0.06); }
+.ctx-menu-item.danger { color: #f38ba8; }
+.ctx-menu-item.danger:hover { background: rgba(243, 139, 168, 0.12); }
+
 /* Project/session list rows */
 .group-block + .group-block {
   margin-top: 10px;
@@ -313,6 +347,23 @@ html, body, #root {
 .project-group {
   margin-bottom: 6px;
 }
+.wsl-connection {
+  margin-bottom: 6px;
+}
+.wsl-projects {
+  margin-left: 10px;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  padding-left: 4px;
+}
+.wsl-connection > .project-row:not(.wsl-connected) {
+  opacity: 0.8;
+}
+.wsl-connect-hint {
+  color: var(--accent);
+  font-size: 11px;
+  margin-left: 2px;
+  opacity: 0.8;
+}
 .project-row {
   display: flex;
   align-items: center;
@@ -382,6 +433,13 @@ html, body, #root {
   gap: 6px;
 }
 .session-row:hover { background: rgba(255, 255, 255, 0.04); }
+.session-row.active {
+  background: rgba(137, 180, 250, 0.12);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.session-row.active .session-preview {
+  color: var(--accent);
+}
 .session-body {
   flex: 1;
   min-width: 0;
@@ -764,11 +822,58 @@ html, body, #root {
   user-select: text;
   cursor: auto;
 }
+.viewer-content.viewer-error {
+  color: #f38ba8;
+}
 .viewer-content.code-view {
   white-space: pre;
 }
 .viewer-content.code-view code {
   font-family: var(--mono);
+}
+
+/* Editable mode (viewer) */
+.viewer-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg-panel);
+}
+.viewer-edit-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+.viewer-editing {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.viewer-edit-textarea {
+  flex: 1;
+  width: 100%;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 12px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
 }
 
 /* --- Markdown (shared by FileViewer + tool results) --- */
@@ -876,7 +981,29 @@ html, body, #root {
 .dialog-title {
   font-size: 16px;
   font-weight: 600;
-  margin-bottom: 18px;
+  margin-bottom: 12px;
+}
+.dialog-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.dialog-tab {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 5px 5px 0 0;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: none;
+}
+.dialog-tab.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 .dialog-body label {
   display: block;

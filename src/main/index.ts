@@ -1,26 +1,28 @@
 import { app, BrowserWindow, ipcMain, dialog } from "electron";
-import { join, posix as posixPath } from "node:path";
-import { unlinkSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { join, posix as posixPath, win32 as win32Path } from "node:path";
+import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync, rmSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
-import { listFiles, readFileContent } from "./file-tree";
+import { listFiles, readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, type FileOpResult } from "./file-tree";
 import {
   createTab, closeTab, closeAllTabs, getTab, listTabs, setActiveTab,
   resizeTab, writeTab, subscribeTab, getActiveTab, findSshBin,
   getRemoteBrowsePath, setRemoteBrowsePath, buildRemoteKey, setThemeMode,
-  hasNodeInstalled, hasGlobalPiInstalled, installGlobalPi, getPiDetectionDiagnostics,
-  type TabInfo, type RemoteOpts,
+  hasNodeInstalled, hasGlobalPiInstalled, installGlobalPi, getPiDetectionDiagnostics, warmPiDetection, invalidatePiDetection,
+  onTabsChanged, setTabTitle, linkTabSession, listWslDistros,
+  type TabInfo, type RemoteOpts, type WslOpts,
 } from "./pty";
 import {
   ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp,
   type RemoteThemeSyncResult,
 } from "./theme-sync";
 import type { ThemeMode } from "../shared/terminal-theme";
-import { encodeCwd, listSessions, listLocalProjects, parseSessionText, sessionDirFor, type SessionEntry } from "./session-list";
+import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
+import { SessionIndex } from "./session-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
 import { getSettings, updateSettings, type AppSettings } from "./settings";
-import { addLocalProject, addRemoteProject, addModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync } from "./projects";
+import { addLocalProject, addRemoteProject, addWslProject, addModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync } from "./projects";
 
 interface RemoteModelListResponse {
   data?: Array<{ id?: string }>;
@@ -28,6 +30,7 @@ interface RemoteModelListResponse {
 import { listRemoteHistory, saveRemoteHistory } from "./remote-history";
 
 let mainWindow: BrowserWindow | null = null;
+let remotePollTimer: NodeJS.Timeout | null = null;
 
 type RemoteSessionCacheEntry = {
   expiresAt: number;
@@ -78,8 +81,74 @@ const remoteThemeSyncAt = new Map<string, number>();
 const REMOTE_THEME_SYNC_TTL_MS = 15 * 60 * 1000;
 let activeRemoteHydrations = 0;
 
+// --- Live local session list sync -----------------------------------------
+// All local session listing/caching lives in SessionIndex (session-index.ts):
+// the renderer's session:list invoke, the 4s active-cwd poll, and the
+// session:local-updated push all cross the same seam.
+const sessionIndex = new SessionIndex();
+
+function startLocalSessionsPoll(cwd: string): void {
+  sessionIndex.startPolling(cwd);
+}
+
+function stopLocalSessionsPoll(): void {
+  sessionIndex.stopPolling();
+}
+
 function emitRemoteSessionsUpdated(tabId: string, remoteCwd: string, sessions: SessionEntry[]): void {
   mainWindow?.webContents.send("session:remote-updated", { tabId, remoteCwd, sessions });
+  syncRemoteTabTitles(tabId, remoteCwd, sessions);
+}
+
+/**
+ * Sync remote tab titles (and blank-tab → session links) from a session
+ * list. Called whenever remote sessions are fetched/hydrated, so a middle
+ * tab's title follows its session label — the same rule as local tabs.
+ */
+function syncRemoteTabTitles(tabId: string, remoteCwd: string, sessions: SessionEntry[]): void {
+  const origin = getTab(tabId);
+  if (!origin) return;
+  // WSL tabs are matched by distro + resolved path (they have no remoteKey);
+  // SSH tabs by host key + browse path. Both follow the same rules below:
+  // sync linked tabs' titles and link blank tabs to their session file.
+  const isWsl = !!origin.wsl;
+  if (!isWsl && !origin.remote) return;
+  const sameProject = (t: TabInfo): boolean => {
+    if (isWsl) {
+      return !!t.wsl && t.wsl.distro === origin.wsl!.distro &&
+        (t.wsl.path ?? "~") === remoteCwd;
+    }
+    return !!t.remote && t.remoteKey === origin.remoteKey &&
+      (t.remoteBrowsePath ?? t.remote?.path ?? "~") === remoteCwd;
+  };
+  // Connection-only tabs (startPi:false, "· 连接") never run pi — exclude them
+  // from both title sync and blank-tab linking. WSL tabs always run pi.
+  const tabs = listTabs().filter((t) => sameProject(t) && t.remote?.startPi !== false);
+  const linked = new Set(tabs.map((t) => t.sessionPath).filter((p): p is string => !!p));
+  const labelFor = (s: SessionEntry): string | null => {
+    const label = (s.name || s.firstMessage || "").trim();
+    return label ? label.slice(0, 40) : null;
+  };
+  for (const t of tabs) {
+    if (!t.sessionPath) continue;
+    const s = sessions.find((x) => x.path === t.sessionPath);
+    if (!s) continue;
+    const label = labelFor(s);
+    if (label) setTabTitle(t.id, label);
+  }
+  // Blank tabs ("+ 新建会话"): the newest unlinked session belongs to the
+  // oldest blank tab, mirroring the local dir-watch heuristic.
+  const blanks = tabs.filter((t) => !t.sessionPath).sort((a, b) => a.createdAt - b.createdAt);
+  if (blanks.length > 0) {
+    const unlinked = sessions
+      .filter((s) => !linked.has(s.path) && s.mtime >= blanks[0].createdAt - 500)
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const blank of blanks) {
+      const s = unlinked.shift();
+      if (!s) break;
+      linkTabSession(blank.id, s.path, labelFor(s));
+    }
+  }
 }
 
 function stableRemoteKey(remote: RemoteOpts): string {
@@ -152,6 +221,22 @@ function invalidateRemoteCaches(remote: RemoteOpts): void {
   for (const key of [...remoteSessionCache.keys()]) {
     if (key.startsWith(prefix)) remoteSessionCache.delete(key);
   }
+  for (const key of [...remoteFileTreeCache.keys()]) {
+    if (key.startsWith(prefix)) remoteFileTreeCache.delete(key);
+  }
+}
+
+/** Drop only the file-tree cache entries for a remote (keeps session cache). */
+function invalidateRemoteFileTree(remote: RemoteOpts): void {
+  const prefix = stableRemoteKey(remote) + "::tree::";
+  for (const key of [...remoteFileTreeCache.keys()]) {
+    if (key.startsWith(prefix)) remoteFileTreeCache.delete(key);
+  }
+}
+
+/** Drop the file-tree cache entries for a WSL distro. */
+function invalidateWslFileTree(distro: string): void {
+  const prefix = `wsl:${distro}:`;
   for (const key of [...remoteFileTreeCache.keys()]) {
     if (key.startsWith(prefix)) remoteFileTreeCache.delete(key);
   }
@@ -241,6 +326,144 @@ async function getSftpLease(remote: RemoteOpts): Promise<SftpLease> {
   return lease.connectPromise;
 }
 
+// --- WSL path helpers --------------------------------------------------------
+
+/** Convert a Linux path inside a WSL distro to a Windows UNC path.
+ *  NOTE: callers must pre-resolve `~` (via resolveWslPath / getWslHome) before
+ *  calling this; the `~` special-casing below is a defensive fallback only. */
+function wslToWinPath(distro: string, linuxPath: string): string {
+  // Normalize: strip trailing slash, handle ~ prefix
+  let p = linuxPath.trim();
+  if (p === "~") p = "/home";
+  else if (p.startsWith("~/")) p = "/home/" + p.slice(2);
+  // Build UNC path: \\wsl$\<distro>\<linux_path>
+  const parts = p.replace(/\//g, "\\").replace(/^\\/, "");
+  return `\\\\wsl$\\${distro}\\${parts}`.replace(/\\+$/, "");
+}
+
+/** Get the WSL user's home directory via `wsl.exe`. Cached per distro — but
+ *  only successful results are cached, so a cold-start timeout/failure is
+ *  retried on the next call instead of poisoning the session with a wrong
+ *  fallback home. */
+const wslHomeCache = new Map<string, string>();
+function getWslHome(distro: string): string {
+  const cached = wslHomeCache.get(distro);
+  if (cached) return cached;
+  const { spawnSync } = require("node:child_process");
+  const result = spawnSync("wsl.exe", ["-d", distro, "--", "bash", "-c", "echo $HOME"], {
+    encoding: "utf8",
+    stdio: "pipe",
+    windowsHide: true,
+    timeout: 5000,
+  });
+  const home = (result.stdout ?? "").trim();
+  if (home) {
+    wslHomeCache.set(distro, home);
+    return home;
+  }
+  // Fallback that is NOT cached — next call retries wsl.exe.
+  return `/home/${distro.split("-")[0].toLowerCase()}`;
+}
+
+/** Resolve a WSL path that may start with ~ to an absolute Linux path. */
+function resolveWslPath(distro: string, linuxPath: string): string {
+  let p = linuxPath.trim();
+  if (p === "~" || p === "") return getWslHome(distro);
+  if (p.startsWith("~/")) return getWslHome(distro) + "/" + p.slice(2);
+  return p;
+}
+
+// --- WSL session scan (direct \\\\wsl$ UNC filesystem reads) ---
+// WSL sessions are plain files on the local disk, so the 4s title poll can
+// read them directly — the WSL counterpart of the SSH poll (SFTP) and the
+// local fs.watch title sync in pty.ts. Snapshot-based incremental parsing
+// mirrors pollLocalSessionsOnce: only files whose (mtime, size) changed are
+// re-read, so the poll never re-parses a whole session dir every 4s.
+const wslSessionSnapshots = new Map<string, Array<{ path: string; mtime: number; size: number }>>();
+const wslSessionLists = new Map<string, SessionEntry[]>();
+
+async function wslScanSessionDir(
+  distro: string,
+  linuxCwd: string,
+  incremental: boolean,
+): Promise<{ sessions: SessionEntry[]; changed: boolean }> {
+  const resolved = resolveWslPath(distro, linuxCwd);
+  const winHome = wslToWinPath(distro, getWslHome(distro));
+  const encoded = encodeCwd(resolved);
+  const sessionDir = join(winHome, ".pi", "agent", "sessions", encoded);
+  const snapKey = `wsl:${distro}:${sessionDir}`;
+  const { readdir, readFile, stat } = await import("node:fs/promises");
+  let snap: Array<{ path: string; mtime: number; size: number }>;
+  try {
+    if (!existsSync(sessionDir)) return { sessions: [], changed: false };
+    snap = (await readdir(sessionDir))
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => {
+        const full = join(sessionDir, f);
+        const st = statSync(full);
+        return { path: full, mtime: st.mtimeMs, size: st.size };
+      });
+  } catch {
+    return { sessions: [], changed: false };
+  }
+  snap.sort((a, b) => b.mtime - a.mtime);
+
+  if (!incremental) {
+    // One-shot full scan (sidebar expand): read + parse every file.
+    const entries: SessionEntry[] = [];
+    for (const f of snap) {
+      try {
+        const [st, content] = await Promise.all([stat(f.path), readFile(f.path, "utf8")]);
+        const e = parseSessionText(content, f.path, { mtime: st.mtimeMs, size: st.size });
+        if (e) entries.push(e);
+      } catch {
+        // skip unreadable files
+      }
+    }
+    entries.sort((a, b) => b.mtime - a.mtime);
+    return { sessions: entries, changed: true };
+  }
+
+  // Incremental: reuse cached entries for unchanged files.
+  const prev = wslSessionSnapshots.get(snapKey);
+  wslSessionSnapshots.set(snapKey, snap);
+  const sameWslSnapshot = (a: Array<{ path: string; mtime: number; size: number }>, b: Array<{ path: string; mtime: number; size: number }>): boolean => {
+    if (a.length !== b.length) return false;
+    const byPath = new Map(b.map((s) => [s.path, s]));
+    return a.every((s) => {
+      const o = byPath.get(s.path);
+      return !!o && o.mtime === s.mtime && o.size === s.size;
+    });
+  };
+  if (prev && sameWslSnapshot(prev, snap)) {
+    return { sessions: wslSessionLists.get(snapKey) ?? [], changed: false };
+  }
+  // Only a change in the FILE SET (new/deleted sessions) counts as a change
+  // for the renderer; mtime drift on an actively-written session is routine.
+  const prevPaths = new Set((prev ?? []).map((x) => x.path));
+  const curPaths = new Set(snap.map((x) => x.path));
+  const pathSetChanged = prevPaths.size !== curPaths.size || [...prevPaths].some((p) => !curPaths.has(p));
+  const prevSessions = new Map((wslSessionLists.get(snapKey) ?? []).map((s) => [s.path, s]));
+  const next: SessionEntry[] = [];
+  for (const f of snap) {
+    const oldSnap = prev?.find((x) => x.path === f.path);
+    const cached = prevSessions.get(f.path);
+    if (oldSnap && cached && oldSnap.mtime === f.mtime && oldSnap.size === f.size) {
+      next.push(cached);
+      continue;
+    }
+    try {
+      const [st, content] = await Promise.all([stat(f.path), readFile(f.path, "utf8")]);
+      const parsed = parseSessionText(content, f.path, { mtime: st.mtimeMs, size: st.size });
+      next.push(parsed ?? cached ?? { path: f.path, sessionId: "", mtime: f.mtime, size: f.size, messageCount: 0, firstMessage: "", name: null });
+    } catch {
+      next.push(cached ?? { path: f.path, sessionId: "", mtime: f.mtime, size: f.size, messageCount: 0, firstMessage: "", name: null });
+    }
+  }
+  wslSessionLists.set(snapKey, next);
+  return { sessions: next, changed: pathSetChanged };
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     title: "pipi",
@@ -271,30 +494,56 @@ function emitTabs() {
     cwd: t.cwd,
     sessionPath: t.sessionPath,
     title: t.title,
-    isRemote: !!t.remote,
+    isRemote: !!(t.remote || t.wsl),
     remoteKey: t.remoteKey,
     remoteHost: t.remote?.host,
     remoteUser: t.remote?.user,
     remotePort: t.remote?.port ?? 22,
     // Local tabs always run pi; remote tabs do unless startPi:false.
     pi: t.remote ? t.remote.startPi !== false : true,
+    isWsl: !!t.wsl,
+    wslDistro: t.wsl?.distro,
   })));
 }
+
+// pty.ts watches local session files and bumps tab titles; keep the renderer
+// in sync whenever that happens (also covers remote SFTP title sync below).
+onTabsChanged(() => emitTabs());
 
 function emitActive() {
   const t = getActiveTab();
   if (t) {
-    const cwd = t.remote ? (t.remoteBrowsePath || t.remote.path || "~") : t.cwd;
-    mainWindow?.webContents.send("tabs:active", { id: t.id, cwd, isRemote: !!t.remote });
-    if (t.remote) stopWatching();
-    else startWatching(t.cwd);
+    const cwd = t.wsl ? (t.wsl.path || "~") : t.remote ? (t.remoteBrowsePath || t.remote.path || "~") : t.cwd;
+    // Attach a warm cached session list for local tabs so the renderer can
+    // skip the session:list round-trip entirely (see SessionIndex.cached).
+    const sessions = t.remote || t.wsl ? undefined : sessionIndex.cached(cwd);
+    mainWindow?.webContents.send("tabs:active", {
+      id: t.id,
+      cwd,
+      isRemote: !!(t.remote || t.wsl),
+      sessions: sessions ?? undefined,
+    });
+    if (t.remote || t.wsl) {
+      stopWatching();
+      stopLocalSessionsPoll();
+    } else {
+      startWatching(t.cwd);
+      startLocalSessionsPoll(t.cwd);
+    }
     return;
   }
   stopWatching();
+  stopLocalSessionsPoll();
   mainWindow?.webContents.send("tabs:active", { id: null, cwd: "", isRemote: false });
 }
 
 app.whenReady().then(async () => {
+  // Forward SessionIndex change events to the renderer (replaces the old
+  // pollLocalSessionsOnce emit). Only emitted when a list actually changed.
+  sessionIndex.onAnyChange((cwd, sessions) => {
+    mainWindow?.webContents.send("session:local-updated", { cwd, sessions });
+  });
+
   async function showAppMessageBox(options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> {
     const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
     return win ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options);
@@ -361,21 +610,30 @@ app.whenReady().then(async () => {
       buttons: ["确定"],
       defaultId: 0,
     });
+    // The detection caches were populated while pi was absent (bare-name
+    // fallback, piOk=false). Drop them so the freshly installed binary is
+    // picked up, then re-warm in the background.
+    invalidatePiDetection();
+    warmPiDetection();
     return { ok: true };
   }
 
   // --- Terminal / tabs ---
-  ipcMain.handle("tab:create", async (_e, opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; remote?: { host: string; user: string; port?: number; path?: string; password?: string }; themeMode?: ThemeMode }) => {
-    if (!opts.remote) {
+  ipcMain.handle("tab:create", async (_e, opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean }; wsl?: { distro: string; path?: string }; themeMode?: ThemeMode }) => {
+    if (!opts.remote && !opts.wsl) {
       const ready = await ensurePiReady();
       if (!ready.ok) {
         throw new Error(ready.reason);
       }
     }
-    // Remote tabs always spawn from process.cwd(); also fix cwd if the
+    // Remote / WSL tabs always spawn from process.cwd(); also fix cwd if the
     // renderer accidentally passes a remote path (e.g. "/home/user").
-    if (opts.remote || opts.cwd.startsWith("/") || opts.cwd.startsWith("~")) {
+    if (opts.remote || opts.wsl || opts.cwd.startsWith("/") || opts.cwd.startsWith("~")) {
       opts.cwd = process.cwd();
+    }
+    // Resolve WSL ~ paths to absolute Linux paths before spawning.
+    if (opts.wsl) {
+      opts.wsl = { ...opts.wsl, path: resolveWslPath(opts.wsl.distro, opts.wsl.path || "~") };
     }
     // Push the app-controlled themes to the remote BEFORE pi starts, so the
     // very first session already renders with the app's theme. Best-effort:
@@ -433,29 +691,67 @@ app.whenReady().then(async () => {
   ipcMain.handle("tab:write", (_e, id: string, data: string) => writeTab(id, data));
   ipcMain.handle("tab:resize", (_e, id: string, cols: number, rows: number) => resizeTab(id, cols, rows));
   ipcMain.handle("tab:list", () => listTabs().map((t) => ({
-    id: t.id, cwd: t.cwd, sessionPath: t.sessionPath, title: t.title, isRemote: !!t.remote,
+    id: t.id, cwd: t.cwd, sessionPath: t.sessionPath, title: t.title,
+    isRemote: !!(t.remote || t.wsl),
+    isWsl: !!t.wsl,
+    wslDistro: t.wsl?.distro,
   })));
 
   // --- File tree + viewer (left/right panels) ---
   ipcMain.handle("file:list", async (_e, payload?: { tabId?: string; dirPath?: string; rootPath?: string }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
     const dirPath = payload?.dirPath;
-    if (t?.remote) {
-      const targetDir = dirPath ?? payload?.rootPath ?? t.remoteBrowsePath ?? t.remote.path ?? "~";
-      const cacheKey = remoteFileTreeCacheKey(t.remote, targetDir);
-      const cached = getCachedRemoteFileTree(cacheKey);
-      if (cached) return cached;
-      return setCachedRemoteFileTree(cacheKey, await remoteListFiles(t.remote, targetDir));
+    // rootPath = explicit LOCAL preview root (sidebar project click). It is
+    // authoritative: never route it through a remote/WSL tab even if one is
+    // active — previews browse the local filesystem, period.
+    if (!payload?.rootPath) {
+      if (t?.wsl) {
+        const targetDir = dirPath ?? payload?.rootPath ?? t.wsl.path ?? "~";
+        const resolved = resolveWslPath(t.wsl.distro, targetDir);
+        const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
+        const cached = getCachedRemoteFileTree(cacheKey);
+        if (cached) return cached;
+        return setCachedRemoteFileTree(cacheKey, await wslListFiles(t.wsl.distro, resolved));
+      }
+      if (t?.remote) {
+        const targetDir = dirPath ?? payload?.rootPath ?? t.remoteBrowsePath ?? t.remote.path ?? "~";
+        const cacheKey = remoteFileTreeCacheKey(t.remote, targetDir);
+        const cached = getCachedRemoteFileTree(cacheKey);
+        if (cached) return cached;
+        return setCachedRemoteFileTree(cacheKey, await remoteListFiles(t.remote, targetDir));
+      }
     }
-    return listFiles(payload?.rootPath ?? dirPath ?? t?.cwd ?? process.cwd());
+    // No resolvable root (no tab / no explicit root): return an empty tree
+    // instead of silently falling back to the app's own directory — that
+    // fallback made the tree show the software's files under a wrong header.
+    const root = payload?.rootPath ?? dirPath ?? t?.cwd;
+    if (!root) return [];
+    return listFiles(root);
   });
-  ipcMain.handle("file:read", async (_e, payload: { tabId?: string; relPath: string }) => {
+  ipcMain.handle("file:read", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
     const relPath = payload.relPath;
-    if (t?.remote) {
-      return remoteReadFile(t.remote, relPath, t.remoteBrowsePath ?? t.remote.path ?? "~");
+    // Local preview root is authoritative (see file:list).
+    if (!payload.rootPath) {
+      if (t?.wsl) {
+        const fullPath = wslFullPath(t, relPath);
+        try {
+          const buf = readFileSync(fullPath);
+          const isBin = buf.subarray(0, Math.min(8192, buf.length)).includes(0);
+          return {
+            content: isBin ? "[二进制文件]" : buf.toString("utf8"),
+            bytes: buf.length,
+            isBinary: isBin,
+          };
+        } catch (err) {
+          return { content: `⚠️ 读取失败: ${err instanceof Error ? err.message : String(err)}`, bytes: 0, isBinary: false, error: String(err) };
+        }
+      }
+      if (t?.remote) {
+        return remoteReadFile(t.remote, relPath, t.remoteBrowsePath ?? t.remote.path ?? "~");
+      }
     }
-    return readFileContent(t?.cwd ?? process.cwd(), relPath).catch((err) => ({
+    return readFileContent(payload.rootPath ?? t?.cwd ?? process.cwd(), relPath).catch((err) => ({
       content: `⚠️ 读取失败: ${err instanceof Error ? err.message : String(err)}`,
       bytes: 0,
       isBinary: false,
@@ -463,14 +759,222 @@ app.whenReady().then(async () => {
     }));
   });
 
+  // --- File mutations (write / mkdir / delete / rename) — local / WSL / SFTP ---
+  type FileMutationResult = { ok: true } | { ok: false; error: string };
+
+  function validateRel(relPath: string): string | null {
+    if (!relPath) return "路径不能为空";
+    // Reject traversal on BOTH separators: WSL paths are converted to Windows
+    // (\\wsl$\...) where backslash-encoded .. would escape the browse dir
+    // onto the host filesystem (\mnt\c).
+    if (relPath.split(/[\\/]/).includes("..")) return "路径不能包含 ..";
+    if (relPath.startsWith("\\\\")) return "路径不能以 \\ 开头";
+    return null;
+  }
+
+  function remoteFullPath(relPath: string, baseDir: string, homeDir: string): string {
+    const base = resolveRemotePath(baseDir, homeDir);
+    const full = relPath.startsWith("/")
+      ? posixPath.normalize(relPath)
+      : resolveRemotePath(posixPath.join(baseDir, relPath), homeDir);
+    // Mutations stay inside the browse dir (tree paths are children of it;
+    // the synthetic ".." entry would otherwise be deletable/renamable).
+    if (full !== base && !full.startsWith(base === "/" ? "/" : base + "/")) {
+      throw new Error(`路径越界: ${relPath}`);
+    }
+    return full;
+  }
+
+  function wslBaseDirFor(t: TabInfo): string {
+    return resolveWslPath(t.wsl!.distro, t.wsl!.path || "~");
+  }
+
+  function wslFullPath(t: TabInfo, relPath: string): string {
+    const distro = t.wsl!.distro;
+    const baseWin = wslToWinPath(distro, wslBaseDirFor(t));
+    const rawWin = relPath.startsWith("/")
+      ? wslToWinPath(distro, relPath)
+      : `${baseWin}\\${relPath.replace(/\//g, "\\")}`;
+    const win = win32Path.normalize(rawWin);
+    const baseNorm = win32Path.normalize(baseWin);
+    if (win !== baseNorm && !win.startsWith(baseNorm + "\\")) {
+      throw new Error(`路径越界: ${relPath}`);
+    }
+    return win;
+  }
+
+  async function remoteWrite(client: SftpClient, full: string, content: string): Promise<void> {
+    await client.mkdir(posixPath.dirname(full), true);
+    // put() treats a string as a LOCAL file path → must pass a Buffer for raw content.
+    await client.put(Buffer.from(content, "utf8"), full);
+  }
+
+  async function remoteDelete(client: SftpClient, full: string): Promise<void> {
+    const kind = await client.exists(full);
+    if (!kind) throw new Error(`路径不存在: ${full}`);
+    if (kind === "d") await client.rmdir(full, true);
+    else await client.delete(full);
+  }
+
+  async function remoteRename(client: SftpClient, full: string, newName: string): Promise<void> {
+    if (!isValidName(newName)) throw new Error("名称不合法（不能包含 / 或 \\）");
+    const target = `${posixPath.dirname(full)}/${newName}`;
+    if (target !== full && (await client.exists(target))) {
+      throw new Error(`目标已存在: ${newName}`);
+    }
+    if (target === full) return; // same name → no-op
+    await client.rename(full, target);
+  }
+
+  function wslWrite(t: TabInfo, relPath: string, content: string): void {
+    const win = wslFullPath(t, relPath);
+    const dir = win.substring(0, win.lastIndexOf("\\"));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(win, content, "utf8");
+  }
+
+  function wslDelete(t: TabInfo, relPath: string): void {
+    const win = wslFullPath(t, relPath);
+    if (!existsSync(win)) throw new Error(`路径不存在: ${relPath}`);
+    rmSync(win, { recursive: true, force: false });
+  }
+
+  function wslRename(t: TabInfo, relPath: string, newName: string): void {
+    if (!isValidName(newName)) throw new Error("名称不合法（不能包含 / 或 \\）");
+    const win = wslFullPath(t, relPath);
+    const target = `${win.substring(0, win.lastIndexOf("\\"))}\\${newName}`;
+    if (target !== win && existsSync(target)) throw new Error(`目标已存在: ${newName}`);
+    if (target === win) return; // same name → no-op
+    renameSync(win, target);
+  }
+
+  /** Shared dispatch for the four mutation handlers. */
+  async function mutateFile(
+    tabId: string | undefined,
+    relPath: string,
+    fn: (t: TabInfo) => Promise<void> | void
+  ): Promise<FileMutationResult> {
+    const bad = validateRel(relPath);
+    if (bad) return { ok: false, error: bad };
+    const t = tabId ? getTab(tabId) : getActiveTab();
+    if (!t) return { ok: false, error: "找不到终端会话" };
+    try {
+      await fn(t);
+      if (t.remote) invalidateRemoteFileTree(t.remote);
+      else if (t.wsl) invalidateWslFileTree(t.wsl.distro);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /** Local mutations in preview mode resolve against rootPath, not the tab cwd. */
+
+  ipcMain.handle("file:write", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string; content: string }) => {
+    const relPath = payload.relPath;
+    const content = payload.content ?? "";
+    // Local preview root is authoritative; needs no tab at all.
+    if (payload.rootPath) {
+      return writeFileContent(payload.rootPath, relPath, content);
+    }
+    return mutateFile(payload.tabId, relPath, async (t) => {
+      if (t.wsl) {
+        wslWrite(t, relPath, content);
+      } else if (t.remote) {
+        await withSftp(t.remote, async (client, homeDir) => {
+          await remoteWrite(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), content);
+        });
+      } else {
+        const r = await writeFileContent(t.cwd ?? process.cwd(), relPath, content);
+        if (!r.ok) throw new Error(r.error);
+      }
+    });
+  });
+
+  ipcMain.handle("file:mkdir", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
+    const relPath = payload.relPath;
+    if (payload.rootPath) {
+      return createDirectory(payload.rootPath, relPath);
+    }
+    return mutateFile(payload.tabId, relPath, async (t) => {
+      if (t.wsl) {
+        mkdirSync(wslFullPath(t, relPath), { recursive: true });
+      } else if (t.remote) {
+        await withSftp(t.remote, async (client, homeDir) => {
+          await client.mkdir(remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), true);
+        });
+      } else {
+        const r = await createDirectory(t.cwd ?? process.cwd(), relPath);
+        if (!r.ok) throw new Error(r.error);
+      }
+    });
+  });
+
+  ipcMain.handle("file:delete", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
+    const relPath = payload.relPath;
+    if (payload.rootPath) {
+      return deletePath(payload.rootPath, relPath);
+    }
+    return mutateFile(payload.tabId, relPath, async (t) => {
+      if (t.wsl) {
+        wslDelete(t, relPath);
+      } else if (t.remote) {
+        await withSftp(t.remote, async (client, homeDir) => {
+          await remoteDelete(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir));
+        });
+      } else {
+        const r = await deletePath(t.cwd ?? process.cwd(), relPath);
+        if (!r.ok) throw new Error(r.error);
+      }
+    });
+  });
+
+  ipcMain.handle("file:rename", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string; newName: string }) => {
+    const relPath = payload.relPath;
+    const newName = (payload.newName ?? "").trim();
+    if (payload.rootPath) {
+      return renamePath(payload.rootPath, relPath, newName);
+    }
+    return mutateFile(payload.tabId, relPath, async (t) => {
+      if (t.wsl) {
+        wslRename(t, relPath, newName);
+      } else if (t.remote) {
+        await withSftp(t.remote, async (client, homeDir) => {
+          await remoteRename(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), newName);
+        });
+      } else {
+        const r = await renamePath(t.cwd ?? process.cwd(), relPath, newName);
+        if (!r.ok) throw new Error(r.error);
+      }
+    });
+  });
+
   ipcMain.handle("remote:set-browse-path", (_e, tabId: string, path: string) => {
+    const t = getTab(tabId);
+    if (t?.wsl) {
+      t.wsl.path = resolveWslPath(t.wsl.distro, path);
+      if (getActiveTab()?.id === tabId) emitActive();
+      return true;
+    }
     const ok = setRemoteBrowsePath(tabId, path);
     if (ok && getActiveTab()?.id === tabId) emitActive();
     return ok;
   });
-  ipcMain.handle("remote:get-browse-path", (_e, tabId: string) => getRemoteBrowsePath(tabId));
+  ipcMain.handle("remote:get-browse-path", (_e, tabId: string) => {
+    const t = getTab(tabId);
+    return t?.wsl ? (t.wsl.path || "~") : getRemoteBrowsePath(tabId);
+  });
   ipcMain.handle("remote:get-info", (_e, tabId: string) => {
     const t = getTab(tabId);
+    if (t?.wsl) {
+      return {
+        host: t.wsl.distro,
+        user: "",
+        port: 0,
+        path: t.wsl.path ?? "~",
+        isWsl: true,
+      };
+    }
     if (!t?.remote) return null;
     return {
       host: t.remote.host,
@@ -484,10 +988,14 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("tab:alive", (_e, tabId: string) => !!getTab(tabId));
 
+  // --- WSL distro list ---
+  ipcMain.handle("wsl:list-distros", () => listWslDistros());
+
   // --- Project list ---
   ipcMain.handle("project:list", () => listProjects());
   ipcMain.handle("project:add-local", (_e, cwd: string) => addLocalProject(cwd));
   ipcMain.handle("project:add-remote", (_e, remote: { host: string; user: string; port?: number; path: string; password?: string }) => addRemoteProject(remote));
+  ipcMain.handle("project:add-wsl", (_e, distro: string, path: string) => addWslProject(distro, path));
   ipcMain.handle("project:delete", (_e, id: string) => deleteProject(id));
   ipcMain.handle("model:list", () => listModels());
   ipcMain.handle("model:add", (_e, input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[] }) => {
@@ -736,11 +1244,87 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("remote:list-history", () => listRemoteHistory());
 
+  // --- Model transplant: copy local pi models/auth to WSL or remote ---
+  function readLocalPiConfigs(): { modelsPath: string; authPath: string } {
+    const localPiDir = join(require("node:os").homedir(), ".pi", "agent");
+    return {
+      modelsPath: join(localPiDir, "models.json"),
+      authPath: join(localPiDir, "auth.json"),
+    };
+  }
+
+  ipcMain.handle("model:transplant-to-wsl", async (_e, distro: string) => {
+    try {
+      const home = getWslHome(distro);
+      const winHome = wslToWinPath(distro, home);
+      const piDir = join(winHome, ".pi", "agent");
+      const { modelsPath, authPath } = readLocalPiConfigs();
+      if (!existsSync(modelsPath) && !existsSync(authPath)) {
+        return { ok: false, error: "本地没有 ~/.pi/agent/models.json 或 auth.json", copied: [] };
+      }
+      mkdirSync(piDir, { recursive: true });
+      const copied: string[] = [];
+      if (existsSync(modelsPath)) {
+        writeFileSync(join(piDir, "models.json"), readFileSync(modelsPath));
+        copied.push("models.json");
+      }
+      if (existsSync(authPath)) {
+        writeFileSync(join(piDir, "auth.json"), readFileSync(authPath));
+        copied.push("auth.json");
+      }
+      return { ok: true, copied };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err), copied: [] };
+    }
+  });
+
+  ipcMain.handle("model:transplant-to-remote", async (_e, remote: RemoteOpts) => {
+    try {
+      const { modelsPath, authPath } = readLocalPiConfigs();
+      if (!existsSync(modelsPath) && !existsSync(authPath)) {
+        return { ok: false, error: "本地没有 ~/.pi/agent/models.json 或 auth.json", copied: [] };
+      }
+      return await withSftp(remote, async (client, homeDir) => {
+        const piDir = posixPath.join(homeDir, ".pi", "agent");
+        const copied: string[] = [];
+        try { await client.mkdir(piDir, true); } catch { /* ok */ }
+        if (existsSync(modelsPath)) {
+          await client.put(readFileSync(modelsPath), posixPath.join(piDir, "models.json"));
+          copied.push("models.json");
+        }
+        if (existsSync(authPath)) {
+          await client.put(readFileSync(authPath), posixPath.join(piDir, "auth.json"));
+          copied.push("auth.json");
+        }
+        return { ok: true, copied };
+      });
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err), copied: [] };
+    }
+  });
+
   // --- Session list (left sidebar, pure fs) ---
-  ipcMain.handle("session:list", (_e, cwd?: string) => {
+  ipcMain.handle("session:list", async (_e, cwd?: string) => {
     const t = getActiveTab();
+    // Only take the WSL branch for Linux-style paths (explicit cwd or the
+    // tab's own WSL path). A caller passing a local Windows path (e.g. local
+    // project sessions) must NOT be routed into \\wsl$ translation.
+    if (t?.wsl && (cwd === undefined || cwd.startsWith("/") || cwd.startsWith("~"))) {
+      const linuxCwd = cwd ?? t.wsl.path ?? "~";
+      try {
+        const r = await wslScanSessionDir(t.wsl.distro, linuxCwd, false);
+        return r.sessions;
+      } catch {
+        return [];
+      }
+    }
     const dir = cwd ?? t?.cwd ?? process.cwd();
-    return listSessions(dir);
+    // Serve from the SessionIndex cache when fresh; otherwise parse async
+    // (cooperative, snapshot-incremental) so the click path never blocks the
+    // main-process event loop.
+    const cached = sessionIndex.cached(dir);
+    if (cached) return cached;
+    return sessionIndex.refresh(dir);
   });
   ipcMain.handle("session:list-projects", () => listLocalProjects());
   ipcMain.handle("session:set-remote-hydration-paused", (_e, tabId: string, remoteCwd: string, paused: boolean) => {
@@ -758,23 +1342,43 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("session:list-remote", async (_e, tabId: string, remoteCwd?: string) => {
     const t = getTab(tabId);
-    if (!t?.remote) return { sessions: [], error: "远程标签页不存在或已断开" };
-    const targetDir = remoteCwd ?? t.remoteBrowsePath ?? t.remote.path ?? "~";
-    const cacheKey = remoteSessionCacheKey(t.remote, targetDir);
+    if (!t?.remote && !t?.wsl) return { sessions: [], error: "远程标签页不存在或已断开" };
+    const targetDir = remoteCwd ?? t.remoteBrowsePath ?? t.remote?.path ?? t.wsl?.path ?? "~";
+    if (t?.wsl) {
+      // WSL sessions are plain files under \\\\wsl$\\<distro>\\home\\<user>\\.pi\\agent\\sessions\\…
+      try {
+        const r = await wslScanSessionDir(t.wsl.distro, targetDir, false);
+        return { sessions: r.sessions, diagnostics: undefined };
+      } catch (e) {
+        return { sessions: [], error: e instanceof Error ? e.message : String(e) };
+      }
+    }
+    const remote = t.remote as RemoteOpts;
+    const cacheKey = remoteSessionCacheKey(remote, targetDir);
+    // Capture the entry BEFORE getCachedRemoteSessions (which deletes it on
+    // expiry) so hydrated fields survive a re-list instead of resetting the
+    // sidebar to "0 条" while re-hydration runs.
+    const previous = remoteSessionCache.get(cacheKey);
     const cached = getCachedRemoteSessions(cacheKey);
     if (cached) {
       markRemoteSessionPriority(cacheKey, 2);
       if (!cached.hydrating) {
         void scheduleRemoteHydrationWork();
       }
-      const diagnostics = await remoteSessionDiagnostics(t.remote, targetDir).catch(() => undefined);
+      // Soft diagnostics: a missing session dir is routine and must not tear
+      // down the shared SFTP lease (that would kill in-flight file ops).
+      const diagnostics = await remoteSessionDiagnosticsSoft(remote, targetDir);
       return { sessions: cached.sessions, diagnostics };
     }
-    const initial = await remoteListSessions(t.remote, targetDir);
+    const initial = await remoteListSessionsSoft(remote, targetDir);
     if (!initial.ok) {
       return { sessions: [], error: initial.error };
     }
-    const sessions = setCachedRemoteSessions(cacheKey, initial.sessions, false, 0, false, 2, Date.now());
+    const sessions = mergeRemoteSessionEntries(initial.sessions, previous);
+    // Carry hydration progress when the file SET is unchanged (mtime drift on
+    // an actively-written session must not restart hydration from zero).
+    const hydratedCount = previous && sameSessionPaths(previous.sessions, sessions) ? previous.hydratedCount : 0;
+    setCachedRemoteSessions(cacheKey, sessions, false, hydratedCount, false, 2, Date.now());
     void scheduleRemoteHydrationWork();
     return { sessions, diagnostics: initial.diagnostics };
   });
@@ -784,6 +1388,7 @@ app.whenReady().then(async () => {
     if (existsSync(payload.path)) {
       try {
         unlinkSync(payload.path);
+        sessionIndex.invalidateFile(payload.path);
         return { ok: true };
       } catch (err) {
         // 例如 Windows 上文件正被 pi 进程占用时抛出 EPERM/EBUSY
@@ -791,6 +1396,17 @@ app.whenReady().then(async () => {
       }
     }
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+    if (t?.wsl && !existsSync(payload.path)) {
+      // WSL session paths are UNC (\\wsl$\<distro>\…) — use them as-is. The
+      // Linux-path translation below only covers legacy/edge callers.
+      const isUnc = /^\\\\wsl\$\\/i.test(payload.path);
+      const winPath = isUnc ? payload.path : wslToWinPath(t.wsl.distro, resolveWslPath(t.wsl.distro, payload.path));
+      try {
+        if (existsSync(winPath)) { unlinkSync(winPath); return { ok: true }; }
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
     if (t?.remote) {
       try {
         await withSftp(t.remote, async (client) => {
@@ -817,6 +1433,7 @@ app.whenReady().then(async () => {
       header.name = name || undefined;
       const rest = raw.slice(idx);
       writeFileSync(path, JSON.stringify(header) + rest, "utf8");
+      sessionIndex.invalidateFile(path);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -875,8 +1492,40 @@ app.whenReady().then(async () => {
     return posixPath.normalize(posixPath.join(homeDir, raw));
   }
 
-  async function remoteListFiles(remote: RemoteOpts, dirPath?: string) {
+  /** Single-level WSL directory listing (mirrors remoteListFiles: fast, lazy).
+   *  Returns Linux-style paths so the renderer can browse with the same
+   *  navigation logic as SSH remotes. Cached by the caller (5s TTL). */
+  async function wslListFiles(distro: string, linuxPath: string) {
     try {
+      const winPath = wslToWinPath(distro, linuxPath);
+      const items = await import("node:fs/promises").then((m) => m.readdir(winPath, { withFileTypes: true }));
+      const entries = items.map((item) => ({
+        name: item.name,
+        path: posixPath.join(linuxPath, item.name),
+        type: (item.isDirectory() ? "directory" : "file") as "directory" | "file",
+        children: item.isDirectory() ? [] : undefined,
+      }));
+      if (linuxPath !== "/") {
+        const parent = posixPath.dirname(linuxPath) || "/";
+        if (parent !== linuxPath) {
+          entries.unshift({ name: "..", path: parent, type: "directory" as const, children: [] });
+        }
+      }
+      entries.sort((a, b) => {
+        if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      return entries;
+    } catch (e) {
+      return [{
+        name: `（WSL 浏览失败: ${e instanceof Error ? e.message : String(e)}）`,
+        path: "",
+        type: "file" as const,
+      }];
+    }
+  }
+
+  async function remoteListFiles(remote: RemoteOpts, dirPath?: string) {    try {
       return await withSftp(remote, async (client, homeDir) => {
         const dir = resolveRemotePath(dirPath ?? remote.path, homeDir);
         const items = await client.list(dir);
@@ -922,6 +1571,12 @@ app.whenReady().then(async () => {
     try {
       const hydrated = await hydrateRemoteSessionsRange(remote, remoteCwd, currentSessions, cacheEntry.hydratedCount, nextTargetCount);
       const latest = remoteSessionCache.get(cacheKey);
+      // A fresh listing may have landed while we were reading (the title poll
+      // or a renderer listRemote). Don't clobber it with our stale snapshot —
+      // abort and let the new entry re-hydrate instead. Compare the file SET
+      // (paths), not mtimes: an active session is written continuously, so
+      // mtime drift is normal and must not cancel hydration.
+      if (!latest || !sameSessionPaths(currentSessions, latest.sessions)) return;
       setCachedRemoteSessions(
         cacheKey,
         hydrated,
@@ -963,62 +1618,90 @@ app.whenReady().then(async () => {
     }
   }
 
-  async function remoteListSessions(remote: RemoteOpts, remoteCwd: string): Promise<{ ok: true; sessions: SessionEntry[]; diagnostics: { resolvedCwd: string; sessionDir: string; fileCount: number } } | { ok: false; error: string }> {
-    try {
-      const result = await withSftp(remote, async (client, homeDir) => {
-        const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
-        const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolvedCwd));
-        const items = await client.list(sessionDir);
-        const files = items
-          .filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl"))
-          .sort((a: { modifyTime?: number }, b: { modifyTime?: number }) => (b.modifyTime ?? 0) - (a.modifyTime ?? 0));
+  type RemoteSessionListResult =
+    | { ok: true; sessions: SessionEntry[]; diagnostics: { resolvedCwd: string; sessionDir: string; fileCount: number } }
+    | { ok: false; error: string };
 
-        const eager = files.slice(0, REMOTE_SESSION_EAGER_PARSE_LIMIT);
-        const deferred = files.slice(REMOTE_SESSION_EAGER_PARSE_LIMIT);
+  /** List + parse one remote session dir (metadata-only; eager limit 0). */
+  async function listRemoteSessionDir(client: SftpClient, homeDir: string, remoteCwd: string): Promise<{ sessions: SessionEntry[]; diagnostics: { resolvedCwd: string; sessionDir: string; fileCount: number } }> {
+    const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
+    const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolvedCwd));
+    const items = await client.list(sessionDir);
+    const files = items
+      .filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl"))
+      .sort((a: { modifyTime?: number }, b: { modifyTime?: number }) => (b.modifyTime ?? 0) - (a.modifyTime ?? 0));
 
-        const eagerParsed = await Promise.all(eager.map(async (item: { name: string; modifyTime?: number; size?: number }) => {
-          const full = posixPath.join(sessionDir, item.name);
-          try {
-            const raw = await client.get(full);
-            const text = (Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw))).subarray(0, REMOTE_SESSION_READ_BYTE_LIMIT).toString("utf8");
-            const parsed = parseSessionText(text, full, {
-              mtime: item.modifyTime ?? 0,
-              size: item.size ?? Buffer.byteLength(text, "utf8"),
-            });
-            return parsed ?? fallbackRemoteSessionEntry(full, item);
-          } catch {
-            return fallbackRemoteSessionEntry(full, item);
-          }
-        }));
+    const eager = files.slice(0, REMOTE_SESSION_EAGER_PARSE_LIMIT);
+    const deferred = files.slice(REMOTE_SESSION_EAGER_PARSE_LIMIT);
 
-        const deferredParsed = deferred.map((item: { name: string; modifyTime?: number; size?: number }) => {
-          const full = posixPath.join(sessionDir, item.name);
-          return fallbackRemoteSessionEntry(full, item);
+    const eagerParsed = await Promise.all(eager.map(async (item: { name: string; modifyTime?: number; size?: number }) => {
+      const full = posixPath.join(sessionDir, item.name);
+      try {
+        const raw = await client.get(full);
+        const text = (Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw))).subarray(0, REMOTE_SESSION_READ_BYTE_LIMIT).toString("utf8");
+        const parsed = parseSessionText(text, full, {
+          mtime: item.modifyTime ?? 0,
+          size: item.size ?? Buffer.byteLength(text, "utf8"),
         });
+        return parsed ?? fallbackRemoteSessionEntry(full, item);
+      } catch {
+        return fallbackRemoteSessionEntry(full, item);
+      }
+    }));
 
-        return {
-          sessions: [...eagerParsed, ...deferredParsed].sort((a, b) => b.mtime - a.mtime),
-          diagnostics: {
-            resolvedCwd,
-            sessionDir,
-            fileCount: files.length,
-          },
-        };
+    const deferredParsed = deferred.map((item: { name: string; modifyTime?: number; size?: number }) => {
+      const full = posixPath.join(sessionDir, item.name);
+      return fallbackRemoteSessionEntry(full, item);
+    });
+
+    return {
+      sessions: [...eagerParsed, ...deferredParsed].sort((a, b) => b.mtime - a.mtime),
+      diagnostics: {
+        resolvedCwd,
+        sessionDir,
+        fileCount: files.length,
+      },
+    };
+  }
+
+  /**
+   * Non-destructive variant for the background title poll: errors (e.g. a
+   * missing session dir, which is routine) are caught INSIDE the callback so
+   * withSftp never tears down the shared lease — teardown would kill any
+   * in-flight file-tree/read operation on the same connection.
+   */
+  async function remoteListSessionsSoft(remote: RemoteOpts, remoteCwd: string): Promise<RemoteSessionListResult> {
+    try {
+      return await withSftp(remote, async (client, homeDir) => {
+        try {
+          const result = await listRemoteSessionDir(client, homeDir, remoteCwd);
+          return { ok: true as const, sessions: result.sessions, diagnostics: result.diagnostics };
+        } catch (error) {
+          return { ok: false as const, error: error instanceof Error ? error.message : String(error) };
+        }
       });
-      return { ok: true, sessions: result.sessions, diagnostics: result.diagnostics };
     } catch (error) {
+      // Connection-level failure — withSftp already cleaned up the lease.
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
-  async function remoteSessionDiagnostics(remote: RemoteOpts, remoteCwd: string): Promise<{ resolvedCwd: string; sessionDir: string; fileCount: number }> {
-    return withSftp(remote, async (client, homeDir) => {
-      const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
-      const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolvedCwd));
-      const items = await client.list(sessionDir);
-      const fileCount = items.filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl")).length;
-      return { resolvedCwd, sessionDir, fileCount };
-    });
+  async function remoteSessionDiagnosticsSoft(remote: RemoteOpts, remoteCwd: string): Promise<{ resolvedCwd: string; sessionDir: string; fileCount: number } | undefined> {
+    try {
+      return await withSftp(remote, async (client, homeDir) => {
+        try {
+          const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
+          const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolvedCwd));
+          const items = await client.list(sessionDir);
+          const fileCount = items.filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl")).length;
+          return { resolvedCwd, sessionDir, fileCount };
+        } catch {
+          return undefined;
+        }
+      });
+    } catch {
+      return undefined;
+    }
   }
 
   async function hydrateRemoteSessionsRange(
@@ -1110,9 +1793,117 @@ app.whenReady().then(async () => {
 
   createWindow();
 
+  // Warm the pi/node detection caches in the background (spawnSync calls like
+  // `pi --version` block the main process ~1s each). Done once at startup so
+  // the FIRST session click doesn't pay for detection; the window paints
+  // first and the warm-up runs 250ms later.
+  setTimeout(() => warmPiDetection(), 250);
+
   // Open the initial tab: continue the most recent session for the cwd.
   emitTabs();
   emitActive();
+
+  // While the user works in a remote pi tab, pi writes its session file on
+  // the server. Light poll of the active remote project's session dir so new
+  // sessions get linked to their tab (title + sidebar highlight) and renamed
+  // sessions update tab titles — the remote counterpart of the local
+  // fs.watch title sync in pty.ts. SSH uses a metadata-only SFTP listing;
+  // WSL reads the same dirs directly via \\\\wsl$ UNC (incremental scan).
+  remotePollTimer = setInterval(() => {
+    void refreshActiveRemoteTabTitles();
+  }, 4000);
+
+  // Back off per server after failures (unreachable host / session dir not
+  // created yet) so one dead server can't block polling for others and we
+  // don't retry an SSH+SFTP connect every 4s in a tight loop.
+  const remoteRefreshFailures = new Map<string, number>(); // remoteKey -> last failure time
+  async function refreshActiveRemoteTabTitles(): Promise<void> {
+    const t = getActiveTab();
+    if (!t) return;
+    if (t.wsl) {
+      // WSL sessions are plain files on the local disk — no SFTP/lease
+      // needed. Scan the session dir and run the same title + blank-tab
+      // linking as the SSH branch below. Mirror SSH: re-emit (sidebar
+      // refresh) only when the session FILE SET changed; otherwise just sync
+      // titles. emitRemoteSessionsUpdated also syncs titles.
+      const targetDir = t.wsl.path ?? "~";
+      const r = await wslScanSessionDir(t.wsl.distro, targetDir, true);
+      if (r.changed) emitRemoteSessionsUpdated(t.id, targetDir, r.sessions);
+      else syncRemoteTabTitles(t.id, targetDir, r.sessions);
+      return;
+    }
+    if (!t.remote || t.remote.startPi === false) return;
+    const targetDir = t.remoteBrowsePath ?? t.remote.path ?? "~";
+    const cacheKey = remoteSessionCacheKey(t.remote, targetDir);
+    // IMPORTANT: read BEFORE getCachedRemoteSessions — that helper deletes the
+    // entry from the Map once it expires, so this must capture it first to
+    // carry names/hydration progress over.
+    const previous = remoteSessionCache.get(cacheKey);
+    const cached = getCachedRemoteSessions(cacheKey);
+    if (cached) {
+      // Cache is fresh (≤12s): sync titles from it and stop. Never re-list
+      // here — that would downgrade the cache to metadata-only and restart
+      // hydration, flashing "正在加载会话信息" on every session. (We do NOT
+      // extend the TTL: letting it expire is what triggers the next re-list,
+      // which discovers the session file pi creates for blank tabs.)
+      syncRemoteTabTitles(t.id, targetDir, cached.sessions);
+      return;
+    }
+    const remoteKey = t.remoteKey ?? buildRemoteKey(t.remote);
+    const lastFailure = remoteRefreshFailures.get(remoteKey) ?? 0;
+    if (Date.now() - lastFailure < 20_000) return;
+    // previous (captured above) may be expired but still holds hydrated
+    // names + progress; carry them over so the sidebar never loses labels.
+    const fresh = await remoteListSessionsSoft(t.remote, targetDir);
+    if (!fresh.ok) {
+      remoteRefreshFailures.set(remoteKey, Date.now());
+      return;
+    }
+    remoteRefreshFailures.delete(remoteKey);
+    const merged = mergeRemoteSessionEntries(fresh.sessions, previous);
+    // Path-set comparison: only new/deleted sessions count as a change for
+    // the renderer. mtime drift on an actively-written session is routine
+    // and must not re-emit the list (that was the "会话一直在刷新" loop).
+    const changed = !previous || !sameSessionPaths(previous.sessions, fresh.sessions);
+    // Reset hydration progress only when the file set changed (new/deleted
+    // sessions — rare); mtime drift keeps the count so hydration never
+    // restarts from zero while a session is simply being written.
+    const hydratedCount = changed ? 0 : (previous?.hydratedCount ?? 0);
+    setCachedRemoteSessions(cacheKey, merged, false, hydratedCount, false, 1, Date.now());
+    void scheduleRemoteHydrationWork();
+    if (changed) emitRemoteSessionsUpdated(t.id, targetDir, merged);
+    else syncRemoteTabTitles(t.id, targetDir, merged);
+  }
+
+  /** Compare only the SET of session files (paths), ignoring mtime drift. */
+  function sameSessionPaths(a: SessionEntry[], b: SessionEntry[]): boolean {
+    if (a.length !== b.length) return false;
+    const setA = new Set(a.map((s) => s.path));
+    return b.every((s) => setA.has(s.path));
+  }
+
+  /**
+   * Carry hydrated fields (name, firstMessage, messageCount, size) from a
+   * previous cache entry onto a fresh metadata-only listing. Without this, an
+   * expired cache re-list resets every remote session to "0 条" until
+   * re-hydration completes (a multi-second flicker on every 12s TTL expiry).
+   */
+  function mergeRemoteSessionEntries(fresh: SessionEntry[], previous?: RemoteSessionCacheEntry): SessionEntry[] {
+    if (!previous) return fresh;
+    const oldByPath = new Map(previous.sessions.map((s) => [s.path, s]));
+    return fresh.map((s) => {
+      const old = oldByPath.get(s.path);
+      if (!old) return s;
+      return {
+        ...s,
+        name: s.name ?? old.name,
+        firstMessage: s.firstMessage || old.firstMessage,
+        messageCount: s.messageCount || old.messageCount,
+        size: s.size || old.size,
+        mtime: s.mtime || old.mtime,
+      };
+    });
+  }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -1120,6 +1911,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", async () => {
+  if (remotePollTimer) clearInterval(remotePollTimer);
+  stopLocalSessionsPoll();
   closeAllTabs();
   stopWatching();
   await Promise.all([...sftpLeases.values()].map((lease) => destroySftpLease(lease)));
@@ -1127,6 +1920,8 @@ app.on("window-all-closed", async () => {
 });
 
 app.on("before-quit", async () => {
+  if (remotePollTimer) clearInterval(remotePollTimer);
+  stopLocalSessionsPoll();
   closeAllTabs();
   stopWatching();
   await Promise.all([...sftpLeases.values()].map((lease) => destroySftpLease(lease)));

@@ -32,7 +32,8 @@ export interface PiModelsFile {
 
 export type ProjectEntry =
   | { id: string; type: "local"; name: string; cwd: string; createdAt: number; updatedAt: number }
-  | { id: string; type: "remote"; name: string; host: string; user: string; port: number; path: string; password?: string; createdAt: number; updatedAt: number };
+  | { id: string; type: "remote"; name: string; host: string; user: string; port: number; path: string; password?: string; createdAt: number; updatedAt: number }
+  | { id: string; type: "wsl"; name: string; distro: string; path: string; createdAt: number; updatedAt: number };
 
 export interface ModelConfigEntry {
   id: string;
@@ -183,6 +184,27 @@ export function addRemoteProject(remote: { host: string; user: string; port?: nu
     port,
     path: remote.path,
     password: remote.password,
+    createdAt: now,
+    updatedAt: now,
+  };
+  projects.push(entry);
+  writeProjects(projects);
+  return entry;
+}
+
+export function addWslProject(distro: string, path: string): ProjectEntry {
+  const projects = readProjects();
+  const now = Date.now();
+  const resolvedPath = path || "~";
+  const existing = projects.find((p) => p.type === "wsl" && p.distro === distro && p.path === resolvedPath);
+  if (existing) return existing;
+  const name = distro === resolvedPath || resolvedPath === "~" ? distro : `${distro}:${projectNameFromPath(resolvedPath)}`;
+  const entry: ProjectEntry = {
+    id: `wsl-${now}`,
+    type: "wsl",
+    name,
+    distro,
+    path: resolvedPath,
     createdAt: now,
     updatedAt: now,
   };
