@@ -35,7 +35,7 @@ interface TreeState {
   setFileTreeError: (error: string | null) => void;
   setRemoteTreeCache: (updater: Updater<Record<string, FileNode[]>>) => void;
   setTreeOrigin: (origin: TreeOrigin | null) => void;
-  loadTree: (dirPath?: string, tabId?: string, rootPath?: string, options?: { isRemote?: boolean; force?: boolean }) => Promise<void>;
+  loadTree: (dirPath?: string, tabId?: string, rootPath?: string, options?: { isRemote?: boolean; force?: boolean; noCache?: boolean }) => Promise<void>;
   /** Re-list the tree at its current origin (keeps previews consistent). */
   refresh: () => Promise<void>;
   navigateRemoteDir: (dirPath: string) => Promise<void>;
@@ -73,7 +73,7 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
       tabId = useTabsStore.getState().activeTab ?? undefined;
       dirPath = undefined;
     }
-    await get().loadTree(dirPath, tabId, rootPath, { isRemote, force: true });
+    await get().loadTree(dirPath, tabId, rootPath, { isRemote, force: true, noCache: true });
   },
 
   loadTree: async (dirPath, tabId, rootPath, options) => {
@@ -105,7 +105,7 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
       });
       // Cache hit: show immediately, refresh in background via main-process
       // cache (WSL/SSH file:list now has a 5s TTL) — no need to block.
-      const nodes = await window.api.file.list(resolvedTabId, dirPath, rootPath).catch(() => null);
+      const nodes = await window.api.file.list(resolvedTabId, dirPath, rootPath, options?.noCache).catch(() => null);
       if (reqSeq !== treeReqSeq.current) return; // superseded by a newer load
       if (nodes) {
         const sortedNodes = sortFileNodes(nodes as FileNode[]);
@@ -126,7 +126,7 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
       set({ fileTreeStatus: "idle", fileTreeError: null });
     }
     try {
-      const nodes = (await window.api.file.list(resolvedTabId, dirPath, rootPath)) as FileNode[];
+      const nodes = (await window.api.file.list(resolvedTabId, dirPath, rootPath, options?.noCache)) as FileNode[];
       if (reqSeq !== treeReqSeq.current) return; // superseded by a newer load
       const sortedNodes = sortFileNodes(nodes);
       set((s) => ({

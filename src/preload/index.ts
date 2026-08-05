@@ -116,8 +116,8 @@ const api = {
 
   // --- File tree + viewer ---
   file: {
-    list: (tabId?: string, dirPath?: string, rootPath?: string): Promise<unknown> =>
-      ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath }),
+    list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean): Promise<unknown> =>
+      ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath, noCache }),
     read: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileReadResult> =>
       ipcRenderer.invoke("file:read", { tabId, relPath, rootPath }),
     write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string): Promise<FileOpResult> =>

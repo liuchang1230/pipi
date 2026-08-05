@@ -140,7 +140,7 @@ declare global {
         setMode: (mode: "dark" | "light") => Promise<boolean>;
       };
       file: {
-        list: (tabId?: string, dirPath?: string, rootPath?: string) => Promise<FileNode[]>;
+        list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean) => Promise<FileNode[]>;
         read: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileReadResult>;
         write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string) => Promise<FileOpResult>;
         mkdir: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;

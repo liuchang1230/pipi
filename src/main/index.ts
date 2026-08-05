@@ -4,7 +4,7 @@ import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSyn
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
-import { listFiles, readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, type FileOpResult } from "./file-tree";
+import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, type FileOpResult } from "./file-tree";
 import {
   createTab, closeTab, closeAllTabs, getTab, listTabs, setActiveTab,
   resizeTab, writeTab, subscribeTab, getActiveTab, findSshBin,
@@ -20,6 +20,7 @@ import {
 import type { ThemeMode } from "../shared/terminal-theme";
 import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
 import { SessionIndex } from "./session-index";
+import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
 import { getSettings, updateSettings, type AppSettings } from "./settings";
 import { addLocalProject, addRemoteProject, addWslProject, addModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync } from "./projects";
@@ -86,6 +87,7 @@ let activeRemoteHydrations = 0;
 // the renderer's session:list invoke, the 4s active-cwd poll, and the
 // session:local-updated push all cross the same seam.
 const sessionIndex = new SessionIndex();
+const fileTreeIndex = new FileTreeIndex();
 
 function startLocalSessionsPoll(cwd: string): void {
   sessionIndex.startPolling(cwd);
@@ -698,7 +700,7 @@ app.whenReady().then(async () => {
   })));
 
   // --- File tree + viewer (left/right panels) ---
-  ipcMain.handle("file:list", async (_e, payload?: { tabId?: string; dirPath?: string; rootPath?: string }) => {
+  ipcMain.handle("file:list", async (_e, payload?: { tabId?: string; dirPath?: string; rootPath?: string; noCache?: boolean }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
     const dirPath = payload?.dirPath;
     // rootPath = explicit LOCAL preview root (sidebar project click). It is
@@ -726,7 +728,16 @@ app.whenReady().then(async () => {
     // fallback made the tree show the software's files under a wrong header.
     const root = payload?.rootPath ?? dirPath ?? t?.cwd;
     if (!root) return [];
-    return listFiles(root);
+    // noCache = force-fresh listing (auto-follow tree sync): pi writes do NOT
+    // go through our mutation handlers, so the TTL cache would hide files pi
+    // just created. Click-path listings (tab switch / preview) stay cached.
+    // Local-only by construction: the renderer skips auto-follow tree
+    // refreshes for remote/WSL/preview origins, so the flag never fires here
+    // for those (their 5s TTL adapters keep serving as before).
+    if (payload?.noCache) return fileTreeIndex.refresh(root);
+    const cachedTree = fileTreeIndex.cached(root);
+    if (cachedTree) return cachedTree;
+    return fileTreeIndex.refresh(root);
   });
   ipcMain.handle("file:read", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
@@ -862,6 +873,7 @@ app.whenReady().then(async () => {
       await fn(t);
       if (t.remote) invalidateRemoteFileTree(t.remote);
       else if (t.wsl) invalidateWslFileTree(t.wsl.distro);
+      else fileTreeIndex.invalidate(t.cwd ?? process.cwd());
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -875,7 +887,9 @@ app.whenReady().then(async () => {
     const content = payload.content ?? "";
     // Local preview root is authoritative; needs no tab at all.
     if (payload.rootPath) {
-      return writeFileContent(payload.rootPath, relPath, content);
+      const r = await writeFileContent(payload.rootPath, relPath, content);
+      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
@@ -894,7 +908,9 @@ app.whenReady().then(async () => {
   ipcMain.handle("file:mkdir", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
     const relPath = payload.relPath;
     if (payload.rootPath) {
-      return createDirectory(payload.rootPath, relPath);
+      const r = await createDirectory(payload.rootPath, relPath);
+      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
@@ -913,7 +929,9 @@ app.whenReady().then(async () => {
   ipcMain.handle("file:delete", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
     const relPath = payload.relPath;
     if (payload.rootPath) {
-      return deletePath(payload.rootPath, relPath);
+      const r = await deletePath(payload.rootPath, relPath);
+      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
@@ -933,7 +951,9 @@ app.whenReady().then(async () => {
     const relPath = payload.relPath;
     const newName = (payload.newName ?? "").trim();
     if (payload.rootPath) {
-      return renamePath(payload.rootPath, relPath, newName);
+      const r = await renamePath(payload.rootPath, relPath, newName);
+      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
