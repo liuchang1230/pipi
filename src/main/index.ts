@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog } from "electron";
 import { join, posix as posixPath, win32 as win32Path } from "node:path";
-import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync, rmSync, renameSync } from "node:fs";
+import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { readFile, writeFile, mkdir, rm, rename, access } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
@@ -592,7 +593,7 @@ app.whenReady().then(async () => {
     });
     void installing;
 
-    const install = installGlobalPi();
+    const install = await installGlobalPi();
     if (!install.ok) {
       await showAppMessageBox({
         type: "error",
@@ -747,7 +748,7 @@ app.whenReady().then(async () => {
       if (t?.wsl) {
         const fullPath = wslFullPath(t, relPath);
         try {
-          const buf = readFileSync(fullPath);
+          const buf = await readFile(fullPath);
           const isBin = buf.subarray(0, Math.min(8192, buf.length)).includes(0);
           return {
             content: isBin ? "[二进制文件]" : buf.toString("utf8"),
@@ -837,26 +838,38 @@ app.whenReady().then(async () => {
     await client.rename(full, target);
   }
 
-  function wslWrite(t: TabInfo, relPath: string, content: string): void {
+  function wslWrite(t: TabInfo, relPath: string, content: string): Promise<void> {
     const win = wslFullPath(t, relPath);
     const dir = win.substring(0, win.lastIndexOf("\\"));
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(win, content, "utf8");
+    return mkdir(dir, { recursive: true }).then(() => writeFile(win, content, "utf8"));
   }
 
-  function wslDelete(t: TabInfo, relPath: string): void {
+  async function wslDelete(t: TabInfo, relPath: string): Promise<void> {
     const win = wslFullPath(t, relPath);
-    if (!existsSync(win)) throw new Error(`路径不存在: ${relPath}`);
-    rmSync(win, { recursive: true, force: false });
+    try {
+      await access(win);
+    } catch {
+      throw new Error(`路径不存在: ${relPath}`);
+    }
+    await rm(win, { recursive: true, force: false });
   }
 
-  function wslRename(t: TabInfo, relPath: string, newName: string): void {
+  async function wslRename(t: TabInfo, relPath: string, newName: string): Promise<void> {
     if (!isValidName(newName)) throw new Error("名称不合法（不能包含 / 或 \\）");
     const win = wslFullPath(t, relPath);
     const target = `${win.substring(0, win.lastIndexOf("\\"))}\\${newName}`;
-    if (target !== win && existsSync(target)) throw new Error(`目标已存在: ${newName}`);
+    if (target !== win) {
+      let exists = false;
+      try {
+        await access(target);
+        exists = true;
+      } catch {
+        /* target free */
+      }
+      if (exists) throw new Error(`目标已存在: ${newName}`);
+    }
     if (target === win) return; // same name → no-op
-    renameSync(win, target);
+    await rename(win, target);
   }
 
   /** Shared dispatch for the four mutation handlers. */
@@ -893,7 +906,7 @@ app.whenReady().then(async () => {
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
-        wslWrite(t, relPath, content);
+        await wslWrite(t, relPath, content);
       } else if (t.remote) {
         await withSftp(t.remote, async (client, homeDir) => {
           await remoteWrite(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), content);
@@ -914,7 +927,7 @@ app.whenReady().then(async () => {
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
-        mkdirSync(wslFullPath(t, relPath), { recursive: true });
+        await mkdir(wslFullPath(t, relPath), { recursive: true });
       } else if (t.remote) {
         await withSftp(t.remote, async (client, homeDir) => {
           await client.mkdir(remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), true);
@@ -935,7 +948,7 @@ app.whenReady().then(async () => {
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
-        wslDelete(t, relPath);
+        await wslDelete(t, relPath);
       } else if (t.remote) {
         await withSftp(t.remote, async (client, homeDir) => {
           await remoteDelete(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir));
@@ -957,7 +970,7 @@ app.whenReady().then(async () => {
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
       if (t.wsl) {
-        wslRename(t, relPath, newName);
+        await wslRename(t, relPath, newName);
       } else if (t.remote) {
         await withSftp(t.remote, async (client, homeDir) => {
           await remoteRename(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), newName);
@@ -1441,9 +1454,12 @@ app.whenReady().then(async () => {
     return { ok: false, error: "文件不存在（可能已被删除）" };
   });
 
-  ipcMain.handle("session:rename", (_e, path: string, name: string) => {
+  ipcMain.handle("session:rename", async (_e, path: string, name: string) => {
     try {
-      const raw = readFileSync(path, "utf8");
+      // Async read/write: a multi-MB session JSONL must never be read+written
+      // synchronously on the main thread (it froze ALL IPC, incl. terminal
+      // streaming, for hundreds of ms on slow disks).
+      const raw = await readFile(path, "utf8");
       const idx = raw.indexOf("\n");
       if (idx < 0) return { ok: false, error: "empty session file" };
       let header;
@@ -1452,7 +1468,7 @@ app.whenReady().then(async () => {
       }
       header.name = name || undefined;
       const rest = raw.slice(idx);
-      writeFileSync(path, JSON.stringify(header) + rest, "utf8");
+      await writeFile(path, JSON.stringify(header) + rest, "utf8");
       sessionIndex.invalidateFile(path);
       return { ok: true };
     } catch (err) {

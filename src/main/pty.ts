@@ -15,6 +15,7 @@ import { existsSync, readFileSync, readdirSync, statSync, watch, openSync, close
 import { spawnSync, spawn, type ChildProcess } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
 import { sessionDirFor } from "./session-list";
+import { parseWslDistroList, type WslDistro } from "./wsl";
 import { themeEnv } from "./theme-sync";
 import { TERMINAL_THEMES, type ThemeMode } from "../shared/terminal-theme";
 
@@ -339,20 +340,22 @@ export function getPiDetectionDiagnostics(): {
   };
 }
 
-export function installGlobalPi(): { ok: true } | { ok: false; error: string } {
+export async function installGlobalPi(): Promise<{ ok: true } | { ok: false; error: string }> {
   const npmBin = findExe("npm.cmd", [
-    join(process.env.APPDATA ?? "", "npm\\npm.cmd"),
-    "C:\\Program Files\\nodejs\\npm.cmd",
-    "C:\\Program Files (x86)\\nodejs\\npm.cmd",
-    join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\npm.cmd"),
+    join(process.env.APPDATA ?? "", "npm\npm.cmd"),
+    "C:\Program Files\nodejs\npm.cmd",
+    "C:\Program Files (x86)\nodejs\npm.cmd",
+    join(process.env.LOCALAPPDATA ?? "", "Programs\nodejs\npm.cmd"),
   ]);
-  const result = spawnSync(
+  // Async + 180s cap: `npm install -g` used to block the main thread 10-60s+
+  // (freezing every IPC channel, incl. terminal streaming) on the click path.
+  const { stdout, stderr, code, error } = await execFileAsync(
     npmBin,
     ["install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"],
-    { encoding: "utf8", stdio: "pipe", windowsHide: true },
+    180000,
   );
-  if (result.error || result.status !== 0) {
-    return { ok: false, error: result.error?.message || result.stderr || result.stdout || `exit code ${result.status}` };
+  if (error || code !== 0) {
+    return { ok: false, error: error?.message || stderr.toString("utf8") || stdout.toString("utf8") || `exit code ${code}` };
   }
   return { ok: true };
 }
@@ -441,42 +444,45 @@ export function findWslBin(): string {
   return findExe("wsl.exe", []);
 }
 
-/** List installed WSL distributions. */
-export function listWslDistros(): WslDistro[] {
-  const wslBin = findWslBin();
-  const result = spawnSync(wslBin, ["-l", "-v"], {
-    encoding: "buffer",
-    stdio: "pipe",
-    windowsHide: true,
-  });
-  if (result.error || result.status !== 0) return [];
-  // wsl.exe outputs UTF-16LE when stdout is not a console; detect and decode.
-  let stdout = "";
-  if (result.stdout && result.stdout.length > 0) {
-    // Check for UTF-16LE BOM or interleaved null bytes
-    if (result.stdout[0] === 0xff && result.stdout[1] === 0xfe) {
-      stdout = result.stdout.toString("utf16le");
-    } else if (result.stdout.length > 2 && result.stdout[1] === 0x00) {
-      stdout = result.stdout.toString("utf16le");
-    } else {
-      stdout = result.stdout.toString("utf8");
-    }
-  }
-  const lines = stdout.split(/\r?\n/);
-  const distros: WslDistro[] = [];
-  for (const line of lines) {
-    // Format: "* Ubuntu-22.04    Running    2" or "  docker-desktop    Stopped    2"
-    const m = line.match(/^(\*?)\s+(\S+)\s+(Running|Stopped)\s+(\d+)/i);
-    if (!m) continue;
-    distros.push({
-      name: m[2],
-      default: m[1] === "*",
-      running: m[3].toLowerCase() === "running",
-      version: parseInt(m[4]) || 2,
+/** Promisified spawn capturing stdout+stderr as raw Buffers. Resolves on
+ *  spawn-failure too (caller checks error/code) and never blocks the main
+ *  thread. Optional timeout kills a hung child and resolves with a
+ *  "ETIMEDOUT" code so the caller can fail fast instead of hanging forever. */
+function execFileAsync(
+  file: string,
+  args: string[],
+  timeoutMs?: number
+): Promise<{ stdout: Buffer; stderr: Buffer; code: number | string | null; error?: Error }> {
+  return new Promise((resolve) => {
+    const child = spawn(file, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    let timedOut = false;
+    const timer = timeoutMs ? setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs) : null;
+    child.stdout?.on("data", (d: Buffer) => outChunks.push(d));
+    child.stderr?.on("data", (d: Buffer) => errChunks.push(d));
+    child.on("error", (error) => {
+      if (timer) clearTimeout(timer);
+      resolve({ stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks), code: null, error });
     });
-  }
-  return distros;
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks), code: timedOut ? "ETIMEDOUT" : code, error: undefined });
+    });
+  });
 }
+
+
+/** List installed WSL distributions (async — the old spawnSync blocked the
+ *  main thread ~100-300ms on every model-config/remote-dialog open; a 15s cap
+ *  so a cold-starting WSL service fails fast instead of hanging the IPC). */
+export async function listWslDistros(): Promise<WslDistro[]> {
+  const wslBin = findWslBin();
+  const { stdout, code, error } = await execFileAsync(wslBin, ["-l", "-v"], 15000);
+  if (error || code !== 0) return [];
+  return parseWslDistroList(stdout);
+}
+
 
 /** Generic: find an executable's absolute path. */
 function findExe(name: string, commonFallbacks: string[]): string {
@@ -526,13 +532,6 @@ function runPiVersion(piBin: string) {
     stdio: "pipe",
     windowsHide: true,
   });
-}
-
-export interface WslDistro {
-  name: string;
-  default: boolean;
-  running: boolean;
-  version: number;
 }
 
 export interface WslOpts {

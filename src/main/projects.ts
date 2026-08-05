@@ -1,5 +1,6 @@
 import { app } from "electron";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
 
 export interface PiProviderModelEntry {
@@ -307,7 +308,10 @@ export function syncModelToPi(input: ModelConfigEntry): void {
   }
 }
 
-export function checkPiModelSync(providerId: string, modelId: string): { ok: boolean; piModelsPath: string; providerExists: boolean; modelExists: boolean; listModelsContains: boolean; error?: string } {
+/** Ask pi whether it recognises the provider/model. The old spawnSync of
+ *  `pi.cmd --list-models` blocked the main thread ~1s on every 验证 click —
+ *  async now (with a 15s cap so a hung pi never leaks an in-flight call). */
+export async function checkPiModelSync(providerId: string, modelId: string): Promise<{ ok: boolean; piModelsPath: string; providerExists: boolean; modelExists: boolean; listModelsContains: boolean; error?: string }> {
   const normalizedProvider = providerId.trim();
   const normalizedModel = modelId.trim();
   const piModels = readPiModelsFile();
@@ -315,13 +319,26 @@ export function checkPiModelSync(providerId: string, modelId: string): { ok: boo
   const providerExists = !!provider;
   const modelExists = !!provider?.models?.some((m) => m.id === normalizedModel);
   try {
-    const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
-    const result = spawnSync("cmd.exe", ["/d", "/c", "pi.cmd", "--list-models"], {
-      encoding: "utf8",
-      windowsHide: true,
-      env: { ...process.env, PI_CODING_AGENT_DIR: piAgentDir() },
+    const { stdout, stderr, code, error } = await new Promise<{ stdout: string; stderr: string; code: number | string | null; error?: Error }>((resolve) => {
+      execFile(
+        "cmd.exe",
+        ["/d", "/c", "pi.cmd", "--list-models"],
+        {
+          encoding: "utf8",
+          windowsHide: true,
+          env: { ...process.env, PI_CODING_AGENT_DIR: piAgentDir() },
+          timeout: 15000,
+        },
+        (err, out, errOut) => {
+          resolve({
+            stdout: out ?? "",
+            stderr: errOut ?? "",
+            code: err ? (err as { code?: number | null }).code ?? null : 0,
+            error: err ?? undefined,
+          });
+        },
+      );
     });
-    const stdout = result.stdout || "";
     const listModelsContains = stdout.includes(normalizedProvider) && stdout.includes(normalizedModel);
     return {
       ok: providerExists && modelExists && listModelsContains,
@@ -329,7 +346,7 @@ export function checkPiModelSync(providerId: string, modelId: string): { ok: boo
       providerExists,
       modelExists,
       listModelsContains,
-      error: result.status === 0 ? undefined : (result.stderr || result.error?.message || `exit code ${result.status}`),
+      error: code === 0 ? undefined : (stderr || error?.message || `exit code ${code}`),
     };
   } catch (error) {
     return {
