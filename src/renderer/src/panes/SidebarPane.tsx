@@ -55,14 +55,10 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
   // --- File tree slice ---
   const tree = useTreeStore((s) => s.tree);
-  const setTree = useTreeStore((s) => s.setTree);
   const expanded = useTreeStore((s) => s.expanded);
   const setExpanded = useTreeStore((s) => s.setExpanded);
   const fileTreeStatus = useTreeStore((s) => s.fileTreeStatus);
   const fileTreeError = useTreeStore((s) => s.fileTreeError);
-  const remoteTreeCache = useTreeStore((s) => s.remoteTreeCache);
-  const setRemoteTreeCache = useTreeStore((s) => s.setRemoteTreeCache);
-  const loadTree = useTreeStore((s) => s.loadTree);
   const navigateRemoteDir = useTreeStore((s) => s.navigateRemoteDir);
 
   // --- Sessions / projects slice ---
@@ -70,25 +66,17 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const projectSessions = useSessionsStore((s) => s.projectSessions);
   const setProjectSessions = useSessionsStore((s) => s.setProjectSessions);
   const projectLoading = useSessionsStore((s) => s.projectLoading);
-  const setProjectLoading = useSessionsStore((s) => s.setProjectLoading);
   const projectSessionStatus = useSessionsStore((s) => s.projectSessionStatus);
-  const setProjectSessionStatus = useSessionsStore((s) => s.setProjectSessionStatus);
   const projectErrors = useSessionsStore((s) => s.projectErrors);
-  const setProjectErrors = useSessionsStore((s) => s.setProjectErrors);
   const projectDiagnostics = useSessionsStore((s) => s.projectDiagnostics);
-  const setProjectDiagnostics = useSessionsStore((s) => s.setProjectDiagnostics);
-  const projectTrees = useSessionsStore((s) => s.projectTrees);
-  const setProjectTrees = useSessionsStore((s) => s.setProjectTrees);
   const remoteSessions = useSessionsStore((s) => s.remoteSessions);
   const setRemoteSessions = useSessionsStore((s) => s.setRemoteSessions);
   const remoteHydration = useSessionsStore((s) => s.remoteHydration);
   const setRemoteHydration = useSessionsStore((s) => s.setRemoteHydration);
   const expandedProjects = useSessionsStore((s) => s.expandedProjects);
-  const setExpandedProjects = useSessionsStore((s) => s.setExpandedProjects);
   const selectedSessions = useSessionsStore((s) => s.selectedSessions);
   const setSelectedSessions = useSessionsStore((s) => s.setSelectedSessions);
   const loadSessions = useSessionsStore((s) => s.loadSessions);
-  const loadProjects = useSessionsStore((s) => s.refreshProjects);
   // Stable store actions (never recreated) — passing these directly keeps the
   // memoized Sidebar/sections from re-rendering on every session poll.
   const openSession = useSessionsStore((s) => s.openSession);
@@ -392,32 +380,12 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   }, [ctxMenuSession]);
 
   // --- Project explorer orchestration (hydration phases + cache fast paths) ---
-  const { toggleProject, handleDeleteProject, handleNewProjectSession } = useProjectExplorer({
-    expandedProjects,
-    projectTrees,
-    projectSessions,
-    remoteSessions,
-    remoteTreeCache,
-    loadProjects,
-    loadTree,
-    setExpandedProjects,
-    setProjectLoading,
-    setProjectSessionStatus,
-    setProjectErrors,
-    setProjectDiagnostics,
-    setProjectSessions,
-    setProjectTrees,
-    setRemoteHydration,
-    setRemoteSessions,
-    setRemoteTreeCache,
-    setTree,
-    setCwd,
-    setRemoteDir,
-    setIsRemote,
-    setRemoteLabel,
-    setActiveTab,
-    cwd,
-  });
+  // Deepened into sessionsStore actions (O2): the pane calls one action per
+  // user gesture; the hydration phases and cache fast paths live with the
+  // session/project state they mutate.
+  const toggleProject = useSessionsStore((s) => s.toggleProject);
+  const deleteProject = useSessionsStore((s) => s.deleteProject);
+  const newProjectSession = useSessionsStore((s) => s.newProjectSession);
 
   // --- Tree rendering ---
   const toggleDir = useCallback((path: string) => {
@@ -581,8 +549,8 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         onSidebarResizerDown={onSidebarResizerDown}
         onToggleProject={toggleProject}
         onNewLocalProject={onNewLocalProject}
-        onDeleteProject={handleDeleteProject}
-        onNewProjectSession={handleNewProjectSession}
+        onDeleteProject={deleteProject}
+        onNewProjectSession={newProjectSession}
         onAddRemoteProject={onAddRemoteProject}
         onOpenSession={openSession}
         onOpenRemoteSession={openRemoteSession}
@@ -1271,247 +1239,3 @@ function relativeTime(ms: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
-// --- useProjectExplorer (moved verbatim from App.tsx) -----------------------
-
-interface UseProjectExplorerArgs {
-  expandedProjects: Set<string>;
-  projectTrees: Record<string, FileNode[]>;
-  projectSessions: Record<string, SessionItem[]>;
-  remoteSessions: Record<string, SessionItem[]>;
-  remoteTreeCache: Record<string, FileNode[]>;
-  loadProjects: () => Promise<void>;
-  loadTree: (dirPath?: string, tabId?: string, rootPath?: string, options?: { isRemote?: boolean }) => Promise<void>;
-  setExpandedProjects: (updater: Updater<Set<string>>) => void;
-  setProjectLoading: (updater: Updater<Record<string, boolean>>) => void;
-  setProjectSessionStatus: (updater: Updater<Record<string, "idle" | "loading" | "ready" | "empty" | "error">>) => void;
-  setProjectErrors: (updater: Updater<Record<string, string | undefined>>) => void;
-  setProjectDiagnostics: (updater: Updater<Record<string, { resolvedCwd: string; sessionDir: string; fileCount: number } | undefined>>) => void;
-  setProjectSessions: (updater: Updater<Record<string, SessionItem[]>>) => void;
-  setProjectTrees: (updater: Updater<Record<string, FileNode[]>>) => void;
-  setRemoteHydration: (updater: Updater<RemoteHydrationState>) => void;
-  setRemoteSessions: (updater: Updater<Record<string, SessionItem[]>>) => void;
-  setRemoteTreeCache: (updater: Updater<Record<string, FileNode[]>>) => void;
-  setTree: (updater: Updater<FileNode[]>) => void;
-  setCwd: (cwd: string) => void;
-  setRemoteDir: (dir: string | null) => void;
-  setIsRemote: (v: boolean) => void;
-  setRemoteLabel: (label: string) => void;
-  setActiveTab: (id: string | null) => void;
-  cwd: string;
-}
-
-interface UseProjectExplorerResult {
-  toggleProject: (project: ProjectGroup) => Promise<void>;
-  handleDeleteProject: (project: ProjectGroup) => Promise<void>;
-  handleNewProjectSession: (project: ProjectGroup) => Promise<void>;
-}
-
-function useProjectExplorer({
-  expandedProjects,
-  projectTrees,
-  projectSessions,
-  remoteSessions,
-  remoteTreeCache,
-  loadProjects,
-  loadTree,
-  setExpandedProjects,
-  setProjectLoading,
-  setProjectSessionStatus,
-  setProjectErrors,
-  setProjectDiagnostics,
-  setProjectSessions,
-  setProjectTrees,
-  setRemoteHydration,
-  setRemoteSessions,
-  setRemoteTreeCache,
-  setTree,
-  setCwd,
-  setRemoteDir,
-  setIsRemote,
-  setRemoteLabel,
-  setActiveTab,
-  cwd,
-}: UseProjectExplorerArgs): UseProjectExplorerResult {
-  const toggleProject = useCallback(async (project: ProjectGroup) => {
-    const willExpand = !expandedProjects.has(project.key);
-    setExpandedProjects((prev) => {
-      const next = new Set(prev);
-      if (next.has(project.key)) next.delete(project.key);
-      else next.add(project.key);
-      return next;
-    });
-
-    if (project.type === "local") {
-      const hasCachedSessions = !!projectSessions[project.key]?.length;
-      if (willExpand && !hasCachedSessions) {
-        setProjectLoading((prev) => ({ ...prev, [project.key]: true }));
-        const list = await window.api.session.list(project.cwd);
-        setProjectSessions((prev) => ({ ...prev, [project.key]: list as SessionItem[] }));
-        setProjectSessionStatus((prev) => ({ ...prev, [project.key]: list.length > 0 ? "ready" : "empty" }));
-        setProjectLoading((prev) => ({ ...prev, [project.key]: false }));
-      }
-      setCwd(project.cwd);
-      setRemoteDir(null);
-      setIsRemote(false);
-      await loadTree(undefined, undefined, project.cwd, { isRemote: false });
-      return;
-    }
-
-    // WSL projects: if the distro has no open tab, auto-connect it so the
-    // click actually opens the project (was previously a silent no-op).
-    if (!project.tabId && project.host && (project.port ?? 22) === 0) {
-      const id = await window.api.tab.create({
-        cwd: cwd || ".",
-        wsl: { distro: project.host, path: project.cwd },
-      });
-      project.tabId = id;
-    }
-
-    if (!project.tabId) {
-      return;
-    }
-
-    await window.api.tab.activate(project.tabId);
-    setActiveTab(project.tabId);
-    setIsRemote(true);
-    setRemoteDir(project.cwd);
-    setCwd(project.cwd);
-    setRemoteLabel(project.host && (project.port ?? 22) === 0 ? `🐧 ${project.host}` : `${project.user}@${project.host}`);
-    await window.api.remote.setBrowsePath(project.tabId, project.cwd);
-    // Record the origin BEFORE any cached tree is shown: file reads/mutations
-    // must resolve against this project even while the activation handler's
-    // async loadTree is still in flight.
-    useTreeStore.setState({ treeOrigin: { tabId: project.tabId, dirPath: project.cwd, isRemote: true } });
-
-    const remoteCacheKey = `${project.tabId}:${project.cwd}`;
-    await window.api.session.setRemoteHydrationPaused(project.tabId, project.cwd, !willExpand);
-    if (willExpand) await window.api.session.prioritizeRemote(project.tabId, project.cwd, 2);
-    const cachedTree = projectTrees[project.key] ?? remoteTreeCache[remoteCacheKey];
-    if (cachedTree) setTree(sortFileNodes(cachedTree));
-
-    if (willExpand) {
-      const cachedSessions = projectSessions[project.key] ?? remoteSessions[remoteCacheKey] ?? [];
-      const hasCachedTree = !!cachedTree?.length;
-      const hasCachedSessions = cachedSessions.length > 0;
-      if (hasCachedSessions) {
-        setProjectSessions((prev) => ({ ...prev, [project.key]: cachedSessions }));
-      }
-      if (hasCachedTree && hasCachedSessions) {
-        setProjectSessionStatus((prev) => ({ ...prev, [project.key]: "ready" }));
-        void window.api.session.listRemote(project.tabId, project.cwd).then((listResult) => {
-          setProjectSessions((prev) => ({ ...prev, [project.key]: listResult.sessions as SessionItem[] }));
-          setProjectErrors((prev) => ({ ...prev, [project.key]: listResult.error }));
-          setProjectDiagnostics((prev) => ({ ...prev, [project.key]: listResult.diagnostics }));
-          setProjectSessionStatus((prev) => ({ ...prev, [project.key]: listResult.error ? "error" : listResult.sessions.length > 0 ? "ready" : "empty" }));
-        }).catch(() => undefined);
-        setProjectLoading((prev) => ({ ...prev, [project.key]: false }));
-        setRemoteHydration({ phase: "idle" });
-        return;
-      }
-      setProjectLoading((prev) => ({ ...prev, [project.key]: true }));
-      setProjectSessionStatus((prev) => ({ ...prev, [project.key]: hasCachedSessions ? "ready" : "loading" }));
-      setRemoteHydration({ phase: hasCachedSessions ? "hydrating" : "loading", tabId: project.tabId, remoteCwd: project.cwd });
-
-      if (!hasCachedSessions) {
-        void window.api.session.listRemote(project.tabId, project.cwd).then((listResult) => {
-          setProjectSessions((prev) => ({ ...prev, [project.key]: listResult.sessions as SessionItem[] }));
-          setProjectErrors((prev) => ({ ...prev, [project.key]: listResult.error }));
-          setProjectDiagnostics((prev) => ({ ...prev, [project.key]: listResult.diagnostics }));
-          setProjectSessionStatus((prev) => ({ ...prev, [project.key]: listResult.error ? "error" : listResult.sessions.length > 0 ? "ready" : "empty" }));
-          setProjectLoading((prev) => ({ ...prev, [project.key]: false }));
-          setRemoteHydration({ phase: "idle" });
-        }).catch((error) => {
-          setProjectErrors((prev) => ({ ...prev, [project.key]: error instanceof Error ? error.message : String(error) }));
-          setProjectSessionStatus((prev) => ({ ...prev, [project.key]: "error" }));
-          setProjectLoading((prev) => ({ ...prev, [project.key]: false }));
-          setRemoteHydration({ phase: "idle" });
-        });
-      } else {
-        setProjectLoading((prev) => ({ ...prev, [project.key]: false }));
-      }
-
-      if (!hasCachedTree) {
-        const nodes = await window.api.file.list(project.tabId, project.cwd);
-        const sortedNodes = sortFileNodes(nodes as FileNode[]);
-        setTree(sortedNodes);
-        setProjectTrees((prev) => ({ ...prev, [project.key]: sortedNodes }));
-        setRemoteTreeCache((prev) => ({ ...prev, [remoteCacheKey]: sortedNodes }));
-      }
-      return;
-    }
-
-    const nodes = await window.api.file.list(project.tabId, project.cwd);
-    const sortedNodes = sortFileNodes(nodes as FileNode[]);
-    setTree(sortedNodes);
-    setProjectTrees((prev) => ({ ...prev, [project.key]: sortedNodes }));
-    setRemoteTreeCache((prev) => ({ ...prev, [remoteCacheKey]: sortedNodes }));
-    setProjectLoading((prev) => ({ ...prev, [project.key]: false }));
-    setRemoteHydration({ phase: "idle" });
-  }, [cwd, expandedProjects, loadTree, projectSessions, projectTrees, remoteSessions, remoteTreeCache, setActiveTab, setCwd, setExpandedProjects, setIsRemote, setProjectDiagnostics, setProjectErrors, setProjectLoading, setProjectSessionStatus, setProjectSessions, setProjectTrees, setRemoteDir, setRemoteHydration, setRemoteLabel, setRemoteTreeCache, setTree]);
-
-  const handleDeleteProject = useCallback(async (project: ProjectGroup) => {
-    if (!confirm(`删除项目 ${project.label}？\n这不会删除实际文件夹。`)) return;
-    const ok = await window.api.project.delete(project.key);
-    if (!ok) {
-      alert("删除项目失败");
-      return;
-    }
-    setExpandedProjects((prev) => {
-      const next = new Set(prev);
-      next.delete(project.key);
-      return next;
-    });
-    await loadProjects();
-  }, [loadProjects, setExpandedProjects]);
-
-  const handleNewProjectSession = useCallback(async (project: ProjectGroup) => {
-    // WSL projects reuse type "remote" but are identified by port === 0 +
-    // host = distro. Create a WSL tab (not SSH) for a new session.
-    if (project.type === "remote" && (project.port ?? 22) === 0 && project.host) {
-      const id = await window.api.tab.create({
-        cwd: cwd || ".",
-        wsl: { distro: project.host, path: project.cwd },
-      });
-      const wslTabId = project.tabId || id;
-      const wslListResult = await window.api.session.listRemote(wslTabId, project.cwd);
-      setRemoteSessions((prev) => ({ ...prev, [remoteSessionCacheKey(wslTabId, project.cwd)]: wslListResult.sessions as SessionItem[] }));
-      setProjectErrors((prev) => ({ ...prev, [project.key]: wslListResult.error }));
-      setProjectDiagnostics((prev) => ({ ...prev, [project.key]: wslListResult.diagnostics }));
-      setProjectSessionStatus((prev) => ({ ...prev, [project.key]: wslListResult.error ? "error" : wslListResult.sessions.length > 0 ? "ready" : "empty" }));
-      return;
-    }
-    if (project.type === "remote") {
-      let remoteInfo = project.tabId ? await window.api.remote.getInfo(project.tabId) : null;
-      if (!remoteInfo && project.host && project.user) {
-        remoteInfo = {
-          host: project.host,
-          user: project.user,
-          port: project.port,
-          path: project.cwd,
-          password: project.password,
-        };
-      }
-      if (!remoteInfo) return;
-      const id = await window.api.tab.create({
-        cwd: cwd || ".",
-        remote: {
-          host: remoteInfo.host,
-          user: remoteInfo.user,
-          port: remoteInfo.port,
-          path: project.cwd,
-          password: remoteInfo.password,
-        },
-      });
-      const remoteTabId = project.tabId || id;
-      const remoteListResult = await window.api.session.listRemote(remoteTabId, project.cwd);
-      setRemoteSessions((prev) => ({ ...prev, [remoteSessionCacheKey(remoteTabId, project.cwd)]: remoteListResult.sessions as SessionItem[] }));
-      setProjectErrors((prev) => ({ ...prev, [project.key]: remoteListResult.error }));
-      setProjectDiagnostics((prev) => ({ ...prev, [project.key]: remoteListResult.diagnostics }));
-      setProjectSessionStatus((prev) => ({ ...prev, [project.key]: remoteListResult.error ? "error" : remoteListResult.sessions.length > 0 ? "ready" : "empty" }));
-      return;
-    }
-    await window.api.tab.create({ cwd: project.cwd });
-  }, [cwd, setProjectDiagnostics, setProjectErrors, setProjectSessionStatus, setRemoteSessions]);
-
-  return { toggleProject, handleDeleteProject, handleNewProjectSession };
-}

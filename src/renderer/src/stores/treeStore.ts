@@ -4,13 +4,8 @@
 // tab A from clobbering a newer one for tab B.
 import { create } from "zustand";
 import { useTabsStore } from "./tabsStore";
+import { apply, type Updater } from "./utils";
 import type { FileNode } from "./types";
-
-type Updater<T> = T | ((prev: T) => T);
-
-function apply<T>(prev: T, value: Updater<T>): T {
-  return typeof value === "function" ? (value as (p: T) => T)(prev) : value;
-}
 
 /** Where the current `tree` listing came from. Event-driven refreshes and
  *  file reads/mutations must resolve against this origin — NOT the active
