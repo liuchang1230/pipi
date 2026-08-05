@@ -38,7 +38,7 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
       cursorBlink: true,
       cursorStyle: "bar",
       allowProposedApi: true,
-      scrollback: 10000,
+      scrollback: 50000,
       smoothScrollDuration: 0,
       scrollOnUserInput: true,
       // pi's TUI redraws with `\x1b[2J` (ED2) inside DEC 2026 sync blocks
@@ -123,39 +123,6 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
       term.write("\r\n\x1b[2m[进程已退出]\x1b[0m\r\n");
     });
 
-    // --- Viewport pin (defensive): while the user reads history, re-assert
-    // their scroll position if xterm internally yanks it (pi's ED2-inside-
-    // sync redraws reset viewportY per xtermjs#5801). User-initiated scrolls
-    // (wheel / scrollbar mousedown) re-pin to wherever they land; anything
-    // else that moves viewportY away from the pin is treated as an internal
-    // yank and restored. scrollToLine(pin) settles at the pin, so no loop.
-    let pinnedYdisp: number | null = null;
-    let lastUserScroll = 0;
-    const userScroll = () => {
-      lastUserScroll = Date.now();
-    };
-    const termEl = term.element; // set by term.open() above
-    const scrollableEl = termEl?.querySelector(".xterm-scrollable-element");
-    termEl?.addEventListener("wheel", userScroll, { passive: true });
-    scrollableEl?.addEventListener("mousedown", userScroll);
-    const offScroll = term.onScroll(() => {
-      const buf = term.buffer.active;
-      const ydisp = buf.viewportY;
-      const ybase = buf.baseY;
-      const userScrolling = Date.now() - lastUserScroll < 500;
-      if (userScrolling) {
-        pinnedYdisp = ydisp < ybase ? ydisp : null;
-        return;
-      }
-      if (pinnedYdisp === null) {
-        if (ydisp < ybase) pinnedYdisp = ydisp;
-        return;
-      }
-      if (ydisp !== pinnedYdisp) {
-        term.scrollToLine(pinnedYdisp);
-      }
-    });
-
     // Report initial size.
     onResize(term.cols, term.rows);
 
@@ -182,12 +149,9 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
 
     return () => {
       term.element?.removeEventListener("contextmenu", ctxHandler);
-      termEl?.removeEventListener("wheel", userScroll);
-      scrollableEl?.removeEventListener("mousedown", userScroll);
       disp.dispose();
       offData();
       offExit();
-      offScroll.dispose();
       ro.disconnect();
       ime.detach();
       term.dispose();
