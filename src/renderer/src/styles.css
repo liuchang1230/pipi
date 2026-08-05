@@ -1,47 +1,5 @@
-:root {
-  --bg: #1e1e2e;
-  --bg-panel: #181825;
-  --bg-input: #11111b;
-  --text: #cdd6f4;
-  --text-dim: #7f849c;
-  --border: #313244;
-  --accent: #89b4fa;
-  --success: #a6e3a1;
-  --user-bg: rgba(137, 180, 250, 0.08);
-  --assistant-bg: rgba(166, 227, 161, 0.05);
-  --danger: #f38ba8;
-  /* Semantic surface tokens: hovers/rows/borders must derive from these so
-     light mode works by overriding tokens alone (never white-on-white). */
-  --hover: rgba(255, 255, 255, 0.04);
-  --hover-medium: rgba(255, 255, 255, 0.06);
-  --hover-strong: rgba(255, 255, 255, 0.08);
-  --hover-soft: rgba(255, 255, 255, 0.05);
-  --hover-faint: rgba(255, 255, 255, 0.02);
-  --mono: "Cascadia Code", "Consolas", "Courier New", monospace;
-}
-
-[data-theme="light"] {
-  --bg: #f5f5f5;
-  --bg-panel: #ffffff;
-  --bg-input: #e8e8e8;
-  --text: #1a1a2e;
-  --text-dim: #6b7280;
-  --border: #d1d5db;
-  --accent: #2563eb;
-  --success: #16a34a;
-  --user-bg: rgba(37, 99, 235, 0.06);
-  --assistant-bg: rgba(16, 185, 129, 0.05);
-  --danger: #dc2626;
-  --hover: rgba(0, 0, 0, 0.05);
-  --hover-medium: rgba(0, 0, 0, 0.07);
-  --hover-strong: rgba(0, 0, 0, 0.1);
-  --hover-soft: rgba(0, 0, 0, 0.06);
-  --hover-faint: rgba(0, 0, 0, 0.03);
-}
-[data-theme="light"] .terminal-wrap,
-[data-theme="light"] .terminal-container .xterm-viewport {
-  background: #ffffff;
-}
+/* CSS custom properties are GENERATED at boot from shared/theme-tokens.ts
+   (theme-vars.ts injects a <style>); do not hand-edit the token values here. */
 
 /* --- highlight.js dark overrides (base is github.css light theme) --- */
 [data-theme="dark"] .hljs {
@@ -618,7 +576,7 @@ html, body, #root {
 .terminal-wrap {
   flex: 1;
   position: relative;
-  background: #000;
+  background: var(--terminal-bg);
   min-height: 0;
 }
 .terminal-pane {
@@ -633,7 +591,7 @@ html, body, #root {
   visibility: visible;
 }
 .terminal-container .xterm-viewport {
-  background: #000;
+  background: var(--terminal-bg);
 }
 .terminal-container {
   position: absolute;

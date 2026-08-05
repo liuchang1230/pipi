@@ -21,6 +21,7 @@
  * and cannot be shadowed by the user's own terminal background detection.
  */
 import type { ITheme } from "@xterm/xterm";
+import { THEME_TOKENS } from "./theme-tokens";
 
 export type ThemeMode = "dark" | "light";
 
@@ -141,11 +142,15 @@ const dark = {
     },
   },
   xterm: {
-    background: "#000000",
-    foreground: "#cdd6f4",
-    cursor: "#89b4fa",
+    // Shared surface fields derive from THEME_TOKENS (the single token
+    // source) so the terminal can never drift from the app chrome: cursor /
+    // selection follow the accent, foreground follows text, background the
+    // terminal viewport token. The ANSI palettes stay terminal-specific.
+    background: THEME_TOKENS.dark.terminalBg,
+    foreground: THEME_TOKENS.dark.text,
+    cursor: THEME_TOKENS.dark.accent,
     cursorAccent: "#000000",
-    selectionBackground: "#89b4fa",
+    selectionBackground: THEME_TOKENS.dark.accent,
     selectionForeground: "#000000",
     // ANSI 0-7 / 8-15 aligned with the pi dark theme's accent vars so
     // raw program colors (ls, git, shell prompts) stay in the same family.
@@ -240,11 +245,11 @@ const light = {
     },
   },
   xterm: {
-    background: "#ffffff",
-    foreground: "#1a1a2e",
-    cursor: "#2563eb",
+    background: THEME_TOKENS.light.terminalBg,
+    foreground: THEME_TOKENS.light.text,
+    cursor: THEME_TOKENS.light.accent,
     cursorAccent: "#ffffff",
-    selectionBackground: "#2563eb",
+    selectionBackground: THEME_TOKENS.light.accent,
     selectionForeground: "#ffffff",
     ansi: ["#1f2328", "#aa5555", "#588458", "#9a7326", "#547da7", "#875f87", "#5a8080", "#b0b0b0"],
     brightAnsi: ["#767676", "#cc6666", "#6aa06a", "#b08a30", "#6a8fbf", "#9d6f9d", "#6e9d9d", "#ffffff"],
