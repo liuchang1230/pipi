@@ -66,7 +66,8 @@ html, body, #root {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+  /* 中文字体栈：Windows 优先雅黑，macOS PingFang，Linux Noto Sans SC */
+  font-family: -apple-system, "Segoe UI", system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
   font-size: 13px;
   overflow: hidden;
 }

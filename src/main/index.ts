@@ -470,7 +470,8 @@ async function wslScanSessionDir(
 function createWindow() {
   mainWindow = new BrowserWindow({
     title: "pipi",
-    icon: join(__dirname, `../../resources/icon.${process.platform === "win32" ? "ico" : "png"}`),
+    // 用户提供的 图标.png 作为窗口图标（覆盖旧的 icon.ico/icon.png）。
+    icon: join(__dirname, "../../resources/icon.png"),
     width: 1280,
     height: 820,
     webPreferences: {

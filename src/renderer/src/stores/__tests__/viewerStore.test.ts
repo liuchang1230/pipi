@@ -7,6 +7,7 @@ import { useViewerStore, isManualOpenPending } from "../viewerStore";
 import { useTabsStore } from "../tabsStore";
 import { useTreeStore } from "../treeStore";
 import { useUiStore } from "../uiStore";
+import { useLayoutStore } from "../layoutStore";
 
 const OK_FILE = { content: "hello", bytes: 5, isBinary: false };
 
@@ -33,6 +34,7 @@ beforeEach(() => {
   useTabsStore.setState({ activeTab: "t1", isRemote: false, cwd: "/proj", remoteDir: null, remoteLabel: "" });
   useTreeStore.setState({ tree: [], expanded: new Set(), fileTreeStatus: "idle", fileTreeError: null, remoteTreeCache: {}, treeOrigin: null });
   useUiStore.setState({ toast: null });
+  useLayoutStore.setState({ leftWidth: 260, rightWidth: 420, viewerCollapsed: false });
 });
 
 describe("openFile", () => {
@@ -54,6 +56,12 @@ describe("openFile", () => {
     useTreeStore.setState({ treeOrigin: { rootPath: "/preview", isRemote: false } });
     await useViewerStore.getState().openFile("a.ts", false);
     expect(api.file.read).toHaveBeenCalledWith(expect.anything(), "a.ts", "/preview");
+  });
+
+  it("reveals a collapsed viewer when a file is opened (click means: show it)", async () => {
+    useLayoutStore.setState({ viewerCollapsed: true });
+    await useViewerStore.getState().openFile("a.ts", false);
+    expect(useLayoutStore.getState().viewerCollapsed).toBe(false);
   });
 
   it("latest open wins a race (stale read must not clobber a newer one)", async () => {

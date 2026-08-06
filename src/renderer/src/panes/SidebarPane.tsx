@@ -511,6 +511,23 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
     [tabs, activeTab],
   );
 
+  // Switching middle tabs scrolls the sidebar so the linked session row is
+  // visible ("点击标签页 → 左侧定位到对应会话"). rAF defers one frame so the
+  // freshly-rendered rows exist before we look them up.
+  useEffect(() => {
+    if (!activeSessionPath) return;
+    const raf = requestAnimationFrame(() => {
+      const rows = document.querySelectorAll<HTMLElement>(".session-row[data-session-path]");
+      for (const el of rows) {
+        if (el.dataset.sessionPath === activeSessionPath) {
+          el.scrollIntoView({ block: "nearest" });
+          return;
+        }
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [activeSessionPath]);
+
   // Stable wrapper so the memoized Sidebar never re-renders from changing
   // closure identities (only from actual data changes).
   const handleBatchDeleteClick = useCallback(() => {
@@ -1150,7 +1167,13 @@ const SessionRow = memo(function SessionRow({ session, active, checked, onToggle
   // and a placeholder count of 0 — rendering "0 条" would be misleading.
   const hydrating = session.name === null && session.firstMessage === "" && session.messageCount === 0;
   return (
-    <div className={`session-row${active ? " active" : ""}`} onClick={onOpen} onContextMenu={onContextMenu} title={session.firstMessage || "会话信息加载中…"}>
+    <div
+      className={`session-row${active ? " active" : ""}`}
+      data-session-path={session.path}
+      onClick={onOpen}
+      onContextMenu={onContextMenu}
+      title={session.firstMessage || "会话信息加载中…"}
+    >
       <input type="checkbox" className="session-check" checked={checked} onChange={() => onToggleChecked(session.path)} onClick={(e) => e.stopPropagation()} />
       <div className="session-body">
         <div className="session-preview">{sessionLabel(session)}</div>

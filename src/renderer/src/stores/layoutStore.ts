@@ -10,6 +10,7 @@ interface LayoutState {
   viewerCollapsed: boolean;
   setLeftWidth: (w: number) => void;
   setRightWidth: (w: number) => void;
+  setViewerCollapsed: (v: boolean) => void;
   toggleViewer: () => void;
 }
 
@@ -19,5 +20,6 @@ export const useLayoutStore = create<LayoutState>()((set) => ({
   viewerCollapsed: false,
   setLeftWidth: (leftWidth) => set({ leftWidth }),
   setRightWidth: (rightWidth) => set({ rightWidth }),
+  setViewerCollapsed: (viewerCollapsed) => set({ viewerCollapsed }),
   toggleViewer: () => set((s) => ({ viewerCollapsed: !s.viewerCollapsed })),
 }));
