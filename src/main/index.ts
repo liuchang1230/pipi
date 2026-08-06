@@ -471,7 +471,9 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     title: "pipi",
     // 用户提供的 图标.png 作为窗口图标（覆盖旧的 icon.ico/icon.png）。
-    icon: join(__dirname, "../../resources/icon.png"),
+    // 图标来自 图标1.png（scripts/make-icon.mjs 生成）：Windows 用多尺寸
+    // ico（16-256px，任务栏/标题栏/大图标模式都清晰），其他平台用 256px png。
+    icon: join(__dirname, `../../resources/icon.${process.platform === "win32" ? "ico" : "png"}`),
     width: 1280,
     height: 820,
     webPreferences: {
