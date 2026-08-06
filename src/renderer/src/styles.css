@@ -591,16 +591,25 @@ html, body, #root {
 .terminal-pane.active {
   visibility: visible;
 }
-.terminal-container .xterm-viewport {
-  background: var(--terminal-bg);
-}
 .terminal-container {
   position: absolute;
   inset: 0;
+  background: var(--terminal-bg);
 }
 .terminal-container .xterm {
   width: 100%;
   height: 100%;
+  background: var(--terminal-bg);
+}
+/* xterm.css has a stronger built-in rule:
+   .xterm:not(.allow-transparency) .xterm-viewport { background-color: #000; }
+   Fit can only allocate whole rows, so any leftover height below the last row
+   shows the viewport background. Override it with equal-or-higher specificity
+   or light theme gets a black strip at the bottom. */
+.terminal-container .xterm:not(.allow-transparency) .xterm-viewport,
+.terminal-container .xterm-viewport {
+  background: var(--terminal-bg);
+  background-color: var(--terminal-bg);
 }
 /* Keep xterm's IME helper layers in a stable coordinate space.
    The actual caret anchoring is handled in xterm-ime-anchor.ts. */
