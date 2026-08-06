@@ -543,6 +543,13 @@ function emitActive() {
   mainWindow?.webContents.send("tabs:active", { id: null, cwd: "", isRemote: false });
 }
 
+// Windows 任务栏图标归属：没有 AppUserModelID 时 dev 模式的 electron.exe
+// 会归到 Electron 组、图标显示为默认（用户反馈"图标小/不正常"）。
+// 必须在 ready 之前设置。
+if (process.platform === "win32") {
+  app.setAppUserModelId("com.pipi.desktop");
+}
+
 app.whenReady().then(async () => {
   // Forward SessionIndex change events to the renderer (replaces the old
   // pollLocalSessionsOnce emit). Only emitted when a list actually changed.

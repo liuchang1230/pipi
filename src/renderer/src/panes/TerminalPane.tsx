@@ -54,6 +54,34 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
     term.loadAddon(fit);
     term.open(containerRef.current);
     fit.fit();
+    // fit() depends on the font measurement (cellHeight); on the FIRST call
+    // the font may not be ready yet and fit() returns early (cellHeight===0
+    // guard), leaving the terminal at its initial rows with a big empty band
+    // of --terminal-bg below it. Retry until the rows settle: once on the
+    // first render (font measured), plus a bounded fallback timer chain.
+    let fitTries = 0;
+    let fitTimer: ReturnType<typeof setTimeout> | null = null;
+    const retryFit = () => {
+      fitTimer = null;
+      if (fitTries >= 15) return;
+      fitTries++;
+      const before = { cols: term.cols, rows: term.rows };
+      try {
+        fit.fit();
+      } catch {
+        /* container not ready */
+      }
+      if (term.cols !== before.cols || term.rows !== before.rows) {
+        onResize(term.cols, term.rows); // pty must learn the real size
+        return;
+      }
+      fitTimer = setTimeout(retryFit, 120); // still not measured — wait
+    };
+    const retryOnFirstRender = term.onRender(() => {
+      retryOnFirstRender.dispose();
+      retryFit();
+    });
+    fitTimer = setTimeout(retryFit, 300); // fallback if no render fires
     // Instant feedback while the pty/pi boots: a dim placeholder that the
     // first real frame (pi TUI / shell prompt) overwrites. Without it the
     // pane sits blank for the ~1s pi takes to start.
@@ -148,6 +176,7 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
     ro.observe(containerRef.current);
 
     return () => {
+      if (fitTimer) clearTimeout(fitTimer);
       term.element?.removeEventListener("contextmenu", ctxHandler);
       disp.dispose();
       offData();
