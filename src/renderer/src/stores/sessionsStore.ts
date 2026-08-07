@@ -30,6 +30,8 @@ export function sessionLabel(s: SessionItem): string {
 export const remoteSessionCacheKey = (tabId: string, remoteCwd: string) => `${tabId}:${remoteCwd}`;
 export const buildRemoteKey = (host?: string, user?: string, port?: number) => `${user ?? ""}@${host ?? ""}:${port ?? 22}`;
 
+const pathTitle = (path: string) => path.replace(/\\/g, "/").split("/").pop() || path;
+
 /** In-flight open guards (module-level, not reactive: never a re-render). */
 const openingSessions = new Set<string>();
 
@@ -175,17 +177,20 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     if (openingSessions.has(session.path)) return;
     const existing = useTabsStore.getState().tabs.find((t) => t.sessionPath === session.path);
     if (existing) {
-      await window.api.tab.activate(existing.id);
+      const ok = await window.api.tab.activate(existing.id);
+      if (ok) useTabsStore.getState().setActiveTab(existing.id);
       return;
     }
     openingSessions.add(session.path);
     try {
-      await window.api.tab.create({
-        cwd: projectCwd || useTabsStore.getState().cwd,
+      const cwd = projectCwd || useTabsStore.getState().cwd;
+      const id = await window.api.tab.create({
+        cwd,
         sessionPath: session.path,
         continueRecent: false,
         title: sessionLabel(session),
       });
+      useTabsStore.getState().showTabImmediately({ id, cwd, sessionPath: session.path, title: sessionLabel(session), pi: true }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
     } finally {
       openingSessions.delete(session.path);
     }
@@ -194,7 +199,8 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     if (openingSessions.has(session.path)) return;
     const existing = useTabsStore.getState().tabs.find((t) => t.sessionPath === session.path);
     if (existing) {
-      await window.api.tab.activate(existing.id);
+      const ok = await window.api.tab.activate(existing.id);
+      if (ok) useTabsStore.getState().setActiveTab(existing.id);
       return;
     }
     const remote = await window.api.remote.getInfo(tabId);
@@ -202,14 +208,18 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     openingSessions.add(session.path);
     try {
       if ((remote as { isWsl?: boolean }).isWsl) {
-        await window.api.tab.create({
+        const id = await window.api.tab.create({
           cwd: useTabsStore.getState().cwd || ".",
           sessionPath: session.path,
           title: sessionLabel(session),
           wsl: { distro: (remote as { host: string }).host, path: projectCwd },
         });
+        useTabsStore.getState().showTabImmediately(
+          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, isWsl: true, wslDistro: (remote as { host: string }).host, pi: true },
+          { cwd: projectCwd, isRemote: true, remoteDir: projectCwd, remoteLabel: `🐧 ${(remote as { host: string }).host}` },
+        );
       } else {
-        await window.api.tab.create({
+        const id = await window.api.tab.create({
           cwd: useTabsStore.getState().cwd || ".",
           sessionPath: session.path,
           title: sessionLabel(session),
@@ -221,6 +231,10 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
             password: remote.password,
           },
         });
+        useTabsStore.getState().showTabImmediately(
+          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, pi: true },
+          { cwd: projectCwd, isRemote: true, remoteDir: projectCwd, remoteLabel: `${remote.user}@${remote.host}` },
+        );
       }
     } finally {
       openingSessions.delete(session.path);
@@ -471,6 +485,10 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         cwd: tabsState.cwd || ".",
         wsl: { distro: project.host, path: project.cwd },
       });
+      useTabsStore.getState().showTabImmediately(
+        { id, cwd: project.cwd, title: project.label, isRemote: true, isWsl: true, wslDistro: project.host, pi: true },
+        { cwd: project.cwd, isRemote: true, remoteDir: project.cwd, remoteLabel: `🐧 ${project.host}` },
+      );
       const wslTabId = project.tabId || id;
       const wslListResult = await window.api.session.listRemote(wslTabId, project.cwd);
       set((s) => ({
@@ -503,6 +521,10 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
           password: remoteInfo.password,
         },
       });
+      useTabsStore.getState().showTabImmediately(
+        { id, cwd: project.cwd, title: project.label, isRemote: true, pi: true },
+        { cwd: project.cwd, isRemote: true, remoteDir: project.cwd, remoteLabel: `${remoteInfo.user}@${remoteInfo.host}` },
+      );
       const remoteTabId = project.tabId || id;
       const remoteListResult = await window.api.session.listRemote(remoteTabId, project.cwd);
       set((s) => ({
@@ -513,7 +535,8 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       }));
       return;
     }
-    await window.api.tab.create({ cwd: project.cwd });
+    const id = await window.api.tab.create({ cwd: project.cwd });
+    useTabsStore.getState().showTabImmediately({ id, cwd: project.cwd, title: pathTitle(project.cwd), pi: true }, { cwd: project.cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
   },
 
   addLocalProject: async (dir) => {

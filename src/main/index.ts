@@ -697,9 +697,9 @@ app.whenReady().then(async () => {
     return true;
   });
   ipcMain.handle("tab:activate", (_e, id: string) => {
-    setActiveTab(id);
-    emitActive();
-    return true;
+    const ok = setActiveTab(id);
+    if (ok) emitActive();
+    return ok;
   });
   ipcMain.handle("tab:write", (_e, id: string, data: string) => writeTab(id, data));
   ipcMain.handle("tab:resize", (_e, id: string, cols: number, rows: number) => resizeTab(id, cols, rows));

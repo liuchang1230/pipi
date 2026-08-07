@@ -87,7 +87,7 @@ describe("helpers", () => {
 });
 
 describe("openSession", () => {
-  it("creates a pi tab for the session when no tab holds it", async () => {
+  it("creates and immediately shows a pi tab for the session when no tab holds it", async () => {
     await useSessionsStore.getState().openSession(SESSION);
     const api = (globalThis as any).window.api;
     expect(api.tab.create).toHaveBeenCalledWith({
@@ -96,14 +96,27 @@ describe("openSession", () => {
       continueRecent: false,
       title: "帮我改个 bug",
     });
+    expect(useTabsStore.getState().activeTab).toBe("tab-1");
+    expect(useTabsStore.getState().tabs).toEqual([
+      expect.objectContaining({ id: "tab-1", cwd: "/proj", sessionPath: SESSION.path, title: "帮我改个 bug" }),
+    ]);
   });
 
-  it("activates the existing tab instead of creating a duplicate", async () => {
-    useTabsStore.setState({ tabs: [{ id: "t-open", sessionPath: SESSION.path, title: "x" } as any] });
+  it("activates and immediately shows the existing tab instead of creating a duplicate", async () => {
+    useTabsStore.setState({ tabs: [{ id: "t-open", cwd: "/old", sessionPath: SESSION.path, title: "x", pi: true } as any] });
     await useSessionsStore.getState().openSession(SESSION);
     const api = (globalThis as any).window.api;
     expect(api.tab.activate).toHaveBeenCalledWith("t-open");
     expect(api.tab.create).not.toHaveBeenCalled();
+    expect(useTabsStore.getState().activeTab).toBe("t-open");
+  });
+
+  it("does not switch when activating an existing tab fails", async () => {
+    const api = makeApi();
+    api.tab.activate.mockResolvedValue(false);
+    useTabsStore.setState({ tabs: [{ id: "stale", cwd: "/old", sessionPath: SESSION.path, title: "x", pi: true } as any], activeTab: "current" });
+    await useSessionsStore.getState().openSession(SESSION);
+    expect(useTabsStore.getState().activeTab).toBe("current");
   });
 
   it("dedups concurrent double-clicks on the same session", async () => {
@@ -125,7 +138,7 @@ describe("openSession", () => {
 });
 
 describe("openRemoteSession", () => {
-  it("creates a WSL tab when the source tab is a WSL connection", async () => {
+  it("creates and immediately shows a WSL tab when the source tab is a WSL connection", async () => {
     const api = makeApi();
     api.remote.getInfo.mockResolvedValue({ host: "Ubuntu", user: "", isWsl: true, path: "~" });
     await useSessionsStore.getState().openRemoteSession("t-wsl", "/proj", SESSION);
@@ -135,6 +148,9 @@ describe("openRemoteSession", () => {
       title: "帮我改个 bug",
       wsl: { distro: "Ubuntu", path: "/proj" },
     });
+    expect(useTabsStore.getState().activeTab).toBe("tab-1");
+    expect(useTabsStore.getState().isRemote).toBe(true);
+    expect(useTabsStore.getState().remoteDir).toBe("/proj");
   });
 
   it("creates an SSH tab for a regular remote tab", async () => {
@@ -146,12 +162,17 @@ describe("openRemoteSession", () => {
     );
   });
 
-  it("dedups against an already-open tab for the session", async () => {
+  it("dedups against an already-open tab for the session without clobbering remoteDir", async () => {
     const api = makeApi();
-    useTabsStore.setState({ tabs: [{ id: "t-open", sessionPath: SESSION.path, title: "x" } as any] });
+    useTabsStore.setState({
+      tabs: [{ id: "t-open", cwd: "D:/app", isRemote: true, sessionPath: SESSION.path, title: "x", pi: true } as any],
+      remoteDir: "/remote/project",
+    });
     await useSessionsStore.getState().openRemoteSession("t-any", "/proj", SESSION);
     expect(api.tab.activate).toHaveBeenCalledWith("t-open");
     expect(api.tab.create).not.toHaveBeenCalled();
+    expect(useTabsStore.getState().activeTab).toBe("t-open");
+    expect(useTabsStore.getState().remoteDir).toBe("/remote/project");
   });
 });
 
@@ -280,10 +301,12 @@ describe("toggleProject (explorer orchestration)", () => {
     expect(useTreeStore.getState().treeOrigin).toEqual({ tabId: "tab-1", dirPath: "/w/proj", isRemote: true });
   });
 
-  it("newProjectSession: local project opens a plain tab", async () => {
+  it("newProjectSession: local project opens and immediately shows a plain tab", async () => {
     const api = makeApi();
     await useSessionsStore.getState().newProjectSession({ key: "p1", label: "P1", cwd: "/p1", type: "local" as const, sessions: [] });
     expect(api.tab.create).toHaveBeenCalledWith({ cwd: "/p1" });
+    expect(useTabsStore.getState().activeTab).toBe("tab-1");
+    expect(useTabsStore.getState().cwd).toBe("/p1");
   });
 
   it("newProjectSession: WSL project creates a WSL tab and refreshes its sessions", async () => {
@@ -295,6 +318,8 @@ describe("toggleProject (explorer orchestration)", () => {
     });
     expect(api.tab.create).toHaveBeenCalledWith({ cwd: "/proj", wsl: { distro: "Ubuntu", path: "/w/proj" } });
     expect(api.session.listRemote).toHaveBeenCalledWith("tab-1", "/w/proj");
+    expect(useTabsStore.getState().activeTab).toBe("tab-1");
+    expect(useTabsStore.getState().remoteDir).toBe("/w/proj");
     expect(useSessionsStore.getState().projectSessionStatus.wp).toBe("ready");
   });
 });
