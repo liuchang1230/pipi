@@ -2,28 +2,18 @@ import { app } from "electron";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
+import { specForModel } from "../shared/model-specs";
+import type { SpecHints } from "./specs-lookup";
+import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 
-export interface PiProviderModelEntry {
+export interface PiProviderModelEntry extends ModelEditorSpec {
   id: string;
-  name?: string;
-  reasoning?: boolean;
-  input?: Array<"text" | "image">;
-  contextWindow?: number;
-  maxTokens?: number;
-  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
-export interface PiProviderConfigEntry {
+export interface PiProviderConfigEntry extends ProviderEditorConfig {
   baseUrl: string;
-  api: "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai";
+  api: PiApi;
   apiKey?: string;
-  authHeader?: boolean;
-  compat?: {
-    supportsDeveloperRole?: boolean;
-    supportsReasoningEffort?: boolean;
-    supportsUsageInStreaming?: boolean;
-    maxTokensField?: "max_completion_tokens" | "max_tokens";
-  };
   models: PiProviderModelEntry[];
 }
 
@@ -44,6 +34,14 @@ export interface ModelConfigEntry {
   model: string;
   provider?: string;
   availableModels?: string[];
+  /** Primary model's spec — auto-filled from the spec table / existing pi
+   *  config so the UI can show what pi will use. */
+  contextWindow?: number;
+  maxTokens?: number;
+  /** Provider-level Pi settings. */
+  providerConfig?: ProviderEditorConfig;
+  /** Per-model Pi settings, including input capabilities. */
+  modelSpecs?: Record<string, ModelEditorSpec>;
   createdAt: number;
   updatedAt: number;
 }
@@ -222,11 +220,70 @@ export function deleteProject(id: string): boolean {
   return true;
 }
 
-export function listModels(): ModelConfigEntry[] {
-  return readModels().sort((a, b) => b.updatedAt - a.updatedAt);
+function piProviderToModelEntry(provider: string, cfg: PiProviderConfigEntry, existing?: ModelConfigEntry): ModelConfigEntry | null {
+  const modelIds = (cfg.models ?? []).map((m) => m?.id).filter((id): id is string => typeof id === "string" && id.trim().length > 0);
+  if (!cfg.baseUrl && modelIds.length === 0) return null;
+  const now = existing?.updatedAt ?? existing?.createdAt ?? 0;
+  // models.json may hold a "placeholder" sentinel for keyless entries; the
+  // real key lives in auth.json (if any). Never surface the sentinel.
+  const auth = readPiAuthFile();
+  const realKey = auth[provider]?.key;
+  const cfgKey = cfg.apiKey && cfg.apiKey !== "placeholder" ? cfg.apiKey : undefined;
+  const primaryId = existing?.model || modelIds[0] || "";
+  const primaryCfg = cfg.models?.find((m) => m.id === primaryId);
+  const primarySpec = specForModel(primaryId);
+  const modelSpecs: Record<string, { contextWindow?: number; maxTokens?: number }> = {};
+  for (const model of cfg.models ?? []) {
+    if (!model?.id) continue;
+    // Only explicitly-configured values go here; unset fields stay undefined
+    // so the dialog's auto-fill (spec table / network) still applies on save.
+    const entry: ModelEditorSpec = { ...model };
+    delete (entry as { id?: string }).id;
+    if (Object.keys(entry).length === 0) continue;
+    if (Object.keys(entry).length > 0) modelSpecs[model.id] = entry;
+  }
+  return {
+    id: existing?.id ?? `pi-${provider}`,
+    name: existing?.name || provider,
+    baseUrl: existing?.baseUrl || cfg.baseUrl || "",
+    apiKey: existing?.apiKey ?? realKey ?? cfgKey,
+    model: primaryId,
+    provider,
+    availableModels: Array.from(new Set([...(existing?.availableModels ?? []), ...modelIds].map((id) => id.trim()).filter(Boolean))),
+    contextWindow: existing?.contextWindow ?? primaryCfg?.contextWindow ?? (primaryId ? primarySpec.contextWindow : undefined),
+    maxTokens: existing?.maxTokens ?? primaryCfg?.maxTokens ?? (primaryId ? primarySpec.maxTokens : undefined),
+    providerConfig: {
+      api: cfg.api,
+      headers: cfg.headers,
+      authHeader: cfg.authHeader,
+      oauth: cfg.oauth,
+      compat: cfg.compat,
+    },
+    modelSpecs: { ...modelSpecs, ...(existing?.modelSpecs ?? {}) },
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+  };
 }
 
-export function addModel(input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[] }): ModelConfigEntry {
+export function listModels(): ModelConfigEntry[] {
+  const appModels = readModels();
+  const byProvider = new Map(appModels.map((m) => [m.provider?.trim() || "", m]));
+  const merged = [...appModels];
+  const piModels = readPiModelsFile();
+  for (const [provider, cfg] of Object.entries(piModels.providers)) {
+    const existing = byProvider.get(provider);
+    const entry = piProviderToModelEntry(provider, cfg, existing);
+    if (!entry) continue;
+    if (existing) {
+      Object.assign(existing, entry);
+    } else {
+      merged.push(entry);
+    }
+  }
+  return merged.sort((a, b) => b.updatedAt - a.updatedAt || (a.provider || a.name).localeCompare(b.provider || b.name));
+}
+
+export function addModel(input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }): ModelConfigEntry {
   const models = readModels();
   const now = Date.now();
   const normalizedBaseUrl = input.baseUrl.trim().replace(/\/+$/, "");
@@ -237,6 +294,8 @@ export function addModel(input: { name: string; baseUrl: string; apiKey?: string
     existing.name = normalizedName;
     existing.apiKey = input.apiKey;
     existing.availableModels = input.availableModels;
+    existing.providerConfig = input.providerConfig;
+    existing.modelSpecs = input.modelSpecs;
     existing.updatedAt = now;
     writeModels(models);
     return existing;
@@ -249,6 +308,8 @@ export function addModel(input: { name: string; baseUrl: string; apiKey?: string
     model: normalizedModel,
     provider: input.provider?.trim() || undefined,
     availableModels: input.availableModels,
+    providerConfig: input.providerConfig,
+    modelSpecs: input.modelSpecs,
     createdAt: now,
     updatedAt: now,
   };
@@ -257,11 +318,66 @@ export function addModel(input: { name: string; baseUrl: string; apiKey?: string
   return entry;
 }
 
+export function updateModel(id: string, input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }): ModelConfigEntry {
+  const models = readModels();
+  let target = models.find((m) => m.id === id);
+  // Pi-native providers live only in ~/.pi/agent/models.json — import them
+  // into the app cache on first edit so update/sync work uniformly.
+  if (!target && id.startsWith("pi-")) {
+    const providerName = id.slice(3);
+    const piModels = readPiModelsFile();
+    const cfg = piModels.providers[providerName];
+    const imported = cfg ? piProviderToModelEntry(providerName, cfg) : null;
+    if (imported) {
+      target = { ...imported, id };
+      models.push(target);
+    }
+  }
+  if (!target) throw new Error("模型配置不存在");
+  const oldProvider = target.provider?.trim();
+  const normalizedBaseUrl = input.baseUrl.trim().replace(/\/+$/, "");
+  const normalizedModel = input.model.trim();
+  const normalizedProvider = input.provider?.trim() || undefined;
+  if (!normalizedBaseUrl) throw new Error("Base URL 必填");
+  if (!normalizedModel) throw new Error("模型 ID 必填");
+  const duplicate = models.find((m) => m.id !== id && m.baseUrl === normalizedBaseUrl && m.model === normalizedModel && (m.provider || "") === (normalizedProvider || ""));
+  if (duplicate) throw new Error("已有相同模型配置");
+  target.name = input.name.trim() || normalizedModel;
+  target.baseUrl = normalizedBaseUrl;
+  target.apiKey = input.apiKey;
+  target.model = normalizedModel;
+  target.provider = normalizedProvider;
+  target.availableModels = input.availableModels;
+  target.providerConfig = input.providerConfig;
+  target.modelSpecs = input.modelSpecs;
+  target.updatedAt = Date.now();
+  writeModels(models);
+  if (oldProvider && oldProvider !== normalizedProvider) {
+    const piModels = readPiModelsFile();
+    delete piModels.providers[oldProvider];
+    writePiModelsFile(piModels);
+  }
+  return target;
+}
+
 export function deleteModel(id: string): boolean {
   const models = readModels();
   const target = models.find((m) => m.id === id);
   const next = models.filter((m) => m.id !== id);
-  if (next.length === models.length) return false;
+  if (next.length === models.length) {
+    // Pi-native provider not in the app cache — remove it from pi's models
+    // file directly so the list refresh picks up the deletion.
+    if (id.startsWith("pi-")) {
+      const piModels = readPiModelsFile();
+      const providerName = id.slice(3);
+      if (piModels.providers[providerName]) {
+        delete piModels.providers[providerName];
+        writePiModelsFile(piModels);
+        return true;
+      }
+    }
+    return false;
+  }
   writeModels(next);
   if (target?.provider) {
     const piModels = readPiModelsFile();
@@ -271,39 +387,49 @@ export function deleteModel(id: string): boolean {
   return true;
 }
 
-export function syncModelToPi(input: ModelConfigEntry): void {
+export function syncModelToPi(input: ModelConfigEntry, overrides?: Record<string, SpecHints>): void {
   const providerId = input.provider?.trim();
   if (!providerId) return;
   const selectedId = input.model.trim();
   const discovered = (input.availableModels ?? []).map((id) => id.trim()).filter(Boolean);
   const modelIds = Array.from(new Set([selectedId, ...discovered]));
-  const models = modelIds.map((id) => ({
-    id,
-    name: id,
-    reasoning: /gpt-5|o1|o3|o4|deepseek-r|deepseek-v4|claude|gemini-2\.5/i.test(id),
-    input: ["text"] as Array<"text" | "image">,
-    contextWindow: 128000,
-    maxTokens: 16384,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  }));
   const piModels = readPiModelsFile();
+  // Preserve existing per-model fields (contextWindow/maxTokens/cost/...) so
+  // an edit never downgrades what pi already had; network-overridden specs
+  // and the local table fill gaps only.
+  const prevModels = piModels.providers[providerId]?.models ?? [];
+  const models = modelIds.map((id) => {
+    const prev = prevModels.find((m) => m.id === id);
+    const spec = specForModel(id);
+    const override = overrides?.[id];
+    const manual = input.modelSpecs?.[id];
+    return {
+      ...prev,
+      id,
+      name: manual?.name ?? prev?.name ?? id,
+      reasoning: manual?.reasoning ?? prev?.reasoning ?? /gpt-5|o1|o3|o4|deepseek-r|deepseek-v4|claude|gemini-2\.5/i.test(id),
+      input: manual?.input ?? prev?.input ?? ["text"] as Array<"text" | "image">,
+      contextWindow: manual?.contextWindow ?? prev?.contextWindow ?? override?.contextWindow ?? spec.contextWindow,
+      maxTokens: manual?.maxTokens ?? prev?.maxTokens ?? override?.maxTokens ?? spec.maxTokens,
+      cost: manual?.cost ?? prev?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+  });
   piModels.providers[providerId] = {
+    ...piModels.providers[providerId],
     baseUrl: input.baseUrl,
-    api: "openai-completions",
+    api: input.providerConfig?.api ?? piModels.providers[providerId]?.api ?? "openai-completions",
     apiKey: input.apiKey || "placeholder",
-    authHeader: true,
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
-      supportsUsageInStreaming: false,
-      maxTokensField: "max_tokens",
-    },
+    authHeader: input.providerConfig?.authHeader ?? piModels.providers[providerId]?.authHeader ?? true,
+    ...(input.providerConfig?.headers ? { headers: input.providerConfig.headers } : {}),
+    ...(input.providerConfig?.oauth ? { oauth: input.providerConfig.oauth } : {}),
+    ...(input.providerConfig?.compat ? { compat: input.providerConfig.compat } : {}),
     models,
   };
   writePiModelsFile(piModels);
-  if (input.apiKey?.trim()) {
+  const trimmedKey = input.apiKey?.trim();
+  if (trimmedKey && trimmedKey !== "placeholder") {
     const auth = readPiAuthFile();
-    auth[providerId] = { type: "api_key", key: input.apiKey.trim() };
+    auth[providerId] = { type: "api_key", key: trimmedKey };
     writePiAuthFile(auth);
   }
 }

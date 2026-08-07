@@ -11,10 +11,13 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { TERMINAL_THEMES } from "../../../shared/terminal-theme";
+import { openExternalSafe } from "../openExternal";
 // Keep Windows IME candidate/preedit anchored to pi's visible TUI caret.
 import { attachImeHeuristic } from "../xterm-ime-anchor";
 import { useTabsStore } from "../stores/tabsStore";
+import { useViewerStore } from "../stores/viewerStore";
 import type { TabInfo } from "../stores/types";
+import { ChatView } from "./ChatPane";
 
 interface TerminalViewProps {
   tabId: string;
@@ -35,7 +38,7 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
     const term = new Terminal({
       fontFamily: '"Cascadia Code", "Sarasa Mono SC", "Microsoft YaHei Mono", "Noto Sans Mono CJK SC", "Microsoft YaHei", "Consolas", monospace',
       fontSize: 13,
-      cursorBlink: true,
+      cursorBlink: false,
       cursorStyle: "bar",
       allowProposedApi: true,
       scrollback: 50000,
@@ -49,6 +52,17 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
       // rows into scrollback instead, so history survives redraws.
       scrollOnEraseInDisplay: true,
       theme: TERMINAL_THEMES[theme].xterm,
+      linkHandler: {
+        allowNonHttpProtocols: true,
+        activate: async (_event, uri) => {
+          const resolved = await window.api.file.resolveLink({ href: uri, tabId });
+          if (resolved.ok) {
+            await useViewerStore.getState().openFile(resolved.relPath, false, { tabId: resolved.tabId, rootPath: resolved.rootPath });
+          } else {
+            openExternalSafe(uri);
+          }
+        },
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -213,11 +227,15 @@ const TerminalHost = memo(function TerminalHost({ visibleTabs, activeTab, theme 
       ) : (
         visibleTabs.map((tab) => (
           <div key={tab.id} className={`terminal-pane${tab.id === activeTab ? " active" : " hidden"}`}>
-            <TerminalView
-              tabId={tab.id}
-              theme={theme}
-              onResize={(cols, rows) => window.api.tab.resize(tab.id, cols, rows)}
-            />
+            {tab.mode === "rpc" ? (
+              <ChatView tabId={tab.id} />
+            ) : (
+              <TerminalView
+                tabId={tab.id}
+                theme={theme}
+                onResize={(cols, rows) => window.api.tab.resize(tab.id, cols, rows)}
+              />
+            )}
           </div>
         ))
       )}

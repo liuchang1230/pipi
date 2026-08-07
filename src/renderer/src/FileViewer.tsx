@@ -281,7 +281,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     return (
       <div className="viewer-body">
         {actions}
-        <Markdown content={file.content} className="viewer-content" onContextMenu={handleContextMenu} />
+        <Markdown content={file.content} className="viewer-content" currentPath={file.path} onContextMenu={handleContextMenu} />
       </div>
     );
   }

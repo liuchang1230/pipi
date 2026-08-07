@@ -40,7 +40,7 @@ interface ViewerState {
   /** Open a file (relative to the tree origin) into the viewer. `followed`
    *  marks auto-follow opens (retried on ENOENT, never clobbering a manual
    *  open). Resolves reads against the TREE's origin, not the active tab. */
-  openFile: (relPath: string, followed: boolean) => Promise<void>;
+  openFile: (relPath: string, followed: boolean, originOverride?: { tabId?: string; rootPath?: string }) => Promise<void>;
 }
 
 export const useViewerStore = create<ViewerState>()((set, get) => ({
@@ -54,11 +54,11 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
     set((s) => ({ followCfg: typeof cfg === "function" ? (cfg as (prev: AutoFollowSettings) => AutoFollowSettings)(s.followCfg) : cfg })),
   setFollowDegraded: (followDegraded) => set({ followDegraded }),
 
-  openFile: async (relPath, followed) => {
+  openFile: async (relPath, followed, originOverride) => {
     const tabs = useTabsStore.getState();
     const origin = useTreeStore.getState().treeOrigin;
-    const tabId = origin?.tabId ?? tabs.activeTab ?? undefined;
-    const rootPath = origin?.rootPath;
+    const tabId = originOverride?.tabId ?? origin?.tabId ?? tabs.activeTab ?? undefined;
+    const rootPath = originOverride?.rootPath ?? origin?.rootPath;
     const seq = ++openReq.seq;
     if (!followed) openReq.manualSeq = seq;
     set({ fileLoading: true });

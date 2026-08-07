@@ -190,7 +190,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         continueRecent: false,
         title: sessionLabel(session),
       });
-      useTabsStore.getState().showTabImmediately({ id, cwd, sessionPath: session.path, title: sessionLabel(session), pi: true }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
+      useTabsStore.getState().showTabImmediately({ id, cwd, sessionPath: session.path, title: sessionLabel(session), pi: true, mode: "rpc" }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
     } finally {
       openingSessions.delete(session.path);
     }
@@ -215,7 +215,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
           wsl: { distro: (remote as { host: string }).host, path: projectCwd },
         });
         useTabsStore.getState().showTabImmediately(
-          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, isWsl: true, wslDistro: (remote as { host: string }).host, pi: true },
+          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, isWsl: true, wslDistro: (remote as { host: string }).host, pi: true, mode: "rpc" },
           { cwd: projectCwd, isRemote: true, remoteDir: projectCwd, remoteLabel: `🐧 ${(remote as { host: string }).host}` },
         );
       } else {
@@ -232,7 +232,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
           },
         });
         useTabsStore.getState().showTabImmediately(
-          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, pi: true },
+          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, pi: true, mode: "rpc" },
           { cwd: projectCwd, isRemote: true, remoteDir: projectCwd, remoteLabel: `${remote.user}@${remote.host}` },
         );
       }

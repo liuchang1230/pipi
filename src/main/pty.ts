@@ -544,7 +544,8 @@ export interface TabInfo {
   cwd: string;
   sessionPath?: string;
   title: string;
-  pty: pty.IPty;
+  /** Present for pty-backed tabs; undefined for RPC-backed tabs (registerExternalTab). */
+  pty?: pty.IPty;
   cols: number;
   rows: number;
   remote?: RemoteOpts;
@@ -566,6 +567,8 @@ export interface CreateTabOptions {
   wsl?: WslOpts; // WSL distro direct connection (no SSH)
   title?: string;
   themeMode?: ThemeMode; // per-tab override; default = app theme mode
+  /** Explicit tab id (RPC→pty fallback keeps its identity across the switch). */
+  id?: string;
 }
 
 export interface RemoteOpts {
@@ -708,7 +711,7 @@ function respawnShellInTab(id: string): void {
 
 /** Create a new tab and spawn pi inside it. Returns the tab id. */
 export function createTab(opts: CreateTabOptions): string {
-  const id = `tab-${nextId++}`;
+  const id = opts.id ?? `tab-${nextId++}`;
 
   if (opts.wsl) {
     return createWslTab(id, opts);
@@ -817,7 +820,7 @@ export function setActiveTab(id: string): boolean {
 /** Resize a tab's pty. */
 export function resizeTab(id: string, cols: number, rows: number): boolean {
   const t = tabs.get(id);
-  if (!t || cols < 1 || rows < 1) return false;
+  if (!t?.pty || cols < 1 || rows < 1) return false;
   try {
     t.pty.resize(cols, rows);
     t.cols = cols;
@@ -831,8 +834,28 @@ export function resizeTab(id: string, cols: number, rows: number): boolean {
 /** Send user input to a tab's pty. */
 export function writeTab(id: string, data: string): boolean {
   const t = tabs.get(id);
-  if (!t) return false;
+  if (!t?.pty) return false;
   t.pty.write(data);
+  return true;
+}
+
+/**
+ * Register a non-pty (RPC-backed) tab in the shared registry so
+ * getTab/listTabs/active-tracking/title-watchers treat it like any other tab.
+ * The caller owns the RPC process lifecycle (rpc-session.ts).
+ */
+export function registerExternalTab(tab: TabInfo): void {
+  tabs.set(tab.id, tab);
+  activeId = tab.id;
+}
+
+/** Remove a non-pty tab from the shared registry (no process kill). */
+export function unregisterExternalTab(id: string): boolean {
+  if (!tabs.has(id)) return false;
+  tabs.delete(id);
+  if (activeId === id) {
+    activeId = tabs.size > 0 ? [...tabs.keys()][tabs.size - 1] : null;
+  }
   return true;
 }
 
@@ -842,10 +865,12 @@ export function closeTab(id: string): boolean {
   if (!t) return false;
   flushTabStream(id);
   stopSessionWatcher(id);
-  try {
-    t.pty.kill();
-  } catch {
-    /* process may already be dead */
+  if (t.pty) {
+    try {
+      t.pty.kill();
+    } catch {
+      /* process may already be dead */
+    }
   }
   tabs.delete(id);
   if (activeId === id) {
@@ -866,7 +891,7 @@ export function subscribeTab(
   onExit: (code: number, signal?: number) => void
 ): () => void {
   const t = tabs.get(id);
-  if (!t) return () => {};
+  if (!t?.pty) return () => {};
   const d = t.pty.onData(onData);
   const e = t.pty.onExit(({ exitCode, signal }) => onExit(exitCode, signal));
   return () => {

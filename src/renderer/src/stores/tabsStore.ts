@@ -86,7 +86,7 @@ export const useTabsStore = create<TabsState>()((set, get) => ({
             wsl: { distro: remote.host, path: remotePath },
           });
           get().showTabImmediately(
-            { id, cwd: remotePath, title: remote.host, isRemote: true, isWsl: true, wslDistro: remote.host, pi: true },
+            { id, cwd: remotePath, title: remote.host, isRemote: true, isWsl: true, wslDistro: remote.host, pi: true, mode: "rpc" },
             { cwd: remotePath, isRemote: true, remoteDir: remotePath, remoteLabel: `🐧 ${remote.host}` },
           );
         } else {
@@ -101,7 +101,7 @@ export const useTabsStore = create<TabsState>()((set, get) => ({
             },
           });
           get().showTabImmediately(
-            { id, cwd: remotePath, title: remote.host, isRemote: true, pi: true },
+            { id, cwd: remotePath, title: remote.host, isRemote: true, pi: true, mode: "rpc" },
             { cwd: remotePath, isRemote: true, remoteDir: remotePath, remoteLabel: `${remote.user}@${remote.host}` },
           );
         }
@@ -111,7 +111,7 @@ export const useTabsStore = create<TabsState>()((set, get) => ({
     const cwd = s.cwd || "D:/其余文件/项目/agent";
     const id = await window.api.tab.create({ cwd });
     const title = cwd.replace(/\\/g, "/").split("/").pop() || cwd;
-    get().showTabImmediately({ id, cwd, title, pi: true }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
+    get().showTabImmediately({ id, cwd, title, pi: true, mode: "rpc" }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
   },
   closeTab: async (id) => {
     await window.api.tab.close(id);

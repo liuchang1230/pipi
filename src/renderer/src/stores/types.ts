@@ -21,6 +21,8 @@ export interface TabInfo {
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
+  /** rpc = headless ChatPane (local tabs); pty/undefined = terminal view. */
+  mode?: "rpc" | "pty";
 }
 
 export interface SessionItem {

@@ -1,11 +1,13 @@
 import { app, BrowserWindow, ipcMain, dialog } from "electron";
-import { join, posix as posixPath, win32 as win32Path } from "node:path";
+import { isAbsolute, relative, sep, join, posix as posixPath, win32 as win32Path } from "node:path";
 import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { readFile, writeFile, mkdir, rm, rename, access } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
 import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, type FileOpResult } from "./file-tree";
+import { specForModel } from "../shared/model-specs";
+import { lookupModelSpecs } from "./specs-lookup";
 import {
   createTab, closeTab, closeAllTabs, getTab, listTabs, setActiveTab,
   resizeTab, writeTab, subscribeTab, getActiveTab, findSshBin,
@@ -19,12 +21,19 @@ import {
   type RemoteThemeSyncResult,
 } from "./theme-sync";
 import type { ThemeMode } from "../shared/terminal-theme";
+import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
 import { SessionIndex } from "./session-index";
+import { ensureShippedExtensions } from "./extension-sync";
+import {
+  closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
+  setUiRequestHandler, switchRpcToTerminal,
+  type ExtensionUiRequest,
+} from "./rpc-session";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
 import { getSettings, updateSettings, type AppSettings } from "./settings";
-import { addLocalProject, addRemoteProject, addWslProject, addModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync } from "./projects";
+import { addLocalProject, addRemoteProject, addWslProject, addModel, updateModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync } from "./projects";
 
 interface RemoteModelListResponse {
   data?: Array<{ id?: string }>;
@@ -495,7 +504,10 @@ function createWindow() {
 
 // --- Active-tab tracking: the sidebar follows the active tab's cwd. ----
 function emitTabs() {
-  mainWindow?.webContents.send("tabs:update", listTabs().map((t) => ({
+  // listTabs() includes RPC-backed tabs in the shared registry — exclude
+  // them here; listRpcSessions() emits them with mode "rpc". Otherwise the
+  // renderer gets the same tab twice (pty + rpc) and renders BOTH panes.
+  const ptyTabs = listTabs().filter((t) => t.pty).map((t) => ({
     id: t.id,
     cwd: t.cwd,
     sessionPath: t.sessionPath,
@@ -509,7 +521,27 @@ function emitTabs() {
     pi: t.remote ? t.remote.startPi !== false : true,
     isWsl: !!t.wsl,
     wslDistro: t.wsl?.distro,
-  })));
+    mode: "pty" as const,
+  }));
+  const rpcTabs = listRpcSessions().map((s) => {
+    const t = getTab(s.id);
+    return {
+      id: s.id,
+      cwd: t?.cwd ?? "",
+      sessionPath: t?.sessionPath,
+      title: t?.title ?? "",
+      isRemote: !!(t?.remote || t?.wsl),
+      remoteKey: t?.remoteKey,
+      remoteHost: t?.remote?.host,
+      remoteUser: t?.remote?.user,
+      remotePort: t?.remote?.port ?? 22,
+      isWsl: !!t?.wsl,
+      wslDistro: t?.wsl?.distro,
+      pi: true,
+      mode: "rpc" as const,
+    };
+  });
+  mainWindow?.webContents.send("tabs:update", [...ptyTabs, ...rpcTabs]);
 }
 
 // pty.ts watches local session files and bumps tab titles; keep the renderer
@@ -551,6 +583,24 @@ if (process.platform === "win32") {
 }
 
 app.whenReady().then(async () => {
+  // Ship app-bundled pi extensions (static working indicator etc.) BEFORE any
+  // tab can spawn pi, so every pi process auto-discovers them.
+  ensureShippedExtensions();
+
+  // Extension UI sub-protocol → forwarded to the renderer, which renders
+  // select/confirm/input/editor as native dialogs (UiDialog in ChatPane) and
+  // answers via tab:rpc-ui-response.
+  setUiRequestHandler((tabId, req) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(`tab:rpc-ui-request:${tabId}`, req);
+    }
+  });
+
+  // Renderer answers for extension UI dialogs (value/confirmed/cancelled).
+  ipcMain.handle("tab:rpc-ui-response", (_e, tabId: string, response: Record<string, unknown>) => {
+    return getRpcSession(tabId)?.send({ type: "extension_ui_response", ...response }) ?? false;
+  });
+
   // Forward SessionIndex change events to the renderer (replaces the old
   // pollLocalSessionsOnce emit). Only emitted when a list actually changed.
   sessionIndex.onAnyChange((cwd, sessions) => {
@@ -671,7 +721,9 @@ app.whenReady().then(async () => {
         }
       }
     }
-    const id = createTab(opts);
+    // All pi tabs run headless RPC (ChatPane) — local, WSL, and remote;
+    // only plain-shell connection tabs (startPi:false) keep the pty TUI.
+    const id = opts.remote && opts.remote.startPi === false ? createTab(opts) : createRpcTab(opts);
     if (opts.remote) saveRemoteHistory(opts.remote);
     emitTabs();
     emitActive();
@@ -684,9 +736,14 @@ app.whenReady().then(async () => {
     return true;
   });
   ipcMain.handle("tab:close", async (_e, id: string) => {
+    // RPC tabs are owned by rpc-session; pty tabs by pty.ts.
     const tab = getTab(id);
     const remote = tab?.remote;
-    closeTab(id);
+    if (getRpcSession(id)) {
+      closeRpcTab(id);
+    } else {
+      closeTab(id);
+    }
     if (remote) {
       invalidateRemoteCaches(remote);
       const lease = sftpLeases.get(stableRemoteKey(remote));
@@ -703,12 +760,34 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("tab:write", (_e, id: string, data: string) => writeTab(id, data));
   ipcMain.handle("tab:resize", (_e, id: string, cols: number, rows: number) => resizeTab(id, cols, rows));
-  ipcMain.handle("tab:list", () => listTabs().map((t) => ({
-    id: t.id, cwd: t.cwd, sessionPath: t.sessionPath, title: t.title,
-    isRemote: !!(t.remote || t.wsl),
-    isWsl: !!t.wsl,
-    wslDistro: t.wsl?.distro,
-  })));
+  ipcMain.handle("tab:list", () => [
+    ...listTabs().filter((t) => t.pty).map((t) => ({
+      id: t.id, cwd: t.cwd, sessionPath: t.sessionPath, title: t.title,
+      isRemote: !!(t.remote || t.wsl),
+      isWsl: !!t.wsl,
+      wslDistro: t.wsl?.distro,
+      pi: t.remote ? t.remote.startPi !== false : true,
+      mode: "pty" as const,
+    })),
+    ...listRpcSessions().map((s) => {
+      const t = getTab(s.id);
+      return {
+        id: s.id,
+        cwd: t?.cwd ?? "",
+        sessionPath: t?.sessionPath,
+        title: t?.title ?? "",
+        isRemote: !!(t?.remote || t?.wsl),
+        remoteKey: t?.remoteKey,
+        remoteHost: t?.remote?.host,
+        remoteUser: t?.remote?.user,
+        remotePort: t?.remote?.port ?? 22,
+        isWsl: !!t?.wsl,
+        wslDistro: t?.wsl?.distro,
+        pi: true,
+        mode: "rpc" as const,
+      };
+    }),
+  ]);
 
   // --- File tree + viewer (left/right panels) ---
   ipcMain.handle("file:list", async (_e, payload?: { tabId?: string; dirPath?: string; rootPath?: string; noCache?: boolean }) => {
@@ -750,6 +829,71 @@ app.whenReady().then(async () => {
     if (cachedTree) return cachedTree;
     return fileTreeIndex.refresh(root);
   });
+  ipcMain.handle("file:resolve-link", (_e, payload: { tabId?: string; rootPath?: string; currentPath?: string; href: string }) => {
+    const rawHref = (payload.href || "").trim();
+    if (!rawHref) return { ok: false as const };
+    if (/^(https?|mailto):/i.test(rawHref)) return { ok: false as const };
+    const cleanHref = rawHref.replace(/[?#].*$/, "");
+    let decoded = cleanHref;
+    try {
+      decoded = decodeURIComponent(cleanHref);
+    } catch {
+      /* keep raw */
+    }
+    if (/^file:/i.test(decoded)) {
+      try {
+        decoded = new URL(decoded).pathname;
+        if (/^\/[A-Za-z]:\//.test(decoded)) decoded = decoded.slice(1);
+      } catch {
+        return { ok: false as const };
+      }
+    }
+    const currentDir = payload.currentPath ? posixPath.dirname(payload.currentPath.replace(/\\/g, "/")) : ".";
+    const t = payload.tabId ? getTab(payload.tabId) : getActiveTab();
+    /** Shared path normalization for link targets: `~/` expands to home
+     *  (resolved later by the read handlers), absolute paths stay absolute,
+     *  relative paths join the current file's dir; `..` traversal is
+     *  rejected for all targets so a bad link degrades to a dead click
+     *  instead of an error pane. */
+    function resolveLinkPath(target: string, allowTilde: boolean): string | null {
+      let p = target.replace(/\\/g, "/");
+      if (allowTilde && p.startsWith("~/")) {
+        p = `~/${p.slice(2)}`;
+      } else if (p.startsWith("/")) {
+        p = posixPath.normalize(p);
+      } else {
+        p = posixPath.normalize(posixPath.join(currentDir, p));
+      }
+      if (!p || p === "." || p.split("/").includes("..")) return null;
+      return p;
+    }
+    if (!payload.rootPath) {
+      if (t?.remote) {
+        const relPath = resolveLinkPath(decoded, true);
+        if (!relPath) return { ok: false as const };
+        return { ok: true as const, relPath, tabId: t.id };
+      }
+      if (t?.wsl) {
+        const relPath = resolveLinkPath(decoded, true);
+        if (!relPath) return { ok: false as const };
+        return { ok: true as const, relPath, tabId: t.id };
+      }
+    }
+    const root = payload.rootPath ?? t?.cwd;
+    if (!root) return { ok: false as const };
+    let relPath: string;
+    if (isAbsolute(decoded) || /^[A-Za-z]:[\\/]/.test(decoded)) {
+      const fromRoot = relative(root, decoded).split(sep).join("/");
+      if (fromRoot === "" || fromRoot.startsWith("..") || isAbsolute(fromRoot)) return { ok: false as const };
+      relPath = fromRoot;
+    } else {
+      const joined = resolveLinkPath(decoded, false);
+      if (!joined) return { ok: false as const };
+      relPath = joined;
+    }
+    return { ok: true as const, relPath, tabId: payload.rootPath ? undefined : t?.id, rootPath: payload.rootPath };
+  });
+
   ipcMain.handle("file:read", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
     const relPath = payload.relPath;
@@ -1029,7 +1173,21 @@ app.whenReady().then(async () => {
     };
   });
 
-  ipcMain.handle("tab:alive", (_e, tabId: string) => !!getTab(tabId));
+  ipcMain.handle("tab:alive", (_e, tabId: string) => !!getTab(tabId) || !!getRpcSession(tabId));
+
+  // --- RPC chat (local pi tabs) ---
+  ipcMain.handle("tab:rpc-send", (_e, tabId: string, cmd: Record<string, unknown>) => {
+    const session = getRpcSession(tabId);
+    return session ? session.send(cmd) : false;
+  });
+  ipcMain.handle("tab:rpc-switch-terminal", (_e, tabId: string) => {
+    const ok = switchRpcToTerminal(tabId);
+    if (ok) {
+      emitTabs();
+      emitActive();
+    }
+    return ok;
+  });
 
   // --- WSL distro list ---
   ipcMain.handle("wsl:list-distros", () => listWslDistros());
@@ -1041,11 +1199,21 @@ app.whenReady().then(async () => {
   ipcMain.handle("project:add-wsl", (_e, distro: string, path: string) => addWslProject(distro, path));
   ipcMain.handle("project:delete", (_e, id: string) => deleteProject(id));
   ipcMain.handle("model:list", () => listModels());
-  ipcMain.handle("model:add", (_e, input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[] }) => {
+  ipcMain.handle("model:add", async (_e, input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }) => {
+    const specIds = [input.model, ...(input.availableModels ?? [])].map((s) => s.trim()).filter(Boolean);
+    const overrides = await lookupModelSpecs(specIds);
     const saved = addModel(input);
-    syncModelToPi(saved);
+    syncModelToPi(saved, overrides);
     return saved;
   });
+  ipcMain.handle("model:update", async (_e, id: string, input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }) => {
+    const specIds = [input.model, ...(input.availableModels ?? [])].map((s) => s.trim()).filter(Boolean);
+    const overrides = await lookupModelSpecs(specIds);
+    const saved = updateModel(id, input);
+    syncModelToPi(saved, overrides);
+    return saved;
+  });
+  ipcMain.handle("model:lookup-specs", async (_e, ids: string[]) => lookupModelSpecs(Array.isArray(ids) ? ids : []));
   ipcMain.handle("model:delete", (_e, id: string) => deleteModel(id));
   ipcMain.handle("model:check-sync", (_e, input: { provider: string; model: string }) => checkPiModelSync(input.provider, input.model));
   // --- Remote model configuration (SFTP write + SSH exec) ---
@@ -1157,15 +1325,27 @@ app.whenReady().then(async () => {
     try {
       return await withSftp(remote, async (client, homeDir) => {
         const obj = await readRemoteJson(client, remoteModelsFilePath(homeDir));
-        const providers = (obj && typeof obj.providers === "object" && !Array.isArray(obj.providers) ? obj.providers : {}) as Record<string, { baseUrl?: string; apiKey?: string; models?: Array<{ id?: string }> }>;
+        const providers = (obj && typeof obj.providers === "object" && !Array.isArray(obj.providers) ? obj.providers : {}) as Record<string, { baseUrl?: string; apiKey?: string; api?: string; authHeader?: boolean; headers?: Record<string, string>; oauth?: string; compat?: Record<string, unknown>; models?: Array<Record<string, unknown> & { id?: string }> }>;
         return Object.entries(providers).map(([provider, cfg]) => ({
           id: `remote-${provider}`,
           name: provider,
           baseUrl: cfg?.baseUrl ?? "",
           model: cfg?.models?.[0]?.id ?? "",
           provider,
-          apiKey: typeof cfg?.apiKey === "string" && cfg.apiKey.length > 0 ? cfg.apiKey : undefined,
+          apiKey: typeof cfg?.apiKey === "string" && cfg.apiKey.length > 0 && cfg.apiKey !== "placeholder" ? cfg.apiKey : undefined,
+          providerConfig: {
+            api: (cfg?.api as PiApi | undefined) ?? "openai-completions",
+            headers: cfg?.headers,
+            authHeader: cfg?.authHeader,
+            oauth: cfg?.oauth,
+            compat: cfg?.compat,
+          },
           availableModels: (cfg?.models ?? []).map((m) => m?.id).filter((x): x is string => typeof x === "string"),
+          modelSpecs: Object.fromEntries(
+            (cfg?.models ?? [])
+              .filter((m): m is Record<string, unknown> & { id?: string } => typeof m?.id === "string" && m.id.length > 0)
+              .map((m) => { const { id: _id, ...rest } = m; return [m.id as string, rest as ModelEditorSpec]; }),
+          ),
           createdAt: 0,
           updatedAt: 0,
         }));
@@ -1175,45 +1355,58 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("model:add-remote", async (_e, input: { remote: RemoteOpts; baseUrl: string; apiKey?: string; model: string; provider: string; availableModels?: string[] }) => {
+  ipcMain.handle("model:add-remote", async (_e, input: { remote: RemoteOpts; baseUrl: string; apiKey?: string; model: string; provider: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }) => {
     const providerId = input.provider.trim();
     const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
     if (!providerId) throw new Error("Provider 必填");
     if (!baseUrl) throw new Error("Base URL 必填");
     const modelIds = Array.from(new Set([input.model.trim(), ...(input.availableModels ?? [])].map((s) => s.trim()).filter(Boolean)));
     if (modelIds.length === 0) throw new Error("模型 ID 必填");
-    const models = modelIds.map((id) => ({
-      id,
-      name: id,
-      reasoning: /gpt-5|o1|o3|o4|deepseek-r|deepseek-v4|claude|gemini-2\.5/i.test(id),
-      input: ["text"] as Array<"text" | "image">,
-      contextWindow: 128000,
-      maxTokens: 16384,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }));
+    const specIds = [input.model, ...(input.availableModels ?? [])].map((s) => s.trim()).filter(Boolean);
+    const overrides = await lookupModelSpecs(specIds);
     return await withSftp(input.remote, async (client, homeDir) => {
       const modelsPath = remoteModelsFilePath(homeDir);
       const obj = (await readRemoteJson(client, modelsPath)) ?? {};
       const providers = (obj && typeof obj.providers === "object" && !Array.isArray(obj.providers) ? obj.providers : {}) as Record<string, unknown>;
       obj.providers = providers;
+      // Preserve existing per-model fields on the remote side so an edit
+      // never downgrades configured contextWindow/maxTokens; spec table
+      // fills gaps for new/unknown models only.
+      const prevProvider = (providers[providerId] ?? {}) as { models?: Array<Record<string, unknown> & { id?: string }> };
+      const prevModels = Array.isArray(prevProvider.models) ? prevProvider.models : [];
+      const models = modelIds.map((id) => {
+        const prev = prevModels.find((m) => m?.id === id);
+        const spec = specForModel(id);
+        const manual = input.modelSpecs?.[id];
+        return {
+          ...prev,
+          id,
+          name: manual?.name ?? (prev?.name as string | undefined) ?? id,
+          reasoning: manual?.reasoning ?? (prev?.reasoning as boolean | undefined) ?? /gpt-5|o1|o3|o4|deepseek-r|deepseek-v4|claude|gemini-2\.5/i.test(id),
+          input: manual?.input ?? (prev?.input as Array<"text" | "image"> | undefined) ?? ["text"],
+          contextWindow: manual?.contextWindow ?? (prev?.contextWindow as number | undefined) ?? overrides[id]?.contextWindow ?? spec.contextWindow,
+          maxTokens: manual?.maxTokens ?? (prev?.maxTokens as number | undefined) ?? overrides[id]?.maxTokens ?? spec.maxTokens,
+          cost: manual?.cost ?? (prev?.cost as Record<string, number> | undefined) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        };
+      });
+      const prevProviderCfg = (providers[providerId] ?? {}) as Record<string, unknown>;
       providers[providerId] = {
+        ...prevProviderCfg,
         baseUrl,
-        api: "openai-completions",
+        api: input.providerConfig?.api ?? (prevProviderCfg.api as string | undefined) ?? "openai-completions",
         apiKey: input.apiKey?.trim() || "placeholder",
-        authHeader: true,
-        compat: {
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-          supportsUsageInStreaming: false,
-          maxTokensField: "max_tokens",
-        },
+        authHeader: input.providerConfig?.authHeader ?? (prevProviderCfg.authHeader as boolean | undefined) ?? true,
+        ...(input.providerConfig?.headers ? { headers: input.providerConfig.headers } : {}),
+        ...(input.providerConfig?.oauth ? { oauth: input.providerConfig.oauth } : {}),
+        ...(input.providerConfig?.compat ? { compat: input.providerConfig.compat } : {}),
         models,
       };
       await writeRemoteJson(client, modelsPath, obj);
-      if (input.apiKey?.trim()) {
+      const trimmedKey = input.apiKey?.trim();
+      if (trimmedKey && trimmedKey !== "placeholder") {
         const authPath = remoteAuthFilePath(homeDir);
         const auth = (await readRemoteJson(client, authPath)) ?? {};
-        (auth as Record<string, unknown>)[providerId] = { type: "api_key", key: input.apiKey.trim() };
+        (auth as Record<string, unknown>)[providerId] = { type: "api_key", key: trimmedKey };
         await writeRemoteJson(client, authPath, auth);
       }
       return { ok: true, provider: providerId };
@@ -1960,6 +2153,7 @@ app.on("window-all-closed", async () => {
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopLocalSessionsPoll();
   closeAllTabs();
+  closeAllRpcSessions();
   stopWatching();
   await Promise.all([...sftpLeases.values()].map((lease) => destroySftpLease(lease)));
   if (process.platform !== "darwin") app.quit();
@@ -1969,6 +2163,7 @@ app.on("before-quit", async () => {
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopLocalSessionsPoll();
   closeAllTabs();
+  closeAllRpcSessions();
   stopWatching();
   await Promise.all([...sftpLeases.values()].map((lease) => destroySftpLease(lease)));
 });

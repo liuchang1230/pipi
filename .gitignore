@@ -25,3 +25,7 @@ Thumbs.db
 NUL
 图标.png
 图标*.png
+
+# Smoke-test profiles (CDP-driven e2e)
+.smoke-profile*/
+

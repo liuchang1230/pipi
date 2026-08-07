@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { ModelEditorSpec, ProviderEditorConfig } from "../shared/model-config-types";
 
 export interface FileReadResult {
   content: string;
@@ -23,6 +24,8 @@ export interface TabSummary {
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
+  /** rpc = headless ChatPane (local tabs); pty = terminal view. */
+  mode?: "rpc" | "pty";
 }
 
 export interface SessionListItem {
@@ -53,6 +56,10 @@ export interface ModelConfigItem {
   model: string;
   provider?: string;
   availableModels?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+  providerConfig?: ProviderEditorConfig;
+  modelSpecs?: Record<string, ModelEditorSpec>;
   createdAt: number;
   updatedAt: number;
 }
@@ -77,6 +84,12 @@ const api = {
       ipcRenderer.invoke("tab:resize", id, cols, rows),
     alive: (id: string): Promise<boolean> => ipcRenderer.invoke("tab:alive", id),
     list: (): Promise<TabSummary[]> => ipcRenderer.invoke("tab:list"),
+    /** Send a JSON command to a tab's RPC pi session (prompt/steer/abort/…). */
+    rpcSend: (id: string, cmd: Record<string, unknown>): Promise<boolean> =>
+      ipcRenderer.invoke("tab:rpc-send", id, cmd),
+    /** Fall back from the chat view to the full TUI for this tab (same id). */
+    rpcSwitchToTerminal: (id: string): Promise<string | null> =>
+      ipcRenderer.invoke("tab:rpc-switch-terminal", id),
     waitUntilAlive: async (id: string, timeoutMs = 3000, intervalMs = 250): Promise<boolean> => {
       const startedAt = Date.now();
       while (Date.now() - startedAt < timeoutMs) {
@@ -98,6 +111,30 @@ const api = {
     ipcRenderer.on(channel, handler);
     return () => ipcRenderer.removeListener(channel, handler);
   },
+  /** RPC chat: parsed pi events (message_update, tool_execution_*, …). */
+  onRpcEvent: (id: string, callback: (event: Record<string, unknown>) => void): (() => void) => {
+    const channel = `tab:rpc-event:${id}`;
+    const handler = (_e: Electron.IpcRendererEvent, event: Record<string, unknown>) => callback(event);
+    ipcRenderer.on(channel, handler);
+    return () => ipcRenderer.removeListener(channel, handler);
+  },
+  /** RPC chat: pi process exited. */
+  onRpcExit: (id: string, callback: (code: number) => void): (() => void) => {
+    const channel = `tab:rpc-exit:${id}`;
+    const handler = (_e: Electron.IpcRendererEvent, code: number) => callback(code);
+    ipcRenderer.on(channel, handler);
+    return () => ipcRenderer.removeListener(channel, handler);
+  },
+  /** RPC chat: extension UI dialog request (select/confirm/input/editor). */
+  onRpcUiRequest: (id: string, callback: (req: Record<string, unknown>) => void): (() => void) => {
+    const channel = `tab:rpc-ui-request:${id}`;
+    const handler = (_e: Electron.IpcRendererEvent, req: Record<string, unknown>) => callback(req);
+    ipcRenderer.on(channel, handler);
+    return () => ipcRenderer.removeListener(channel, handler);
+  },
+  /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
+  rpcUiResponse: (id: string, response: Record<string, unknown>): Promise<boolean> =>
+    ipcRenderer.invoke("tab:rpc-ui-response", id, response),
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>
       ipcRenderer.invoke("theme:set-mode", mode),
@@ -118,6 +155,8 @@ const api = {
   file: {
     list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean): Promise<unknown> =>
       ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath, noCache }),
+    resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }): Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }> =>
+      ipcRenderer.invoke("file:resolve-link", input),
     read: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileReadResult> =>
       ipcRenderer.invoke("file:read", { tabId, relPath, rootPath }),
     write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string): Promise<FileOpResult> =>
@@ -158,15 +197,17 @@ const api = {
 
   model: {
     list: (): Promise<ModelConfigItem[]> => ipcRenderer.invoke("model:list"),
-    add: (input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[] }): Promise<ModelConfigItem> =>
+    add: (input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }): Promise<ModelConfigItem> =>
       ipcRenderer.invoke("model:add", input),
+    update: (id: string, input: { name: string; baseUrl: string; apiKey?: string; model: string; provider?: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }): Promise<ModelConfigItem> =>
+      ipcRenderer.invoke("model:update", id, input),
     discover: (input: { baseUrl: string; apiKey?: string }): Promise<string[]> =>
       ipcRenderer.invoke("model:discover", input),
     delete: (id: string): Promise<boolean> => ipcRenderer.invoke("model:delete", id),
     checkSync: (input: { provider: string; model: string }): Promise<{ ok: boolean; piModelsPath: string; providerExists: boolean; modelExists: boolean; listModelsContains: boolean; error?: string }> =>
       ipcRenderer.invoke("model:check-sync", input),
     listRemote: (remote: RemoteTarget): Promise<ModelConfigItem[]> => ipcRenderer.invoke("model:list-remote", remote),
-    addRemote: (input: { remote: RemoteTarget; baseUrl: string; apiKey?: string; model: string; provider: string; availableModels?: string[] }): Promise<{ ok: boolean; provider: string }> =>
+    addRemote: (input: { remote: RemoteTarget; baseUrl: string; apiKey?: string; model: string; provider: string; availableModels?: string[]; providerConfig?: ProviderEditorConfig; modelSpecs?: Record<string, ModelEditorSpec> }): Promise<{ ok: boolean; provider: string }> =>
       ipcRenderer.invoke("model:add-remote", input),
     deleteRemote: (input: { remote: RemoteTarget; provider: string }): Promise<boolean> =>
       ipcRenderer.invoke("model:delete-remote", input),

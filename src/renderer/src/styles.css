@@ -302,11 +302,152 @@ html, body, #root {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.model-row-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.model-chip {
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-chip.primary {
+  color: var(--text);
+  border-color: var(--accent);
+}
+/* --- Model config dialog layout --- */
+.dialog-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.dialog-target-row .dialog-input {
+  width: 220px;
+  margin-top: 0;
+  flex-shrink: 0;
+}
+.dialog-target-row .dialog-hint { font-size: 12px; }
+.editing-note { margin-left: 2px; }
+.dialog-section {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 10px;
+}
+.dialog-section:first-of-type { border-top: none; margin-top: 8px; padding-top: 0; }
+.section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 8px;
+}
+.form-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.model-edit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  margin-top: 8px;
+  padding-right: 2px;
+}
+.model-edit-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+}
+.model-edit-card.primary {
+  border-color: var(--accent);
+  background: rgba(137, 180, 250, 0.06);
+}
+.model-edit-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.model-edit-head input[type="radio"] {
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.model-edit-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.model-edit-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 10px;
+}
+.form-grid-2 label { margin-bottom: 0; }
+.model-edit-grid label { margin-bottom: 0; }
+.model-edit-grid .dialog-input {
+  padding: 4px 8px;
+  font-size: 12px;
+  margin-top: 2px;
+}
+.model-add-input {
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.advanced-json-wrap {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.advanced-json-wrap summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+}
+.advanced-json-wrap summary:hover { color: var(--accent); }
+.model-advanced-json {
+  margin-top: 6px;
+  min-height: 80px;
+  font-family: var(--mono);
+  font-size: 12px;
+  resize: vertical;
+}
 .model-discover-row {
   display: flex;
   align-items: center;
   gap: 10px;
   margin-top: 4px;
+}
+.dialog-checkbox-row {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 6px !important;
+  color: var(--text) !important;
+  cursor: pointer;
+}
+.dialog-checkbox-row input {
+  width: auto;
 }
 .model-discover-hint {
   font-size: 12px;
@@ -631,6 +772,11 @@ html, body, #root {
 }
 .terminal-container .composition-view {
   position: absolute !important;
+  min-width: max-content !important;
+  max-width: min(360px, 80vw) !important;
+  overflow: visible !important;
+  direction: ltr !important;
+  white-space: pre !important;
 }
 
 /* --- Right: file viewer --- */
@@ -947,10 +1093,19 @@ html, body, #root {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 24px;
-  width: 400px;
-  max-width: 90vw;
+  padding: 20px 24px;
+  width: 560px;
+  max-width: 92vw;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+.dialog-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 .dialog-title {
   font-size: 16px;
@@ -1102,4 +1257,631 @@ html, body, #root {
 @keyframes toast-in {
   from { opacity: 0; transform: translateX(-50%) translateY(8px); }
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* --- Chat pane (RPC tabs) --- */
+.chat-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.chat-header-model {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-header-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 5px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.chat-header-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.chat-header-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chat-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 14px 18px 8px;
+}
+.chat-placeholder {
+  color: var(--text-dim);
+  text-align: center;
+  margin-top: 48px;
+  font-size: 13px;
+  user-select: none;
+}
+.chat-error-banner {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 12px;
+}
+.chat-msg {
+  display: flex;
+  margin-bottom: 14px;
+}
+.chat-msg.user {
+  justify-content: flex-end;
+}
+.chat-bubble.user {
+  background: var(--accent);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 10px 10px 2px 10px;
+  max-width: 82%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-bubble.assistant {
+  max-width: 100%;
+  width: 100%;
+}
+.chat-msg-empty {
+  height: 4px;
+}
+.chat-msg-md {
+  line-height: 1.6;
+}
+.chat-msg-md p {
+  margin: 4px 0;
+}
+.chat-thinking {
+  margin: 4px 0;
+  font-size: 12px;
+}
+.chat-thinking summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  user-select: none;
+  list-style: none;
+}
+.chat-thinking summary::before {
+  content: "▸ ";
+}
+.chat-thinking[open] summary::before {
+  content: "▾ ";
+}
+.chat-thinking-body {
+  margin: 6px 0 6px 12px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.chat-tool {
+  margin: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.chat-tool.error {
+  border-color: var(--danger);
+}
+.chat-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--bg-panel);
+}
+.chat-tool-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex: 0 0 auto;
+}
+.chat-tool-dot.running {
+  background: var(--accent);
+  animation: chat-dot-pulse 1s ease-in-out infinite;
+}
+@keyframes chat-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.chat-tool-name {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+}
+.chat-tool-toggle {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.chat-tool-args {
+  margin: 0;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  max-height: 160px;
+  overflow: auto;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-tool-result-wrap {
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+}
+.chat-tool-result-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+  user-select: none;
+}
+.chat-tool-result {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 200px;
+  overflow: auto;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid var(--border);
+}
+.chat-tool-result.error {
+  color: var(--danger);
+}
+.chat-input-wrap {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  padding: 10px 14px 8px;
+  background: var(--bg-panel);
+}
+.chat-textarea {
+  width: 100%;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  padding: 9px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.5;
+  outline: none;
+  min-height: 40px;
+  max-height: 180px;
+  box-sizing: border-box;
+  display: block;
+}
+.chat-textarea:focus {
+  border-color: var(--accent);
+}
+.chat-textarea:disabled {
+  opacity: 0.6;
+}
+.chat-input-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+}
+.chat-input-hint {
+  flex: 1;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.chat-btn {
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.chat-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.chat-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.chat-btn.send {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.chat-btn.stop {
+  color: var(--danger);
+}
+
+/* --- Chat model switch menu --- */
+.chat-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+.chat-model-switch-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+.chat-model-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 120;
+  min-width: 220px;
+  max-width: 320px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+.chat-model-menu-title {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 5px 8px 3px;
+}
+.chat-model-item {
+  padding: 6px 8px;
+  border-radius: 5px;
+  font-size: 12px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-model-item:hover {
+  background: var(--border);
+}
+.chat-model-item.current {
+  color: var(--accent);
+}
+
+/* --- Extension UI dialogs (select/confirm/input/editor) --- */
+.ui-dialog {
+  width: 480px;
+}
+.ui-select-list {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.ui-select-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ui-select-item:last-child {
+  border-bottom: none;
+}
+.ui-select-item:hover,
+.ui-select-item.selected {
+  background: var(--accent);
+  color: var(--text);
+}
+.ui-select-empty {
+  padding: 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.ui-confirm-msg {
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.ui-input {
+  width: 100%;
+}
+.ui-editor {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.5;
+}
+.ui-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* --- Chat session stats + diff --- */
+.chat-header-stats {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: "Cascadia Code", Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-tool-result.diff {
+  line-height: 1.45;
+}
+.chat-tool-result.diff .hljs-deletion {
+  background: rgba(243, 139, 168, 0.15);
+  color: var(--danger);
+  display: block;
+}
+.chat-tool-result.diff .hljs-addition {
+  background: rgba(166, 227, 161, 0.15);
+  color: var(--success);
+  display: block;
+}
+.chat-tool-result.diff .hljs-meta {
+  color: var(--accent);
+}
+
+/* --- Session tree dialog --- */
+.tree-dialog {
+  width: 560px;
+}
+.tree-scroll {
+  max-height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 0;
+}
+.tree-empty {
+  padding: 16px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+.tree-error {
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.tree-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  line-height: 1.4;
+}
+.tree-row:last-child {
+  border-bottom: none;
+}
+.tree-row:hover {
+  background: var(--border);
+}
+.tree-row.selected {
+  background: rgba(137, 180, 250, 0.12);
+}
+.tree-row.leaf .tree-label {
+  color: var(--accent);
+}
+.tree-icon {
+  flex: 0 0 auto;
+}
+.tree-label {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  min-width: 30px;
+}
+.tree-branch-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.tree-preview {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.tree-leaf-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--success);
+}
+.tree-detail {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.tree-detail-text {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tree-detail-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+.tree-detail-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* --- Session tree dialog (aligned with /tree) --- */
+.tree-dialog {
+  width: 640px;
+}
+.tree-search {
+  margin-bottom: 8px;
+}
+.tree-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 0;
+  font-family: "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+  font-size: 12px;
+}
+.tree-row {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  padding: 3px 8px;
+  cursor: pointer;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.tree-row:hover {
+  background: var(--border);
+}
+.tree-row.selected {
+  background: rgba(137, 180, 250, 0.18);
+}
+.tree-row.current .tree-entrylabel,
+.tree-row.current .tree-entrytext {
+  color: var(--accent);
+}
+.tree-gutter {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.tree-fold {
+  flex: 0 0 auto;
+  color: var(--accent);
+  cursor: pointer;
+  width: 14px;
+  text-align: center;
+}
+.tree-pathmark {
+  flex: 0 0 auto;
+  color: var(--accent);
+  width: 10px;
+}
+.tree-entrylabel {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+.tree-entrylabel.user { color: var(--accent); }
+.tree-entrylabel.assistant { color: var(--success); }
+.tree-entrytext {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+.tree-entrytext.muted { color: var(--text-dim); }
+.tree-entrytext.error { color: var(--danger); }
+.tree-entrytext.compaction { color: var(--text-dim); }
+.tree-entrytext.summary { color: var(--warning, #f9e2af); }
+.tree-branch-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--warning, #f9e2af);
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  padding: 0 5px;
+}
+.tree-leaf-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--success);
+}
+.tree-status {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.tree-empty {
+  padding: 16px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.tree-error {
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.tree-detail {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.tree-detail-text {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tree-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.tree-detail-hint {
+  flex: 1 1 100%;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.tree-summary-options {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.tree-instr {
+  margin-top: 8px;
+  min-height: 60px;
 }
