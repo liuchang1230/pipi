@@ -7,14 +7,14 @@
  * back to the full TUI (same tab id) for anything that needs it.
  */
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import hljs from "highlight.js";
 import Markdown from "../Markdown";
 import { useChatStore, type ChatBlock, type ChatMessage } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
-import { DiffDialog, DiffView, editsToDiff } from "../dialogs/DiffDialog";
+import { DiffView, editsToDiff, isDiffish } from "../components/DiffView";
+import { useViewerStore } from "../stores/viewerStore";
 
 // --- Block renderers --------------------------------------------------------
 
@@ -34,11 +34,7 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
   const [showResult, setShowResult] = useState(false);
   const running = block.status === "streaming";
   const resultText = block.resultText ?? "";
-  // Highlight git diffs in tool results (hljs diff grammar + github.css theme).
-  const isDiff =
-    resultText.startsWith("diff --git") ||
-    /^[+-]{3} \S/m.test(resultText) ||
-    /^@@ -\d+,\d+ \+\d+,\d+ @@/m.test(resultText);
+  const isDiff = isDiffish(resultText);
   // edit tool: render a real diff from args (oldText→newText) even before
   // the result arrives — args-only JSON is unreadable.
   const editDiff = useMemo(() => {
@@ -51,6 +47,17 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
       return null;
     }
   }, [block.name, block.argsText]);
+  // write tool: show path + content preview instead of JSON args.
+  const writePreview = useMemo(() => {
+    if (block.name !== "write_file" && block.name !== "write") return null;
+    try {
+      const args = JSON.parse(block.argsText || "{}") as { path?: string; content?: string };
+      if (typeof args.content !== "string" && typeof args.path !== "string") return null;
+      return { path: args.path ?? "", content: args.content ?? "" };
+    } catch {
+      return null;
+    }
+  }, [block.name, block.argsText]);
   return (
     <div className={`chat-tool${block.isError ? " error" : ""}`}>
       <div className="chat-tool-head" onClick={() => setShowArgs((v) => !v)}>
@@ -58,10 +65,16 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
         <span className="chat-tool-name">{block.name ?? "tool"}</span>
         <span className="chat-tool-toggle">{showArgs ? "▾" : "▸"}</span>
       </div>
-      {showArgs && (
+      {showArgs && !writePreview && (
         <pre className="chat-tool-args">
           {block.argsText || (running ? "(参数生成中…)" : "")}
         </pre>
+      )}
+      {writePreview && (
+        <div className="chat-tool-editdiff">
+          <div className="chat-tool-result-head">写入 {writePreview.path || "（未知路径）"}</div>
+          <pre className="chat-tool-write-preview">{writePreview.content || "（空内容）"}</pre>
+        </div>
       )}
       {editDiff && !isDiff && (
         <div className="chat-tool-editdiff">
@@ -77,10 +90,9 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
           </div>
           {showResult &&
             (isDiff ? (
-              <pre
-                className={`chat-tool-result diff hljs${block.isError ? " error" : ""}`}
-                dangerouslySetInnerHTML={{ __html: hljs.highlight(resultText, { language: "diff" }).value }}
-              />
+              <div className="chat-tool-result diff">
+                <DiffView diffText={resultText} />
+              </div>
             ) : (
               <pre className={`chat-tool-result${block.isError ? " error" : ""}`}>{resultText || "(空)"}</pre>
             ))}
@@ -138,7 +150,6 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
   const [modelView, setModelView] = useState<"providers" | "models">("providers");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [treeOpen, setTreeOpen] = useState(false);
-  const [diffOpen, setDiffOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [stats, setStats] = useState<{ tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; context?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | null>(null);
   const [modelList, setModelList] = useState<Array<{ id: string; name?: string; provider?: string }>>([]);
@@ -490,7 +501,16 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
           分支
         </button>
-        <button className="chat-header-btn" onClick={() => setDiffOpen(true)} title="工作区文件变更（git diff）">
+        <button
+          className="chat-header-btn"
+          onClick={() => {
+            // 打开右侧变更面板，聚焦当前查看器里的文件（如果有）。
+            const cur = useViewerStore.getState().currentFile;
+            useViewerStore.getState().setViewerMode("changes");
+            useViewerStore.getState().setChangesFocusPath(cur?.path ?? null);
+          }}
+          title="工作区文件变更与版本对比（右侧面板）"
+        >
           文件变更
         </button>
         <button className="chat-header-btn" onClick={switchToTerminal} disabled={switchBusy} title="切换为完整终端视图（TUI）">
@@ -561,7 +581,6 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         </div>
       </div>
       {uiReq && <UiDialog tabId={tabId} req={uiReq} onClose={() => setUiReq(null)} />}
-      {diffOpen && <DiffDialog tabId={tabId} onClose={() => setDiffOpen(false)} />}
       {treeOpen && (
         <TreeDialog
           tabId={tabId}

@@ -30,6 +30,12 @@ function isRetryableReadError(error: string): boolean {
 
 interface ViewerState {
   currentFile: CurrentFile | null;
+  /** Right-pane mode: file viewer or changes/version-compare panel. */
+  viewerMode: "viewer" | "changes";
+  setViewerMode: (mode: "viewer" | "changes") => void;
+  /** File to focus when the changes panel opens (e.g. the file in the viewer). */
+  changesFocusPath: string | null;
+  setChangesFocusPath: (path: string | null) => void;
   fileLoading: boolean;
   followCfg: AutoFollowSettings;
   followDegraded: boolean;
@@ -48,6 +54,10 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
   fileLoading: false,
   followCfg: { enabled: true, followReads: true },
   followDegraded: false,
+  viewerMode: "viewer",
+  setViewerMode: (mode) => set({ viewerMode: mode }),
+  changesFocusPath: null,
+  setChangesFocusPath: (path) => set({ changesFocusPath: path }),
   setCurrentFile: (currentFile) => set({ currentFile }),
   setFileLoading: (fileLoading) => set({ fileLoading }),
   setFollowCfg: (cfg) =>

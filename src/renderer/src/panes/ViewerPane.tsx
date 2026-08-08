@@ -9,6 +9,7 @@ import { useTabsStore } from "../stores/tabsStore";
 import { useTreeStore } from "../stores/treeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useViewerStore, isManualOpenPending } from "../stores/viewerStore";
+import { ChangesView } from "./ChangesView";
 import { useLayoutStore } from "../stores/layoutStore";
 
 export function ViewerPane() {
@@ -19,6 +20,10 @@ export function ViewerPane() {
   const followDegraded = useViewerStore((s) => s.followDegraded);
   const setFollowDegraded = useViewerStore((s) => s.setFollowDegraded);
   const openFile = useViewerStore((s) => s.openFile);
+  const viewerMode = useViewerStore((s) => s.viewerMode);
+  const setViewerMode = useViewerStore((s) => s.setViewerMode);
+  const changesFocusPath = useViewerStore((s) => s.changesFocusPath);
+  const setChangesFocusPath = useViewerStore((s) => s.setChangesFocusPath);
   const activeTab = useTabsStore((s) => s.activeTab);
   const isRemote = useTabsStore((s) => s.isRemote);
   const remoteLabel = useTabsStore((s) => s.remoteLabel);
@@ -161,8 +166,22 @@ export function ViewerPane() {
         <button className="viewer-toggle" onClick={toggleViewer} title={viewerCollapsed ? "展开预览" : "收起预览"} aria-label={viewerCollapsed ? "展开预览" : "收起预览"}>
           <span className="viewer-toggle-icon">{viewerCollapsed ? "❮" : "❯"}</span>
         </button>
-        {!viewerCollapsed && <span className="viewer-path">{currentFile?.path ?? "（未选择文件）"}</span>}
-        {!viewerCollapsed && <div className="viewer-meta">
+        {!viewerCollapsed && (
+          <div className="viewer-modes" role="tablist">
+            <button
+              className={`viewer-mode${viewerMode === "viewer" ? " active" : ""}`}
+              onClick={() => setViewerMode("viewer")}
+              title="文件查看器"
+            >查看</button>
+            <button
+              className={`viewer-mode${viewerMode === "changes" ? " active" : ""}`}
+              onClick={() => setViewerMode("changes")}
+              title="工作区文件变更与版本对比"
+            >变更</button>
+          </div>
+        )}
+        {!viewerCollapsed && viewerMode === "viewer" && <span className="viewer-path">{currentFile?.path ?? "（未选择文件）"}</span>}
+        {!viewerCollapsed && viewerMode === "viewer" && <div className="viewer-meta">
           <div className="viewer-follow-wrap">
             <button
               className={`viewer-follow-btn${followCfg.enabled ? "" : " off"}${followDegraded ? " degraded" : ""}`}
@@ -207,13 +226,20 @@ export function ViewerPane() {
           {currentFile?.followed && <span className="viewer-auto">自动跟随</span>}
         </div>}
       </div>
-      {!viewerCollapsed && (
+      {!viewerCollapsed && viewerMode === "viewer" && (
         <FileViewer
           file={currentFile}
           loading={fileLoading}
           tabId={activeTab ?? undefined}
           onSaved={handleFileSaved}
           onToast={(msg, type) => useUiStore.getState().showToast(msg, type)}
+        />
+      )}
+      {!viewerCollapsed && viewerMode === "changes" && (
+        <ChangesView
+          tabId={activeTab ?? ""}
+          focusPath={changesFocusPath}
+          onFocusPathHandled={() => setChangesFocusPath(null)}
         />
       )}
     </aside>

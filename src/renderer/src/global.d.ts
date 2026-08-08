@@ -161,6 +161,8 @@ declare global {
       diff: {
         list: (tabId: string) => Promise<{ isGit: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }>;
         get: (tabId: string, path: string) => Promise<{ diff: string; isUntracked: boolean; error?: string }>;
+        history: (tabId: string, path: string, events: unknown[]) => Promise<{ versions: { label: string; content: string }[]; error?: string }>;
+        compare: (a: string, b: string, path: string) => Promise<{ diff: string }>;
       };
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
       onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;

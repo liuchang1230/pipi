@@ -148,6 +148,10 @@ const api = {
       ipcRenderer.invoke("diff:list", tabId),
     get: (tabId: string, path: string): Promise<{ diff: string; isUntracked: boolean; error?: string }> =>
       ipcRenderer.invoke("diff:get", tabId, path),
+    history: (tabId: string, path: string, events: unknown[]): Promise<{ versions: { label: string; content: string }[]; error?: string }> =>
+      ipcRenderer.invoke("diff:history", tabId, path, events),
+    compare: (a: string, b: string, path: string): Promise<{ diff: string }> =>
+      ipcRenderer.invoke("diff:compare", a, b, path),
   },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>

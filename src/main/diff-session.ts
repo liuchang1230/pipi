@@ -236,3 +236,134 @@ export async function getFileDiff(tabId: string, path: string): Promise<FileDiff
     return { diff: "", isUntracked: true, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+/* ===== Version-chain reconstruction ===== */
+
+export interface FileVersion {
+  label: string;
+  content: string;
+}
+export interface FileHistoryResult {
+  versions: FileVersion[];
+  error?: string;
+}
+export interface FileHistoryEvent {
+  type: "edit";
+  edits: Array<{ oldText: string; newText: string }>;
+}
+/**
+ * Apply a unified patch (subset of git diff output) to content.
+ * Hunk: @@ -oldStart[,oldCount] +newStart[,newCount] @@ followed by
+ * context lines (leading space), '-' lines and '+' lines.
+ */
+function applyUnifiedPatch(content: string, patch: string): string | null {
+  let lines = content.split("\n");
+  const patchLines = patch.split("\n");
+  let i = 0;
+  while (i < patchLines.length) {
+    const line = patchLines[i]!;
+    const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (!m) {
+      i++;
+      continue;
+    }
+    const oldStart = parseInt(m[1]!, 10);
+    const oldCount = m[2] ? parseInt(m[2]!, 10) : 1;
+    i++;
+    const body: string[] = [];
+    while (i < patchLines.length && !patchLines[i]!.startsWith("@@")) {
+      body.push(patchLines[i]!);
+      i++;
+    }
+    const remove: string[] = [];
+    const insert: string[] = [];
+    for (const bl of body) {
+      if (bl.startsWith("+")) insert.push(bl.slice(1));
+      else if (bl.startsWith("-")) remove.push(bl.slice(1));
+      else if (bl.startsWith(" ")) {
+        remove.push(bl.slice(1));
+        insert.push(bl.slice(1));
+      }
+      // "\ No newline at end of file" and headers are skipped
+    }
+    const start = oldStart - 1;
+    const seg = lines.slice(start, start + oldCount);
+    // Verify removed lines appear in order within the segment (tolerant: the
+    // patch may contain context beyond the replaced block).
+    let k = 0;
+    for (const r of remove) {
+      while (k < seg.length && seg[k] !== r) k++;
+      if (k >= seg.length) return null;
+      k++;
+    }
+    lines = [...lines.slice(0, start), ...insert, ...lines.slice(start + oldCount)];
+  }
+  return lines.join("\n");
+}
+
+/** Rebuild a file's version chain: HEAD (when available) + each session edit. */
+export async function getFileHistory(
+  tabId: string,
+  path: string,
+  events: FileHistoryEvent[],
+): Promise<FileHistoryResult> {
+  const ctx = gitCtxFor(tabId);
+  if (!ctx) return { versions: [], error: "tab not found" };
+  let content: string | null = null;
+  // Base: HEAD version (git repo only).
+  const head = await runGit(ctx, ["show", `HEAD:${path}`]);
+  if (head.code === 0 && head.stdout !== "") {
+    content = head.stdout.replace(/\r?\n$/, "");
+  }
+  const versions: FileVersion[] = [];
+  let failed = 0;
+  if (content !== null) versions.push({ label: "初始（HEAD）", content });
+  else versions.push({ label: "会话前（未知）", content: "" });
+  let n = 0;
+  for (const ev of events) {
+    n++;
+    if (ev.type !== "edit" || !Array.isArray(ev.edits) || content === null) {
+      failed++;
+      continue;
+    }
+    let cur = content;
+    let ok = true;
+    for (const e of ev.edits) {
+      const idx = cur.indexOf(e.oldText);
+      if (idx < 0) {
+        ok = false;
+        break;
+      }
+      cur = cur.slice(0, idx) + e.newText + cur.slice(idx + e.oldText.length);
+    }
+    if (!ok) {
+      failed++;
+      continue;
+    }
+    content = cur;
+    versions.push({ label: `第 ${n} 次编辑后`, content });
+  }
+  if (failed > 0) console.log(`[diff] ${path}: ${failed}/${events.length} events not applied`);
+  return { versions };
+}
+
+/** Row diff between two contents → unified diff text (simplified LCS). */
+export function diffTextOf(a: string, b: string, path = "file"): string {
+  const A = a === "" ? [] : a.split("\n");
+  const B = b === "" ? [] : b.split("\n");
+  // Common prefix/suffix of lines; the middle is replaced wholesale.
+  let pre = 0;
+  while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+  let suf = 0;
+  while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++;
+  const oldMid = A.slice(pre, A.length - suf);
+  const newMid = B.slice(pre, B.length - suf);
+  if (!oldMid.length && !newMid.length) return "";
+  const out: string[] = [`--- a/${path}`, `+++ b/${path}`];
+  const oldStart = pre + 1;
+  const newStart = pre + 1;
+  out.push(`@@ -${oldStart},${oldMid.length} +${newStart},${newMid.length} @@`);
+  for (const l of oldMid) out.push(`-${l}`);
+  for (const l of newMid) out.push(`+${l}`);
+  return out.join("\n");
+}
