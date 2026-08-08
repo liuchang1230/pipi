@@ -78,6 +78,24 @@ function textOf(content: unknown): string {
   return "";
 }
 
+/** Does this text look like a git/unified diff already? */
+function isDiffish(text: string): boolean {
+  return text.startsWith("diff --git") || /^[+-]{3} \S/m.test(text) || /^@@ -\d+,\d+ \+\d+,\d+ @@/m.test(text);
+}
+
+/**
+ * Best display text for a tool result: pi's edit tool puts the real diff in
+ * `result.details.diff` (content is only prose like "Edited 2 changes").
+ * Prefer that diff so tool cards and file aggregation see actual changes.
+ */
+function resultTextOf(res: { content?: unknown; details?: { diff?: unknown } } | undefined): string {
+  if (!res) return "";
+  const text = textOf(res.content);
+  const diff = res.details?.diff;
+  if (typeof diff === "string" && diff.trim() && !isDiffish(text)) return diff;
+  return text;
+}
+
 /** Convert a pi AgentMessage content array into ChatBlocks (assistant side). */
 function blocksFromContent(content: unknown): ChatBlock[] {
   if (typeof content === "string") {
@@ -113,6 +131,7 @@ interface ToolResultLike {
   toolName?: string;
   isError?: boolean;
   content?: unknown;
+  details?: { diff?: unknown };
 }
 
 /** Attach historical toolResult messages to their toolCall blocks. */
@@ -122,7 +141,7 @@ function attachToolResults(messages: ChatMessage[], toolResults: ToolResultLike[
     for (let i = messages.length - 1; i >= 0; i--) {
       const target = messages[i]!.blocks.find((b) => b.kind === "tool" && b.toolCallId === tr.toolCallId);
       if (target && target.kind === "tool") {
-        target.resultText = textOf(tr.content);
+        target.resultText = resultTextOf(tr);
         target.isError = tr.isError;
         target.resultDone = true;
         target.status = "done";
@@ -405,11 +424,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
               target.resultText = "";
               target.resultDone = false;
             } else if (type === "tool_execution_update") {
-              const pr = event.partialResult as { content?: unknown } | undefined;
-              target.resultText = pr ? textOf(pr.content) : target.resultText;
+              const pr = event.partialResult as { content?: unknown; details?: { diff?: unknown } } | undefined;
+              target.resultText = pr ? resultTextOf(pr) : target.resultText;
             } else {
-              const res = event.result as { content?: unknown } | undefined;
-              if (res) target.resultText = textOf(res.content);
+              const res = event.result as { content?: unknown; details?: { diff?: unknown } } | undefined;
+              if (res) target.resultText = resultTextOf(res);
               target.isError = !!event.isError;
               target.resultDone = true;
               target.status = "done";

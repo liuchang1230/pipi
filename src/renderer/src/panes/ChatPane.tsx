@@ -14,7 +14,7 @@ import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
-import { DiffDialog } from "../dialogs/DiffDialog";
+import { DiffDialog, DiffView, editsToDiff } from "../dialogs/DiffDialog";
 
 // --- Block renderers --------------------------------------------------------
 
@@ -39,6 +39,18 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
     resultText.startsWith("diff --git") ||
     /^[+-]{3} \S/m.test(resultText) ||
     /^@@ -\d+,\d+ \+\d+,\d+ @@/m.test(resultText);
+  // edit tool: render a real diff from args (oldText→newText) even before
+  // the result arrives — args-only JSON is unreadable.
+  const editDiff = useMemo(() => {
+    if (block.name !== "edit") return null;
+    try {
+      const args = JSON.parse(block.argsText || "{}") as { path?: string; edits?: Array<{ oldText: string; newText: string }> };
+      if (!Array.isArray(args.edits) || !args.edits.length) return null;
+      return editsToDiff(args.path, args.edits);
+    } catch {
+      return null;
+    }
+  }, [block.name, block.argsText]);
   return (
     <div className={`chat-tool${block.isError ? " error" : ""}`}>
       <div className="chat-tool-head" onClick={() => setShowArgs((v) => !v)}>
@@ -50,6 +62,12 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
         <pre className="chat-tool-args">
           {block.argsText || (running ? "(参数生成中…)" : "")}
         </pre>
+      )}
+      {editDiff && !isDiff && (
+        <div className="chat-tool-editdiff">
+          <div className="chat-tool-result-head">编辑预览</div>
+          <DiffView diffText={editDiff} />
+        </div>
       )}
       {(block.resultDone || running) && (
         <div className="chat-tool-result-wrap" onClick={() => setShowResult((v) => !v)}>

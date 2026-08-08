@@ -2107,3 +2107,13 @@ html, body, #root {
 .diff-header { color: var(--accent); padding: 4px 12px; font-weight: 600; }
 .diff-hunk { color: #d29922; padding: 2px 12px; }
 .diff-add, .diff-del, .diff-ctx { padding-left: 12px; padding-right: 12px; }
+
+/* --- edit-tool inline diff preview in chat --- */
+.chat-tool-editdiff {
+  border-top: 1px solid var(--border);
+  max-height: 260px;
+  overflow: auto;
+}
+.chat-tool-editdiff .diff-view { padding: 4px 0; }
+.chat-tool-editdiff .diff-header { padding: 2px 12px; font-size: 11px; }
+.diff-status.st-S { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); }

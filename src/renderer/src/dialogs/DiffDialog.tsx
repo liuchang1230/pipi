@@ -5,6 +5,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { useChatStore } from "../stores/chatStore";
+import { useTabsStore } from "../stores/tabsStore";
 
 interface DiffFileEntry {
   status: string;
@@ -25,20 +26,44 @@ function diffPath(text: string): string | null {
   return m2?.[1] ?? null;
 }
 
+function normalizePath(p: string, cwd: string): string {
+  const normCwd = cwd.replace(/\\/g, "/").replace(/\/$/, "");
+  const normP = p.replace(/\\/g, "/");
+  if (normP.startsWith(normCwd + "/")) return normP.slice(normCwd.length + 1);
+  return p;
+}
+
 /** Fallback for non-git cwd: aggregate apply_patch/edit diffs from the session. */
-function aggregateToolDiffs(tabId: string): { files: DiffFileEntry[]; diffs: Map<string, string> } {
+function aggregateToolDiffs(tabId: string, cwd: string): { files: DiffFileEntry[]; diffs: Map<string, string> } {
   const state = useChatStore.getState().states[tabId];
   const byPath = new Map<string, string[]>();
   for (const msg of state?.messages ?? []) {
     for (const b of msg.blocks) {
-      if (b.kind === "tool" && b.resultText?.startsWith("diff --git")) {
-        const p = diffPath(b.resultText);
-        if (p) {
-          const arr = byPath.get(p) ?? [];
-          arr.push(b.resultText);
-          byPath.set(p, arr);
+      if (b.kind !== "tool" || !b.resultText) continue;
+      const argsPath = (() => {
+        try {
+          const args = JSON.parse(b.argsText || "{}") as { path?: string };
+          return typeof args.path === "string" ? args.path : undefined;
+        } catch {
+          return undefined;
         }
-      }
+      })();
+      const p = normalizePath(diffPath(b.resultText) ?? argsPath ?? "", cwd);
+      if (!p) continue;
+      const arr = byPath.get(p) ?? [];
+      // prefer a real diff; else synthesize one from edit args
+      const diffText = b.resultText.startsWith("diff --git")
+        ? b.resultText
+        : (() => {
+            try {
+              const args = JSON.parse(b.argsText || "{}") as { edits?: Array<{ oldText: string; newText: string }> };
+              return editsToDiff(p, Array.isArray(args.edits) ? args.edits : []);
+            } catch {
+              return "";
+            }
+          })();
+      if (diffText) arr.push(diffText);
+      byPath.set(p, arr);
     }
   }
   const files: DiffFileEntry[] = [...byPath.entries()].map(([path]) => ({
@@ -113,7 +138,7 @@ function DiffLineRow({ line }: { line: DiffLine }) {
   );
 }
 
-function DiffView({ diffText }: { diffText: string }) {
+export function DiffView({ diffText }: { diffText: string }) {
   const lines = useMemo(() => parseDiff(diffText), [diffText]);
   // Pair adjacent -/+ rows for inline highlighting.
   const rows = useMemo(() => {
@@ -166,12 +191,30 @@ function DiffView({ diffText }: { diffText: string }) {
   return <div className="diff-view">{rows}</div>;
 }
 
+/**
+ * Build a synthetic unified diff for edit-tool args (oldText → newText pairs),
+ * so tool cards can show a diff before/without a result.
+ */
+export function editsToDiff(path: string | undefined, edits: Array<{ oldText: string; newText: string }>): string {
+  if (!edits.length) return "";
+  const p = path ?? "file";
+  const parts: string[] = [`--- a/${p}`, `+++ b/${p}`];
+  for (const e of edits) {
+    const oldLines = e.oldText.split("\n");
+    const newLines = e.newText.split("\n");
+    if (oldLines[oldLines.length - 1] === "") oldLines.pop();
+    if (newLines[newLines.length - 1] === "") newLines.pop();
+    parts.push(`@@ -1,${oldLines.length} +1,${newLines.length} @@`);
+    for (const l of oldLines) parts.push(`-${l}`);
+    for (const l of newLines) parts.push(`+${l}`);
+  }
+  return parts.join("\n");
+}
+
 interface DiffDialogProps {
   tabId: string;
   onClose: () => void;
-}
-
-export function DiffDialog({ tabId, onClose }: DiffDialogProps) {
+}export function DiffDialog({ tabId, onClose }: DiffDialogProps) {
   const [list, setList] = useState<{ isGit: boolean; files: DiffFileEntry[]; error?: string } | null>(null);
   const [fallback, setFallback] = useState<Map<string, string>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
@@ -183,17 +226,30 @@ export function DiffDialog({ tabId, onClose }: DiffDialogProps) {
     setLoading(true);
     setError(null);
     try {
+      const cwd = useTabsStore.getState().tabs.find((t) => t.id === tabId)?.cwd ?? "";
+      const agg = aggregateToolDiffs(tabId, cwd);
       const r = await window.api.diff.list(tabId);
       if (!r.isGit) {
-        const agg = aggregateToolDiffs(tabId);
         setList({ isGit: false, files: agg.files });
         setFallback(agg.diffs);
       } else {
-        setList(r);
-        setFallback(new Map());
+        // git list + session-touched files (e.g. gitignored docs) merged;
+        // session-only files fall back to aggregated diffs.
+        const gitPaths = new Set(r.files.map((f) => f.path));
+        const merged = [...r.files];
+        const mergedDiffs = new Map<string, string>();
+        for (const f of agg.files) {
+          if (!gitPaths.has(f.path)) {
+            merged.push({ ...f, status: "S" });
+            const d = agg.diffs.get(f.path);
+            if (d) mergedDiffs.set(f.path, d);
+          }
+        }
+        setList({ isGit: true, files: merged });
+        setFallback(mergedDiffs);
       }
       // Keep selection if still present.
-      const keep = selected && (list?.isGit ? list.files.some((f) => f.path === selected) : fallback.has(selected));
+      const keep = selected && list?.files.some((f) => f.path === selected);
       if (!keep) {
         setSelected(null);
         setDiffText(null);
@@ -213,6 +269,11 @@ export function DiffDialog({ tabId, onClose }: DiffDialogProps) {
     setError(null);
     if (list && !list.isGit) {
       setDiffText(fallback.get(path) ?? null);
+      return;
+    }
+    if (list && list.isGit && fallback.has(path)) {
+      // Session-touched file not tracked by git (e.g. gitignored).
+      setDiffText(fallback.get(path)!);
       return;
     }
     const r = await window.api.diff.get(tabId, path);
@@ -272,7 +333,7 @@ export function DiffDialog({ tabId, onClose }: DiffDialogProps) {
                 onClick={() => void openFile(f.path)}
                 title={f.path}
               >
-                <span className={`diff-status st-${f.status}`}>{STATUS_LABEL[f.status] ?? f.status}</span>
+                <span className={`diff-status st-${f.status}`}>{STATUS_LABEL[f.status] ?? (f.status === "S" ? "会话" : f.status)}</span>
                 <span className="diff-filepath">{f.path}</span>
                 {f.additions !== 0 || f.deletions !== 0 ? (
                   <span className="diff-filecount">
