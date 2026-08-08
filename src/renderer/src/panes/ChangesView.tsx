@@ -1,6 +1,6 @@
 /**
- * 右侧「变更」面板：git 工作区 diff + 会话工具聚合 + 版本对比。
- * 选中文件后显示版本链（HEAD → 每次编辑后 → 当前），任选两个版本对比；
+ * 右侧「变更」面板：默认聚焦当前查看器打开的文件，展示它的完整变更记录
+ * 与版本对比（HEAD → 每次编辑后 → 当前）。顶部下拉可切换其他变更文件；
  * 非 git 场景自动降级为会话工具聚合。
  */
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -16,7 +16,7 @@ export interface DiffFileEntry {
 }
 
 const STATUS_LABEL: Record<string, string> = {
-  M: "修改", A: "新增", D: "删除", R: "重命名", C: "复制", U: "未跟踪",
+  M: "修改", A: "新增", D: "删除", R: "重命名", C: "复制", U: "未跟踪", S: "会话",
 };
 
 /** Extract the file path from a unified diff text (diff --git a/… b/…). */
@@ -52,7 +52,6 @@ function aggregateToolDiffs(tabId: string, cwd: string): { files: DiffFileEntry[
       const p = normalizePath(diffPath(b.resultText) ?? argsPath ?? "", cwd);
       if (!p) continue;
       const arr = byPath.get(p) ?? [];
-      // prefer a real diff; else synthesize one from edit args
       const diffText = isDiffish(b.resultText)
         ? b.resultText
         : (() => {
@@ -79,13 +78,14 @@ function aggregateToolDiffs(tabId: string, cwd: string): { files: DiffFileEntry[
 
 interface ChangesViewProps {
   tabId: string;
-  /** File to focus when present (e.g. the file open in the viewer). */
+  /** File to focus (the file open in the viewer, if any). */
   focusPath?: string | null;
   onFocusPathHandled?: () => void;
 }
 
 export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesViewProps) {
-  const [list, setList] = useState<{ isGit: boolean; files: DiffFileEntry[]; error?: string } | null>(null);
+  const [files, setFiles] = useState<DiffFileEntry[]>([]);
+  const [isGit, setIsGit] = useState(true);
   const [fallback, setFallback] = useState<Map<string, string>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
   const [gitDiff, setGitDiff] = useState<string | null>(null);
@@ -96,29 +96,57 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const cwdRef = useRef("");
+  const focusHandled = useRef(false);
 
-  // Focus a file: select it and switch to version-compare when it has a history.
+  /** Show one file: working-tree diff + version history. */
   const selectFile = async (path: string) => {
     setSelected(path);
     setGitDiff(null);
     setVersions(null);
     setCompareText(null);
+    setVerA(null);
+    setVerB(null);
     setError(null);
-    if (list && !list.isGit) {
+    // Working-tree diff (or aggregated session diff for gitignored/non-git).
+    if (!isGit || fallback.has(path)) {
       setGitDiff(fallback.get(path) ?? "");
-      return;
-    }
-    if (list && list.isGit && fallback.has(path)) {
-      // Session-touched file not tracked by git (e.g. gitignored).
-      setGitDiff(fallback.get(path) ?? "");
-      return;
-    }
-    const r = await window.api.diff.get(tabId, path);
-    if (r.error) {
-      setError(r.error);
-      setGitDiff("");
     } else {
-      setGitDiff(r.diff || "（无变更内容）");
+      const r = await window.api.diff.get(tabId, path);
+      if (r.error) {
+        setError(r.error);
+        setGitDiff("");
+      } else {
+        setGitDiff(r.diff || "（无变更内容）");
+      }
+    }
+    // Version history from session edit events.
+    const st = useChatStore.getState().states[tabId];
+    const events: Array<{ type: "edit"; edits: Array<{ oldText: string; newText: string }> }> = [];
+    for (const msg of st?.messages ?? []) {
+      for (const b of msg.blocks) {
+        if (b.kind !== "tool" || b.name !== "edit") continue;
+        try {
+          const args = JSON.parse(b.argsText || "{}") as {
+            path?: string;
+            edits?: Array<{ oldText: string; newText: string }>;
+          };
+          if (normalizePath(args.path ?? "", cwdRef.current) !== path) continue;
+          const edits = Array.isArray(args.edits) ? args.edits : [];
+          if (edits.length) events.push({ type: "edit", edits });
+        } catch {
+          /* partial args */
+        }
+      }
+    }
+    if (events.length) {
+      const r = await window.api.diff.history(tabId, path, events);
+      if (r.error) {
+        setError(r.error);
+        return;
+      }
+      setVersions(r.versions);
+      setVerA(0);
+      setVerB(r.versions.length - 1);
     }
   };
 
@@ -130,15 +158,17 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
       cwdRef.current = cwd;
       const agg = aggregateToolDiffs(tabId, cwd);
       const r = await window.api.diff.list(tabId);
+      let merged: DiffFileEntry[];
+      let mergedDiffs: Map<string, string>;
       if (!r.isGit) {
-        setList({ isGit: false, files: agg.files });
-        setFallback(agg.diffs);
+        setIsGit(false);
+        merged = agg.files;
+        mergedDiffs = agg.diffs;
       } else {
-        // git list + session-touched files (e.g. gitignored docs) merged;
-        // session-only files fall back to aggregated diffs.
+        setIsGit(true);
         const gitPaths = new Set(r.files.map((f) => f.path));
-        const merged = [...r.files];
-        const mergedDiffs = new Map<string, string>();
+        merged = [...r.files];
+        mergedDiffs = new Map();
         for (const f of agg.files) {
           if (!gitPaths.has(f.path)) {
             merged.push({ ...f, status: "S" });
@@ -146,78 +176,37 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
             if (d) mergedDiffs.set(f.path, d);
           }
         }
-        setList({ isGit: true, files: merged });
-        setFallback(mergedDiffs);
       }
-      // Re-select the focused or previously selected file.
-      const keep = (focusPath ?? selected) && list?.files.some((f) => f.path === (focusPath ?? selected));
-      const target = keep ? (focusPath ?? selected)! : null;
+      setFiles(merged);
+      setFallback(mergedDiffs);
+      // Focus: requested file (viewer), else keep current, else first.
+      const target =
+        (focusPath && merged.some((f) => f.path === normalizePath(focusPath, cwd)))
+          ? normalizePath(focusPath, cwd)
+          : (selected && merged.some((f) => f.path === selected) ? selected : merged[0]?.path ?? null);
       if (target && target !== selected) {
+        await selectFile(target);
+      } else if (!selected && target) {
         await selectFile(target);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
-      onFocusPathHandled?.();
+      if (!focusHandled.current) {
+        focusHandled.current = true;
+        onFocusPathHandled?.();
+      }
     }
   };
 
   useEffect(() => {
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tabId]);
+  }, [tabId, focusPath]);
 
-  // Load version history for the selected file (from session edit events).
-  const loadHistory = async (path: string) => {
-    const st = useChatStore.getState().states[tabId];
-    const events: Array<{ type: "edit"; edits: Array<{ oldText: string; newText: string }> }> = [];
-    for (const msg of st?.messages ?? []) {
-      for (const b of msg.blocks) {
-        if (b.kind !== "tool" || (b.name !== "edit" && b.name !== "apply_patch")) continue;
-        let edits: Array<{ oldText: string; newText: string }> = [];
-        try {
-          const args = JSON.parse(b.argsText || "{}") as {
-            path?: string;
-            edits?: Array<{ oldText: string; newText: string }>;
-          };
-          const p = normalizePath(args.path ?? "", cwdRef.current);
-          if (p !== path) continue;
-          edits = Array.isArray(args.edits) ? args.edits : [];
-        } catch {
-          continue;
-        }
-        if (!edits.length) continue;
-        events.push({ type: "edit", edits });
-      }
-    }
-    if (!events.length) {
-      setVersions(null);
-      setVerA(null);
-      setVerB(null);
-      setCompareText(null);
-      return;
-    }
-    const r = await window.api.diff.history(tabId, path, events);
-    if (r.error) {
-      setError(r.error);
-      return;
-    }
-    setVersions(r.versions);
-    setVerA(0);
-    setVerB(r.versions.length - 1);
-    setCompareText(null);
-  };
-
-  const handleSelect = async (path: string) => {
-    setSelected(path);
-    await selectFile(path);
-    void loadHistory(path);
-  };
-
-  // Compare two versions.
   const doCompare = async (a: number, b: number) => {
-    if (!versions || a === b) return;
+    if (!versions || a === b || a == null || b == null) return;
     const contentA = versions[a]?.content ?? "";
     const contentB = versions[b]?.content ?? "";
     const path = selected ?? "file";
@@ -239,7 +228,6 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [verA, verB, versions]);
 
-  const files = list?.files ?? [];
   const totalAdd = files.reduce((s, f) => s + Math.max(f.additions, 0), 0);
   const totalDel = files.reduce((s, f) => s + Math.max(f.deletions, 0), 0);
   const showCompare = compareText !== null && verA !== null && verB !== null;
@@ -248,85 +236,64 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   return (
     <div className="changes-panel">
       <div className="changes-header">
-        <span className="changes-title">
-          文件变更
+        <select
+          className="changes-file-select"
+          value={selected ?? ""}
+          onChange={(e) => void selectFile(e.target.value)}
+          title="变更文件（默认当前查看器打开的文件）"
+        >
+          {files.length === 0 && <option value="">（没有变更文件）</option>}
+          {files.map((f) => (
+            <option key={f.path} value={f.path}>
+              [{STATUS_LABEL[f.status] ?? f.status}] {f.path}
+            </option>
+          ))}
+        </select>
+        <div className="diff-dialog-actions">
           {files.length > 0 && (
-            <span className="diff-dialog-count">
-              {files.length} 个文件
-              {(totalAdd > 0 || totalDel > 0) && (
-                <span className="diff-total">
-                  <span className="add">+{totalAdd}</span>
-                  <span className="del">−{totalDel}</span>
-                </span>
-              )}
+            <span className="diff-total">
+              <span className="add">+{totalAdd}</span>
+              <span className="del">−{totalDel}</span>
             </span>
           )}
-        </span>
-        <div className="diff-dialog-actions">
-          {!list?.isGit && files.length > 0 && <span className="diff-fallback-tag">会话工具聚合（非 git）</span>}
+          {!isGit && files.length > 0 && <span className="diff-fallback-tag">非 git</span>}
           <button className="chat-btn" onClick={() => void refresh()} disabled={loading}>
             {loading ? "加载中…" : "刷新"}
           </button>
         </div>
       </div>
       {error && <div className="diff-error">{error}</div>}
+      {selected && versions && versions.length > 1 && (
+        <div className="changes-compare">
+          <span className="changes-compare-label">版本对比</span>
+          <select value={verA ?? 0} onChange={(e) => setVerA(Number(e.target.value))}>
+            {versions.map((v, i) => (
+              <option key={i} value={i}>{v.label}</option>
+            ))}
+          </select>
+          <span className="changes-compare-vs">vs</span>
+          <select value={verB ?? 0} onChange={(e) => setVerB(Number(e.target.value))}>
+            {versions.map((v, i) => (
+              <option key={i} value={i}>{v.label}</option>
+            ))}
+          </select>
+          {versions[verA ?? 0]?.content === versions[verB ?? 0]?.content && (
+            <span className="changes-compare-same">内容相同</span>
+          )}
+        </div>
+      )}
       <div className="changes-body">
-        <div className="diff-filelist">
-          {files.length === 0 && !loading && <div className="diff-empty">工作区没有变更</div>}
-          {files.map((f) => (
-            <div
-              key={f.path}
-              className={`diff-file ${selected === f.path ? "active" : ""}`}
-              onClick={() => void handleSelect(f.path)}
-              title={f.path}
-            >
-              <span className={`diff-status st-${f.status}`}>
-                {STATUS_LABEL[f.status] ?? (f.status === "S" ? "会话" : f.status)}
-              </span>
-              <span className="diff-filepath">{f.path}</span>
-              {f.additions !== 0 || f.deletions !== 0 ? (
-                <span className="diff-filecount">
-                  <span className="add">+{f.additions}</span>
-                  <span className="del">−{f.deletions}</span>
-                </span>
-              ) : f.status === "U" ? (
-                <span className="diff-filecount new">新文件</span>
-              ) : null}
-            </div>
-          ))}
-        </div>
-        <div className="diff-content">
-          {!selected && <div className="diff-placeholder">← 选择一个文件查看 diff</div>}
-          {selected && versions && versions.length > 1 && (
-            <div className="changes-compare">
-              <span className="changes-compare-label">版本对比</span>
-              <select value={verA ?? 0} onChange={(e) => setVerA(Number(e.target.value))}>
-                {versions.map((v, i) => (
-                  <option key={i} value={i}>{v.label}</option>
-                ))}
-              </select>
-              <span className="changes-compare-vs">vs</span>
-              <select value={verB ?? 0} onChange={(e) => setVerB(Number(e.target.value))}>
-                {versions.map((v, i) => (
-                  <option key={i} value={i}>{v.label}</option>
-                ))}
-              </select>
-              {versions[verA ?? 0]?.content === versions[verB ?? 0]?.content && (
-                <span className="changes-compare-same">内容相同</span>
-              )}
-            </div>
-          )}
-          {selected && gitDiff !== null && !showCompare && (
-            isDiffish(gitDiff) ? <DiffView diffText={gitDiff} /> : <div className="diff-empty">{gitDiff || "（无变更内容）"}</div>
-          )}
-          {selected && showCompare && isCompareText && <DiffView diffText={compareText ?? ""} />}
-          {selected && showCompare && !isCompareText && (
-            <div className="diff-empty">{compareText || "（无差异）"}</div>
-          )}
-          {selected && versions && versions.length <= 1 && (
-            <div className="diff-empty">该文件在会话中没有可对比的编辑记录</div>
-          )}
-        </div>
+        {!selected && <div className="diff-empty">{loading ? "加载中…" : "（没有变更文件）"}</div>}
+        {selected && !showCompare && gitDiff !== null && (
+          isDiffish(gitDiff) ? <DiffView diffText={gitDiff} /> : <div className="diff-empty">{gitDiff || "（无变更内容）"}</div>
+        )}
+        {selected && showCompare && isCompareText && <DiffView diffText={compareText ?? ""} />}
+        {selected && showCompare && !isCompareText && (
+          <div className="diff-empty">{compareText || "（无差异）"}</div>
+        )}
+        {selected && versions && versions.length <= 1 && (
+          <div className="diff-empty">该文件在会话中没有编辑记录；上方为工作区变更</div>
+        )}
       </div>
     </div>
   );

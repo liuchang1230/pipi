@@ -175,8 +175,12 @@ export function ViewerPane() {
             >查看</button>
             <button
               className={`viewer-mode${viewerMode === "changes" ? " active" : ""}`}
-              onClick={() => setViewerMode("changes")}
-              title="工作区文件变更与版本对比"
+              onClick={() => {
+                setViewerMode("changes");
+                // 变更面板默认聚焦当前查看器打开的文件。
+                setChangesFocusPath(useViewerStore.getState().currentFile?.path ?? null);
+              }}
+              title="当前文件的变更与版本对比"
             >变更</button>
           </div>
         )}

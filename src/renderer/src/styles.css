@@ -2201,15 +2201,39 @@ html, body, #root {
 }
 
 /* --- diff: stronger row background so the tint actually covers the row --- */
+/* Row width follows the longest line so the colored background always
+   covers every character (overflow container scrolls, background never cuts). */
+.diff-view { width: max-content; min-width: 100%; }
+.diff-row { width: max-content; min-width: 100%; }
 .diff-add { background: color-mix(in srgb, #3fb950 18%, transparent); color: #4ade80; }
 .diff-del { background: color-mix(in srgb, #f85149 18%, transparent); color: #f87171; }
 .diff-ctx { background: color-mix(in srgb, var(--text) 3%, transparent); }
 .diff-row mark {
-  background: color-mix(in srgb, #d29922 70%, transparent);
+  background: color-mix(in srgb, #2ea043 75%, transparent);
   color: #fff;
   padding: 0 1px;
   border-radius: 2px;
 }
+.diff-del mark { background: color-mix(in srgb, #da3633 75%, transparent); }
+.diff-add mark { background: color-mix(in srgb, #238636 75%, transparent); }
 /* tool result diff now uses DiffView: give it the same full-width rows */
 .chat-tool-result.diff { padding: 0; background: transparent; }
 .chat-tool-result.diff .diff-view { padding: 4px 0; }
+
+/* --- Changes panel: file selector instead of a full list --- */
+.changes-file-select {
+  flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.changes-file-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
