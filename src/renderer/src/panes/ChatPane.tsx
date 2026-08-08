@@ -163,7 +163,19 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         return;
       }
       if (event.type === "response" && event.command === "set_model") {
-        const data = event.data as { model?: { id?: string; name?: string } } | null;
+        // The response data IS the full Model object (not wrapped in .model).
+        const model = event.data as { name?: string; id?: string; provider?: string } | null;
+        if (model?.id) {
+          useChatStore.getState().applyEvent(tabId, {
+            type: "state_ready",
+            model,
+            sessionName: useChatStore.getState().states[tabId]?.sessionName ?? null,
+          });
+        }
+        return;
+      }
+      if (event.type === "response" && event.command === "get_state") {
+        const data = event.data as { model?: { name?: string; id?: string; provider?: string } | null } | undefined;
         if (data?.model) {
           useChatStore.getState().applyEvent(tabId, {
             type: "state_ready",
@@ -363,7 +375,10 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                 setThinkMenuOpen(false);
                 setModelMenuOpen(true);
                 setModelView("providers");
-                void window.api.tab.rpcSend(tabId, { type: "get_available_models" });
+                // Cache: don't re-request on every open (menu feels snappy).
+                if (modelList.length === 0) {
+                  void window.api.tab.rpcSend(tabId, { type: "get_available_models" });
+                }
               }}
               title="切换模型"
             >
@@ -383,8 +398,7 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                           setModelView("models");
                         }}
                       >
-                        <span>{p}</span>
-                        <span className="chat-model-count">{modelsByProvider[p]!.length}</span>
+                        {p}
                       </div>
                     ))}
                   </>
@@ -432,7 +446,9 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                 }
                 setModelMenuOpen(false);
                 setThinkMenuOpen(true);
-                void window.api.tab.rpcSend(tabId, { type: "get_available_thinking_levels" });
+                if (thinkingLevels.length === 0) {
+                  void window.api.tab.rpcSend(tabId, { type: "get_available_thinking_levels" });
+                }
               }}
               title="切换思考级别"
             >
