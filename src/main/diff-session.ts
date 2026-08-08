@@ -42,11 +42,11 @@ interface ExecResult {
   stderr: string;
 }
 
-function execLocal(file: string, args: string[], cwd?: string): Promise<ExecResult> {
+function execLocal(file: string, args: string[], cwd?: string, input?: string): Promise<ExecResult> {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(file, args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      child = spawn(file, args, { cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     } catch (e) {
       resolve({ code: null, stdout: "", stderr: e instanceof Error ? e.message : String(e) });
       return;
@@ -72,6 +72,14 @@ function execLocal(file: string, args: string[], cwd?: string): Promise<ExecResu
       clearTimeout(timer);
       resolve({ code, stdout, stderr });
     });
+    if (input !== undefined) {
+      child.stdin?.on("error", () => {
+        /* EPIPE when the remote closes early */
+      });
+      child.stdin?.write(input, () => child.stdin?.end());
+    } else {
+      child.stdin?.end();
+    }
   });
 }
 
@@ -305,6 +313,18 @@ export interface FileHistoryEvent {
   type: "edit";
   edits: Array<{ oldText: string; newText: string }>;
 }
+
+export interface FileWriteEvent {
+  type: "write";
+  content: string;
+}
+
+export interface FilePatchEvent {
+  type: "patch";
+  patch: string;
+}
+
+export type FileVersionEvent = FileHistoryEvent | FileWriteEvent | FilePatchEvent;
 /**
  * Apply a unified patch (subset of git diff output) to content.
  * Hunk: @@ -oldStart[,oldCount] +newStart[,newCount] @@ followed by
@@ -359,7 +379,7 @@ function applyUnifiedPatch(content: string, patch: string): string | null {
 export async function getFileHistory(
   tabId: string,
   path: string,
-  events: FileHistoryEvent[],
+  events: FileVersionEvent[],
 ): Promise<FileHistoryResult> {
   const ctx = gitCtxFor(tabId);
   if (!ctx) return { versions: [], error: "tab not found" };
@@ -376,29 +396,140 @@ export async function getFileHistory(
   let n = 0;
   for (const ev of events) {
     n++;
-    if (ev.type !== "edit" || !Array.isArray(ev.edits) || content === null) {
-      failed++;
-      continue;
-    }
-    let cur = content;
-    let ok = true;
-    for (const e of ev.edits) {
-      const idx = cur.indexOf(e.oldText);
-      if (idx < 0) {
-        ok = false;
-        break;
+    if (content === null) {
+      // No base (non-git, new file): a full write event can still anchor.
+      if (ev.type === "write") {
+        content = ev.content;
+        versions.push({ label: `第 ${n} 次写入后`, content });
+        continue;
       }
-      cur = cur.slice(0, idx) + e.newText + cur.slice(idx + e.oldText.length);
-    }
-    if (!ok) {
       failed++;
       continue;
     }
-    content = cur;
-    versions.push({ label: `第 ${n} 次编辑后`, content });
+    if (ev.type === "edit" && Array.isArray(ev.edits)) {
+      let cur = content;
+      let ok = true;
+      for (const e of ev.edits) {
+        const idx = cur.indexOf(e.oldText);
+        if (idx < 0) {
+          ok = false;
+          break;
+        }
+        cur = cur.slice(0, idx) + e.newText + cur.slice(idx + e.oldText.length);
+      }
+      if (!ok) {
+        failed++;
+        continue;
+      }
+      content = cur;
+      versions.push({ label: `第 ${n} 次编辑后`, content });
+    } else if (ev.type === "patch") {
+      const next = applyUnifiedPatch(content, ev.patch);
+      if (next === null) {
+        failed++;
+        continue;
+      }
+      content = next;
+      versions.push({ label: `第 ${n} 次补丁后`, content });
+    } else if (ev.type === "write") {
+      content = ev.content;
+      versions.push({ label: `第 ${n} 次写入后`, content });
+    } else {
+      failed++;
+    }
   }
   if (failed > 0) console.log(`[diff] ${path}: ${failed}/${events.length} events not applied`);
   return { versions };
+}
+
+/** Write content to a file over the tab's channel (used for version rollback). */
+export async function rollbackFileContent(
+  tabId: string,
+  path: string,
+  content: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = gitCtxFor(tabId);
+  if (!ctx) return { ok: false, error: "tab not found" };
+  try {
+    if (ctx.kind === "local") {
+      writeFileSync(join(ctx.dir ?? "", path), content, "utf8");
+      return { ok: true };
+    }
+    if (ctx.kind === "wsl") {
+      const r = await execLocal(
+        findWslBin(),
+        ["-d", ctx.wslDistro!, ...(ctx.dir ? ["--cd", ctx.dir] : []), "--", "sh", "-c", `cat > ${sq(path)}`],
+        undefined,
+        content,
+      );
+      return { ok: r.code === 0, error: r.code === 0 ? undefined : r.stderr.slice(0, 300) };
+    }
+    if (ctx.kind === "remote" && ctx.remote) {
+      const r = await execRemoteWithInput(ctx.remote, `cat > ${sq(path)}`, content);
+      return { ok: r.code === 0, error: r.code === 0 ? undefined : r.stderr.slice(0, 300) };
+    }
+    return { ok: false, error: "unsupported channel" };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Remote exec with stdin payload (ssh2 or ssh.exe). */
+function execRemoteWithInput(remote: RemoteOpts, cmd: string, input: string): Promise<ExecResult> {
+  if (remote.password) {
+    return new Promise((resolve) => {
+      const conn = new SshClient();
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        try {
+          conn.end();
+        } catch {
+          /* */
+        }
+      }, TIMEOUT_MS);
+      const done = (code: number | null, err?: string) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr: err !== undefined ? err : stderr });
+      };
+      conn.on("ready", () => {
+        conn.exec(cmd, (e, stream) => {
+          if (e) {
+            done(null, e.message);
+            return;
+          }
+          stream.setEncoding("utf8");
+          stream.on("data", (d: string) => (stdout += d));
+          stream.stderr?.setEncoding("utf8");
+          stream.stderr?.on("data", (d: string) => (stderr += d));
+          stream.on("close", (code: number | undefined) => done(code ?? 0));
+          stream.stdin.write(input, () => stream.stdin.end());
+        });
+      });
+      conn.on("error", (e) => done(null, e.message));
+      conn.connect({
+        host: remote.host,
+        port: remote.port ?? 22,
+        username: remote.user,
+        password: remote.password,
+        readyTimeout: 10000,
+      });
+    });
+  }
+  // Key auth via ssh.exe: `cat > file` reads stdin.
+  return execLocal(
+    sshBin(),
+    [
+      "-p", String(remote.port ?? 22),
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-o", "ConnectTimeout=10",
+      `${remote.user}@${remote.host}`,
+      cmd,
+    ],
+    undefined,
+    input,
+  );
 }
 
 /** Row diff between two contents → unified diff text (simplified LCS). */

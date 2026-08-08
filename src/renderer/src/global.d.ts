@@ -163,6 +163,7 @@ declare global {
         get: (tabId: string, path: string) => Promise<{ diff: string; isUntracked: boolean; error?: string }>;
         history: (tabId: string, path: string, events: unknown[]) => Promise<{ versions: { label: string; content: string }[]; error?: string }>;
         compare: (a: string, b: string, path: string) => Promise<{ diff: string }>;
+        write: (tabId: string, path: string, content: string) => Promise<{ ok: boolean; error?: string }>;
       };
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
       onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;

@@ -11,6 +11,8 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
+import { useTabsStore } from "../stores/tabsStore";
+import { useChatStore } from "../stores/chatStore";
 
 interface TreeEntry {
   id: string;
@@ -134,6 +136,16 @@ function flattenTree(roots: TreeNode[], leafId: string | null): { flat: FlatNode
 
 // --- entry display (mirrors getEntryDisplayText) ----------------------------
 
+/** Tools that mutate files — their nodes are rollback checkpoints. */
+const EDIT_TOOLS = new Set(["edit", "apply_patch", "write_file", "write"]);
+
+function isEditToolCall(tc: { name: string; args: unknown } | undefined): { path?: string } | null {
+  if (!tc || !EDIT_TOOLS.has(tc.name)) return null;
+  const args = (tc.args ?? {}) as { path?: unknown };
+  if (typeof args.path === "string") return { path: args.path };
+  return {};
+}
+
 function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; args: unknown }>): { label: string; cls: string; text: string } {
   const e = node.entry;
   switch (e.type) {
@@ -148,9 +160,10 @@ function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; arg
         return { label: "assistant:", cls: "assistant", text: "(no content)" };
       }
       if (role === "toolResult") {
-        const tc = e.toolCallId ? toolCalls.get(e.toolCallId) : undefined;
+        const m = e.message as { toolCallId?: string; toolName?: string } | undefined;
+        const tc = m?.toolCallId ? toolCalls.get(m.toolCallId) : undefined;
         if (tc) return { label: "", cls: "muted", text: formatToolCall(tc.name, tc.args) };
-        return { label: "", cls: "muted", text: `[${e.toolName ?? "tool"}]` };
+        return { label: "", cls: "muted", text: `[${m?.toolName ?? "tool"}]` };
       }
       if (role === "bashExecution") return { label: "", cls: "muted", text: `[bash]: ${normalize(e.command ?? "")}` };
       return { label: "", cls: "muted", text: `[${role}]` };
@@ -277,6 +290,20 @@ export function TreeDialog({
     return null;
   }, [flat, selectedId]);
 
+  // Rollback support: which node ids are file-edit checkpoints, and their path.
+  const editPoints = useMemo(() => {
+    const m = new Map<string, { path?: string }>();
+    for (const [tcId, tc] of toolCalls) {
+      const info = isEditToolCall(tc);
+      if (info) m.set(tcId, info);
+    }
+    return m;
+  }, [toolCalls]);
+  const selectedEditPath = selected?.entry.type === "message" && selected.entry.message?.role === "toolResult"
+    ? editPoints.get((selected.entry.message as { toolCallId?: string }).toolCallId ?? "")?.path ?? null
+    : null;
+  const [rollingBack, setRollingBack] = useState(false);
+
   const selectedText = selected ? normalize(textOf(selected.entry.message?.content)) : "";
   const isUserMsg = selected?.entry.type === "message" && selected.entry.message?.role === "user";
   const isLeaf = selected?.entry.id === leafId;
@@ -297,6 +324,71 @@ export function TreeDialog({
       return;
     }
     doNavigate(choice === "auto" ? "summarize" : undefined, undefined);
+  };
+
+  /** Roll the edited file back to the state right after the selected node. */
+  const rollbackToNode = async () => {
+    const nodeId = selected?.entry.type === "message" ? (selected.entry.message as { toolCallId?: string }).toolCallId : undefined;
+    const path = selectedEditPath;
+    if (!nodeId || !path) return;
+    setRollingBack(true);
+    try {
+      const cwd = useTabsStore.getState().tabs.find((t) => t.id === tabId)?.cwd ?? "";
+      const norm = (p: string) => p.replace(/\\/g, "/");
+      const normCwd = norm(cwd).replace(/\/$/, "");
+      const isTarget = (p: string) => {
+        const np = norm(p);
+        return np === path || np === normCwd + "/" + path;
+      };
+      // Collect file events in session order, cut at this node's tool call.
+      const st = useChatStore.getState().states[tabId];
+      const events: Array<Record<string, unknown>> = [];
+      let cutAt = -1;
+      for (const msg of st?.messages ?? []) {
+        for (const b of msg.blocks) {
+          if (b.kind !== "tool") continue;
+          let args: { path?: string; edits?: Array<{ oldText: string; newText: string }>; content?: string } = {};
+          try {
+            args = JSON.parse(b.argsText || "{}");
+          } catch {
+            continue;
+          }
+          if (!args.path || !isTarget(args.path)) continue;
+          if (b.name === "edit" && Array.isArray(args.edits) && args.edits.length) {
+            events.push({ type: "edit", edits: args.edits });
+          } else if ((b.name === "apply_patch" || b.name === "patch") && b.resultText) {
+            events.push({ type: "patch", patch: b.resultText });
+          } else if ((b.name === "write_file" || b.name === "write") && typeof args.content === "string") {
+            events.push({ type: "write", content: args.content });
+          } else {
+            continue;
+          }
+          if (b.toolCallId === nodeId) cutAt = events.length - 1;
+        }
+      }
+      if (cutAt < 0) {
+        useUiStore.getState().showToast("未找到该节点的文件事件", "err");
+        return;
+      }
+      const r = await window.api.diff.history(tabId, path, events.slice(0, cutAt + 1));
+      const target = r.versions[r.versions.length - 1];
+      if (!target || (!target.content && r.versions.length <= 1)) {
+        useUiStore.getState().showToast("无法重建该节点的文件状态", "err");
+        return;
+      }
+      const w = await window.api.diff.write(tabId, path, target.content);
+      if (w.ok) {
+        useUiStore.getState().showToast(`已回退 ${path} 到「${target.label}」`, "ok");
+        // Reload the tree so leaf diff markers stay consistent.
+        void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+      } else {
+        useUiStore.getState().showToast(`回退失败: ${w.error ?? ""}`, "err");
+      }
+    } catch (e) {
+      useUiStore.getState().showToast(`回退失败: ${e instanceof Error ? e.message : String(e)}`, "err");
+    } finally {
+      setRollingBack(false);
+    }
   };
 
   const doNavigate = (summarize?: string, instructions?: string) => {
@@ -411,6 +503,10 @@ export function TreeDialog({
               const foldMarker = hasChildren ? (isFolded ? "⊞ " : "⊟ ") : "";
               const pathMarker = isOnActive ? "• " : "";
               const labelPart = f.node.label ? `[${f.node.label}] ` : "";
+              // rollback checkpoint badge on file-edit tool nodes
+              const cp = e.type === "message" && e.message?.role === "toolResult"
+                ? editPoints.get((e.message as { toolCallId?: string }).toolCallId ?? "")
+                : undefined;
               return (
                 <div
                   key={e.id}
@@ -433,6 +529,7 @@ export function TreeDialog({
                   <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
                   <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
                   {labelPart && <span className="tree-branch-tag">{labelPart}</span>}
+                  {cp && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${cp.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
                   {isCurrent && <span className="tree-leaf-tag">当前</span>}
                 </div>
               );
@@ -453,6 +550,11 @@ export function TreeDialog({
                 {!isLeaf && (
                   <button className="btn btn-primary" onClick={() => setNavPhase("choose-summary")} disabled={!!navigatingId}>
                     导航到这里
+                  </button>
+                )}
+                {selectedEditPath && (
+                  <button className="btn" onClick={() => void rollbackToNode()} disabled={rollingBack || !!navigatingId} title={`把 ${selectedEditPath} 回退到此节点编辑后的状态`}>
+                    {rollingBack ? "回退中…" : "回退文件到此状态"}
                   </button>
                 )}
                 {isUserMsg && !isLeaf && (

@@ -14,7 +14,6 @@ import { useUiStore } from "../stores/uiStore";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
 import { DiffView, editsToDiff, isDiffish } from "../components/DiffView";
-import { useViewerStore } from "../stores/viewerStore";
 
 // --- Block renderers --------------------------------------------------------
 
@@ -500,18 +499,6 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         </div>
         <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
           分支
-        </button>
-        <button
-          className="chat-header-btn"
-          onClick={() => {
-            // 打开右侧变更面板，聚焦当前查看器里的文件（如果有）。
-            const cur = useViewerStore.getState().currentFile;
-            useViewerStore.getState().setViewerMode("changes");
-            useViewerStore.getState().setChangesFocusPath(cur?.path ?? null);
-          }}
-          title="工作区文件变更与版本对比（右侧面板）"
-        >
-          文件变更
         </button>
         <button className="chat-header-btn" onClick={switchToTerminal} disabled={switchBusy} title="切换为完整终端视图（TUI）">
           终端视图

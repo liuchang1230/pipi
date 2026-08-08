@@ -152,6 +152,8 @@ const api = {
       ipcRenderer.invoke("diff:history", tabId, path, events),
     compare: (a: string, b: string, path: string): Promise<{ diff: string }> =>
       ipcRenderer.invoke("diff:compare", a, b, path),
+    write: (tabId: string, path: string, content: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke("diff:write", tabId, path, content),
   },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>

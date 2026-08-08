@@ -85,13 +85,15 @@ function isDiffish(text: string): boolean {
 
 /**
  * Best display text for a tool result: pi's edit tool puts the real diff in
- * `result.details.diff` (content is only prose like "Edited 2 changes").
- * Prefer that diff so tool cards and file aggregation see actual changes.
+ * `result.details` (patch is standard unified, diff is a line-number format).
+ * Prefer those so tool cards and file aggregation see actual changes.
  */
-function resultTextOf(res: { content?: unknown; details?: { diff?: unknown } } | undefined): string {
+function resultTextOf(res: { content?: unknown; details?: { diff?: unknown; patch?: unknown } } | undefined): string {
   if (!res) return "";
   const text = textOf(res.content);
+  const patch = res.details?.patch;
   const diff = res.details?.diff;
+  if (typeof patch === "string" && patch.trim() && !isDiffish(text)) return patch;
   if (typeof diff === "string" && diff.trim() && !isDiffish(text)) return diff;
   return text;
 }

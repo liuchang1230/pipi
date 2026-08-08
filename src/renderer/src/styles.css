@@ -2245,3 +2245,15 @@ html, body, #root {
   outline: none;
 }
 .diff-fallback-tag.init { color: #3fb950; background: color-mix(in srgb, #3fb950 14%, transparent); }
+
+/* --- tree: rollback checkpoint tag --- */
+.tree-cp-tag {
+  font-size: 10px;
+  color: #3fb950;
+  background: color-mix(in srgb, #3fb950 14%, transparent);
+  border: 1px solid color-mix(in srgb, #3fb950 40%, transparent);
+  border-radius: 999px;
+  padding: 0 6px;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
