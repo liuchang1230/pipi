@@ -1930,3 +1930,22 @@ html, body, #root {
 .chat-model-back:hover {
   color: var(--text);
 }
+
+/* --- Model/thinking pills: the current values themselves are the buttons --- */
+.chat-model-btn,
+.chat-think-btn {
+  background: var(--bg-panel);
+  border-radius: 12px;
+  padding: 3px 12px;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  color: var(--text);
+}
+.chat-model-btn:hover,
+.chat-think-btn:hover {
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-panel));
+  border-color: var(--accent);
+}

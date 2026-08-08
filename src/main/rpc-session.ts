@@ -439,7 +439,7 @@ export function createRpcTab(opts: CreateTabOptions): string {
   // Link the session file pi created/loaded so title/sidebar stay in sync.
   // Local only: remote session files live on the remote side (SFTP sync owns
   // the sidebar list there); the watcher is a no-op for remote/wsl tabs.
-  session.request<{ sessionFile?: string; sessionName?: string; model?: { id?: string; name?: string } | null }>(
+  session.request<{ sessionFile?: string; sessionName?: string; thinkingLevel?: string | null; model?: { id?: string; name?: string; provider?: string } | null }>(
     { type: "get_state" },
     // WSL/remote pi boots slowly (wsl.exe chain + pi startup can take 15-20s).
     remote || wsl ? 40000 : 15000
@@ -457,6 +457,7 @@ export function createRpcTab(opts: CreateTabOptions): string {
       type: "state_ready",
       model: data.model ?? null,
       sessionName: data.sessionName ?? null,
+      thinkingLevel: data.thinkingLevel ?? null,
     });
   });
 

@@ -36,6 +36,7 @@ export interface ChatTabState {
   modelName?: string;
   modelId?: string;
   modelProvider?: string;
+  thinkingLevel?: string;
   sessionName?: string | null;
   booted: boolean;
   exited: boolean;
@@ -223,6 +224,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         modelName: model?.name ?? model?.id,
         modelId: model?.id,
         modelProvider: model?.provider,
+        thinkingLevel: (event.thinkingLevel as string | null | undefined) ?? undefined,
         sessionName: (event.sessionName as string | null) ?? undefined,
         booted: true,
       });

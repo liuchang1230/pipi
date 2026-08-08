@@ -175,12 +175,13 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         return;
       }
       if (event.type === "response" && event.command === "get_state") {
-        const data = event.data as { model?: { name?: string; id?: string; provider?: string } | null } | undefined;
-        if (data?.model) {
+        const data = event.data as { model?: { name?: string; id?: string; provider?: string } | null; thinkingLevel?: string | null } | undefined;
+        if (data?.model || data?.thinkingLevel) {
           useChatStore.getState().applyEvent(tabId, {
             type: "state_ready",
-            model: data.model,
+            model: data.model ?? null,
             sessionName: useChatStore.getState().states[tabId]?.sessionName ?? null,
+            thinkingLevel: data.thinkingLevel ?? null,
           });
         }
         return;
@@ -348,22 +349,6 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
     <div className="chat-pane">
       <div className="chat-header">
         <div className="chat-header-left">
-          <span className="chat-header-model" title={state?.modelName}>
-            {state?.modelName ?? "pi"}
-            {state?.sessionName ? ` · ${state.sessionName}` : ""}
-          </span>
-          {stats && (
-            <span className="chat-header-stats" title="会话统计（token / 成本 / 上下文）">
-              {stats.tokens &&
-                (() => {
-                  const t = stats.tokens;
-                  const fmt = (n?: number) => (n ? `${n >= 1000 ? (n / 1000).toFixed(1) + "k" : n}` : "0");
-                  return `↑${fmt(t.input)} ↓${fmt(t.output)}${t.cacheRead ? ` R${fmt(t.cacheRead)}` : ""}`;
-                })()}
-              {typeof stats.cost === "number" ? ` · $${stats.cost.toFixed(4)}` : ""}
-              {typeof stats.context?.percent === "number" ? ` · ${stats.context.percent.toFixed(1)}%` : ""}
-            </span>
-          )}
           <span className="chat-model-switch-wrap">
             <button
               className="chat-header-btn chat-model-btn"
@@ -380,9 +365,9 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                   void window.api.tab.rpcSend(tabId, { type: "get_available_models" });
                 }
               }}
-              title="切换模型"
+              title={`${state?.modelName ?? "pi"}${state?.sessionName ? ` · ${state.sessionName}` : ""} — 点击切换模型`}
             >
-              模型 ▾
+              {state?.modelName ?? "模型"} ▾
             </button>
             {modelMenuOpen && (
               <div className="chat-model-menu">
@@ -450,9 +435,9 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                   void window.api.tab.rpcSend(tabId, { type: "get_available_thinking_levels" });
                 }
               }}
-              title="切换思考级别"
+              title="点击切换思考级别"
             >
-              思考 ▾
+              思考 {state?.thinkingLevel ?? "—"} ▾
             </button>
             {thinkMenuOpen && (
               <div className="chat-model-menu">
@@ -460,8 +445,15 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                 {thinkingLevels.map((lv) => (
                   <div
                     key={lv}
-                    className="chat-model-item"
+                    className={`chat-model-item${lv === state?.thinkingLevel ? " current" : ""}`}
                     onClick={() => {
+                      // Optimistic local update; get_state confirms later.
+                      useChatStore.getState().applyEvent(tabId, {
+                        type: "state_ready",
+                        model: null,
+                        sessionName: null,
+                        thinkingLevel: lv,
+                      });
                       void window.api.tab.rpcSend(tabId, { type: "set_thinking_level", level: lv });
                       setThinkMenuOpen(false);
                     }}
@@ -472,6 +464,18 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
               </div>
             )}
           </span>
+          {stats && (
+            <span className="chat-header-stats" title="会话统计（token / 成本 / 上下文）">
+              {stats.tokens &&
+                (() => {
+                  const t = stats.tokens;
+                  const fmt = (n?: number) => (n ? `${n >= 1000 ? (n / 1000).toFixed(1) + "k" : n}` : "0");
+                  return `↑${fmt(t.input)} ↓${fmt(t.output)}${t.cacheRead ? ` R${fmt(t.cacheRead)}` : ""}`;
+                })()}
+              {typeof stats.cost === "number" ? ` · $${stats.cost.toFixed(4)}` : ""}
+              {typeof stats.context?.percent === "number" ? ` · ${stats.context.percent.toFixed(1)}%` : ""}
+            </span>
+          )}
         </div>
         <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
           分支
