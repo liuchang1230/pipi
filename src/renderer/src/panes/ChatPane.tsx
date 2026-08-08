@@ -6,7 +6,7 @@
  * direct deletion are native browser behavior. A "终端视图" button falls
  * back to the full TUI (same tab id) for anything that needs it.
  */
-import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import hljs from "highlight.js";
 import Markdown from "../Markdown";
 import { useChatStore, type ChatBlock, type ChatMessage } from "../stores/chatStore";
@@ -115,6 +115,9 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
   const [input, setInput] = useState("");
   const [uiReq, setUiReq] = useState<UiRequest | null>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [thinkMenuOpen, setThinkMenuOpen] = useState(false);
+  const [modelView, setModelView] = useState<"providers" | "models">("providers");
+  const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [treeOpen, setTreeOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [stats, setStats] = useState<{ tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; context?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | null>(null);
@@ -307,6 +310,28 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
   const exited = !!state?.exited;
   const booted = !!state?.booted;
 
+  // Model list grouped by provider (first level = providers, second = models).
+  const modelsByProvider = useMemo(() => {
+    const map: Record<string, typeof modelList> = {};
+    for (const m of modelList) {
+      const p = m.provider ?? m.id.split("/")[0] ?? "其他";
+      (map[p] ??= []).push(m);
+    }
+    return map;
+  }, [modelList]);
+  const providers = useMemo(() => Object.keys(modelsByProvider).sort(), [modelsByProvider]);
+  const currentProvider = useMemo(() => {
+    // Prefer the provider recorded at state_ready (exact); fall back to
+    // matching by name/id (ambiguous when providers share model names).
+    if (state?.modelProvider) return state.modelProvider;
+    const name = state?.modelName;
+    if (!name) return null;
+    for (const m of modelList) {
+      if (m.name === name || m.id === name) return m.provider ?? m.id.split("/")[0] ?? null;
+    }
+    return null;
+  }, [modelList, state?.modelName, state?.modelProvider]);
+
   return (
     <div className="chat-pane">
       <div className="chat-header">
@@ -335,38 +360,94 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
                   setModelMenuOpen(false);
                   return;
                 }
+                setThinkMenuOpen(false);
                 setModelMenuOpen(true);
+                setModelView("providers");
                 void window.api.tab.rpcSend(tabId, { type: "get_available_models" });
-                void window.api.tab.rpcSend(tabId, { type: "get_available_thinking_levels" });
               }}
-              title="切换模型 / 思考级别"
+              title="切换模型"
             >
               模型 ▾
             </button>
             {modelMenuOpen && (
               <div className="chat-model-menu">
-                <div className="chat-model-menu-title">模型</div>
-                {modelList.map((m) => (
-                  <div
-                    key={m.id}
-                    className={`chat-model-item${state?.modelName === (m.name ?? m.id) ? " current" : ""}`}
-                    onClick={() => {
-                      void window.api.tab.rpcSend(tabId, { type: "set_model", provider: m.provider ?? m.id.split("/")[0], modelId: m.id });
-                      setModelMenuOpen(false);
-                    }}
-                    title={m.id}
-                  >
-                    {m.name ?? m.id}
-                  </div>
-                ))}
-                {thinkingLevels.length > 0 && <div className="chat-model-menu-title">思考</div>}
+                {modelView === "providers" ? (
+                  <>
+                    <div className="chat-model-menu-title">提供商</div>
+                    {providers.map((p) => (
+                      <div
+                        key={p}
+                        className={`chat-model-provider${p === currentProvider ? " current" : ""}`}
+                        onClick={() => {
+                          setSelectedProvider(p);
+                          setModelView("models");
+                        }}
+                      >
+                        <span>{p}</span>
+                        <span className="chat-model-count">{modelsByProvider[p]!.length}</span>
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    <div
+                      className="chat-model-back"
+                      onClick={() => {
+                        setModelView("providers");
+                        setSelectedProvider(null);
+                      }}
+                    >
+                      ← {selectedProvider}
+                    </div>
+                    {(modelsByProvider[selectedProvider ?? ""] ?? []).map((m) => (
+                      <div
+                        key={m.id}
+                        className={`chat-model-item${
+                          (m.provider === state?.modelProvider && state?.modelId === m.id) ||
+                          (!state?.modelProvider && !state?.modelId && state?.modelName === (m.name ?? m.id))
+                            ? " current"
+                            : ""
+                        }`}
+                        onClick={() => {
+                          void window.api.tab.rpcSend(tabId, { type: "set_model", provider: m.provider ?? selectedProvider ?? m.id.split("/")[0], modelId: m.id });
+                          setModelMenuOpen(false);
+                        }}
+                        title={m.id}
+                      >
+                        {m.name ?? m.id}
+                      </div>
+                    ))}
+                  </>
+                )}
+              </div>
+            )}
+          </span>
+          <span className="chat-model-switch-wrap">
+            <button
+              className="chat-header-btn chat-think-btn"
+              onClick={() => {
+                if (thinkMenuOpen) {
+                  setThinkMenuOpen(false);
+                  return;
+                }
+                setModelMenuOpen(false);
+                setThinkMenuOpen(true);
+                void window.api.tab.rpcSend(tabId, { type: "get_available_thinking_levels" });
+              }}
+              title="切换思考级别"
+            >
+              思考 ▾
+            </button>
+            {thinkMenuOpen && (
+              <div className="chat-model-menu">
+                <div className="chat-model-menu-title">思考级别</div>
                 {thinkingLevels.map((lv) => (
                   <div
                     key={lv}
                     className="chat-model-item"
                     onClick={() => {
                       void window.api.tab.rpcSend(tabId, { type: "set_thinking_level", level: lv });
-                      setModelMenuOpen(false);
+                      setThinkMenuOpen(false);
                     }}
                   >
                     {lv}

@@ -1521,6 +1521,10 @@ html, body, #root {
 .chat-btn.send {
   background: var(--accent);
   border-color: var(--accent);
+  /* Contrast on both themes: dark theme = light-blue bg + dark text,
+     light theme = blue bg + white text (--bg flips with the theme). */
+  color: var(--bg);
+  font-weight: 600;
 }
 .chat-btn.stop {
   color: var(--danger);

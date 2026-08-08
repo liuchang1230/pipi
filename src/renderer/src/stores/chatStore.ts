@@ -34,6 +34,8 @@ export interface ChatTabState {
   messages: ChatMessage[];
   isStreaming: boolean;
   modelName?: string;
+  modelId?: string;
+  modelProvider?: string;
   sessionName?: string | null;
   booted: boolean;
   exited: boolean;
@@ -216,9 +218,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       }));
 
     if (type === "state_ready") {
-      const model = (event.model ?? null) as { name?: string; id?: string } | null;
+      const model = (event.model ?? null) as { name?: string; id?: string; provider?: string } | null;
       patch({
         modelName: model?.name ?? model?.id,
+        modelId: model?.id,
+        modelProvider: model?.provider,
         sessionName: (event.sessionName as string | null) ?? undefined,
         booted: true,
       });
