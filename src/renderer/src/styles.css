@@ -1949,3 +1949,15 @@ html, body, #root {
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-panel));
   border-color: var(--accent);
 }
+
+/* --- Usage stats under the input box --- */
+.chat-input-stats {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 0 auto;
+  max-width: 46%;
+}

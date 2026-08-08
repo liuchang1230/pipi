@@ -464,18 +464,6 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
               </div>
             )}
           </span>
-          {stats && (
-            <span className="chat-header-stats" title="会话统计（token / 成本 / 上下文）">
-              {stats.tokens &&
-                (() => {
-                  const t = stats.tokens;
-                  const fmt = (n?: number) => (n ? `${n >= 1000 ? (n / 1000).toFixed(1) + "k" : n}` : "0");
-                  return `↑${fmt(t.input)} ↓${fmt(t.output)}${t.cacheRead ? ` R${fmt(t.cacheRead)}` : ""}`;
-                })()}
-              {typeof stats.cost === "number" ? ` · $${stats.cost.toFixed(4)}` : ""}
-              {typeof stats.context?.percent === "number" ? ` · ${stats.context.percent.toFixed(1)}%` : ""}
-            </span>
-          )}
         </div>
         <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
           分支
@@ -519,6 +507,19 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
           spellCheck={false}
         />
         <div className="chat-input-bar">
+          <span className="chat-input-stats" title="会话用量（输入↑ / 输出↓ / 缓存R / 成本 / 上下文占用）">
+            {stats
+              ? (() => {
+                  const t = stats.tokens;
+                  const fmt = (n?: number) => (n ? `${n >= 1000 ? (n / 1000).toFixed(1) + "k" : n}` : "0");
+                  const parts: string[] = [];
+                  if (t) parts.push(`↑${fmt(t.input)} ↓${fmt(t.output)}${t.cacheRead ? ` R${fmt(t.cacheRead)}` : ""}`);
+                  if (typeof stats.cost === "number") parts.push(`$${stats.cost.toFixed(4)}`);
+                  if (typeof stats.context?.percent === "number") parts.push(`${stats.context.percent.toFixed(1)}%`);
+                  return parts.join(" · ");
+                })()
+              : "用量将在首轮对话后显示"}
+          </span>
           <span className="chat-input-hint">
             {isStreaming ? "Enter 排队（steer）· Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行 · / 命令可用"}
           </span>
