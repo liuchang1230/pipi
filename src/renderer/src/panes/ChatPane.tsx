@@ -509,14 +509,16 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
           spellCheck={false}
         />
         <div className="chat-input-bar">
-          <span className="chat-input-stats" title="会话用量（输入↑ / 输出↓ / 缓存R / 成本 / 上下文占用）">
+          <span className="chat-input-stats" title="会话用量（输入↑ / 输出↓ / 缓存读取 / 上下文占用）">
             {stats
               ? (() => {
                   const t = stats.tokens;
                   const fmt = (n?: number) => (n ? `${n >= 1000 ? (n / 1000).toFixed(1) + "k" : n}` : "0");
                   const parts: string[] = [];
-                  if (t) parts.push(`↑${fmt(t.input)} ↓${fmt(t.output)}${t.cacheRead ? ` R${fmt(t.cacheRead)}` : ""}`);
-                  if (typeof stats.cost === "number") parts.push(`$${stats.cost.toFixed(4)}`);
+                  if (t) {
+                    parts.push(`↑${fmt(t.input)} ↓${fmt(t.output)}`);
+                    if (t.cacheRead) parts.push(`缓存${fmt(t.cacheRead)}`);
+                  }
                   if (typeof stats.context?.percent === "number") parts.push(`${stats.context.percent.toFixed(1)}%`);
                   return parts.join(" · ");
                 })()
