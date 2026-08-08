@@ -1494,13 +1494,22 @@ html, body, #root {
 .chat-input-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   margin-top: 7px;
+  /* One type style for the whole info row — mixed fonts (mono vs sans) have
+     different baselines and made stats/hint look vertically misaligned. */
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  font-family: inherit;
 }
 .chat-input-hint {
   flex: 1;
-  color: var(--text-dim);
-  font-size: 11px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
 }
 .chat-btn {
   border: 1px solid var(--border);
@@ -1952,14 +1961,12 @@ html, body, #root {
 
 /* --- Usage stats under the input box --- */
 .chat-input-stats {
-  font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 11px;
-  color: var(--text-dim);
+  flex: 0 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  flex: 0 0 auto;
-  max-width: 46%;
+  max-width: 52%;
 }
 
 /* --- pi update banner (bottom-right, above toasts) --- */
