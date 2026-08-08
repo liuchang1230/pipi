@@ -39,6 +39,49 @@ function ToastHost() {
   return <div className={`toast toast-${toast.type}`}>{toast.text}</div>;
 }
 
+/** pi 更新横幅（RPC 聊天没有 TUI 的 Update Available 提示，app 层补齐）。 */
+function UpdateBanner() {
+  const [info, setInfo] = useState<{ current: string | null; latest: string | null } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    window.api.update.check().then((r) => {
+      if (!cancelled && r.hasUpdate) setInfo({ current: r.current, latest: r.latest });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!info) return null;
+  return (
+    <div className="update-banner">
+      <span>
+        pi 有新版本：{info.current} → {info.latest}（含扩展包更新）
+      </span>
+      <button
+        className="btn btn-primary update-banner-btn"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          const r = await window.api.update.run();
+          setBusy(false);
+          if (r.ok) {
+            setInfo(null);
+            useUiStore.getState().showToast("更新完成，请重启标签页生效", "ok");
+          } else {
+            useUiStore.getState().showToast(`更新失败: ${r.error ?? r.output.slice(0, 120)}`, "err");
+          }
+        }}
+      >
+        {busy ? "更新中…" : "立即更新"}
+      </button>
+      <button className="update-banner-close" onClick={() => setInfo(null)} title="关闭">×</button>
+    </div>
+  );
+}
+
 export default function App() {
   // --- Theme (app chrome; TerminalPane pushes the live pi color-scheme) ---
   const [theme, setTheme] = useState<"dark" | "light">(() => {
@@ -251,6 +294,7 @@ export default function App() {
 
       {/* Toast notification */}
       <ToastHost />
+      <UpdateBanner />
     </div>
   );
 }

@@ -30,6 +30,7 @@ import {
   setUiRequestHandler, switchRpcToTerminal,
   type ExtensionUiRequest,
 } from "./rpc-session";
+import { checkPiUpdate, runPiUpdate } from "./update-check";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
 import { getSettings, updateSettings, type AppSettings } from "./settings";
@@ -1188,6 +1189,10 @@ app.whenReady().then(async () => {
     }
     return ok;
   });
+
+  // --- pi / extension updates (RPC chat has no TUI update banner) ---
+  ipcMain.handle("update:check", (_e, force?: boolean) => checkPiUpdate(force));
+  ipcMain.handle("update:run", () => runPiUpdate());
 
   // --- WSL distro list ---
   ipcMain.handle("wsl:list-distros", () => listWslDistros());

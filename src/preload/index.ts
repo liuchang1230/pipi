@@ -135,6 +135,11 @@ const api = {
   /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
   rpcUiResponse: (id: string, response: Record<string, unknown>): Promise<boolean> =>
     ipcRenderer.invoke("tab:rpc-ui-response", id, response),
+  update: {
+    check: (force?: boolean): Promise<{ current: string | null; latest: string | null; hasUpdate: boolean; error?: string }> =>
+      ipcRenderer.invoke("update:check", force),
+    run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
+  },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>
       ipcRenderer.invoke("theme:set-mode", mode),

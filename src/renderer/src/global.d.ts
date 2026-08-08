@@ -152,6 +152,10 @@ declare global {
       onRpcUiRequest: (id: string, callback: (req: Record<string, unknown>) => void) => () => void;
       /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
       rpcUiResponse: (id: string, response: Record<string, unknown>) => Promise<boolean>;
+      update: {
+        check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; hasUpdate: boolean; error?: string }>;
+        run: () => Promise<{ ok: boolean; output: string; error?: string }>;
+      };
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
       onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;
       theme: {

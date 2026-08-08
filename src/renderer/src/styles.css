@@ -1602,8 +1602,8 @@ html, body, #root {
 }
 .ui-select-item:hover,
 .ui-select-item.selected {
-  background: var(--accent);
-  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
 }
 .ui-select-empty {
   padding: 12px;
@@ -1960,4 +1960,36 @@ html, body, #root {
   text-overflow: ellipsis;
   flex: 0 0 auto;
   max-width: 46%;
+}
+
+/* --- pi update banner (bottom-right, above toasts) --- */
+.update-banner {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  max-width: 480px;
+}
+.update-banner-btn {
+  flex: 0 0 auto;
+}
+.update-banner-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.update-banner-close:hover {
+  color: var(--text);
 }
