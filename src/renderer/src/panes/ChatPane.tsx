@@ -31,7 +31,7 @@ function ThinkingBlock({ block }: { block: Extract<ChatBlock, { kind: "thinking"
 function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
   const [showArgs, setShowArgs] = useState(false);
   const [showResult, setShowResult] = useState(false);
-  const running = block.status === "streaming" || (block.toolCallId && !block.resultDone);
+  const running = block.status === "streaming";
   const resultText = block.resultText ?? "";
   // Highlight git diffs in tool results (hljs diff grammar + github.css theme).
   const isDiff =
@@ -437,12 +437,13 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
           tabId={tabId}
           onClose={() => setTreeOpen(false)}
           onNavigated={(editorText) => {
-            // Navigation switched the leaf: reload history; user-message
-            // targets put their text into the input box (TUI /tree behavior).
+            // Navigation switched the leaf: reload history. The input box
+            // follows the target — user-message targets restore their text
+            // (TUI /tree behavior), anything else clears stale text.
             void window.api.tab.rpcSend(tabId, { type: "get_messages" });
             void window.api.tab.rpcSend(tabId, { type: "get_state" });
+            setInput(editorText ?? "");
             if (editorText) {
-              setInput(editorText);
               requestAnimationFrame(() => taRef.current?.focus());
             }
           }}

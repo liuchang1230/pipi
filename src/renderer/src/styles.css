@@ -1282,6 +1282,8 @@ html, body, #root {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 .chat-header-btn {
   background: transparent;
@@ -1330,7 +1332,10 @@ html, body, #root {
   justify-content: flex-end;
 }
 .chat-bubble.user {
-  background: var(--accent);
+  /* Soft theme-tinted bubble instead of solid accent — reads better in both
+     dark and light themes without the harsh blue block. */
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
   color: var(--text);
   padding: 8px 12px;
   border-radius: 10px 10px 2px 10px;
@@ -1527,7 +1532,8 @@ html, body, #root {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  overflow: hidden;
+  /* No overflow:hidden here — the model menu is absolutely positioned below
+     the header and would be clipped ("clicking 模型 does nothing"). */
 }
 .chat-model-switch-wrap {
   position: relative;

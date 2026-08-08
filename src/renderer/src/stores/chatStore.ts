@@ -96,6 +96,9 @@ function blocksFromContent(content: unknown): ChatBlock[] {
         name: b.name,
         argsText: b.arguments ? JSON.stringify(b.arguments, null, 2) : "",
         status: "done",
+        // Historical tool calls are complete; without a toolResult they show
+        // as finished with no output rather than an endless running pulse.
+        resultDone: true,
       });
     }
   });
@@ -188,7 +191,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     set((s) => ({
       states: {
         ...s.states,
-        [tabId]: { ...s.states[tabId]!, messages: chatMessages, booted: true },
+        [tabId]: {
+          ...s.states[tabId]!,
+          messages: chatMessages,
+          booted: true,
+          // A history reload (navigation/fork) always lands on an idle agent.
+          isStreaming: false,
+        },
       },
     }));
   },
