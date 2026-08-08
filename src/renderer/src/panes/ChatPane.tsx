@@ -227,11 +227,13 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
       if (!consumed) setUiReq(req);
     });
 
-    // Boot: load history + current state.
+    // Boot: load history + current state + session usage (historical sessions
+    // already have real token/cost numbers from pi).
     const st = useChatStore.getState().states[tabId];
     if (!st?.booted) {
       void window.api.tab.rpcSend(tabId, { type: "get_messages" });
       void window.api.tab.rpcSend(tabId, { type: "get_state" });
+      void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
     }
     return () => {
       offEvent();
