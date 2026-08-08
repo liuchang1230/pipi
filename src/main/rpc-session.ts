@@ -23,7 +23,7 @@ import { delimiter, dirname, join } from "node:path";
 import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
 import {
-  createTab, getGlobalPiBin, getTab, linkTabSession, registerExternalTab, setTabTitle, unregisterExternalTab,
+  closeTab, createTab, getGlobalPiBin, getTab, linkTabSession, registerExternalTab, setTabTitle, unregisterExternalTab,
   type CreateTabOptions, type RemoteOpts, type TabInfo, type WslOpts,
 } from "./pty";
 
@@ -498,4 +498,28 @@ export function switchRpcToTerminal(id: string): string | null {
 /** Close all RPC sessions (app quit). */
 export function closeAllRpcSessions(): void {
   for (const id of [...sessions.keys()]) closeRpcTab(id);
+}
+
+/**
+ * pty → RPC fallback (the reverse of switchRpcToTerminal): kill the pty pi
+ * and respawn it headless for the SAME tab id, so the renderer keeps its tab
+ * identity. Works for local / wsl / remote pi tabs.
+ */
+export function switchTerminalToRpc(id: string): string | null {
+  const tab = getTab(id);
+  if (!tab || !tab.pty) return null;
+  if (!tab.sessionPath && !tab.remote && !tab.wsl) {
+    // Blank tab: pi may already have created a session file lazily — ask
+    // pi itself later; for now continue-recent is the best guess.
+  }
+  closeTab(id);
+  return createRpcTab({
+    id,
+    cwd: tab.cwd,
+    sessionPath: tab.sessionPath,
+    continueRecent: tab.sessionPath ? undefined : true,
+    title: tab.title,
+    remote: tab.remote,
+    wsl: tab.wsl,
+  });
 }

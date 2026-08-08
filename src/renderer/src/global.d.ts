@@ -141,6 +141,8 @@ declare global {
         rpcSend: (id: string, cmd: Record<string, unknown>) => Promise<boolean>;
         /** Fall back from the chat view to the full TUI for this tab (same id). */
         rpcSwitchToTerminal: (id: string) => Promise<string | null>;
+        /** Switch back from the TUI to the chat view (same id). */
+        rpcSwitchToChat: (id: string) => Promise<string | null>;
       };
       onTabData: (id: string, callback: (data: string) => void) => () => void;
       onTabExit: (id: string, callback: (code: number) => void) => () => void;

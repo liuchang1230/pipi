@@ -90,6 +90,9 @@ const api = {
     /** Fall back from the chat view to the full TUI for this tab (same id). */
     rpcSwitchToTerminal: (id: string): Promise<string | null> =>
       ipcRenderer.invoke("tab:rpc-switch-terminal", id),
+    /** Switch back from the TUI to the chat view (same id). */
+    rpcSwitchToChat: (id: string): Promise<string | null> =>
+      ipcRenderer.invoke("tab:rpc-switch-chat", id),
     waitUntilAlive: async (id: string, timeoutMs = 3000, intervalMs = 250): Promise<boolean> => {
       const startedAt = Date.now();
       while (Date.now() - startedAt < timeoutMs) {

@@ -27,7 +27,7 @@ import { SessionIndex } from "./session-index";
 import { ensureShippedExtensions } from "./extension-sync";
 import {
   closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
-  setUiRequestHandler, switchRpcToTerminal,
+  setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
   type ExtensionUiRequest,
 } from "./rpc-session";
 import { checkPiUpdate, runPiUpdate } from "./update-check";
@@ -1183,6 +1183,14 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("tab:rpc-switch-terminal", (_e, tabId: string) => {
     const ok = switchRpcToTerminal(tabId);
+    if (ok) {
+      emitTabs();
+      emitActive();
+    }
+    return ok;
+  });
+  ipcMain.handle("tab:rpc-switch-chat", (_e, tabId: string) => {
+    const ok = switchTerminalToRpc(tabId);
     if (ok) {
       emitTabs();
       emitActive();

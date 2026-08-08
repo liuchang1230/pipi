@@ -6,7 +6,7 @@
 // palette from main's COLORFGBG injection, so a running pi only needs a
 // `CSI ?997` nudge when the mode actually flips. (The old effect depended on
 // [theme, tabs] and re-pushed to every running pi on every tab-list change.)
-import { memo, useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -16,6 +16,7 @@ import { openExternalSafe } from "../openExternal";
 import { attachImeHeuristic } from "../xterm-ime-anchor";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
+import { useChatStore } from "../stores/chatStore";
 import type { TabInfo } from "../stores/types";
 import { ChatView } from "./ChatPane";
 
@@ -254,6 +255,10 @@ interface TabBarProps {
 }
 
 const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onCloseTab, onNewTab, onShowRemote, onShowModels }: TabBarProps) {
+  const active = visibleTabs.find((t) => t.id === activeTab);
+  // A pty-backed pi tab can switch back to the chat view.
+  const canSwitchToChat = !!active && active.pi && active.mode !== "rpc";
+  const [switching, setSwitching] = useState(false);
   return (
     <div className="tab-bar">
       <div className="tabs">
@@ -275,6 +280,24 @@ const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onClo
         ))}
       </div>
       <button className="tab-new" onClick={onNewTab} title="新标签（新建空白会话）">+</button>
+      {canSwitchToChat && (
+        <button
+          className="tab-remote"
+          disabled={switching}
+          onClick={async () => {
+            setSwitching(true);
+            // Drop stale chat state so the remounted ChatView re-boots
+            // (messages + stats come from pi via --session resume).
+            useChatStore.getState().clear(activeTab!);
+            await window.api.tab.rpcSwitchToChat(activeTab!);
+            // tabs:update flips this tab to mode "rpc"; TerminalPane re-renders.
+            setSwitching(false);
+          }}
+          title="切换为聊天视图"
+        >
+          聊天视图
+        </button>
+      )}
       <button className="tab-remote" onClick={onShowModels} title="模型配置">🤖</button>
       <button className="tab-remote" onClick={onShowRemote} title="远程连接">🌐</button>
     </div>
