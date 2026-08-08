@@ -158,6 +158,10 @@ declare global {
         check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; hasUpdate: boolean; error?: string }>;
         run: () => Promise<{ ok: boolean; output: string; error?: string }>;
       };
+      diff: {
+        list: (tabId: string) => Promise<{ isGit: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }>;
+        get: (tabId: string, path: string) => Promise<{ diff: string; isUntracked: boolean; error?: string }>;
+      };
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
       onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;
       theme: {

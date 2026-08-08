@@ -143,6 +143,12 @@ const api = {
       ipcRenderer.invoke("update:check", force),
     run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
   },
+  diff: {
+    list: (tabId: string): Promise<{ isGit: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }> =>
+      ipcRenderer.invoke("diff:list", tabId),
+    get: (tabId: string, path: string): Promise<{ diff: string; isUntracked: boolean; error?: string }> =>
+      ipcRenderer.invoke("diff:get", tabId, path),
+  },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>
       ipcRenderer.invoke("theme:set-mode", mode),

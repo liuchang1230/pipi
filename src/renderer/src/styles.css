@@ -2000,3 +2000,110 @@ html, body, #root {
 .update-banner-close:hover {
   color: var(--text);
 }
+
+/* --- File-changes dialog (git diff / tool-diff fallback) --- */
+.diff-dialog {
+  width: min(880px, 92vw);
+  height: min(560px, 82vh);
+  display: flex;
+  flex-direction: column;
+}
+.diff-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+}
+.diff-dialog-title { display: flex; align-items: center; gap: 8px; }
+.diff-dialog-count { font-weight: 400; color: var(--text-dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.diff-total { display: inline-flex; gap: 6px; margin-left: 2px; }
+.diff-total .add, .diff-filecount .add { color: #3fb950; }
+.diff-total .del, .diff-filecount .del { color: #f85149; }
+.diff-dialog-actions { display: flex; align-items: center; gap: 8px; }
+.diff-fallback-tag {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.diff-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.diff-close:hover { color: var(--text); }
+.diff-error {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: #f85149;
+  background: color-mix(in srgb, #f85149 10%, transparent);
+}
+.diff-body { flex: 1; display: flex; min-height: 0; }
+.diff-filelist {
+  width: 260px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  flex: 0 0 auto;
+  padding: 6px 0;
+}
+.diff-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.diff-file:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.diff-file.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.diff-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.diff-status.st-M { color: #d29922; background: color-mix(in srgb, #d29922 16%, transparent); }
+.diff-status.st-A, .diff-status.st-U { color: #3fb950; background: color-mix(in srgb, #3fb950 16%, transparent); }
+.diff-status.st-D { color: #f85149; background: color-mix(in srgb, #f85149 16%, transparent); }
+.diff-filepath { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.diff-filecount { flex: 0 0 auto; font-size: 11px; display: flex; gap: 5px; font-variant-numeric: tabular-nums; }
+.diff-filecount.new { color: #3fb950; }
+.diff-content { flex: 1; min-width: 0; overflow: auto; }
+.diff-placeholder, .diff-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 24px;
+  text-align: center;
+}
+.diff-view { font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.55; padding: 8px 0; }
+.diff-row { display: flex; align-items: baseline; white-space: pre; }
+.diff-num {
+  flex: 0 0 42px;
+  text-align: right;
+  padding-right: 8px;
+  color: var(--text-dim);
+  opacity: 0.55;
+  user-select: none;
+  font-size: 11px;
+}
+.diff-sig { flex: 0 0 18px; text-align: center; user-select: none; }
+.diff-code { flex: 1; min-width: 0; }
+.diff-add { background: color-mix(in srgb, #3fb950 13%, transparent); color: #4ade80; }
+.diff-add mark { background: color-mix(in srgb, #3fb950 55%, transparent); color: #fff; padding: 0 1px; border-radius: 2px; }
+.diff-del { background: color-mix(in srgb, #f85149 13%, transparent); color: #f87171; }
+.diff-del mark { background: color-mix(in srgb, #f85149 55%, transparent); color: #fff; padding: 0 1px; border-radius: 2px; }
+.diff-ctx { color: var(--text); opacity: 0.75; }
+.diff-header { color: var(--accent); padding: 4px 12px; font-weight: 600; }
+.diff-hunk { color: #d29922; padding: 2px 12px; }
+.diff-add, .diff-del, .diff-ctx { padding-left: 12px; padding-right: 12px; }

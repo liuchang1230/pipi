@@ -14,6 +14,7 @@ import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
+import { DiffDialog } from "../dialogs/DiffDialog";
 
 // --- Block renderers --------------------------------------------------------
 
@@ -119,6 +120,7 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
   const [modelView, setModelView] = useState<"providers" | "models">("providers");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [treeOpen, setTreeOpen] = useState(false);
+  const [diffOpen, setDiffOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [stats, setStats] = useState<{ tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; context?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | null>(null);
   const [modelList, setModelList] = useState<Array<{ id: string; name?: string; provider?: string }>>([]);
@@ -470,6 +472,9 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
           分支
         </button>
+        <button className="chat-header-btn" onClick={() => setDiffOpen(true)} title="工作区文件变更（git diff）">
+          文件变更
+        </button>
         <button className="chat-header-btn" onClick={switchToTerminal} disabled={switchBusy} title="切换为完整终端视图（TUI）">
           终端视图
         </button>
@@ -538,6 +543,7 @@ export const ChatView = memo(function ChatView({ tabId }: { tabId: string }) {
         </div>
       </div>
       {uiReq && <UiDialog tabId={tabId} req={uiReq} onClose={() => setUiReq(null)} />}
+      {diffOpen && <DiffDialog tabId={tabId} onClose={() => setDiffOpen(false)} />}
       {treeOpen && (
         <TreeDialog
           tabId={tabId}
