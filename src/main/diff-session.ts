@@ -9,7 +9,7 @@
  * tool-result diffs from the session event stream.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client as SshClient } from "ssh2";
 import { findWslBin } from "./pty";
@@ -24,6 +24,8 @@ export interface DiffFileEntry {
 export interface FileChangesList {
   isGit: boolean;
   files: DiffFileEntry[];
+  /** True when this call lazily ran `git init` + baseline commit. */
+  initialized?: boolean;
   error?: string;
 }
 export interface FileDiffResult {
@@ -164,17 +166,69 @@ async function runGit(ctx: GitCtx, args: string[]): Promise<ExecResult> {
   return execRemote(ctx.remote!, `git ${cmdArgs.map(sq).join(" ")}`);
 }
 
+/**
+ * Lazily turn a non-git directory into a git repo with a baseline commit,
+ * so the changes view has a HEAD to diff against. Inline user config avoids
+ * touching the user's global git identity. Best-effort: returns false when
+ * git is unavailable (server without git) so the caller falls back.
+ */
+async function ensureGitBaseline(ctx: GitCtx): Promise<boolean> {
+  try {
+    const repo = await runGit(ctx, ["rev-parse", "--git-dir"]);
+    if (repo.code !== 0) {
+      const init = await runGit(ctx, ["init", "-q"]);
+      if (init.code !== 0) return false;
+    }
+    // Baseline .gitignore so heavy junk (node_modules, dist…) stays out of
+    // the baseline commit and the diff stays fast.
+    if (ctx.kind === "local" && ctx.dir) {
+      const giPath = join(ctx.dir, ".gitignore");
+      if (!existsSync(giPath)) {
+        try {
+          writeFileSync(
+            giPath,
+            "node_modules/\ndist/\nout/\nbuild/\n*.log\n.DS_Store\n",
+            "utf8",
+          );
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    const add = await runGit(ctx, ["add", "-A"]);
+    if (add.code !== 0) return true; // repo exists even if staging failed
+    const commit = await runGit(ctx, [
+      "-c", "user.email=pipi@local",
+      "-c", "user.name=pipi",
+      "commit", "-qm", "init: pipi baseline",
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** List changed files (tracked via `git diff HEAD`, plus untracked). */
 export async function listFileChanges(tabId: string): Promise<FileChangesList> {
   const ctx = gitCtxFor(tabId);
   if (!ctx) return { isGit: false, files: [], error: "tab not found" };
-  const repo = await runGit(ctx, ["rev-parse", "--git-dir"]);
+  let repo = await runGit(ctx, ["rev-parse", "--git-dir"]);
+  let initialized = false;
+  if (repo.code !== 0) {
+    // Non-git directory: lazily create a baseline repo (only for local/wsl
+    // project dirs; remote servers without git fall through).
+    initialized = await ensureGitBaseline(ctx);
+    if (initialized) repo = await runGit(ctx, ["rev-parse", "--git-dir"]);
+  }
   if (repo.code !== 0) return { isGit: false, files: [] };
 
+  // Scope diffs to the tab's cwd (a cwd inside a bigger repo must not list
+  // the whole parent repository). `-C cwd` + pathspec "." = this directory.
+  const scope = ["--", "."];
   const [ns, num, untracked] = await Promise.all([
-    runGit(ctx, ["-c", "core.quotepath=false", "diff", "HEAD", "--name-status"]),
-    runGit(ctx, ["-c", "core.quotepath=false", "diff", "HEAD", "--numstat"]),
-    runGit(ctx, ["ls-files", "--others", "--exclude-standard"]),
+    runGit(ctx, ["-c", "core.quotepath=false", "diff", "HEAD", "--name-status", ...scope]),
+    runGit(ctx, ["-c", "core.quotepath=false", "diff", "HEAD", "--numstat", ...scope]),
+    runGit(ctx, ["ls-files", "--others", "--exclude-standard", ...scope]),
   ]);
   const numMap = new Map<string, { adds: number; dels: number }>();
   for (const line of num.stdout.split(/\r?\n/)) {
@@ -196,7 +250,7 @@ export async function listFileChanges(tabId: string): Promise<FileChangesList> {
   for (const p of untracked.stdout.split(/\r?\n/)) {
     if (p.trim()) files.push({ status: "U", path: p, additions: 0, deletions: 0 });
   }
-  return { isGit: true, files };
+  return { isGit: true, files, initialized };
 }
 
 async function readFileContent(ctx: GitCtx, path: string): Promise<string> {

@@ -159,7 +159,7 @@ declare global {
         run: () => Promise<{ ok: boolean; output: string; error?: string }>;
       };
       diff: {
-        list: (tabId: string) => Promise<{ isGit: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }>;
+        list: (tabId: string) => Promise<{ isGit: boolean; initialized?: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }>;
         get: (tabId: string, path: string) => Promise<{ diff: string; isUntracked: boolean; error?: string }>;
         history: (tabId: string, path: string, events: unknown[]) => Promise<{ versions: { label: string; content: string }[]; error?: string }>;
         compare: (a: string, b: string, path: string) => Promise<{ diff: string }>;

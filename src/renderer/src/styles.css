@@ -2201,10 +2201,17 @@ html, body, #root {
 }
 
 /* --- diff: stronger row background so the tint actually covers the row --- */
-/* Row width follows the longest line so the colored background always
-   covers every character (overflow container scrolls, background never cuts). */
+/* Grid rows: the 1fr code track sizes to its max-content inside a
+   max-content row, so the colored background always covers every character. */
 .diff-view { width: max-content; min-width: 100%; }
-.diff-row { width: max-content; min-width: 100%; }
+.diff-row {
+  display: grid;
+  grid-template-columns: 42px 18px minmax(0, 1fr);
+  align-items: baseline;
+  white-space: pre;
+  width: max-content;
+  min-width: 100%;
+}
 .diff-add { background: color-mix(in srgb, #3fb950 18%, transparent); color: #4ade80; }
 .diff-del { background: color-mix(in srgb, #f85149 18%, transparent); color: #f87171; }
 .diff-ctx { background: color-mix(in srgb, var(--text) 3%, transparent); }
@@ -2237,3 +2244,4 @@ html, body, #root {
   border-color: var(--accent);
   outline: none;
 }
+.diff-fallback-tag.init { color: #3fb950; background: color-mix(in srgb, #3fb950 14%, transparent); }

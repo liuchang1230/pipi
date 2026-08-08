@@ -86,6 +86,7 @@ interface ChangesViewProps {
 export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesViewProps) {
   const [files, setFiles] = useState<DiffFileEntry[]>([]);
   const [isGit, setIsGit] = useState(true);
+  const [initialized, setInitialized] = useState(false);
   const [fallback, setFallback] = useState<Map<string, string>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
   const [gitDiff, setGitDiff] = useState<string | null>(null);
@@ -158,6 +159,7 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
       cwdRef.current = cwd;
       const agg = aggregateToolDiffs(tabId, cwd);
       const r = await window.api.diff.list(tabId);
+      setInitialized(!!r.initialized);
       let merged: DiffFileEntry[];
       let mergedDiffs: Map<string, string>;
       if (!r.isGit) {
@@ -236,6 +238,7 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   return (
     <div className="changes-panel">
       <div className="changes-header">
+        {initialized && <span className="diff-fallback-tag init">已自动初始化 git 基线</span>}
         <select
           className="changes-file-select"
           value={selected ?? ""}

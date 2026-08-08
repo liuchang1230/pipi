@@ -144,7 +144,7 @@ const api = {
     run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
   },
   diff: {
-    list: (tabId: string): Promise<{ isGit: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }> =>
+    list: (tabId: string): Promise<{ isGit: boolean; initialized?: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }> =>
       ipcRenderer.invoke("diff:list", tabId),
     get: (tabId: string, path: string): Promise<{ diff: string; isUntracked: boolean; error?: string }> =>
       ipcRenderer.invoke("diff:get", tabId, path),
