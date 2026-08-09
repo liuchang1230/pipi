@@ -57,6 +57,27 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
       return null;
     }
   }, [block.name, block.argsText]);
+  // apply_patch: the patch argument is already a unified diff → render it.
+  const patchDiff = useMemo(() => {
+    if (block.name !== "apply_patch" && block.name !== "patch") return null;
+    try {
+      const args = JSON.parse(block.argsText || "{}") as { patch?: unknown };
+      if (typeof args.patch === "string" && isDiffish(args.patch)) return args.patch;
+    } catch {
+      /* partial args */
+    }
+    return null;
+  }, [block.name, block.argsText]);
+  // JSON result texts get pretty-printed instead of raw single-line dumps.
+  const prettyResult = useMemo(() => {
+    const t = resultText.trim();
+    if (!t.startsWith("{") && !t.startsWith("[")) return null;
+    try {
+      return JSON.stringify(JSON.parse(t), null, 2);
+    } catch {
+      return null;
+    }
+  }, [resultText]);
   return (
     <div className={`chat-tool${block.isError ? " error" : ""}`}>
       <div className="chat-tool-head" onClick={() => setShowArgs((v) => !v)}>
@@ -68,6 +89,11 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
         <div className="chat-tool-editdiff">
           <div className="chat-tool-result-head">编辑参数（diff 视图）</div>
           <DiffView diffText={editDiff} />
+        </div>
+      ) : patchDiff ? (
+        <div className="chat-tool-editdiff">
+          <div className="chat-tool-result-head">补丁内容（diff 视图）</div>
+          <DiffView diffText={patchDiff} />
         </div>
       ) : (
         <pre className="chat-tool-args">
@@ -97,6 +123,8 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
               <div className="chat-tool-result diff">
                 <DiffView diffText={resultText} />
               </div>
+            ) : prettyResult ? (
+              <pre className={`chat-tool-result${block.isError ? " error" : ""}`}>{prettyResult}</pre>
             ) : (
               <pre className={`chat-tool-result${block.isError ? " error" : ""}`}>{resultText || "(空)"}</pre>
             ))}
