@@ -20,6 +20,7 @@
     "src/main/**/*",
     "src/preload/**/*",
     "src/shared/**/*",
+    "src/renderer/src/components/diff-utils.ts",
     "electron.vite.config.ts"
   ]
 }
