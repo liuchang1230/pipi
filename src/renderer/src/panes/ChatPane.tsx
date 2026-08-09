@@ -64,11 +64,16 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
         <span className="chat-tool-name">{block.name ?? "tool"}</span>
         <span className="chat-tool-toggle">{showArgs ? "▾" : "▸"}</span>
       </div>
-      {showArgs && !writePreview && (
+      {showArgs && !writePreview && (editDiff ? (
+        <div className="chat-tool-editdiff">
+          <div className="chat-tool-result-head">编辑参数（diff 视图）</div>
+          <DiffView diffText={editDiff} />
+        </div>
+      ) : (
         <pre className="chat-tool-args">
           {block.argsText || (running ? "(参数生成中…)" : "")}
         </pre>
-      )}
+      ))}
       {writePreview && (
         <div className="chat-tool-editdiff">
           <div className="chat-tool-result-head">写入 {writePreview.path || "（未知路径）"}</div>

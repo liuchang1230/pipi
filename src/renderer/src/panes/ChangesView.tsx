@@ -109,7 +109,8 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
 
   /** Show one file: working-tree diff + version history (git commits + session edits). */
   const selectFile = async (path: string) => {
-    setSelected(path);
+    const rel = normalizePath(path, cwdRef.current);
+    setSelected(rel);
     setGitDiff(null);
     setVersions(null);
     setSessionVersions(null);
@@ -118,10 +119,10 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
     setVerB(null);
     setError(null);
     // Working-tree diff (or aggregated session diff for gitignored/non-git).
-    if (!isGit || fallback.has(path)) {
-      setGitDiff(fallback.get(path) ?? "");
+    if (!isGit || fallback.has(rel)) {
+      setGitDiff(fallback.get(rel) ?? "");
     } else {
-      const r = await window.api.diff.get(tabId, path);
+      const r = await window.api.diff.get(tabId, rel);
       if (r.error) {
         setError(r.error);
         setGitDiff("");
@@ -131,8 +132,8 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
     }
     // Version history: git commits (all history) + session edit chain.
     const [commits, sessionR] = await Promise.all([
-      window.api.diff.commits(tabId, path),
-      collectSessionVersions(path),
+      window.api.diff.commits(tabId, rel),
+      collectSessionVersions(rel),
     ]);
     const opts: VersionOption[] = [];
     for (let i = commits.length - 1; i >= 0; i--) {
@@ -254,7 +255,7 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
     if (!versions || a === b || a == null || b == null) return;
     const va = versions[a]!;
     const vb = versions[b]!;
-    const path = selected ?? "file";
+    const path = normalizePath(selected ?? "file", cwdRef.current);
     // Resolve content: git rev → fetch on demand; else cached session content.
     let contentA = va.content ?? "";
     let contentB = vb.content ?? "";

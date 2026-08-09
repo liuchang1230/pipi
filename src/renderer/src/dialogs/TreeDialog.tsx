@@ -329,13 +329,17 @@ export function TreeDialog({
   /** Roll the edited file back to the state right after the selected node. */
   const rollbackToNode = async () => {
     const nodeId = selected?.entry.type === "message" ? (selected.entry.message as { toolCallId?: string }).toolCallId : undefined;
-    const path = selectedEditPath;
-    if (!nodeId || !path) return;
+    const rawPath = selectedEditPath;
+    if (!nodeId || !rawPath) return;
     setRollingBack(true);
     try {
       const cwd = useTabsStore.getState().tabs.find((t) => t.id === tabId)?.cwd ?? "";
       const norm = (p: string) => p.replace(/\\/g, "/");
       const normCwd = norm(cwd).replace(/\/$/, "");
+      // args.path may be absolute (pi passes the full path): relativize it.
+      const path = norm(rawPath).startsWith(normCwd + "/")
+        ? norm(rawPath).slice(normCwd.length + 1)
+        : rawPath;
       const isTarget = (p: string) => {
         const np = norm(p);
         return np === path || np === normCwd + "/" + path;
