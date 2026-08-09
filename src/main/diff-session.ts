@@ -442,6 +442,36 @@ export async function getFileHistory(
   return { versions };
 }
 
+/** git 提交历史（--follow 支持重命名），最新在前。 */
+export async function listGitCommits(tabId: string, path: string): Promise<{ rev: string; subject: string }[]> {
+  const ctx = gitCtxFor(tabId);
+  if (!ctx) return [];
+  const r = await runGit(ctx, ["log", "--format=%h %s", "--follow", "--", path]);
+  if (r.code !== 0) return [];
+  const out: { rev: string; subject: string }[] = [];
+  for (const line of r.stdout.split(/\r?\n/)) {
+    const m = line.match(/^(\S+) (.*)$/);
+    if (m) out.push({ rev: m[1]!, subject: m[2]!.trim() });
+  }
+  return out;
+}
+
+/** 读取文件在指定 commit（或工作区，rev 为空）的内容。 */
+export async function getFileAt(tabId: string, path: string, rev?: string): Promise<{ content: string; error?: string }> {
+  const ctx = gitCtxFor(tabId);
+  if (!ctx) return { content: "", error: "tab not found" };
+  if (!rev) {
+    try {
+      return { content: await readFileContent(ctx, path) };
+    } catch (e) {
+      return { content: "", error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  const r = await runGit(ctx, ["show", `${rev}:${path}`]);
+  if (r.code !== 0) return { content: "", error: r.stderr.slice(0, 200) };
+  return { content: r.stdout.replace(/\r?\n$/, "") };
+}
+
 /** Write content to a file over the tab's channel (used for version rollback). */
 export async function rollbackFileContent(
   tabId: string,

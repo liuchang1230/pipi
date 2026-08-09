@@ -76,6 +76,13 @@ function aggregateToolDiffs(tabId: string, cwd: string): { files: DiffFileEntry[
   return { files, diffs };
 }
 
+interface VersionOption {
+  label: string;
+  /** git commit rev (content fetched on demand) or undefined (content cached). */
+  rev?: string;
+  content?: string;
+}
+
 interface ChangesViewProps {
   tabId: string;
   /** File to focus (the file open in the viewer, if any). */
@@ -90,7 +97,8 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   const [fallback, setFallback] = useState<Map<string, string>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
   const [gitDiff, setGitDiff] = useState<string | null>(null);
-  const [versions, setVersions] = useState<Array<{ label: string; content: string }> | null>(null);
+  const [versions, setVersions] = useState<VersionOption[] | null>(null);
+  const [sessionVersions, setSessionVersions] = useState<Array<{ label: string; content: string }> | null>(null);
   const [verA, setVerA] = useState<number | null>(null);
   const [verB, setVerB] = useState<number | null>(null);
   const [compareText, setCompareText] = useState<string | null>(null);
@@ -99,11 +107,12 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   const cwdRef = useRef("");
   const focusHandled = useRef(false);
 
-  /** Show one file: working-tree diff + version history. */
+  /** Show one file: working-tree diff + version history (git commits + session edits). */
   const selectFile = async (path: string) => {
     setSelected(path);
     setGitDiff(null);
     setVersions(null);
+    setSessionVersions(null);
     setCompareText(null);
     setVerA(null);
     setVerB(null);
@@ -120,7 +129,35 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
         setGitDiff(r.diff || "（无变更内容）");
       }
     }
-    // Version history from session edit events.
+    // Version history: git commits (all history) + session edit chain.
+    const [commits, sessionR] = await Promise.all([
+      window.api.diff.commits(tabId, path),
+      collectSessionVersions(path),
+    ]);
+    const opts: VersionOption[] = [];
+    for (let i = commits.length - 1; i >= 0; i--) {
+      const c = commits[i]!;
+      opts.push({ label: `${c.rev} ${c.subject}`, rev: c.rev });
+    }
+    const session = sessionR?.versions ?? null;
+    setSessionVersions(session);
+    if (session && session.length > 0) {
+      for (const v of session) opts.push({ label: v.label, content: v.content });
+    }
+    opts.push({ label: "当前（工作区）" });
+    if (opts.length > 1) {
+      setVersions(opts);
+      setVerA(0);
+      setVerB(opts.length - 1);
+    } else {
+      setVersions(null);
+      setVerA(null);
+      setVerB(null);
+    }
+  };
+
+  /** Session edit chain for this file (git HEAD base + applied edits). */
+  const collectSessionVersions = async (path: string) => {
     const st = useChatStore.getState().states[tabId];
     const events: Array<{ type: "edit"; edits: Array<{ oldText: string; newText: string }> }> = [];
     for (const msg of st?.messages ?? []) {
@@ -139,16 +176,13 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
         }
       }
     }
-    if (events.length) {
-      const r = await window.api.diff.history(tabId, path, events);
-      if (r.error) {
-        setError(r.error);
-        return;
-      }
-      setVersions(r.versions);
-      setVerA(0);
-      setVerB(r.versions.length - 1);
+    if (!events.length) return null;
+    const r = await window.api.diff.history(tabId, path, events);
+    if (r.error) {
+      setError(r.error);
+      return null;
     }
+    return r;
   };
 
   const refresh = async () => {
@@ -181,6 +215,15 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
       }
       setFiles(merged);
       setFallback(mergedDiffs);
+      // The file currently open in the viewer must always be reachable — even
+      // when it has no uncommitted changes, its git history is still viewable.
+      if (focusPath) {
+        const normFocus = normalizePath(focusPath, cwd);
+        if (!merged.some((f) => f.path === normFocus)) {
+          merged.push({ status: "S", path: normFocus, additions: 0, deletions: 0 });
+          setFiles([...merged]);
+        }
+      }
       // Focus: requested file (viewer), else keep current, else first.
       const target =
         (focusPath && merged.some((f) => f.path === normalizePath(focusPath, cwd)))
@@ -209,9 +252,24 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
 
   const doCompare = async (a: number, b: number) => {
     if (!versions || a === b || a == null || b == null) return;
-    const contentA = versions[a]?.content ?? "";
-    const contentB = versions[b]?.content ?? "";
+    const va = versions[a]!;
+    const vb = versions[b]!;
     const path = selected ?? "file";
+    // Resolve content: git rev → fetch on demand; else cached session content.
+    let contentA = va.content ?? "";
+    let contentB = vb.content ?? "";
+    if (va.rev || vb.rev) {
+      const [ra, rb] = await Promise.all([
+        va.rev ? window.api.diff.at(tabId, path, va.rev) : Promise.resolve({ content: contentA, error: undefined }),
+        vb.rev ? window.api.diff.at(tabId, path, vb.rev) : Promise.resolve({ content: contentB, error: undefined }),
+      ]);
+      if (ra.error || rb.error) {
+        setError(ra.error ?? rb.error ?? "");
+        return;
+      }
+      if (va.rev) contentA = ra.content;
+      if (vb.rev) contentB = rb.content;
+    }
     if (!contentA && !contentB) {
       setCompareText("");
       return;

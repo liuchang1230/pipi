@@ -31,7 +31,7 @@ import {
   type ExtensionUiRequest,
 } from "./rpc-session";
 import { checkPiUpdate, runPiUpdate } from "./update-check";
-import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileContent, type FileVersionEvent } from "./diff-session";
+import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileContent, listGitCommits, getFileAt, type FileVersionEvent } from "./diff-session";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
 import { getSettings, updateSettings, type AppSettings } from "./settings";
@@ -1207,6 +1207,8 @@ app.whenReady().then(async () => {
   );
   ipcMain.handle("diff:compare", (_e, a: string, b: string, path: string) => ({ diff: diffTextOf(a, b, path) }));
   ipcMain.handle("diff:write", (_e, tabId: string, path: string, content: string) => rollbackFileContent(tabId, path, content));
+  ipcMain.handle("diff:commits", (_e, tabId: string, path: string) => listGitCommits(tabId, path));
+  ipcMain.handle("diff:at", (_e, tabId: string, path: string, rev?: string) => getFileAt(tabId, path, rev));
 
   // --- pi / extension updates (RPC chat has no TUI update banner) ---
   ipcMain.handle("update:check", (_e, force?: boolean) => checkPiUpdate(force));
