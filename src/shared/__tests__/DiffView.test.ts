@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { editsToDiff, isDiffish } from "../../renderer/src/components/DiffView";
+import { editsToDiff, isDiffish } from "../../renderer/src/components/diff-utils";
 
 describe("isDiffish", () => {
   it("recognizes unified diff forms (incl. apply_patch patch arg)", () => {
