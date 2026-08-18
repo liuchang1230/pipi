@@ -94,7 +94,14 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const leftWidth = useLayoutStore((s) => s.leftWidth);
 
   // --- Local state owned by this pane ---
-  const [sidebarSplit, setSidebarSplit] = useState(55); // % for file tree
+  const [sidebarSplit, setSidebarSplit] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem("pipi-sidebar-split"));
+      return Number.isFinite(saved) ? Math.max(20, Math.min(80, saved)) : 55;
+    } catch {
+      return 55;
+    }
+  }); // % for file tree
   const sidebarRef = useRef<HTMLDivElement>(null);
   const [treeCtx, setTreeCtx] = useState<{ x: number; y: number; node: FileNode | null } | null>(null);
   const [filePrompt, setFilePrompt] = useState<{ kind: "file" | "dir" | "rename"; title: string; node: FileNode | null } | null>(null);
@@ -119,7 +126,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
             if (matchesTab) next[project.id] = sessions as SessionItem[];
           } else if (project.type === "remote") {
             if (!project.host || !project.user) continue;
-            const projectRemoteKey = buildRemoteKey(project.host, project.user, project.port);
+            const projectRemoteKey = buildRemoteKey(project.host, project.user, project.port, (project as { agentDir?: string }).agentDir);
             const matchesTab = tabs.find((t) => t.id === tabId && t.isRemote && t.remoteKey === projectRemoteKey);
             if (matchesTab) next[project.id] = sessions as SessionItem[];
           }
@@ -154,17 +161,35 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
   // --- Sidebar vertical resizer (sidebarSplit is this pane's local state) ---
   const sidebarDragRef = useRef(false);
+  const sidebarSplitRef = useRef(sidebarSplit);
+  const sidebarSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onSidebarResizerDown = useCallback(() => { sidebarDragRef.current = true; }, []);
+  useEffect(() => {
+    sidebarSplitRef.current = sidebarSplit;
+  }, [sidebarSplit]);
+  useEffect(() => {
+    return () => {
+      if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
+    };
+  }, []);
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (sidebarDragRef.current && sidebarRef.current) {
         const rect = sidebarRef.current.getBoundingClientRect();
         const pct = ((e.clientY - rect.top) / rect.height) * 100;
-        setSidebarSplit(Math.max(20, Math.min(80, pct)));
+        const next = Math.max(20, Math.min(80, pct));
+        setSidebarSplit(next);
+        if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
+        sidebarSaveTimerRef.current = setTimeout(() => {
+          try { localStorage.setItem("pipi-sidebar-split", String(Math.round(sidebarSplitRef.current))); } catch { /* best effort */ }
+        }, 160);
       }
     };
     const onUp = () => {
+      if (!sidebarDragRef.current) return;
       sidebarDragRef.current = false;
+      if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
+      try { localStorage.setItem("pipi-sidebar-split", String(Math.round(sidebarSplitRef.current))); } catch { /* best effort */ }
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -215,7 +240,12 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         const parts = expandPath.split("/").filter(Boolean);
         const ancestors: string[] = [];
         for (let i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join("/"));
-        if (ancestors.length) setExpanded((prev) => new Set([...prev, ...ancestors]));
+        if (ancestors.length) {
+          setExpanded((prev) => new Set([...prev, ...ancestors]));
+          // Lazy: fetch the newly-expanded ancestors too, or they'd sit on
+          // the "…加载中" placeholder until the next refresh/toggle.
+          for (const a of ancestors) void useTreeStore.getState().expandDir(a);
+        }
       }
     },
     [setExpanded],
@@ -368,7 +398,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const handleRenameSubmit = useCallback(async () => {
     if (!renameSession) return;
     const r = await window.api.session.rename(renameSession.path, renameValue.trim());
-    if (!r.ok) { alert(`重命名失败: ${r.error}`); return; }
+    if (!r.ok) { useUiStore.getState().showToast(`重命名失败: ${r.error}`, "err"); return; }
     setRenameSession(null);
     loadSessions(cwd);
   }, [renameSession, renameValue, cwd, loadSessions]);
@@ -393,12 +423,16 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
     if (tabsState.isRemote) {
       void navigateRemoteDir(path);
     } else {
+      const s = useTreeStore.getState();
+      const willExpand = !s.expanded.has(path);
       setExpanded((prev) => {
         const n = new Set(prev);
         if (n.has(path)) n.delete(path);
         else n.add(path);
         return n;
       });
+      // Lazy: expanding a directory fetches its children on demand.
+      if (willExpand) void useTreeStore.getState().expandDir(path);
     }
   }, [navigateRemoteDir, setExpanded]);
 
@@ -447,7 +481,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       projects
         .filter((p) => p.type === "remote" && p.path && p.host && p.user)
         .map((p) => {
-          const projectRemoteKey = buildRemoteKey(p.host, p.user, p.port);
+          const projectRemoteKey = buildRemoteKey(p.host, p.user, p.port, (p as { agentDir?: string }).agentDir);
           const connectionTab = tabs.find((t) => t.isRemote && t.remoteKey === projectRemoteKey);
           const tab = connectionTab;
           const connected = connectedRemoteKeys.has(projectRemoteKey);
@@ -511,16 +545,34 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
     [tabs, activeTab],
   );
 
-  // Switching middle tabs scrolls the sidebar so the linked session row is
-  // visible ("点击标签页 → 左侧定位到对应会话"). rAF defers one frame so the
-  // freshly-rendered rows exist before we look them up.
+  // Latest project groups (incl. WSL projects) for locating a session's owning
+  // group. Read via a ref so the scroll effect below does NOT re-run on every
+  // session poll (which would re-center the sidebar on each 4s refresh).
+  const sessionOwnerRef = useRef<ProjectGroup[]>([]);
+  sessionOwnerRef.current = [
+    ...localProjectGroups,
+    ...remoteProjectGroups,
+    ...wslConnections.flatMap((c) => c.projects),
+  ];
+
+  // Switching middle tabs locates the linked session in the left sidebar: the
+  // owning project group auto-expands if collapsed, then the row scrolls to
+  // the CENTER of the session list ("点击标签页 → 左侧定位并居中显示"). rAF
+  // defers one frame so the freshly-rendered rows exist before we look them up.
   useEffect(() => {
     if (!activeSessionPath) return;
+    const owner = sessionOwnerRef.current.find((g) => g.sessions.some((s) => s.path === activeSessionPath));
+    if (owner) {
+      const st = useSessionsStore.getState();
+      if (!st.expandedProjects.has(owner.key)) {
+        st.setExpandedProjects((prev) => new Set(prev).add(owner.key));
+      }
+    }
     const raf = requestAnimationFrame(() => {
       const rows = document.querySelectorAll<HTMLElement>(".session-row[data-session-path]");
       for (const el of rows) {
         if (el.dataset.sessionPath === activeSessionPath) {
-          el.scrollIntoView({ block: "nearest" });
+          el.scrollIntoView({ block: "center" });
           return;
         }
       }
@@ -1222,6 +1274,12 @@ const TreeRow = memo(function TreeRow({ node, depth, isExpanded, expandedPaths, 
             onContextMenu={onContextMenu}
           />
         ))}</>
+      )}
+      {/* Lazy tree: an expanded dir whose children haven't loaded yet. */}
+      {isDir && isExpanded && node.children === undefined && (
+        <div className="tree-row" style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}>
+          <span className="tree-name tree-muted">…加载中</span>
+        </div>
       )}
     </>
   );

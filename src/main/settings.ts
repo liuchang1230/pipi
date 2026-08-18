@@ -15,6 +15,9 @@ export interface AutoFollowSettings {
 
 export interface AppSettings {
   autoFollow: AutoFollowSettings;
+  /** Backend selection for local pi tabs: "rpc" forces the old child-process
+   *  backend; unset/undefined uses the in-process SDK worker. */
+  pipi?: { backend?: "rpc" };
 }
 
 const DEFAULTS: AppSettings = {

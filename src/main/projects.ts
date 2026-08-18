@@ -23,7 +23,7 @@ export interface PiModelsFile {
 
 export type ProjectEntry =
   | { id: string; type: "local"; name: string; cwd: string; createdAt: number; updatedAt: number }
-  | { id: string; type: "remote"; name: string; host: string; user: string; port: number; path: string; password?: string; createdAt: number; updatedAt: number }
+  | { id: string; type: "remote"; name: string; host: string; user: string; port: number; path: string; password?: string; agentDir?: string; createdAt: number; updatedAt: number }
   | { id: string; type: "wsl"; name: string; distro: string; path: string; createdAt: number; updatedAt: number };
 
 export interface ModelConfigEntry {
@@ -168,7 +168,7 @@ export function addLocalProject(cwd: string): ProjectEntry {
   return entry;
 }
 
-export function addRemoteProject(remote: { host: string; user: string; port?: number; path: string; password?: string }): ProjectEntry {
+export function addRemoteProject(remote: { host: string; user: string; port?: number; path: string; password?: string; agentDir?: string }): ProjectEntry {
   const projects = readProjects();
   const now = Date.now();
   const port = remote.port ?? 22;
@@ -183,6 +183,7 @@ export function addRemoteProject(remote: { host: string; user: string; port?: nu
     port,
     path: remote.path,
     password: remote.password,
+    agentDir: remote.agentDir,
     createdAt: now,
     updatedAt: now,
   };
@@ -408,6 +409,13 @@ export function syncModelToPi(input: ModelConfigEntry, overrides?: Record<string
       id,
       name: manual?.name ?? prev?.name ?? id,
       reasoning: manual?.reasoning ?? prev?.reasoning ?? /gpt-5|o1|o3|o4|deepseek-r|deepseek-v4|claude|gemini-2\.5/i.test(id),
+      ...(manual?.thinkingLevelMap
+        ? { thinkingLevelMap: manual.thinkingLevelMap }
+        : prev?.thinkingLevelMap
+        ? { thinkingLevelMap: prev.thinkingLevelMap }
+        : /deepseek-v4-(flash|pro)/i.test(id)
+        ? { thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high", max: "max" } }
+        : {}),
       input: manual?.input ?? prev?.input ?? ["text"] as Array<"text" | "image">,
       contextWindow: manual?.contextWindow ?? prev?.contextWindow ?? override?.contextWindow ?? spec.contextWindow,
       maxTokens: manual?.maxTokens ?? prev?.maxTokens ?? override?.maxTokens ?? spec.maxTokens,

@@ -271,8 +271,9 @@ export class RpcSession {
       );
     } else if (opts.remote) {
       const r = opts.remote;
+      const agentDirEnv = r.agentDir ? `export PI_CODING_AGENT_DIR=${r.agentDir}; ` : "";
       const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : "pi --mode rpc";
-      const remoteCmd = `cd ${cdArg(r.path || "~")} && bash -ic '${inner}'`;
+      const remoteCmd = `cd ${cdArg(r.path || "~")} && bash -ic '${agentDirEnv}${inner}'`;
       if (r.password) {
         this.transport = new Ssh2Transport(r, remoteCmd, label);
       } else {

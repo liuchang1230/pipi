@@ -17,16 +17,18 @@ import { attachImeHeuristic } from "../xterm-ime-anchor";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
 import { useChatStore } from "../stores/chatStore";
+import { useUiStore } from "../stores/uiStore";
 import type { TabInfo } from "../stores/types";
 import { ChatView } from "./ChatPane";
 
 interface TerminalViewProps {
   tabId: string;
   theme: "dark" | "light";
+  active: boolean;
   onResize: (cols: number, rows: number) => void;
 }
 
-function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
+function TerminalView({ tabId, theme, active, onResize }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -103,18 +105,25 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
     term.write("\r\n\x1b[2m正在启动会话…\x1b[0m\r\n");
     termRef.current = term;
     fitRef.current = fit;
+    // Focus the input textarea while THIS tab is active — xterm only
+    // receives keystrokes while its helper textarea is focused, and a
+    // freshly opened session starts unfocused (typing would do nothing).
+    if (active) termRef.current?.focus();
     const ime = attachImeHeuristic(term);
 
-    // Pipe user input → pty.
+    // Pipe user input → pty. This deliberately uses one-way IPC: invoke()
+    // allocates a Promise and a reply message for every key. During pi's
+    // frequent full-screen redraws that backlog can starve the renderer and
+    // make Windows IME / typing look frozen.
     const disp = term.onData((data) => {
-      window.api.tab.write(tabId, data);
+      window.api.tab.writeInput(tabId, data);
     });
 
     // Copy / paste handling — terminal eats Ctrl+C/V so we intercept here.
     const keyHandler = (e: KeyboardEvent) => {
       // Shift+Enter → insert newline (pi keybinding `tui.input.newLine`)
       if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && e.type === "keydown") {
-        window.api.tab.write(tabId, "\n");
+        window.api.tab.writeInput(tabId, "\n");
         return false;
       }
       if (e.ctrlKey && e.key === "c" && term.hasSelection()) {
@@ -152,8 +161,22 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
     // auto theme resolves to the app's mode deterministically, and so pi
     // keeps its color-scheme notification listener armed (auto sync).
     let schemeBuf = "";
+    // Let xterm drain output once per animation frame. Calling write() for
+    // every IPC delivery competes directly with keyboard/IME event handling
+    // when pi redraws rapidly; batching preserves byte order while keeping
+    // input responsive.
+    let pendingOutput = "";
+    let outputFrame: number | null = null;
+    const flushOutput = () => {
+      outputFrame = null;
+      if (!pendingOutput) return;
+      const output = pendingOutput;
+      pendingOutput = "";
+      term.write(output);
+    };
     const offData = window.api.onTabData(tabId, (data) => {
-      term.write(data);
+      pendingOutput += data;
+      if (outputFrame === null) outputFrame = requestAnimationFrame(flushOutput);
       schemeBuf += data;
       if (schemeBuf.includes("\x1b[?996n")) {
         schemeBuf = "";
@@ -194,6 +217,9 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
       if (fitTimer) clearTimeout(fitTimer);
       term.element?.removeEventListener("contextmenu", ctxHandler);
       disp.dispose();
+      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      // Do not discard output already delivered by main during unmount.
+      flushOutput();
       offData();
       offExit();
       ro.disconnect();
@@ -203,6 +229,18 @@ function TerminalView({ tabId, theme, onResize }: TerminalViewProps) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
+
+  // Refocus when THIS tab becomes the active one (switching tabs must hand
+  // the keyboard straight back to the terminal, not leave it unfocused).
+  // The window-focus listener lives here too so its closure always sees the
+  // CURRENT active value (a stale first-render value would skip refocus).
+  useEffect(() => {
+    if (!active) return;
+    termRef.current?.focus();
+    const onWinFocus = () => termRef.current?.focus();
+    window.addEventListener("focus", onWinFocus);
+    return () => window.removeEventListener("focus", onWinFocus);
+  }, [active]);
 
   // Update theme without destroying the terminal.
   useEffect(() => {
@@ -224,16 +262,17 @@ const TerminalHost = memo(function TerminalHost({ visibleTabs, activeTab, theme 
   return (
     <div className="terminal-wrap">
       {visibleTabs.length === 0 ? (
-        <div className="placeholder">点击 + 开始（或从左侧选择一个会话）</div>
+        <div className="placeholder">从左侧选择一个会话开始</div>
       ) : (
         visibleTabs.map((tab) => (
           <div key={tab.id} className={`terminal-pane${tab.id === activeTab ? " active" : " hidden"}`}>
-            {tab.mode === "rpc" ? (
-              <ChatView tabId={tab.id} />
+            {tab.mode === "rpc" || tab.mode === "sdk" ? (
+              <ChatView tabId={tab.id} active={tab.id === activeTab} />
             ) : (
               <TerminalView
                 tabId={tab.id}
                 theme={theme}
+                active={tab.id === activeTab}
                 onResize={(cols, rows) => window.api.tab.resize(tab.id, cols, rows)}
               />
             )}
@@ -249,15 +288,15 @@ interface TabBarProps {
   activeTab: string | null;
   onSelectTab: (id: string) => void;
   onCloseTab: (id: string) => void;
-  onNewTab: () => void;
   onShowRemote: () => void;
   onShowModels: () => void;
 }
 
-const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onCloseTab, onNewTab, onShowRemote, onShowModels }: TabBarProps) {
+const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onCloseTab, onShowRemote, onShowModels }: TabBarProps) {
   const active = visibleTabs.find((t) => t.id === activeTab);
-  // A pty-backed pi tab can switch back to the chat view.
-  const canSwitchToChat = !!active && active.pi && active.mode !== "rpc";
+  // A pty-backed pi tab can switch to the chat view (local → in-process SDK,
+  // remote/WSL → RPC). Chat-backed tabs (rpc/sdk) are already in the chat view.
+  const canSwitchToChat = !!active && active.pi && (active.mode === "pty" || active.mode === undefined);
   const [switching, setSwitching] = useState(false);
   return (
     <div className="tab-bar">
@@ -279,19 +318,23 @@ const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onClo
           </div>
         ))}
       </div>
-      <button className="tab-new" onClick={onNewTab} title="新标签（新建空白会话）">+</button>
       {canSwitchToChat && (
         <button
-          className="tab-remote"
+          className="tab-chat"
           disabled={switching}
           onClick={async () => {
             setSwitching(true);
-            // Drop stale chat state so the remounted ChatView re-boots
-            // (messages + stats come from pi via --session resume).
-            useChatStore.getState().clear(activeTab!);
-            await window.api.tab.rpcSwitchToChat(activeTab!);
-            // tabs:update flips this tab to mode "rpc"; TerminalPane re-renders.
-            setSwitching(false);
+            try {
+              // Drop stale chat state so the remounted ChatView re-boots
+              // (messages + stats come from pi via --session resume).
+              useChatStore.getState().clear(activeTab!);
+              await window.api.tab.rpcSwitchToChat(activeTab!);
+              // tabs:update flips this tab to mode "rpc"; TerminalPane re-renders.
+            } catch (e) {
+              useUiStore.getState().showToast(`切换到聊天视图失败: ${e instanceof Error ? e.message : String(e)}`, "err");
+            } finally {
+              setSwitching(false);
+            }
           }}
           title="切换为聊天视图"
         >
@@ -315,7 +358,6 @@ export function TerminalPane({
 }) {
   const tabs = useTabsStore((s) => s.tabs);
   const activeTab = useTabsStore((s) => s.activeTab);
-  const createTab = useTabsStore((s) => s.createTab);
   const closeTab = useTabsStore((s) => s.closeTab);
   const selectTab = useTabsStore((s) => s.selectTab);
 
@@ -340,7 +382,6 @@ export function TerminalPane({
         activeTab={activeTab}
         onSelectTab={(id) => void selectTab(id)}
         onCloseTab={(id) => void closeTab(id)}
-        onNewTab={() => void createTab()}
         onShowRemote={onShowRemote}
         onShowModels={onShowModels}
       />

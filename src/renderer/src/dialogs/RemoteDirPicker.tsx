@@ -45,6 +45,7 @@ export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: ()
           port: remote.port,
           path: pickerPath,
           password: remote.password,
+          agentDir: (remote as { agentDir?: string }).agentDir,
         });
       }
     }

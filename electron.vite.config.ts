@@ -6,11 +6,14 @@ export default defineConfig({
   main: {
     build: {
       rollupOptions: {
-        input: resolve(__dirname, "src/main/index.ts"),
+        input: {
+          index: resolve(__dirname, "src/main/index.ts"),
+          "sdk-worker": resolve(__dirname, "src/main/chat-backend/sdk-worker.ts"),
+        },
         // Keep native / optional-native deps external so Electron loads them
         // from node_modules at runtime instead of bundling ABI-specific .node
         // files into out/main/chunks.
-        external: ["node-pty", "ssh2-sftp-client", "ssh2", "cpu-features"],
+        external: ["node-pty", "ssh2-sftp-client", "ssh2", "cpu-features", "@earendil-works/pi-coding-agent"],
       },
     },
   },

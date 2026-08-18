@@ -1,0 +1,57 @@
+# electron-builder 配置：产出 Windows NSIS 安装包 + 便携版
+# 产物输出到 release/（已 gitignore）
+
+appId: com.pipi.desktop
+productName: pipi
+
+directories:
+  buildResources: resources   # 构建期资源（exe/安装包图标）
+  output: release
+
+# 只打包构建产物 + 运行时图标；node_modules 生产依赖由 electron-builder 自动收集
+files:
+  - out/**
+  - resources/icon.ico
+  - resources/icon.png
+  - "!**/*.map"
+  - "!**/*.pdb"
+  # cpu-features 是 ssh2 的可选原生加速模块：本机无 MSVC 无法按 Electron ABI
+  # 重编译，且 ssh2 对缺失有 try/catch 回退（纯 JS 实现），直接排除
+  - "!node_modules/cpu-features/**"
+  - "!node_modules/@silvia-odwyer/photon-node/**/*.map"
+
+# 原生模块必须解包到 app.asar.unpacked：
+# - node-pty 的 .node（conpty）Electron 会自动重定向加载
+# - conpty_console_list_agent 被 child_process.fork，Electron 会改写为 unpacked 路径
+# - winpty 回退（Win7/8）需要真实磁盘上的 dll/exe
+asarUnpack:
+  - node_modules/node-pty/**
+
+# node-pty 是 N-API（ABI 稳定，dev 模式已在 Electron 34 验证），
+# ssh2 纯 JS + 可选 cpu-features（已排除）、photon-node 为 WASM。
+# 全部无需按 Electron ABI 重编译 → 关闭 rebuild，避免要求构建机装 MSVC。
+npmRebuild: false
+
+win:
+  icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: pipi
+  artifactName: pipi-${version}-setup.${ext}
+
+portable:
+  artifactName: pipi-${version}-portable.${ext}
+
+electronDownload:
+  # 国内网络可覆盖为镜像：
+  #   ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+  mirror: https://github.com/electron/electron/releases/download/

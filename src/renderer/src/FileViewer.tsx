@@ -15,6 +15,11 @@ export interface CurrentFile {
   content: string;
   bytes: number;
   isBinary: boolean;
+  /** Base64 image payload when the file is a previewable raster image. */
+  image?: { mimeType: string; base64: string };
+  /** Set when the file exceeded the preview cap: content is head+tail only,
+   *  and the file is locked read-only (saving would clobber the truncation). */
+  truncated?: boolean;
   /** True when shown because pi's tools touched it (auto-follow), false when opened manually. */
   followed: boolean;
   /** Set when the read failed (e.g. ENOENT); content then carries the message. */
@@ -77,6 +82,16 @@ function extOf(path: string): string {
 
 function isMarkdown(path: string): boolean {
   return ["md", "markdown"].includes(extOf(path));
+}
+
+const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "ico", "svg"]);
+// Syntax highlighting is presentation, not a reason to block file-open. Keep
+// large source previews responsive by rendering escaped text for them.
+const HIGHLIGHT_MAX_CHARS = 160_000;
+
+/** True when the file is a raster image (previewed via main's base64 payload) or an SVG (inline data URL). */
+function isImagePath(path: string): boolean {
+  return IMAGE_EXT.has(extOf(path));
 }
 
 /** Highlight code text; falls back to auto-detection then plaintext. */
@@ -173,7 +188,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     [save],
   );
 
-  const canEdit = !!file && !file.isBinary && !file.error && !loading;
+  const canEdit = !!file && !file.isBinary && !file.error && !loading && !file.truncated;
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -188,8 +203,27 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
   }, []);
 
   const rendered = useMemo(() => {
-    if (!file || file.isBinary) return null;
-    if (isMarkdown(file.path)) return { kind: "md" as const };
+    if (!file) return null;
+    // Image files: raster payload from main, or SVG inlined from its text
+    // content. Must run BEFORE the isBinary early-return (rasters are binary).
+    // A truncated SVG (oversize) falls through to the text branches — the
+    // inline data-URL would be a broken image, and the notice bar needs to
+    // render above the head/tail content.
+    if (isImagePath(file.path) && !file.truncated) {
+      if (file.image) {
+        return { kind: "image" as const, src: `data:${file.image.mimeType};base64,${file.image.base64}` };
+      }
+      if (file.isBinary) {
+        return { kind: "image" as const, src: null }; // raster over the preview size cap
+      }
+      // Only SVG is a text-based image (inline as a data URL); other image
+      // extensions landing here are degenerate (e.g. empty files).
+      if (extOf(file.path) === "svg") {
+        return { kind: "image" as const, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(file.content)}` };
+      }
+    }
+    if (file.isBinary) return null;
+    if (isMarkdown(file.path)) return { kind: "md" as const, plain: file.content.length > HIGHLIGHT_MAX_CHARS };
     const lang = EXT_LANG[extOf(file.path)];
     const isCode =
       !!lang ||
@@ -197,7 +231,11 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
         file.path
       );
     if (isCode) {
-      return { kind: "code" as const, html: highlightCode(file.content, file.path) };
+      return {
+        kind: "code" as const,
+        html: file.content.length <= HIGHLIGHT_MAX_CHARS ? highlightCode(file.content, file.path) : escapeHtml(file.content),
+        plain: file.content.length > HIGHLIGHT_MAX_CHARS,
+      };
     }
     return { kind: "text" as const };
   }, [file]);
@@ -230,7 +268,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
           className="btn btn-small"
           onClick={startEdit}
           disabled={!canEdit}
-          title={canEdit ? "编辑文件" : "二进制文件或未打开文件，不可编辑"}
+          title={canEdit ? "编辑文件" : file?.truncated ? "文件过大（预览为截断内容），已锁定为只读" : "二进制文件或未打开文件，不可编辑"}
         >
           ✏️ 编辑
         </button>
@@ -268,6 +306,27 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     );
   }
 
+  if (rendered?.kind === "image") {
+    return (
+      <div className="viewer-body">
+        {actions}
+        {rendered.src ? (
+          <img
+            className="viewer-image"
+            src={rendered.src}
+            alt={file.path}
+            draggable={false}
+            onContextMenu={handleContextMenu}
+          />
+        ) : (
+          <div className="viewer-content viewer-image-too-large" onContextMenu={handleContextMenu}>
+            📎 图片文件（{(file.bytes / 1024 / 1024).toFixed(1)} MB）超过预览上限（10 MB），无法预览
+          </div>
+        )}
+      </div>
+    );
+  }
+
   if (file.isBinary) {
     return (
       <div className="viewer-body">
@@ -277,11 +336,23 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     );
   }
 
+  // Oversize text: the preview is head+tail only, and the file is locked
+  // read-only (saving the truncated buffer would clobber the original).
+  const truncatedNote = file.truncated ? (
+    <div className="viewer-truncated-note">
+      ⚠️ 文件过大（{(file.bytes / 1024 / 1024).toFixed(1)} MB）：仅显示首尾各 512 KB，已锁定为只读
+    </div>
+  ) : null;
+
   if (rendered?.kind === "md") {
     return (
       <div className="viewer-body">
         {actions}
-        <Markdown content={file.content} className="viewer-content" currentPath={file.path} onContextMenu={handleContextMenu} />
+        {truncatedNote}
+        {rendered.plain && (
+          <div className="viewer-truncated-note">ℹ️ 为保持打开速度，此 Markdown 文件超过 160 KB，已跳过代码块语法高亮</div>
+        )}
+        <Markdown content={file.content} plainCode={rendered.plain} className="viewer-content" currentPath={file.path} onContextMenu={handleContextMenu} />
       </div>
     );
   }
@@ -289,6 +360,10 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     return (
       <div className="viewer-body">
         {actions}
+        {truncatedNote}
+        {rendered.plain && (
+          <div className="viewer-truncated-note">ℹ️ 为保持打开速度，此源文件超过 160 KB，已跳过语法高亮</div>
+        )}
         <pre className="viewer-content code-view" onContextMenu={handleContextMenu}>
           <code
             className="hljs"
@@ -301,6 +376,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
   return (
     <div className="viewer-body">
       {actions}
+      {truncatedNote}
       <pre className="viewer-content" onContextMenu={handleContextMenu}>{file.content}</pre>
     </div>
   );

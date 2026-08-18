@@ -9,6 +9,7 @@ export interface RemoteHistoryEntry {
   port: number;
   password?: string;
   path?: string;
+  agentDir?: string;
   updatedAt: number;
 }
 
@@ -37,25 +38,31 @@ export function listRemoteHistory(): RemoteHistoryEntry[] {
   return readHistory().sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-export function saveRemoteHistory(entry: { host: string; user: string; port?: number; password?: string; path?: string }): RemoteHistoryEntry {
+export function saveRemoteHistory(entry: { host: string; user: string; port?: number; password?: string; path?: string; agentDir?: string }): RemoteHistoryEntry {
   const list = readHistory();
   const port = entry.port ?? 22;
   const now = Date.now();
-  const existing = list.find((i) => i.host === entry.host && i.user === entry.user && i.port === port);
+  // Same server with a DIFFERENT agentDir is a different data space (several
+  // colleagues sharing one account) → keep them as separate history entries.
+  const existing = list.find(
+    (i) => i.host === entry.host && i.user === entry.user && i.port === port && (i.agentDir ?? "") === (entry.agentDir ?? "")
+  );
   if (existing) {
     existing.password = entry.password;
     existing.path = entry.path;
+    existing.agentDir = entry.agentDir;
     existing.updatedAt = now;
     writeHistory(list);
     return existing;
   }
   const item: RemoteHistoryEntry = {
-    id: `remote-history-${now}`,
+    id: `remote-history-${now}-${Math.random().toString(36).slice(2, 8)}`,
     host: entry.host,
     user: entry.user,
     port,
     password: entry.password,
     path: entry.path,
+    agentDir: entry.agentDir,
     updatedAt: now,
   };
   list.push(item);

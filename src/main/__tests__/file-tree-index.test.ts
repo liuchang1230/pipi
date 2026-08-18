@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileTreeIndex } from "../file-tree-index";
+import { listDirChildren } from "../file-tree";
 import type { FileNode } from "../file-tree";
 
 let root: string;
@@ -28,15 +29,26 @@ function makeProject() {
 }
 
 describe("FileTreeIndex", () => {
-  it("walks and caches a fresh root; cached() serves the snapshot", async () => {
+  it("lists a shallow root; dirs carry undefined children (lazy expand)", async () => {
     makeProject();
     const nodes = await index.refresh(root);
     const names = nodes.map((n) => n.name).sort();
     expect(names).toEqual(["README.md", "src"]);
+    // Lazy: the dir's children are NOT walked eagerly anymore.
     const src = nodes.find((n) => n.name === "src");
-    expect(src?.children?.map((c) => c.name)).toEqual(["a.ts"]);
+    expect(src?.children).toBeUndefined();
     // Sync peek hits within the TTL (no re-walk).
     expect(index.cached(root)?.length).toBe(2);
+  });
+
+  it("refreshes a subdir listing with a custom walk (root-relative paths)", async () => {
+    makeProject();
+    const srcDir = join(root, "src");
+    const nodes = await index.refresh(srcDir, (d) => listDirChildren(root, "src"));
+    expect(nodes.map((n) => n.name)).toEqual(["a.ts"]);
+    expect(nodes[0]?.path).toBe("src/a.ts"); // relative to the project root
+    // Same key → served from cache on the second call.
+    expect(index.cached(srcDir)?.map((n) => n.path)).toEqual(["src/a.ts"]);
   });
 
   it("an invalidate() landing mid-walk cannot be undone by the stale walk", async () => {
@@ -109,7 +121,7 @@ describe("FileTreeIndex", () => {
     expect(index.cached(root)?.map((n) => n.name)).not.toContain("LATE.md");
   });
 
-  it("treats a vanished root as an empty tree (listFiles swallows the error)", async () => {
+  it("treats a vanished dir as an empty listing (listDirChildren swallows the error)", async () => {
     const nodes = await index.refresh(join(root, "does-not-exist"));
     expect(nodes).toEqual([]);
     expect(index.cached(join(root, "does-not-exist"))).toEqual([]);

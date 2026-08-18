@@ -11,11 +11,11 @@ describe("themeCssVars (generated CSS custom properties)", () => {
     const css = themeCssVars();
     expect(css.indexOf(":root")).toBeLessThan(css.indexOf('[data-theme="light"]'));
     // Dark values present in :root, light values in the override.
-    expect(css).toContain("--bg: #1e1e2e");
-    expect(css).toContain("--accent: #89b4fa");
+    expect(css).toContain("--bg: #1f1f28");
+    expect(css).toContain("--accent: #8abeb7");
     expect(css).toContain("--hover: rgba(255, 255, 255, 0.04)");
-    expect(css).toContain('--bg: #f5f5f5');
-    expect(css).toContain("--accent: #2563eb");
+    expect(css).toContain('--bg: #eef0f4');
+    expect(css).toContain("--accent: #3d6bd0");
     expect(css).toContain("--hover: rgba(0, 0, 0, 0.05)");
     expect(css).toContain(`--mono: ${MONO_STACK}`);
   });
@@ -23,7 +23,7 @@ describe("themeCssVars (generated CSS custom properties)", () => {
   it("covers every var name the stylesheet consumes", () => {
     const css = themeCssVars();
     for (const name of [
-      "--bg", "--bg-panel", "--bg-input", "--text", "--text-dim", "--border",
+      "--bg", "--bg-panel", "--bg-input", "--tool-bg", "--text", "--text-dim", "--border",
       "--accent", "--success", "--danger", "--user-bg", "--assistant-bg",
       "--terminal-bg", "--hover", "--hover-medium", "--hover-strong",
       "--hover-soft", "--hover-faint", "--mono",

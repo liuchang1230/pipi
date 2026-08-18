@@ -9,8 +9,11 @@
  *    text, terminalBg) so the terminal and the app chrome can never drift
  *    apart again (they already agreed — by coincidence, not by contract).
  *
- * Values are byte-identical to the pre-A1 hand-written CSS so the refactor
- * is behavior-preserving.
+ * Dark values are aligned to the embedded terminal's pipi-dark palette
+ * (terminal-theme.ts) so the app chrome and the terminal share one color
+ * family — the user-facing request was "match the terminal", and the two
+ * used to be Catppuccin vs pipi, which clashed (plus a pure-black terminal
+ * viewport). Light stays as the original neutral scheme.
  */
 export type ThemeMode = "dark" | "light";
 
@@ -18,12 +21,17 @@ export interface AppThemeTokens {
   bg: string;
   bgPanel: string;
   bgInput: string;
+  /** Tool-call card surface: dark = deep dark green (subtler than page,
+   *  never bright); light = soft sage green (muted, not white). */
+  toolBg: string;
   text: string;
   textDim: string;
   border: string;
   accent: string;
   success: string;
   danger: string;
+  /** Caution / pending state distinct from destructive errors. */
+  warning: string;
   userBg: string;
   assistantBg: string;
   /** The terminal viewport background (xterm canvas + scrollbar area). */
@@ -41,18 +49,25 @@ export const MONO_STACK =
 
 export const THEME_TOKENS: Record<ThemeMode, AppThemeTokens> = {
   dark: {
-    bg: "#1e1e2e",
-    bgPanel: "#181825",
-    bgInput: "#11111b",
-    text: "#cdd6f4",
-    textDim: "#7f849c",
-    border: "#313244",
-    accent: "#89b4fa",
-    success: "#a6e3a1",
-    danger: "#f38ba8",
-    userBg: "rgba(137, 180, 250, 0.08)",
-    assistantBg: "rgba(166, 227, 161, 0.05)",
-    terminalBg: "#000000",
+    // pipi-dark family (terminal-theme.ts vars + export.pageBg/cardBg):
+    // bg = pageBg, bgPanel = cardBg, bgInput = toolPendingBg,
+    // border = darkGray, textDim = gray, accent/success/danger = pi's own.
+    // Softened: not near-black (was #18181e), borders muted so the dark
+    // theme reads gentle rather than harsh.
+    bg: "#1f1f28",
+    bgPanel: "#26262f",
+    bgInput: "#2e2e38",
+    toolBg: "#1e2a20",
+    text: "#d4d4d4",
+    textDim: "#8a8a94",
+    border: "#3c3c46",
+    accent: "#8abeb7",
+    success: "#b5bd68",
+    danger: "#cc6666",
+    warning: "#d6a85d",
+    userBg: "rgba(51, 61, 85, 0.35)",
+    assistantBg: "rgba(38, 53, 43, 0.35)",
+    terminalBg: "#1f1f28",
     hover: "rgba(255, 255, 255, 0.04)",
     hoverMedium: "rgba(255, 255, 255, 0.06)",
     hoverStrong: "rgba(255, 255, 255, 0.08)",
@@ -60,18 +75,22 @@ export const THEME_TOKENS: Record<ThemeMode, AppThemeTokens> = {
     hoverFaint: "rgba(255, 255, 255, 0.02)",
   },
   light: {
-    bg: "#f5f5f5",
-    bgPanel: "#ffffff",
-    bgInput: "#e8e8e8",
-    text: "#1a1a2e",
+    // Softened light: no pure white — panels are off-white, page is a
+    // gentle gray, accents muted so the theme reads soft, not bright.
+    bg: "#eef0f4",
+    bgPanel: "#f7f8fa",
+    bgInput: "#e4e7ec",
+    toolBg: "#e2e8e3",
+    text: "#2e3038",
     textDim: "#6b7280",
-    border: "#d1d5db",
-    accent: "#2563eb",
-    success: "#16a34a",
-    danger: "#dc2626",
-    userBg: "rgba(37, 99, 235, 0.06)",
-    assistantBg: "rgba(16, 185, 129, 0.05)",
-    terminalBg: "#ffffff",
+    border: "#d8dbe2",
+    accent: "#3d6bd0",
+    success: "#3f9a63",
+    danger: "#cf4a4a",
+    warning: "#a66a16",
+    userBg: "rgba(61, 107, 208, 0.07)",
+    assistantBg: "rgba(63, 154, 99, 0.06)",
+    terminalBg: "#f8f8f8",
     hover: "rgba(0, 0, 0, 0.05)",
     hoverMedium: "rgba(0, 0, 0, 0.07)",
     hoverStrong: "rgba(0, 0, 0, 0.1)",
@@ -84,12 +103,14 @@ const TOKEN_VAR_MAP: Array<[keyof AppThemeTokens, string]> = [
   ["bg", "--bg"],
   ["bgPanel", "--bg-panel"],
   ["bgInput", "--bg-input"],
+  ["toolBg", "--tool-bg"],
   ["text", "--text"],
   ["textDim", "--text-dim"],
   ["border", "--border"],
   ["accent", "--accent"],
   ["success", "--success"],
   ["danger", "--danger"],
+  ["warning", "--warning"],
   ["userBg", "--user-bg"],
   ["assistantBg", "--assistant-bg"],
   ["terminalBg", "--terminal-bg"],

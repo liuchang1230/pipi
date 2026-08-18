@@ -5,7 +5,7 @@
  * to the renderer are relative to the project root; reads resolve relative to
  * root with a containment check so the renderer can never escape cwd.
  */
-import { readdir, readFile, stat, mkdir, writeFile, rm, rename } from "node:fs/promises";
+import { readdir, readFile, stat, mkdir, writeFile, rm, rename, open as fspOpen } from "node:fs/promises";
 import { join, relative, resolve, sep, dirname } from "node:path";
 
 const IGNORE = new Set([
@@ -32,27 +32,74 @@ export interface FileNode {
   children?: FileNode[];
 }
 
+/** Base64 image payload for the viewer's <img> preview. */
+export interface ImagePayload {
+  mimeType: string;
+  base64: string;
+}
+
+/** Raster images larger than this are NOT base64-encoded for preview. */
+export const IMAGE_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Text previews larger than this are NOT shipped whole — only the head+tail
+ *  windows are read, and the file itself is never fully read into memory
+ *  (a whole-file sync utf-8 decode used to stall the pty's event loop and
+ *  the renderer when a large log/build artifact was clicked). */
+export const TEXT_PREVIEW_MAX_BYTES = 1024 * 1024;
+/** Head/tail window size for oversize text previews. */
+export const TEXT_PREVIEW_HALF_BYTES = 512 * 1024;
+
+const RASTER_IMAGE_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  avif: "image/avif",
+  ico: "image/x-icon",
+};
+
+/** MIME type if `path` names a previewable raster image, else null. */
+export function rasterImageMimeOf(path: string): string | null {
+  const base = path.replace(/\\/g, "/").split("/").pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  if (dot < 0) return null;
+  return RASTER_IMAGE_MIME[base.slice(dot + 1).toLowerCase()] ?? null;
+}
+
+/**
+ * Build the viewer image payload for a buffer, or undefined when the file is
+ * not a raster image or exceeds the preview size cap (too large to ship over
+ * IPC as base64 without freezing the app).
+ */
+export function imagePayloadOf(buf: Buffer, path: string): ImagePayload | undefined {
+  const mimeType = rasterImageMimeOf(path);
+  if (!mimeType) return undefined;
+  if (buf.length === 0 || buf.length > IMAGE_PREVIEW_MAX_BYTES) return undefined;
+  return { mimeType, base64: buf.toString("base64") };
+}
+
 function toPosix(p: string): string {
   return p.split(sep).join("/");
 }
 
-export async function listFiles(
-  rootDir: string,
-  maxDepth = 12
-): Promise<FileNode[]> {
-  return walk(rootDir, rootDir, 0, maxDepth);
+export async function listFiles(rootDir: string): Promise<FileNode[]> {
+  return listDirChildren(rootDir, ".");
 }
 
-async function walk(
-  rootDir: string,
-  dir: string,
-  depth: number,
-  maxDepth: number
-): Promise<FileNode[]> {
-  if (depth > maxDepth) return [];
+/**
+ * Shallow listing of ONE directory: files plus directories whose `children`
+ * is `undefined` (not yet loaded). The renderer fetches children on expand —
+ * the eager depth-12 recursive walk is gone, so a tree click costs at most
+ * one shallow readdir instead of walking (and shipping over IPC) the whole
+ * subtree, most of which the user never expands.
+ */
+export async function listDirChildren(rootDir: string, relDir: string): Promise<FileNode[]> {
+  const abs = resolveWithin(rootDir, relDir);
   let entries;
   try {
-    entries = await readdir(dir, { withFileTypes: true });
+    entries = await readdir(abs, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -63,15 +110,9 @@ async function walk(
     if (entry.name.startsWith(".") && !VISIBLE_DOTFILES.has(entry.name)) {
       continue;
     }
-    const fullPath = join(dir, entry.name);
-    const relPath = toPosix(relative(rootDir, fullPath));
+    const relPath = toPosix(relative(rootDir, join(abs, entry.name)));
     if (entry.isDirectory()) {
-      nodes.push({
-        name: entry.name,
-        path: relPath,
-        type: "directory",
-        children: await walk(rootDir, fullPath, depth + 1, maxDepth),
-      });
+      nodes.push({ name: entry.name, path: relPath, type: "directory", children: undefined });
     } else if (entry.isFile()) {
       nodes.push({ name: entry.name, path: relPath, type: "file" });
     }
@@ -106,18 +147,79 @@ function resolveWithin(rootDir: string, relPath: string): string {
 export async function readFileContent(
   rootDir: string,
   relPath: string
-): Promise<{ content: string; bytes: number; isBinary: boolean; error?: string }> {
+): Promise<{ content: string; bytes: number; isBinary: boolean; image?: ImagePayload; truncated?: boolean; error?: string }> {
   const abs = resolveWithin(rootDir, relPath);
-  const buf = await readFile(abs);
-  const isBinary = isBinaryBuffer(buf);
-  if (isBinary) {
-    return { content: "(二进制文件，无法以文本显示)", bytes: buf.length, isBinary: true };
-  }
-  return { content: buf.toString("utf-8"), bytes: buf.length, isBinary: false };
+  return readPreviewFromAbs(abs, relPath);
 }
 
-function isBinaryBuffer(buf: Buffer): boolean {
+/** Positioned read of [start, start+len) — never buffers the whole file. */
+async function readSlice(abs: string, start: number, len: number): Promise<Buffer> {
+  const handle = await fspOpen(abs, "r");
+  try {
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await handle.read(buf, 0, len, start);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await handle.close().catch(() => {
+      /* best-effort */
+    });
+  }
+}
+
+/**
+ * Preview a file at an ABSOLUTE path (shared by the local and WSL read
+ * paths). Files at/below TEXT_PREVIEW_MAX_BYTES are read whole; larger ones
+ * are sampled head+tail via positioned reads — the whole file is never
+ * buffered. `relPath` drives the image payload decision.
+ */
+export async function readPreviewFromAbs(
+  abs: string,
+  relPath: string
+): Promise<{ content: string; bytes: number; isBinary: boolean; image?: ImagePayload; truncated?: boolean; error?: string }> {
+  const st = await stat(abs);
+  if (st.size <= TEXT_PREVIEW_MAX_BYTES) {
+    const buf = await readFile(abs);
+    const isBinary = isBinaryBuffer(buf);
+    if (isBinary) {
+      return {
+        content: "(二进制文件，无法以文本显示)",
+        bytes: buf.length,
+        isBinary: true,
+        image: imagePayloadOf(buf, relPath),
+      };
+    }
+    return { content: buf.toString("utf-8"), bytes: buf.length, isBinary: false };
+  }
+  // Oversize: sample head+tail without reading the whole file into memory.
+  const half = TEXT_PREVIEW_HALF_BYTES;
+  const head = await readSlice(abs, 0, half);
+  const tail = await readSlice(abs, st.size - half, half);
+  if (isBinaryBuffer(head)) {
+    let image: ImagePayload | undefined;
+    if (rasterImageMimeOf(relPath) && st.size <= IMAGE_PREVIEW_MAX_BYTES) {
+      // A raster within the preview cap still needs the FULL bytes for the
+      // base64 payload — read it (bounded by IMAGE_PREVIEW_MAX_BYTES, OK).
+      const full = await readFile(abs);
+      image = imagePayloadOf(full, relPath);
+    }
+    return {
+      content: "(二进制文件，无法以文本显示)",
+      bytes: st.size,
+      isBinary: true,
+      image,
+    };
+  }
+  return {
+    content: `${head.toString("utf8")}\n\n……\n\n${tail.toString("utf8")}`,
+    bytes: st.size,
+    isBinary: false,
+    truncated: true,
+  };
+}
+
+export function isBinaryBuffer(buf: Buffer): boolean {
   // Heuristic: null bytes or many non-text bytes in first 8KB → binary.
+  // Exported for cross-backend consistency (SFTP uses the same rule).
   const sample = buf.subarray(0, 8192);
   if (sample.length === 0) return false;
   let nonText = 0;

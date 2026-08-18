@@ -40,24 +40,25 @@ function aggregateToolDiffs(tabId: string, cwd: string): { files: DiffFileEntry[
   const byPath = new Map<string, string[]>();
   for (const msg of state?.messages ?? []) {
     for (const b of msg.blocks) {
-      if (b.kind !== "tool" || !b.resultText) continue;
+      if (b.kind !== "tool") continue;
+      const rawResult = b.resultText ?? "";
       const argsPath = (() => {
         try {
-          const args = JSON.parse(b.argsText || "{}") as { path?: string };
-          return typeof args.path === "string" ? args.path : undefined;
+          const args = JSON.parse(b.argsText || "{}") as { path?: string; filePath?: string };
+          return typeof args.path === "string" ? args.path : typeof args.filePath === "string" ? args.filePath : undefined;
         } catch {
           return undefined;
         }
       })();
-      const p = normalizePath(diffPath(b.resultText) ?? argsPath ?? "", cwd);
+      const p = normalizePath(diffPath(rawResult) ?? argsPath ?? "", cwd);
       if (!p) continue;
       const arr = byPath.get(p) ?? [];
-      const diffText = isDiffish(b.resultText)
-        ? b.resultText
+      const diffText = isDiffish(rawResult)
+        ? rawResult
         : (() => {
             try {
-              const args = JSON.parse(b.argsText || "{}") as { edits?: Array<{ oldText: string; newText: string }> };
-              return editsToDiff(p, Array.isArray(args.edits) ? args.edits : []);
+              const args = JSON.parse(b.argsText || "{}") as { path?: string; filePath?: string; edits?: Array<{ oldText: string; newText: string }> };
+              return editsToDiff(args.path ?? args.filePath ?? argsPath, Array.isArray(args.edits) ? args.edits : []);
             } catch {
               return "";
             }
@@ -106,10 +107,18 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   const [error, setError] = useState<string | null>(null);
   const cwdRef = useRef("");
   const focusHandled = useRef(false);
+  const selectionRequest = useRef(0);
 
   /** Show one file: working-tree diff + version history (git commits + session edits). */
-  const selectFile = async (path: string) => {
+  const selectFile = async (path: string, context?: { isGit?: boolean; fallback?: Map<string, string> }) => {
+    const request = ++selectionRequest.current;
+    const isCurrent = () => selectionRequest.current === request;
     const rel = normalizePath(path, cwdRef.current);
+    // refresh() may select a file immediately after updating these values. Use
+    // the snapshot passed by refresh rather than React state from the previous
+    // render (otherwise the first selection asks git for a session-only diff).
+    const gitMode = context?.isGit ?? isGit;
+    const fallbackDiffs = context?.fallback ?? fallback;
     setSelected(rel);
     setGitDiff(null);
     setVersions(null);
@@ -119,10 +128,11 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
     setVerB(null);
     setError(null);
     // Working-tree diff (or aggregated session diff for gitignored/non-git).
-    if (!isGit || fallback.has(rel)) {
-      setGitDiff(fallback.get(rel) ?? "");
+    if (!gitMode || fallbackDiffs.has(rel)) {
+      setGitDiff(fallbackDiffs.get(rel) ?? "");
     } else {
       const r = await window.api.diff.get(tabId, rel);
+      if (!isCurrent()) return;
       if (r.error) {
         setError(r.error);
         setGitDiff("");
@@ -130,11 +140,13 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
         setGitDiff(r.diff || "（无变更内容）");
       }
     }
+    if (!isCurrent()) return;
     // Version history: git commits (all history) + session edit chain.
     const [commits, sessionR] = await Promise.all([
       window.api.diff.commits(tabId, rel),
-      collectSessionVersions(rel),
+      collectSessionVersions(rel, isCurrent),
     ]);
+    if (!isCurrent()) return;
     const opts: VersionOption[] = [];
     for (let i = commits.length - 1; i >= 0; i--) {
       const c = commits[i]!;
@@ -158,7 +170,7 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
   };
 
   /** Session edit chain for this file (git HEAD base + applied edits). */
-  const collectSessionVersions = async (path: string) => {
+  const collectSessionVersions = async (path: string, isCurrent: () => boolean) => {
     const st = useChatStore.getState().states[tabId];
     const events: Array<{ type: "edit"; edits: Array<{ oldText: string; newText: string }> }> = [];
     for (const msg of st?.messages ?? []) {
@@ -167,9 +179,10 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
         try {
           const args = JSON.parse(b.argsText || "{}") as {
             path?: string;
+            filePath?: string;
             edits?: Array<{ oldText: string; newText: string }>;
           };
-          if (normalizePath(args.path ?? "", cwdRef.current) !== path) continue;
+          if (normalizePath(args.path ?? args.filePath ?? "", cwdRef.current) !== path) continue;
           const edits = Array.isArray(args.edits) ? args.edits : [];
           if (edits.length) events.push({ type: "edit", edits });
         } catch {
@@ -180,7 +193,7 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
     if (!events.length) return null;
     const r = await window.api.diff.history(tabId, path, events);
     if (r.error) {
-      setError(r.error);
+      if (isCurrent()) setError(r.error);
       return null;
     }
     return r;
@@ -231,9 +244,9 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
           ? normalizePath(focusPath, cwd)
           : (selected && merged.some((f) => f.path === selected) ? selected : merged[0]?.path ?? null);
       if (target && target !== selected) {
-        await selectFile(target);
+        await selectFile(target, { isGit: r.isGit, fallback: mergedDiffs });
       } else if (!selected && target) {
-        await selectFile(target);
+        await selectFile(target, { isGit: r.isGit, fallback: mergedDiffs });
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

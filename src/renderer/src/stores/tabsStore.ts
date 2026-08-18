@@ -98,6 +98,7 @@ export const useTabsStore = create<TabsState>()((set, get) => ({
               port: remote.port,
               path: remotePath,
               password: remote.password,
+              agentDir: (remote as { agentDir?: string }).agentDir,
             },
           });
           get().showTabImmediately(
@@ -111,7 +112,10 @@ export const useTabsStore = create<TabsState>()((set, get) => ({
     const cwd = s.cwd || "D:/其余文件/项目/agent";
     const id = await window.api.tab.create({ cwd });
     const title = cwd.replace(/\\/g, "/").split("/").pop() || cwd;
-    get().showTabImmediately({ id, cwd, title, pi: true, mode: "rpc" }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
+    // Local tabs default to the terminal view (pty TUI); tabs:update confirms
+    // the mode. The chat view is one click away via the TabBar button.
+    get().showTabImmediately(
+      { id, cwd, title, pi: true, mode: "sdk" }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
   },
   closeTab: async (id) => {
     await window.api.tab.close(id);

@@ -28,7 +28,8 @@ export function sessionLabel(s: SessionItem): string {
 }
 
 export const remoteSessionCacheKey = (tabId: string, remoteCwd: string) => `${tabId}:${remoteCwd}`;
-export const buildRemoteKey = (host?: string, user?: string, port?: number) => `${user ?? ""}@${host ?? ""}:${port ?? 22}`;
+export const buildRemoteKey = (host?: string, user?: string, port?: number, agentDir?: string) =>
+  `${user ?? ""}@${host ?? ""}:${port ?? 22}${agentDir ? `[${agentDir}]` : ""}`;
 
 const pathTitle = (path: string) => path.replace(/\\/g, "/").split("/").pop() || path;
 
@@ -85,7 +86,7 @@ interface SessionsState {
 
   // Project catalog actions (used by the native picker + remote dir picker)
   addLocalProject: (dir: string) => Promise<void>;
-  addRemoteProject: (remote: { host: string; user: string; port?: number; path: string; password?: string }) => Promise<void>;
+  addRemoteProject: (remote: { host: string; user: string; port?: number; path: string; password?: string; agentDir?: string }) => Promise<void>;
   addWslProject: (distro: string, path: string) => Promise<void>;
 }
 
@@ -190,7 +191,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         continueRecent: false,
         title: sessionLabel(session),
       });
-      useTabsStore.getState().showTabImmediately({ id, cwd, sessionPath: session.path, title: sessionLabel(session), pi: true, mode: "rpc" }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
+      useTabsStore.getState().showTabImmediately({ id, cwd, sessionPath: session.path, title: sessionLabel(session), pi: true, mode: "sdk" }, { cwd, isRemote: false, remoteDir: null, remoteLabel: "" });
     } finally {
       openingSessions.delete(session.path);
     }
@@ -508,6 +509,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
           port: project.port,
           path: project.cwd,
           password: project.password,
+          agentDir: (project as { agentDir?: string }).agentDir,
         };
       }
       if (!remoteInfo) return;
@@ -519,6 +521,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
           port: remoteInfo.port,
           path: project.cwd,
           password: remoteInfo.password,
+          agentDir: (remoteInfo as { agentDir?: string }).agentDir,
         },
       });
       useTabsStore.getState().showTabImmediately(

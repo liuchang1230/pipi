@@ -1,7 +1,10 @@
 {
   "name": "pipi",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Desktop AI app fully compatible with pi agent and its extensions",
+  "author": "pipi team",
+  "homepage": "https://github.com/",
+  "license": "MIT",
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
@@ -12,10 +15,14 @@
     "icon": "node scripts/make-icon.mjs",
     "typecheck:node": "tsc -p tsconfig.node.json --noEmit",
     "typecheck:web": "tsc -p tsconfig.web.json --noEmit",
-    "typecheck": "npm run typecheck:node && npm run typecheck:web"
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "dist": "npm run build && electron-builder",
+    "dist:dir": "npm run build && electron-builder --dir",
+    "dist:portable": "npm run build && electron-builder --win portable"
   },
   "dependencies": {
-    "@electron/rebuild": "^4.2.0",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@silvia-odwyer/photon-node": "0.3.4",
     "@xterm/addon-fit": "^0.12.0-beta.292",
     "@xterm/xterm": "^6.1.0-beta.292",
     "highlight.js": "^11.11.1",
@@ -30,12 +37,14 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
     "@types/node": "^22.0.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@types/ssh2-sftp-client": "^9.0.6",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^34.5.8",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
     "sharp": "^0.35.3",
     "typescript": "^5.6.0",

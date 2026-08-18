@@ -1,28 +1,34 @@
 /**
- * FileTreeIndex — the module that owns "list the files under a root dir".
+ * FileTreeIndex — the module that owns "list the children of a directory".
  *
  * Mirrors the SessionIndex seam: the renderer's file:list invoke, the tree
  * refreshes after auto-follow writes, and the mutation invalidation all cross
- * the same cached/refresh/invalidate surface. The remote/WSL backends keep
- * their own 5s TTL adapters (they read via SFTP / \\wsl$); this index serves
- * the LOCAL path that was previously an uncached full walk on every call.
+ * the same cached/refresh/invalidate surface. Cache entries are PER-DIRECTORY
+ * shallow listings (the tree is lazy — expanded directories are fetched on
+ * demand), keyed by the directory's absolute path. The remote/WSL backends
+ * keep their own 5s TTL adapters (they read via SFTP / \\wsl$); this index
+ * serves the LOCAL path.
  *
- *   cached(rootDir)     — sync peek (TTL-guarded), used by the click path
- *   refresh(rootDir)    — async walk + cache; concurrent calls for the same
- *                         root share one in-flight walk
- *   invalidate(rootDir) — drop the entry AND bump the root's generation so an
+ *   cached(dirPath)     — sync peek (TTL-guarded), used by the click path
+ *   refresh(dirPath)    — async listing + cache; concurrent calls for the
+ *                         same dir share one in-flight walk
+ *   invalidate(dirPath) — drop the entry AND bump the dir's generation so an
  *                         already-running walk cannot re-cache the
- *                         pre-mutation snapshot (a just-mutated tree never
- *                         serves a stale listing for the next TTL)
+ *                         pre-mutation snapshot
  */
-import { listFiles, type FileNode } from "./file-tree";
+import { listDirChildren, type FileNode } from "./file-tree";
 
 const CACHE_TTL_MS = 5000;
-/** Cap on cached roots: each entry is a full recursive tree, so bound memory.
- *  Oldest entry is dropped past the cap (Map preserves insertion order). */
-const MAX_CACHED_ROOTS = 32;
+/** Cap on cached directories: each entry is a shallow listing, but a deeply
+ *  browsed tree can accumulate many. Oldest entry is dropped past the cap
+ *  (Map preserves insertion order). */
+const MAX_CACHED_DIRS = 128;
 
-export type TreeWalker = (rootDir: string) => Promise<FileNode[]>;
+export type TreeWalker = (dirPath: string) => Promise<FileNode[]>;
+
+export function defaultTreeWalker(dirPath: string): Promise<FileNode[]> {
+  return listDirChildren(dirPath, ".");
+}
 
 interface CacheEntry {
   expiresAt: number;
@@ -37,55 +43,57 @@ export class FileTreeIndex {
    *  invalidate() that lands mid-walk cannot be undone by the stale walk. */
   private generations = new Map<string, number>();
 
-  constructor(private readonly walk: TreeWalker = listFiles) {}
+  constructor(private readonly walk: TreeWalker = defaultTreeWalker) {}
 
   /** Sync peek. Returns undefined when absent or stale (never a stale read). */
-  cached(rootDir: string): FileNode[] | undefined {
-    const hit = this.cache.get(rootDir);
+  cached(dirPath: string): FileNode[] | undefined {
+    const hit = this.cache.get(dirPath);
     if (!hit) return undefined;
     if (hit.expiresAt <= Date.now()) {
-      this.cache.delete(rootDir);
+      this.cache.delete(dirPath);
       return undefined;
     }
     return hit.nodes;
   }
 
-  /** Async walk + cache. Concurrent calls for the same root share one
-   *  in-flight walk so a burst of refresh triggers can never double-walk. */
-  refresh(rootDir: string): Promise<FileNode[]> {
-    const existing = this.inflight.get(rootDir);
+  /** Async listing + cache. Concurrent calls for the same dir share one
+   *  in-flight walk so a burst of refresh triggers can never double-walk.
+   *  `walk` overrides the walker for this call (e.g. a subdir listing whose
+   *  paths must stay relative to the project root). */
+  refresh(dirPath: string, walk?: TreeWalker): Promise<FileNode[]> {
+    const existing = this.inflight.get(dirPath);
     if (existing) return existing;
-    const gen = this.generations.get(rootDir) ?? 0;
-    const p = this.doRefresh(rootDir, gen);
-    this.inflight.set(rootDir, p);
+    const gen = this.generations.get(dirPath) ?? 0;
+    const p = this.doRefresh(dirPath, gen, walk);
+    this.inflight.set(dirPath, p);
     return p.finally(() => {
-      if (this.inflight.get(rootDir) === p) this.inflight.delete(rootDir);
+      if (this.inflight.get(dirPath) === p) this.inflight.delete(dirPath);
     });
   }
 
-  private async doRefresh(rootDir: string, gen: number): Promise<FileNode[]> {
-    const nodes = await this.walk(rootDir);
+  private async doRefresh(dirPath: string, gen: number, walk?: TreeWalker): Promise<FileNode[]> {
+    const nodes = await (walk ?? this.walk)(dirPath);
     // An invalidation landed while we were walking: the snapshot predates the
     // mutation — return it to THIS caller (their request is that old) but do
     // not re-cache it. The post-invalidation refresh starts a fresh walk.
-    if ((this.generations.get(rootDir) ?? 0) !== gen) return nodes;
-    this.cache.set(rootDir, { expiresAt: Date.now() + CACHE_TTL_MS, nodes });
-    if (this.cache.size > MAX_CACHED_ROOTS) {
+    if ((this.generations.get(dirPath) ?? 0) !== gen) return nodes;
+    this.cache.set(dirPath, { expiresAt: Date.now() + CACHE_TTL_MS, nodes });
+    if (this.cache.size > MAX_CACHED_DIRS) {
       const oldest = this.cache.keys().next().value as string | undefined;
       if (oldest !== undefined) this.cache.delete(oldest);
     }
     return nodes;
   }
 
-  /** Drop the entry for a root and invalidate any in-flight walk for it.
-   *  Called after any local mutation so the next listing re-walks instead of
+  /** Drop the entry for a directory and invalidate any in-flight walk for it.
+   *  Called after any local mutation so the next listing re-lists instead of
    *  serving the pre-mutation snapshot. */
-  invalidate(rootDir: string): void {
-    this.generations.set(rootDir, (this.generations.get(rootDir) ?? 0) + 1);
-    this.cache.delete(rootDir);
+  invalidate(dirPath: string): void {
+    this.generations.set(dirPath, (this.generations.get(dirPath) ?? 0) + 1);
+    this.cache.delete(dirPath);
     // Drop the in-flight promise too: a post-invalidation refresh must start
     // a FRESH walk, not join the stale one (which would hand it the
     // pre-mutation snapshot).
-    this.inflight.delete(rootDir);
+    this.inflight.delete(dirPath);
   }
 }

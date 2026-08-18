@@ -36,12 +36,53 @@ interface TreeState {
   setRemoteTreeCache: (updater: Updater<Record<string, FileNode[]>>) => void;
   setTreeOrigin: (origin: TreeOrigin | null) => void;
   loadTree: (dirPath?: string, tabId?: string, rootPath?: string, options?: { isRemote?: boolean; force?: boolean; noCache?: boolean }) => Promise<void>;
+  /** Lazy local tree: fetch + inject the children of an expanded directory. */
+  expandDir: (relDir: string, force?: boolean) => Promise<void>;
   /** Re-list the tree at its current origin (keeps previews consistent). */
   refresh: () => Promise<void>;
   navigateRemoteDir: (dirPath: string) => Promise<void>;
 }
 
 const treeReqSeq = { current: 0 };
+/** Per-dir expand sequence: only a NEWER expand of the SAME dir supersedes
+ *  an in-flight one; independent dirs never invalidate each other, and an
+ *  expand never cancels an in-flight loadTree (separate counters). */
+const expandSeqs = new Map<string, number>();
+
+/** Min interval between auto-follow tree refreshes (agent write churn clamp). */
+export const TREE_REFRESH_COOLDOWN_MS = 1000;
+let lastTreeRefreshAt = 0;
+
+/** Test-only: clear the refresh cooldown clock. */
+export function __resetTreeRefreshClock(): void {
+  lastTreeRefreshAt = 0;
+}
+
+/** Find a node by its root-relative path (node paths at every level are
+ *  root-relative; descend through prefix ancestors). */
+function findNode(nodes: FileNode[], targetPath: string): FileNode | undefined {
+  for (const n of nodes) {
+    if (n.path === targetPath) return n;
+    if (n.type === "directory" && targetPath.startsWith(n.path + "/")) {
+      const found = findNode(n.children ?? [], targetPath);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+/** Immutably replace the children of the node at `targetPath` (full
+ *  root-relative path; node paths at every level are root-relative, so we
+ *  match by full-path equality, descending through prefix ancestors). */
+function injectChildren(nodes: FileNode[], targetPath: string, children: FileNode[]): FileNode[] {
+  return nodes.map((n) => {
+    if (n.path === targetPath) return { ...n, children }; // the target dir itself
+    if (n.type === "directory" && targetPath.startsWith(n.path + "/")) {
+      return { ...n, children: injectChildren(n.children ?? [], targetPath, children) };
+    }
+    return n;
+  });
+}
 
 export function sortFileNodes(nodes: FileNode[]): FileNode[] {
   return [...nodes].sort((a, b) => {
@@ -65,6 +106,11 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
   setTreeOrigin: (treeOrigin) => set({ treeOrigin }),
 
   refresh: async () => {
+    // Cooldown: an editing agent writes continuously; refresh churns must be
+    // clamped so the tree (and the pty's event loop) isn't hammered.
+    const now = Date.now();
+    if (now - lastTreeRefreshAt < TREE_REFRESH_COOLDOWN_MS) return;
+    lastTreeRefreshAt = now;
     const origin = get().treeOrigin;
     if (!origin) return;
     let { tabId, dirPath, rootPath, isRemote } = origin;
@@ -74,6 +120,42 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
       dirPath = undefined;
     }
     await get().loadTree(dirPath, tabId, rootPath, { isRemote, force: true, noCache: true });
+    // Lazy: also re-list the EXPANDED directories (shallow, cached unless
+    // forced) so pi-created files inside them show up — collapsed branches
+    // cost nothing.
+    for (const dir of get().expanded) {
+      await get().expandDir(dir, true);
+    }
+  },
+
+  expandDir: async (relDir, force = false) => {
+    const origin = get().treeOrigin;
+    if (!origin || origin.isRemote) return; // remote navigates via navigateRemoteDir
+    const { rootPath, tabId } = origin;
+    if (!rootPath && !tabId) return;
+    const node = findNode(get().tree, relDir);
+    if (!node) return; // node vanished — nothing to load
+    if (!force && node.children !== undefined) return; // already loaded
+    const seq = (expandSeqs.get(relDir) ?? 0) + 1;
+    expandSeqs.set(relDir, seq);
+    try {
+      const nodes = (await window.api.file.listDirChildren(rootPath, tabId, relDir, force ? true : undefined)) as FileNode[];
+      if (expandSeqs.get(relDir) !== seq) return; // superseded by a newer expand of THIS dir
+      const cur = get();
+      // Discard if the origin changed, the dir was collapsed, or the node
+      // vanished while the listing was in flight.
+      if (cur.treeOrigin !== origin || !cur.expanded.has(relDir)) return;
+      if (!findNode(cur.tree, relDir)) return;
+      set((st) => ({ tree: injectChildren(st.tree, relDir, sortFileNodes(nodes)) }));
+    } catch {
+      // Failed to list (permission / vanished dir): collapse so the loading
+      // placeholder clears; the next click retries cleanly.
+      if (expandSeqs.get(relDir) === seq) {
+        set((st) => ({ expanded: new Set([...st.expanded].filter((d) => d !== relDir)) }));
+      }
+    } finally {
+      if (expandSeqs.get(relDir) === seq) expandSeqs.delete(relDir);
+    }
   },
 
   loadTree: async (dirPath, tabId, rootPath, options) => {
@@ -133,7 +215,12 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
         tree: sortedNodes,
         ...(cacheKey ? { remoteTreeCache: { ...s.remoteTreeCache, [cacheKey]: sortedNodes } } : {}),
       }));
-      if (nodes.length > 0) set((s) => ({ expanded: new Set(s.expanded).add(nodes[0].path) }));
+      if (nodes.length > 0) {
+        const first = nodes[0];
+        set((s) => ({ expanded: new Set(s.expanded).add(first.path) }));
+        // Lazy: the auto-expanded first directory loads its children on demand.
+        if (first.type === "directory") void get().expandDir(first.path);
+      }
       set({ fileTreeStatus: "idle", fileTreeError: null });
     } catch (error) {
       if (reqSeq !== treeReqSeq.current) return; // superseded by a newer load

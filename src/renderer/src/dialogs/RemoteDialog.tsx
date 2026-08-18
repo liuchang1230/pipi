@@ -23,6 +23,7 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
   const [remotePort, setRemotePort] = useState("22");
   const [remotePath, setRemotePath] = useState("");
   const [remotePassword, setRemotePassword] = useState("");
+  const [remoteAgentDir, setRemoteAgentDir] = useState("");
   const [remoteStatus, setRemoteStatus] = useState<"" | "connecting" | "connected" | "failed">("");
   const [selectedRemoteHistory, setSelectedRemoteHistory] = useState("");
   const [wslDistros, setWslDistros] = useState<Array<{ name: string; default: boolean; running: boolean; version: number }>>([]);
@@ -70,6 +71,7 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
           path: remotePath.trim() || undefined,
           password: remotePassword || undefined,
           startPi: false,
+          agentDir: remoteAgentDir.trim() || undefined,
         },
       });
       const ok = await window.api.tab.waitUntilAlive(id, 3000, 200);
@@ -97,7 +99,7 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
           ss.setProjectTrees((prev) => ({ ...prev, [p.id]: nodes as FileNode[] }));
         }).catch(() => undefined);
       }
-      setRemoteHost(""); setRemoteUser(""); setRemotePort("22"); setRemotePath(""); setRemotePassword("");
+      setRemoteHost(""); setRemoteUser(""); setRemotePort("22"); setRemotePath(""); setRemotePassword(""); setRemoteAgentDir("");
       setSelectedRemoteHistory("");
       if (ok) onClose();
     } catch (e) {
@@ -133,11 +135,12 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
                     setRemotePort(String(item.port || 22));
                     setRemotePassword(item.password || "");
                     setRemotePath(item.path || "");
+                    setRemoteAgentDir(item.agentDir || "");
                   }}
                 >
                   <option value="">选择已保存的地址</option>
                   {remoteHistory.map((item) => (
-                    <option key={item.id} value={item.id}>{item.user}@{item.host}:{item.port}</option>
+                    <option key={item.id} value={item.id}>{item.user}@{item.host}:{item.port}{item.agentDir ? ` · ${item.agentDir}` : ""}</option>
                   ))}
                 </select>
               </label>
@@ -161,6 +164,10 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
             <label>
               密码 <span className="dialog-hint">（可选，免密可留空）</span>
               <input className="dialog-input" value={remotePassword} onChange={(e) => setRemotePassword(e.target.value)} placeholder="输入 SSH 密码" type="password" />
+            </label>
+            <label>
+              pi 数据目录 <span className="dialog-hint">（可选，默认 ~/.pi/agent；多人共用账号时各填各的目录隔离会话）</span>
+              <input className="dialog-input" value={remoteAgentDir} onChange={(e) => setRemoteAgentDir(e.target.value)} placeholder="~/pi-zhangsan/agent" />
             </label>
             <p className="dialog-note">
               终端仍通过 SSH 启动远程 <code>pi</code>。左侧文件树和右侧文件查看会使用密码或免密方式单独建立 SFTP 连接。

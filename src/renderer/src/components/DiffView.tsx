@@ -8,6 +8,8 @@ import { isDiffish, editsToDiff } from "./diff-utils";
 
 export { isDiffish, editsToDiff };
 
+const MAX_RENDERED_DIFF_LINES = 1_500;
+
 interface DiffLine {
   type: "header" | "hunk" | "add" | "del" | "ctx";
   text: string;
@@ -73,7 +75,11 @@ function DiffLineRow({ line }: { line: DiffLine }) {
 }
 
 export function DiffView({ diffText }: { diffText: string }) {
-  const lines = useMemo(() => parseDiff(diffText), [diffText]);
+  const parsedLines = useMemo(() => parseDiff(diffText), [diffText]);
+  // Tool output can contain enormous patches. A bounded preview keeps opening
+  // a tool card instant; the full patch remains available in the terminal.
+  const truncated = parsedLines.length > MAX_RENDERED_DIFF_LINES;
+  const lines = truncated ? parsedLines.slice(0, MAX_RENDERED_DIFF_LINES) : parsedLines;
   // Pair adjacent -/+ rows for inline highlighting.
   const rows = useMemo(() => {
     const out: React.ReactNode[] = [];
@@ -122,5 +128,10 @@ export function DiffView({ diffText }: { diffText: string }) {
     }
     return out;
   }, [lines]);
-  return <div className="diff-view">{rows}</div>;
+  return (
+    <div className="diff-view">
+      {rows}
+      {truncated && <div className="diff-truncated">为保持页面流畅，仅显示前 {MAX_RENDERED_DIFF_LINES.toLocaleString()} / {parsedLines.length.toLocaleString()} 行变更</div>}
+    </div>
+  );
 }

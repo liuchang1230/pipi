@@ -11,9 +11,9 @@
  */
 import { app, BrowserWindow } from "electron";
 import * as pty from "node-pty";
-import { existsSync, readFileSync, readdirSync, statSync, watch, openSync, closeSync, readSync, type FSWatcher } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, watch, openSync, closeSync, readSync, mkdirSync, writeFileSync, cpSync, type FSWatcher } from "node:fs";
 import { spawnSync, spawn, type ChildProcess } from "node:child_process";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, posix } from "node:path";
 import { sessionDirFor } from "./session-list";
 import { parseWslDistroList, type WslDistro } from "./wsl";
 import { themeEnv } from "./theme-sync";
@@ -287,7 +287,21 @@ export function linkTabSession(id: string, sessionPath: string, title?: string |
  * project-local `@earendil-works/pi-coding-agent` package. conpty can be
  * finicky with batch shims, so we resolve the absolute executable path.
  */
-function resolvePiBin(): { file: string; args: string[] } {
+export interface ResolvedPiBin {
+  file: string;
+  args: string[];
+}
+
+/**
+ * Prefer a globally installed `pi.cmd` so the app does not depend on a
+ * project-local `@earendil-works/pi-coding-agent` package. conpty can be
+ * finicky with batch shims, so we resolve the absolute executable path.
+ *
+ * Callers only reach this after ensurePiReady() succeeded, which auto-installs
+ * the global pi from the bundled copy when it is missing — so a working global
+ * pi (or an explicit notice) is guaranteed before we get here.
+ */
+function resolvePiBin(): ResolvedPiBin {
   const globalPi = findPiBin();
   if (/\.cmd$/i.test(globalPi)) {
     const escaped = globalPi.replace(/\//g, "\\");
@@ -298,6 +312,11 @@ function resolvePiBin(): { file: string; args: string[] } {
 
 export function getGlobalPiBin(): string {
   return findPiBin();
+}
+
+/** Path to the bundled pi package inside this app (works dev + packaged/asar). */
+export function bundledPiPackagePath(): string {
+  return join(app.getAppPath(), "node_modules", "@earendil-works", "pi-coding-agent");
 }
 
 export function hasNodeInstalled(): boolean {
@@ -313,7 +332,17 @@ export function hasNodeInstalled(): boolean {
 }
 
 export function hasGlobalPiInstalled(): boolean {
-  if (cachedPiOk !== null) return cachedPiOk;
+  if (cachedPiOk === true) return true;
+  // A cached FALSE must not be trusted blindly: the warm async probe can
+  // fail transiently (startup load, AV scan, slow CLI boot) and would
+  // otherwise poison the cache for the whole session — every local tab would
+  // then claim "pi not found". Re-verify with the authoritative sync probe,
+  // throttled so a genuinely-missing pi doesn't block the main thread on
+  // every click.
+  if (cachedPiOk === false && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
+    return false;
+  }
+  cachedPiCheckAt = Date.now();
   cachedPiOk = getPiDetectionDiagnostics().ok;
   return cachedPiOk;
 }
@@ -340,24 +369,308 @@ export function getPiDetectionDiagnostics(): {
   };
 }
 
-export async function installGlobalPi(): Promise<{ ok: true } | { ok: false; error: string }> {
-  const npmBin = findExe("npm.cmd", [
-    join(process.env.APPDATA ?? "", "npm\npm.cmd"),
-    "C:\Program Files\nodejs\npm.cmd",
-    "C:\Program Files (x86)\nodejs\npm.cmd",
-    join(process.env.LOCALAPPDATA ?? "", "Programs\nodejs\npm.cmd"),
+/** Map npm install output lines to a short human stage for the progress dialog. */
+export function classifyInstallStage(line: string): string | null {
+  const l = line.toLowerCase();
+  if (l.includes("npm error") || l.startsWith("npm err") || /^npm (er|error)/.test(l)) return "安装失败";
+  if (l.includes("fetch") || l.includes("http ")) return "正在下载依赖…";
+  if (l.includes("reify") || l.includes("ideal tree") || l.includes("resolving")) return "正在解析依赖…";
+  if (l.includes("added ") || l.includes("changed ") || l.includes("removed") || l.includes("audit")) return "正在收尾…";
+  if (l.includes("error")) return "正在重试下载…";
+  return "正在安装…";
+}
+
+/**
+ * Resolve a spawnable npm entry from the npm.cmd shim: prefer spawning
+ * node.exe with npm-cli.js directly (cmd.exe /c quoting is fragile with
+ * "Program Files" paths, and spawning .cmd via node's spawn fails with
+ * EINVAL on some Node/Windows combos). Falls back to spawning the shim
+ * itself with shell:true (works for PATH-resolved bare names).
+ */
+export function resolveNpmEntry(npmBin: string): { file: string; args: string[]; shell?: boolean } | null {
+  if (!/\.(cmd|bat)$/i.test(npmBin)) return { file: npmBin, args: [] };
+  const dir = dirname(npmBin);
+  const cli = join(dir, "node_modules", "npm", "bin", "npm-cli.js");
+  const node = join(dir, "node.exe");
+  if (existsSync(cli) && existsSync(node)) return { file: node, args: [cli] };
+  // nvm-style layout: <root>/lib/node_modules/npm/bin/npm-cli.js
+  const cli2 = join(dir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js");
+  const node2 = findExe("node.exe", [
+    "C:\\Program Files\\nodejs\\node.exe",
+    "C:\\Program Files (x86)\\nodejs\\node.exe",
+    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "node.exe"),
   ]);
-  // Async + 180s cap: `npm install -g` used to block the main thread 10-60s+
-  // (freezing every IPC channel, incl. terminal streaming) on the click path.
-  const { stdout, stderr, code, error } = await execFileAsync(
-    npmBin,
-    ["install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"],
-    180000,
-  );
-  if (error || code !== 0) {
-    return { ok: false, error: error?.message || stderr.toString("utf8") || stdout.toString("utf8") || `exit code ${code}` };
+  if (existsSync(cli2) && node2) return { file: node2, args: [cli2] };
+  // Proxy shims (nvm-windows/Volta point npm.cmd elsewhere): let node's
+  // shell:true resolve it via cmd.exe. Works for bare/PATH names; shims with
+  // spaces in the path are rare here since cli/npm.cmd layouts are covered
+  // above.
+  return { file: npmBin, args: [], shell: true };
+}
+
+export interface GlobalPiInstallHandle {
+  abort: () => void;
+  promise: Promise<{ ok: true } | { ok: false; error: string }>;
+}
+
+/** npm global dir (where `pi.cmd` / the pi package live). */
+export function npmGlobalDir(): string {
+  return join(process.env.APPDATA ?? join(process.env.USERPROFILE ?? "", "AppData", "Roaming"), "npm");
+}
+
+/** Global pi package dir (npm global layout). */
+export function globalPiPackageDir(): string {
+  return join(npmGlobalDir(), "node_modules", "@earendil-works", "pi-coding-agent");
+}
+
+/** The shims npm writes next to the package (pi / pi.cmd / pi.ps1). */
+const PI_SHIMS: Array<{ fileName: string; content: string }> = [
+  {
+    fileName: "pi.cmd",
+    content: `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js" %*
+`,
+  },
+  {
+    fileName: "pi",
+    content: `#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+case \`uname\` in
+    *CYGWIN*|*MINGW*|*MSYS*) basedir=\`cygpath -w "$basedir"\`;;
+esac
+
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
+else
+  exec node  "$basedir/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
+fi
+`,
+  },
+  {
+    fileName: "pi.ps1",
+    content: `#!/usr/bin/env pwsh
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
+
+$exe=""
+if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {
+  $exe=".exe"
+}
+$ret=0
+if (Test-Path "$basedir/node$exe") {
+  & "$basedir/node$exe"  "$basedir/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" $args
+  $ret=$LASTEXITCODE
+} else {
+  & "node$exe"  "$basedir/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" $args
+  $ret=$LASTEXITCODE
+}
+exit $ret
+`,
+  },
+];
+
+/**
+ * Recursively walk a package's dependency closure from the bundled
+ * node_modules (app.asar in packaged builds; plain disk in dev) and return
+ * the package-relative paths to copy (relative to node_modules), preserving
+ * nested layout for version conflicts (e.g. A/node_modules/B).
+ */
+function collectPackageClosure(rootNM: string, entryName: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  function walk(pkgName: string, baseDir: string): void {
+    const key = baseDir ? `${baseDir}/${pkgName}` : pkgName;
+    if (seen.has(key)) return;
+    const pkgDir = join(rootNM, baseDir, pkgName);
+    const pkgFile = join(pkgDir, "package.json");
+    if (!existsSync(pkgFile)) return;
+    seen.add(key);
+    out.push(key);
+    let pkg: { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> } = {};
+    try {
+      pkg = JSON.parse(readFileSync(pkgFile, "utf8")) as typeof pkg;
+    } catch {
+      return;
+    }
+    const deps = { ...(pkg.dependencies ?? {}), ...(pkg.optionalDependencies ?? {}) };
+    for (const dep of Object.keys(deps)) {
+      // npm flat layout: prefer the dep's own nested node_modules, else top-level.
+      if (existsSync(join(pkgDir, "node_modules", dep, "package.json"))) {
+        walk(dep, key + "/node_modules");
+      } else {
+        walk(dep, "");
+      }
+    }
   }
-  return { ok: true };
+  walk(entryName, "");
+  return out;
+}
+
+async function copyDirRecursive(src: string, dest: string, filter: (name: string) => boolean): Promise<void> {
+  const fsp = await import("node:fs/promises");
+  await fsp.mkdir(dest, { recursive: true });
+  for (const ent of await fsp.readdir(src, { withFileTypes: true })) {
+    const s = join(src, ent.name);
+    const d = join(dest, ent.name);
+    if (ent.isDirectory()) {
+      await copyDirRecursive(s, d, filter);
+    } else if (filter(ent.name)) {
+      await fsp.writeFile(d, await fsp.readFile(s));
+    }
+  }
+}
+
+/**
+ * Install the GLOBAL pi from the app's bundled copy — no npm, no network, no
+ * MSVC. Copies the pi package plus its full dependency closure (keeping npm's
+ * flat/nested layout) into the npm global node_modules, then writes the
+ * pi/pi.cmd/pi.ps1 shims. Returns what happened.
+ */
+export async function installGlobalPiFromBundled(): Promise<
+  | { ok: true; action: "installed" | "noop" }
+  | { ok: false; error: string }
+> {
+  const src = bundledPiPackagePath();
+  const dest = globalPiPackageDir();
+  try {
+    const cliDest = join(dest, "dist", "cli.js");
+    const needsCopy =
+      !existsSync(cliDest) ||
+      !existsSync(src) ||
+      readFileSync(join(src, "dist", "cli.js"), "utf8").slice(0, 50) !== readFileSync(cliDest, "utf8").slice(0, 50);
+    if (needsCopy) {
+      const startedAt = Date.now();
+      const rootNM = join(app.getAppPath(), "node_modules");
+      const destNM = join(npmGlobalDir(), "node_modules");
+      const closure = collectPackageClosure(rootNM, "@earendil-works/pi-coding-agent");
+      console.log(`[pi] bundled closure: ${closure.length} packages`);
+      for (const rel of closure) {
+        // Async recursive copy: fs.cpSync does not work when the source is
+        // inside app.asar (opendirSync isn't patched), but readdirSync/
+        // readFileSync are — and readFileSync transparently reads
+        // app.asar.unpacked (pi-tui's native module) for us. Async so the
+        // ~19s first-time copy never blocks the main process / IPC.
+        await copyDirRecursive(
+          join(rootNM, rel),
+          join(destNM, rel),
+          (name: string) => !/\.(map|tsbuildinfo)$/.test(name),
+        );
+      }
+      console.log(`[pi] bundled → global package copy: ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+    }
+    // Shim write is ALWAYS ensured (a missing pi.cmd/pi/pi.ps1 is a broken
+    // install even when the package dir is intact).
+    for (const shim of PI_SHIMS) {
+      writeFileSync(join(npmGlobalDir(), shim.fileName), shim.content, "utf8");
+    }
+    return { ok: true, action: needsCopy ? "installed" : "noop" };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Streaming `npm install -g` with per-line output callback (for the
+ * renderer's progress dialog). `--ignore-scripts` mirrors the original
+ * behavior; `--no-audit --no-fund --loglevel=info` reduce tail latency and
+ * make the fetch/reify stages visible in piped output.
+ */
+export function startGlobalPiInstall(onOutput?: (line: string) => void): GlobalPiInstallHandle {
+  const npmBin = findExe("npm.cmd", [
+    join(process.env.APPDATA ?? "", "npm", "npm.cmd"),
+    "C:\\Program Files\\nodejs\\npm.cmd",
+    "C:\\Program Files (x86)\\nodejs\\npm.cmd",
+    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "npm.cmd"),
+  ]);
+  const entry = resolveNpmEntry(npmBin);
+  let child: ReturnType<typeof spawn> | null = null;
+  let settled = false;
+  let resolveFn: (r: { ok: true } | { ok: false; error: string }) => void = () => {};
+  let timer: NodeJS.Timeout | null = null;
+  const finish = (r: { ok: true } | { ok: false; error: string }) => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    resolveFn(r);
+  };
+  const promise = new Promise<{ ok: true } | { ok: false; error: string }>((resolve) => {
+    resolveFn = resolve;
+    if (!entry) {
+      // Shouldn't happen when npm is on PATH, but fail with a helpful error.
+      finish({ ok: false, error: `无法定位 npm（${npmBin} 未找到 npm-cli.js），请检查 Node.js 安装` });
+      return;
+    }
+    // Async + 180s cap: `npm install -g` used to block the main thread 10-60s+
+    // (freezing every IPC channel, incl. terminal streaming) on the click path.
+    child = spawn(
+      entry.file,
+      [...entry.args, "install", "-g", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=info", "@earendil-works/pi-coding-agent"],
+      {
+        windowsHide: true,
+        shell: entry.shell,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    timer = setTimeout(() => {
+      try {
+        child?.kill();
+      } catch {
+        /* already gone */
+      }
+      finish({ ok: false, error: "安装超时（180 秒），请检查网络后重试" });
+    }, 180000);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const onData = (d: Buffer) => {
+      const s = d.toString("utf8");
+      for (const line of s.split(/\r?\n/)) {
+        const t = line.trim();
+        if (t) onOutput?.(t);
+      }
+    };
+    child.stdout?.on("data", (d: Buffer) => {
+      stdout.push(String(d));
+      onData(d);
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      stderr.push(String(d));
+      onData(d);
+    });
+    child.on("error", (e) => finish({ ok: false, error: e.message }));
+    child.on("close", (code) => {
+      if (code === 0) return finish({ ok: true });
+      const err = (stderr.join("") + "\n" + stdout.join("")).trim() || `exit code ${code}`;
+      finish({ ok: false, error: err.slice(-1200) });
+    });
+  });
+  return {
+    abort: () => {
+      try {
+        child?.kill();
+      } catch {
+        /* */
+      }
+      // Settle immediately (settled guard makes the late `close` a no-op) so
+      // the UI never sits in "正在取消…" up to the 180s cap.
+      finish({ ok: false, error: "已取消" });
+    },
+    promise,
+  };
 }
 
 /** Find an absolute global `pi` executable for conpty (cached). */
@@ -371,6 +684,11 @@ export async function installGlobalPi(): Promise<{ ok: true } | { ok: false; err
 let cachedPiBin: string | undefined;
 let cachedNodeOk: boolean | null = null;
 let cachedPiOk: boolean | null = null;
+/** When the last authoritative (sync) pi probe ran; used to throttle the
+ *  re-verification of a cached false (a transient failure must self-heal,
+ *  but a genuinely missing pi shouldn't block the main thread every click). */
+let cachedPiCheckAt: number | null = null;
+const PI_RECHECK_TTL_MS = 5000;
 
 /** Reset the detection caches (after auto-installing pi, so the freshly
  *  installed binary is picked up instead of the stale failure). */
@@ -378,6 +696,7 @@ export function invalidatePiDetection(): void {
   cachedPiBin = undefined;
   cachedNodeOk = null;
   cachedPiOk = null;
+  cachedPiCheckAt = null;
 }
 
 /** Compute the detection caches in the background (best-effort, no dialogs).
@@ -395,11 +714,15 @@ export function warmPiDetection(): void {
   const piBin = cachedPiBin;
   if (!piBin) return;
   const child = spawnVersionProbe(piBin);
+  // Cache ONLY the success: a transient probe failure must NOT poison the
+  // cache — leave it null so the next hasGlobalPiInstalled() runs the
+  // authoritative sync probe on demand (the click path pays ~1.1s only when
+  // the warm probe failed).
   child.once("exit", (code) => {
-    cachedPiOk = code === 0;
+    if (code === 0) cachedPiOk = true;
   });
   child.once("error", () => {
-    cachedPiOk = false;
+    /* keep cachedPiOk = null → sync re-check on demand */
   });
 }
 
@@ -414,17 +737,28 @@ function spawnVersionProbe(piBin: string): ChildProcess {
 
 function findPiBin(): string {
   if (cachedPiBin !== undefined) return cachedPiBin;
+  // 1. npm 全局权威位置（`npm install -g` 的唯一目标目录，绝对路径不受
+  //    PATH/where 选择影响）。
+  const npmGlobalCandidates = [
+    join(npmGlobalDir(), "pi.cmd"),
+    join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", "pi.cmd"),
+  ];
+  for (const c of npmGlobalCandidates) {
+    if (existsSync(c)) {
+      cachedPiBin = c;
+      return c;
+    }
+  }
+  // 2. where.exe（用户 PATH 里的 pi——自定义安装 / nvm 布局）。
   const fromWhere = findViaWhere("pi");
   if (fromWhere) {
     cachedPiBin = fromWhere;
     return fromWhere;
   }
-
+  // 3. 其他常见位置。
   cachedPiBin = findExe("pi.cmd", [
-    join(process.env.APPDATA ?? "", "npm\\pi.cmd"),
-    join(process.env.USERPROFILE ?? "", "AppData\\Roaming\\npm\\pi.cmd"),
-    join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\pi.cmd"),
-    join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\node-v22.19.0-win-x64\\pi.cmd"),
+    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "pi.cmd"),
+    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "node-v22.19.0-win-x64", "pi.cmd"),
   ]);
   return cachedPiBin;
 }
@@ -517,7 +851,50 @@ function findViaWhere(command: string): string | null {
   return preferred || candidates[0] || null;
 }
 
+/**
+ * Resolve the real cli.js a pi shim points at. This is exactly what running
+ * `pi` in a terminal does (pi.cmd → node cli.js); resolving it lets us verify
+ * the install by spawning node.exe directly — node is an .exe, so there is no
+ * cmd.exe /c quoting to get wrong (a pi.cmd under a path with spaces used to
+ * make the old `cmd /c <path> --version` probe fail → false "pi missing").
+ */
+export function resolveCliJsFromShim(piBin: string): string | null {
+  if (!/\.(cmd|bat)$/i.test(piBin)) return null;
+  // Standard npm layout: <npmGlobalDir>\node_modules\@earendil-works\pi-coding-agent\dist\cli.js
+  const standard = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  if (existsSync(standard)) return standard;
+  // Custom layout: read the shim and find the cli.js it references.
+  try {
+    const content = readFileSync(piBin, "utf8");
+    const m = content.match(/("[^"]*cli\.js"|[^\s"]*cli\.js)/i);
+    if (m) {
+      const cand = m[1].replace(/%dp0%/gi, dirname(piBin)).replace(/"/g, "").replace(/\\/g, "/");
+      const abs = cand.startsWith("/") || /^[A-Za-z]:/.test(cand) ? cand : join(dirname(piBin), cand);
+      if (existsSync(abs)) return abs;
+    }
+  } catch {
+    /* unreadable shim → fall through */
+  }
+  return null;
+}
+
 function runPiVersion(piBin: string) {
+  // Preferred: shim → cli.js → node.exe directly (= what a terminal does when
+  // you run `pi`). Bypasses cmd.exe /c quoting entirely.
+  const cli = resolveCliJsFromShim(piBin);
+  const nodeBin = findExe("node.exe", [
+    "C:\\Program Files\\nodejs\\node.exe",
+    "C:\\Program Files (x86)\\nodejs\\node.exe",
+    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "node.exe"),
+  ]);
+  if (cli && nodeBin) {
+    return spawnSync(nodeBin, [cli, "--version"], {
+      encoding: "utf8",
+      stdio: "pipe",
+      windowsHide: true,
+    });
+  }
+  // Fallback: run the shim/binary directly as before.
   if (/\.cmd$/i.test(piBin)) {
     const escaped = piBin.replace(/\//g, "\\");
     return spawnSync("cmd.exe", ["/d", "/c", escaped, "--version"], {
@@ -526,7 +903,6 @@ function runPiVersion(piBin: string) {
       windowsHide: true,
     });
   }
-
   return spawnSync(piBin, ["--version"], {
     encoding: "utf8",
     stdio: "pipe",
@@ -553,6 +929,16 @@ export interface TabInfo {
   remoteKey?: string;
   wsl?: WslOpts;
   createdAt: number;
+  /** True when the pty runs a plain interactive shell (no pi agent), e.g.
+   *  after pi exits (/quit) or for startPi:false connection tabs. Stall
+   *  auto-restart is DISABLED for these — a quiet shell may be running a
+   *  long silent command, and killing it would lose work. */
+  shellMode?: boolean;
+  // Stall watchdog clocks (Windows ConPTY freeze after long lock/sleep).
+  // Absent for non-pty (RPC/SDK) tabs — the watchdog only covers pty tabs.
+  lastOutputAt?: number;
+  pendingProbe?: boolean;
+  probeTimer?: NodeJS.Timeout | null;
 }
 
 let nextId = 1;
@@ -569,6 +955,10 @@ export interface CreateTabOptions {
   themeMode?: ThemeMode; // per-tab override; default = app theme mode
   /** Explicit tab id (RPC→pty fallback keeps its identity across the switch). */
   id?: string;
+  /** Spawn size (default 80x24); used by in-place restarts to keep the pty
+   *  aligned with the renderer without waiting for a resize event. */
+  cols?: number;
+  rows?: number;
 }
 
 export interface RemoteOpts {
@@ -578,10 +968,47 @@ export interface RemoteOpts {
   path?: string; // remote working dir (default: home)
   password?: string;
   startPi?: boolean;
+  /** Remote pi data dir override (default: ~/.pi/agent). Lets multiple
+   *  colleagues sharing one SSH account keep isolated sessions/models. */
+  agentDir?: string;
 }
 
-export function buildRemoteKey(remote: Pick<RemoteOpts, "host" | "user" | "port">): string {
-  return `${remote.user}@${remote.host}:${remote.port ?? 22}`;
+/**
+ * Validate a user-supplied remote agentDir. Only `~`-prefixed or absolute
+ * POSIX paths made of safe characters are accepted (no spaces/quotes/`..`),
+ * so the value can be spliced into a `bash -ic '...'` string unquoted without
+ * injection risk. Returns the trimmed value, or null when invalid/empty.
+ */
+export function sanitizeRemoteAgentDir(dir: string | undefined): string | null {
+  if (!dir || !dir.trim()) return null;
+  const d = dir.trim();
+  if (d.includes("..")) return null;
+  // Reject bash tilde-prefix forms that expand differently than our SFTP-side
+  // expansion: `~user` (someone else's home), `~-`/`~+`/`~-N`/`~+N` (OLDPWD /
+  // PWD-relative). Only plain `~` and `~/…` are supported.
+  if (/^~[A-Za-z]/.test(d) || d.startsWith("~-") || d.startsWith("~+")) return null;
+  if (/^~[A-Za-z0-9_\-./]*$/.test(d)) return d;
+  if (/^\/[A-Za-z0-9_\-./]*$/.test(d)) return d;
+  return null;
+}
+
+/**
+ * Resolve the remote pi data dir for SFTP-side reads/writes: the per-user
+ * override when set (with `~` expanded against the remote home), else the
+ * default `~/.pi/agent`. Must mirror the shell-side expansion in the spawn
+ * commands (bash expands `~` in `export PI_CODING_AGENT_DIR=~/…` the same way).
+ */
+export function remoteAgentDir(remote: Pick<RemoteOpts, "agentDir">, homeDir: string): string {
+  if (remote.agentDir) {
+    if (remote.agentDir === "~") return homeDir;
+    if (remote.agentDir.startsWith("~/")) return posix.join(homeDir, remote.agentDir.slice(2));
+    return remote.agentDir;
+  }
+  return posix.join(homeDir, ".pi", "agent");
+}
+
+export function buildRemoteKey(remote: Pick<RemoteOpts, "host" | "user" | "port" | "agentDir">): string {
+  return `${remote.user}@${remote.host}:${remote.port ?? 22}${remote.agentDir ? `[${remote.agentDir}]` : ""}`;
 }
 
 /** findExe, but returns null instead of the bare-name fallback when missing. */
@@ -610,6 +1037,30 @@ function resolveShellBin(): { file: string; args: string[] } {
 // tool output — never floods the renderer with one IPC message per chunk.
 const STREAM_FLUSH_MS = 5;
 const STREAM_MAX_BATCH = 64 * 1024;
+
+// Windows ConPTY freeze: after a LONG lock/sleep, conhost's pipe can stall —
+// output freezes and input is silently swallowed (known OS bug; VS Code and
+// Windows Terminal hit the same wall and recover by restarting the terminal).
+// Watchdog: when a pi tab has produced NO output for a long idle and the
+// FIRST keystroke afterwards gets no echo within a short window, the pty is
+// stalled — rebuild it in place (same tab id/session; pi resumes from JSONL).
+const STALL_IDLE_MS = 3 * 60 * 1000; // zero-output idle that arms the probe
+const STALL_PROBE_MS = 8000; // echo wait after the first post-idle input
+
+/**
+ * Pure stall-probe decision: arm the echo probe on the FIRST input after a
+ * long zero-output idle, in a pi tab (never a plain shell — a silent shell
+ * may be running a long quiet command). Exported for unit tests.
+ */
+export function shouldArmStallProbe(
+  shellMode: boolean | undefined,
+  pendingProbe: boolean | undefined,
+  lastOutputAt: number | undefined,
+  now: number,
+  idleMs: number
+): boolean {
+  return !shellMode && !pendingProbe && (lastOutputAt ?? 0) > 0 && now - (lastOutputAt ?? 0) > idleMs;
+}
 
 class TabStream {
   private buffer = "";
@@ -648,6 +1099,20 @@ function streamTabData(id: string, data: string): void {
   // A pty can emit a trailing chunk between closeTab and process death; the
   // tab is gone, so drop it instead of recreating a zombie stream.
   if (!tabs.has(id)) return;
+  const t = tabs.get(id)!;
+  t.lastOutputAt = Date.now();
+  // Any output means the pty is alive — cancel a pending stall probe.
+  if (t.pendingProbe) {
+    t.pendingProbe = false;
+    if (t.probeTimer) clearTimeout(t.probeTimer);
+    t.probeTimer = null;
+  }
+  // WSL/remote fall back to a plain interactive shell when pi isn't installed
+  // (`echo [远程服务器未检测到pi-agent…]`). Mark it so the stall watchdog
+  // never auto-restarts (killing) a shell that may run a long quiet command.
+  if (!t.shellMode && data.includes("未检测到pi-agent")) {
+    t.shellMode = true;
+  }
   let s = tabStreams.get(id);
   if (!s) {
     s = new TabStream(id);
@@ -687,6 +1152,12 @@ function respawnShellInTab(id: string): void {
     return;
   }
   t.pty = term;
+  t.shellMode = true; // pi is gone; this tab is now a plain interactive shell
+  // A pending stall probe must not fire against the fresh shell (it would
+  // restart the tab into pi).
+  if (t.probeTimer) clearTimeout(t.probeTimer);
+  t.probeTimer = null;
+  t.pendingProbe = false;
   // The pi session is no longer live in this tab; detach it so re-opening the
   // session from the sidebar spawns a fresh pi instead of reusing this shell,
   // and stop watching the old (dead) session file.
@@ -703,10 +1174,85 @@ function respawnShellInTab(id: string): void {
   });
   term.onExit(({ exitCode }) => {
     flushTabStream(id);
+    const cur = tabs.get(id);
+    if (!cur || cur.pty !== term) return; // stale pty (replaced by restart)
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:exit:${id}`, exitCode);
     }
   });
+}
+
+/**
+ * Push a short notice into a tab's terminal stream (shown to the user).
+ * Counts as pty activity, so it also refreshes the stall clock.
+ */
+function sendTabNotice(id: string, text: string): void {
+  streamTabData(id, `\r\n\x1b[2m[${text}]\x1b[0m\r\n`);
+}
+
+/**
+ * Rebuild a tab's pty in place after the Windows ConPTY pipe stalled (known
+ * conhost bug after a long session lock/sleep: output freezes, input is
+ * swallowed — see STALL_* above). The tab keeps its id/title/session, so the
+ * renderer's terminal buffer and subscriptions survive; pi resumes the same
+ * session file on the fresh pty.
+ */
+export function restartTab(id: string): boolean {
+  const t = tabs.get(id);
+  if (!t || !t.pty) return false;
+  const prevActive = activeId;
+  const prevBrowsePath = t.remoteBrowsePath;
+  const opts: CreateTabOptions = {
+    id: t.id,
+    cwd: t.cwd,
+    sessionPath: t.sessionPath,
+    title: t.title,
+    remote: t.remote,
+    wsl: t.wsl,
+    cols: t.cols,
+    rows: t.rows,
+  };
+  if (t.probeTimer) clearTimeout(t.probeTimer);
+  t.probeTimer = null;
+  t.pendingProbe = false;
+  // Old watcher must not double-watch the session dir after createTab.
+  stopSessionWatcher(id);
+  // Kill BEFORE the synchronous createTab: node-pty's exit event is delivered
+  // on a later tick, by which time tabs.get(id) is the NEW entry and the
+  // onExit stale-guard (t.pty === term) swallows it.
+  try {
+    t.pty.kill();
+  } catch {
+    /* process may already be dead */
+  }
+  let newId: string;
+  try {
+    newId = createTab(opts);
+  } catch (error) {
+    console.error(
+      `[pty] tab ${id}: restart spawn FAILED:`, error instanceof Error ? error.message : String(error)
+    );
+    return false;
+  }
+  if (newId !== id) return false;
+  // Keep the remote file-tree root where it was (createRemoteTab resets it).
+  const fresh = tabs.get(id);
+  if (fresh?.remote && prevBrowsePath) fresh.remoteBrowsePath = prevBrowsePath;
+  // Don't steal focus from another tab the user may be viewing.
+  if (prevActive !== id) activeId = prevActive;
+  // New pty spawns at the stored size; keep the renderer aligned even though
+  // TerminalView does not remount (same tab id → no resize event).
+  const cur = tabs.get(id);
+  if (cur?.pty) {
+    try {
+      cur.pty.resize(t.cols, t.rows);
+    } catch {
+      /* ignore */
+    }
+  }
+  sendTabNotice(id, "检测到终端长时间无响应，已自动重连（会话已保留）");
+  emitTabsChanged();
+  return true;
 }
 
 /** Create a new tab and spawn pi inside it. Returns the tab id. */
@@ -742,8 +1288,8 @@ export function createTab(opts: CreateTabOptions): string {
     const mode = opts.themeMode ?? currentThemeMode;
     term = pty.spawn(file, piArgs, {
       name: "xterm-256color",
-      cols: 80,
-      rows: 24,
+      cols: opts.cols ?? 80,
+      rows: opts.rows ?? 24,
       cwd: opts.cwd,
       env: {
         ...process.env,
@@ -759,7 +1305,17 @@ export function createTab(opts: CreateTabOptions): string {
     throw e;
   }
 
-  const tab: TabInfo = { id, cwd: opts.cwd, sessionPath: opts.sessionPath, title, pty: term, cols: 80, rows: 24, createdAt: Date.now() };
+  const tab: TabInfo = {
+    id,
+    cwd: opts.cwd,
+    sessionPath: opts.sessionPath,
+    title,
+    pty: term,
+    cols: opts.cols ?? 80,
+    rows: opts.rows ?? 24,
+    createdAt: Date.now(),
+    lastOutputAt: Date.now(),
+  };
   tabs.set(id, tab);
   activeId = id;
   setSessionWatcher(tab);
@@ -771,10 +1327,16 @@ export function createTab(opts: CreateTabOptions): string {
   term.onExit(({ exitCode }) => {
     flushTabStream(id);
     const t = tabs.get(id);
+    // A stale exit (the pty was replaced by restartTab) must neither respawn
+    // a shell onto the NEW pty nor announce an exit to the renderer.
+    if (!t || t.pty !== term) return;
     // pi exited cleanly (e.g. `/quit`) — drop into an interactive local shell
     // in the SAME tab so the terminal stays usable instead of going blank.
-    // Closing the tab deletes it first, so a close-kill never respawns.
-    if (t && !t.remote && !t.wsl && exitCode === 0) {
+    // The pty must still be THIS tab's pty: a close-kill followed by a
+    // same-id re-register (terminal→chat switch respawns the tab with the
+    // SDK backend) would otherwise respawn a shell onto the NEW tab record
+    // and leak the process.
+    if (!t.remote && !t.wsl && exitCode === 0) {
       respawnShellInTab(id);
       return;
     }
@@ -784,6 +1346,17 @@ export function createTab(opts: CreateTabOptions): string {
   });
 
   return id;
+}
+
+/**
+ * True when a pty tab's underlying process is still running. node-pty's
+ * typings omit `exitCode`, but the runtime exposes it (windowsPtyAgent.get
+ * exitCode — undefined until the process exits). The "alive" semantic for
+ * tab:alive — a registered-but-crashed ssh.exe must NOT report connected.
+ */
+export function isPtyTabAlive(tab: TabInfo): boolean {
+  const pty = tab.pty as { exitCode?: number } | undefined;
+  return !!pty && pty.exitCode === undefined;
 }
 
 export function getTab(id: string): TabInfo | undefined {
@@ -835,7 +1408,38 @@ export function resizeTab(id: string, cols: number, rows: number): boolean {
 export function writeTab(id: string, data: string): boolean {
   const t = tabs.get(id);
   if (!t?.pty) return false;
-  t.pty.write(data);
+  const now = Date.now();
+  // Skip arming for the app's own CSI color-scheme answers/pushes — these are
+  // system writes (pi's `CSI ?996n` query answer / theme flip), not user
+  // keystrokes, and must not masquerade as "user typed into a stalled pty".
+  const isSystemCsi = data === "\x1b[?997;1n" || data === "\x1b[?997;2n";
+  // First input after a long zero-output idle in a pi tab: arm a short echo
+  // probe. A healthy idle pty echoes the keystroke within ms (any output
+  // cancels the probe); a ConPTY-stalled pty stays silent → the probe
+  // rebuilds the tab. Shell tabs are exempt (a silent shell may be running
+  // a long quiet command — restarting would kill it).
+  if (!isSystemCsi && shouldArmStallProbe(t.shellMode, t.pendingProbe, t.lastOutputAt, now, STALL_IDLE_MS)) {
+    t.pendingProbe = true;
+    t.probeTimer = setTimeout(() => {
+      const cur = tabs.get(id);
+      if (!cur || !cur.pendingProbe) return; // output arrived → healthy
+      cur.pendingProbe = false;
+      cur.probeTimer = null;
+      console.log(
+        `[pty] tab ${id}: no echo after ${STALL_IDLE_MS / 60000}min silence — ConPTY stall, restarting`
+      );
+      restartTab(id);
+    }, STALL_PROBE_MS);
+  }
+  try {
+    t.pty.write(data);
+  } catch (error) {
+    // Broken input pipe (conpty died / pipe torn after sleep) — rebuild the
+    // tab instead of silently swallowing keystrokes.
+    console.error(`[pty] tab ${id}: write failed, restarting:`, error instanceof Error ? error.message : String(error));
+    restartTab(id);
+    return false;
+  }
   return true;
 }
 
@@ -865,6 +1469,9 @@ export function closeTab(id: string): boolean {
   if (!t) return false;
   flushTabStream(id);
   stopSessionWatcher(id);
+  if (t.probeTimer) clearTimeout(t.probeTimer);
+  t.probeTimer = null;
+  t.pendingProbe = false;
   if (t.pty) {
     try {
       t.pty.kill();
@@ -977,11 +1584,11 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
     : undefined;
 
   // Build the inner command: change to the target dir, then start pi
-  // (or resume a session). Falls back to interactive bash if pi is not
-  // installed in the distro.
+  // (or resume a session). Falls back to interactive bash with a clear
+  // notice when pi is not installed in the distro.
   const inner = linuxSessionPath
     ? sessionArg(linuxSessionPath)
-    : `pi; exec bash -i`;
+    : `if command -v pi >/dev/null 2>&1; then pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
 
   const wslBin = findWslBin();
   const wslArgs = [
@@ -999,8 +1606,8 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
     console.log(`[pty] wsl tab ${id}: ${wslBin} ${wslArgs.join(" ")}`);
     term = pty.spawn(wslBin, wslArgs, {
       name: "xterm-256color",
-      cols: 80,
-      rows: 24,
+      cols: opts.cols ?? 80,
+      rows: opts.rows ?? 24,
       cwd: process.cwd(),
       env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" },
       useConpty: true,
@@ -1017,10 +1624,11 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
     sessionPath: opts.sessionPath,
     title,
     pty: term,
-    cols: 80,
-    rows: 24,
+    cols: opts.cols ?? 80,
+    rows: opts.rows ?? 24,
     wsl: opts.wsl,
     createdAt: Date.now(),
+    lastOutputAt: Date.now(),
   };
   tabs.set(id, tab);
   activeId = id;
@@ -1031,6 +1639,8 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
   });
   term.onExit(({ exitCode }) => {
     flushTabStream(id);
+    const cur = tabs.get(id);
+    if (!cur || cur.pty !== term) return; // stale pty (replaced by restart)
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:exit:${id}`, exitCode);
     }
@@ -1051,6 +1661,11 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
   const sshArgs = [
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ServerAliveInterval=30",
+    // Keepalive robustness: tolerate 3 missed keepalive replies (~90s) before
+    // declaring the server dead, and send TCP-level keepalives so NAT/firewall
+    // idle-reapers on the path can't silently drop the session.
+    "-o", "ServerAliveCountMax=3",
+    "-o", "TCPKeepAlive=yes",
     "-t",
     "-p", port,
     `${r.user}@${r.host}`,
@@ -1064,14 +1679,18 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
   const mode = opts.themeMode ?? currentThemeMode;
   const modeEnv =
     `export TERM=xterm-256color COLORTERM=truecolor COLORFGBG="${TERMINAL_THEMES[mode].colorfgbg}";`;
+  // Optional per-user pi data dir: keeps sessions/models isolated when several
+  // people share one SSH account. Validated at tab:create; `~` expands on the
+  // remote shell during the assignment (safe charset → no quoting needed).
+  const agentDirEnv = r.agentDir ? ` export PI_CODING_AGENT_DIR=${r.agentDir};` : "";
   const shellPath = cdArg(r.path || "~");
   const inner = r.startPi === false
     ? `exec bash -i`
     : opts.sessionPath
       // sessionArg already ends with the `pi ...` invocation.
       ? sessionArg(opts.sessionPath)
-      : `pi; exec bash -i`;
-  const remoteCmd = `cd ${shellPath} && bash -ic '${modeEnv} ${inner}'`;
+      : `if command -v pi >/dev/null 2>&1; then pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
+  const remoteCmd = `cd ${shellPath} && bash -ic '${modeEnv}${agentDirEnv} ${inner}'`;
   sshArgs.push(remoteCmd);
 
   const sessionBase = sessionTitleFromFile(opts.sessionPath ?? "")
@@ -1088,8 +1707,8 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
     // Use process.cwd() for the local spawn context, not the remote path.
     term = pty.spawn(sshBin, sshArgs, {
       name: "xterm-256color",
-      cols: 80,
-      rows: 24,
+      cols: opts.cols ?? 80,
+      rows: opts.rows ?? 24,
       cwd: process.cwd(),
       env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" },
       useConpty: true,
@@ -1106,12 +1725,14 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
     sessionPath: opts.sessionPath,
     title,
     pty: term,
-    cols: 80,
-    rows: 24,
+    cols: opts.cols ?? 80,
+    rows: opts.rows ?? 24,
     remote: opts.remote,
     remoteBrowsePath: r.path || "~",
     remoteKey: buildRemoteKey(r),
     createdAt: Date.now(),
+    lastOutputAt: Date.now(),
+    shellMode: r.startPi === false ? true : undefined,
   };
   tabs.set(id, tab);
   if (r.startPi !== false) activeId = id;
@@ -1122,6 +1743,8 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
   });
   term.onExit(({ exitCode }) => {
     flushTabStream(id);
+    const cur = tabs.get(id);
+    if (!cur || cur.pty !== term) return; // stale pty (replaced by restart)
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:exit:${id}`, exitCode);
     }

@@ -4,6 +4,41 @@
 // The sidebar's own vertical split (sidebarSplit) stays local to SidebarPane.
 import { create } from "zustand";
 
+const LAYOUT_STORAGE_KEY = "pipi-layout";
+const DEFAULT_LAYOUT = { leftWidth: 260, rightWidth: 420, viewerCollapsed: false };
+
+type PersistedLayout = Partial<typeof DEFAULT_LAYOUT>;
+
+function readLayout(): typeof DEFAULT_LAYOUT {
+  if (typeof localStorage === "undefined") return { ...DEFAULT_LAYOUT };
+  try {
+    const value = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "null") as PersistedLayout | null;
+    return {
+      leftWidth: typeof value?.leftWidth === "number" ? Math.max(220, Math.min(520, value.leftWidth)) : DEFAULT_LAYOUT.leftWidth,
+      rightWidth: typeof value?.rightWidth === "number" ? Math.max(320, Math.min(900, value.rightWidth)) : DEFAULT_LAYOUT.rightWidth,
+      viewerCollapsed: value?.viewerCollapsed === true,
+    };
+  } catch {
+    return { ...DEFAULT_LAYOUT };
+  }
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function saveLayout(layout: PersistedLayout) {
+  if (typeof localStorage === "undefined") return;
+  // Resizers can emit dozens of updates per second; defer the synchronous
+  // storage write so dragging remains on the render path only.
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+    } catch {
+      // Storage can be unavailable in private/sandboxed renderers. Layout still works in memory.
+    }
+  }, 160);
+}
+
 interface LayoutState {
   leftWidth: number;
   rightWidth: number;
@@ -14,12 +49,28 @@ interface LayoutState {
   toggleViewer: () => void;
 }
 
+const initial = readLayout();
+
 export const useLayoutStore = create<LayoutState>()((set) => ({
-  leftWidth: 260,
-  rightWidth: 420,
-  viewerCollapsed: false,
-  setLeftWidth: (leftWidth) => set({ leftWidth }),
-  setRightWidth: (rightWidth) => set({ rightWidth }),
-  setViewerCollapsed: (viewerCollapsed) => set({ viewerCollapsed }),
-  toggleViewer: () => set((s) => ({ viewerCollapsed: !s.viewerCollapsed })),
+  ...initial,
+  setLeftWidth: (leftWidth) => set((state) => {
+    const next = { leftWidth: Math.max(220, Math.min(520, leftWidth)) };
+    saveLayout({ ...state, ...next });
+    return next;
+  }),
+  setRightWidth: (rightWidth) => set((state) => {
+    const next = { rightWidth: Math.max(320, Math.min(900, rightWidth)) };
+    saveLayout({ ...state, ...next });
+    return next;
+  }),
+  setViewerCollapsed: (viewerCollapsed) => set((state) => {
+    const next = { viewerCollapsed };
+    saveLayout({ ...state, ...next });
+    return next;
+  }),
+  toggleViewer: () => set((state) => {
+    const next = { viewerCollapsed: !state.viewerCollapsed };
+    saveLayout({ ...state, ...next });
+    return next;
+  }),
 }));

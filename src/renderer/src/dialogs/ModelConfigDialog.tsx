@@ -30,7 +30,7 @@ interface ModelConfigItem {
 
 type ModelTarget =
   | { kind: "local" }
-  | { kind: "remote"; index: number; host: string; user: string; port: number; password?: string; path?: string }
+  | { kind: "remote"; index: number; host: string; user: string; port: number; password?: string; path?: string; agentDir?: string }
   | { kind: "wsl"; distro: string };
 
 const showToast = (text: string, type: "ok" | "err") => useUiStore.getState().showToast(text, type);
@@ -50,11 +50,12 @@ function computeInitialTarget(): ModelTarget {
     target = { kind: "wsl", distro: active.wslDistro };
   } else if (active?.isRemote && active.remoteHost && active.remoteUser) {
     const rh = allHistory.find(
-      (h) => h.host === active.remoteHost && h.user === active.remoteUser && (h.port ?? 22) === (active.remotePort ?? 22),
+      (h) => h.host === active.remoteHost && h.user === active.remoteUser && (h.port ?? 22) === (active.remotePort ?? 22)
+        && (h.agentDir ?? "") === ((active as { remoteAgentDir?: string }).remoteAgentDir ?? ""),
     );
     if (rh) {
       const idx = allHistory.indexOf(rh);
-      target = { kind: "remote", index: idx, host: rh.host, user: rh.user, port: rh.port ?? 22, password: rh.password, path: rh.path };
+      target = { kind: "remote", index: idx, host: rh.host, user: rh.user, port: rh.port ?? 22, password: rh.password, path: rh.path, agentDir: rh.agentDir };
     }
   }
   return target;
@@ -73,6 +74,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [modelProvider, setModelProvider] = useState("");
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [discoveringModels, setDiscoveringModels] = useState(false);
+  /** In-flight async button guard (double-click must not double-fire). */
+  const [busyAction, setBusyAction] = useState<string | null>(null);
   const [modelTarget, setModelTarget] = useState<ModelTarget>(computeInitialTarget);
   const [modelRemoteLoading, setModelRemoteLoading] = useState(false);
   const [wslDistros, setWslDistros] = useState<Array<{ name: string; default: boolean; running: boolean; version: number }>>([]);
@@ -180,7 +183,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
       let list: string[];
       if (modelTarget.kind === "remote") {
         list = await window.api.model.discoverRemote({
-          remote: { host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, password: modelTarget.password, path: modelTarget.path },
+          remote: { host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, password: modelTarget.password, path: modelTarget.path, agentDir: (modelTarget as { agentDir?: string }).agentDir },
           baseUrl: modelBaseUrl,
           apiKey: modelApiKey,
         });
@@ -395,30 +398,44 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                   {modelTarget.kind === "local" && (
                     <button
                       className="btn"
+                      disabled={busyAction !== null}
                       onClick={async () => {
-                        const result = await window.api.model.checkSync({ provider: item.provider || "", model: item.model });
-                        showToast(
-                          result.ok
-                            ? `Pi 已识别：${item.provider}/${item.model}`
-                            : `Pi 未完全识别：provider=${result.providerExists ? "✓" : "✗"} model=${result.modelExists ? "✓" : "✗"} list=${result.listModelsContains ? "✓" : "✗"}`,
-                          result.ok ? "ok" : "err",
-                        );
+                        if (busyAction) return;
+                        setBusyAction("check");
+                        try {
+                          const result = await window.api.model.checkSync({ provider: item.provider || "", model: item.model });
+                          showToast(
+                            result.ok
+                              ? `Pi 已识别：${item.provider}/${item.model}`
+                              : `Pi 未完全识别：provider=${result.providerExists ? "✓" : "✗"} model=${result.modelExists ? "✓" : "✗"} list=${result.listModelsContains ? "✓" : "✗"}`,
+                            result.ok ? "ok" : "err",
+                          );
+                        } finally {
+                          setBusyAction(null);
+                        }
                       }}
                       title="检查是否已同步到 Pi"
                     >验证</button>
                   )}
                   <button
                     className="row-delete"
+                    disabled={busyAction !== null}
                     onClick={async () => {
-                      if (modelTarget.kind === "remote") {
-                        await window.api.model.deleteRemote({
-                          remote: { host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, password: modelTarget.password, path: modelTarget.path },
-                          provider: item.provider || "",
-                        });
-                        await loadRemoteModels(modelTarget);
-                      } else {
-                        await window.api.model.delete(item.id);
-                        await loadModels();
+                      if (busyAction) return;
+                      setBusyAction("delete");
+                      try {
+                        if (modelTarget.kind === "remote") {
+                          await window.api.model.deleteRemote({
+                            remote: { host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, password: modelTarget.password, path: modelTarget.path, agentDir: (modelTarget as { agentDir?: string }).agentDir },
+                            provider: item.provider || "",
+                          });
+                          await loadRemoteModels(modelTarget);
+                        } else {
+                          await window.api.model.delete(item.id);
+                          await loadModels();
+                        }
+                      } finally {
+                        setBusyAction(null);
                       }
                     }}
                     title="删除配置"
@@ -434,7 +451,10 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
           {(modelTarget.kind === "wsl" || modelTarget.kind === "remote") && (
             <button
               className="btn"
+              disabled={busyAction !== null}
               onClick={async () => {
+                if (busyAction) return;
+                setBusyAction("transplant");
                 try {
                   let result: { ok: boolean; error?: string; copied: string[] };
                   if (modelTarget.kind === "wsl") {
@@ -446,26 +466,34 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                       port: (modelTarget as Extract<ModelTarget, { kind: "remote" }>).port,
                       password: (modelTarget as Extract<ModelTarget, { kind: "remote" }>).password,
                       path: (modelTarget as Extract<ModelTarget, { kind: "remote" }>).path,
+                      agentDir: (modelTarget as Extract<ModelTarget, { kind: "remote" }>).agentDir,
                     });
                   }
                   const label = modelTarget.kind === "wsl" ? modelTarget.distro : `${(modelTarget as any).user}@${(modelTarget as any).host}`;
                   showToast(result.ok ? `已移植 ${result.copied.join(", ")} 到 ${label}` : `移植失败: ${result.error}`, result.ok ? "ok" : "err");
                 } catch (err) {
                   showToast(`移植失败: ${err instanceof Error ? err.message : String(err)}`, "err");
+                } finally {
+                  setBusyAction(null);
                 }
               }}
             >📋 从本机移植配置</button>
           )}
           <button
             className="btn btn-primary"
+            disabled={busyAction !== null}
             onClick={async () => {
               const normalizedBaseUrl = modelBaseUrl.trim();
               const normalizedModelId = modelIdValue.trim();
               const normalizedProvider = modelProvider.trim();
+              // Validate BEFORE arming the busy guard — an early return must
+              // never leave busyAction stuck (all buttons disable on it).
               if (!normalizedBaseUrl || !normalizedModelId || !normalizedProvider) {
                 showToast(`请填写 Base URL、Provider 和模型 ID（当前: baseUrl=${normalizedBaseUrl ? "✓" : "✗"}, provider=${normalizedProvider ? "✓" : "✗"}, model=${normalizedModelId ? "✓" : "✗"}）`, "err");
                 return;
               }
+              if (busyAction) return;
+              setBusyAction("save");
               try {
                 const targetKindWsl = modelTarget.kind === "wsl";
                 // Only explicitly-set specs travel with the save; unset
@@ -514,7 +542,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                   modelSpecs,
                 };
                 if (modelTarget.kind === "remote") {
-                  const remote = { host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, password: modelTarget.password, path: modelTarget.path };
+                  const remote = { host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, password: modelTarget.password, path: modelTarget.path, agentDir: (modelTarget as { agentDir?: string }).agentDir };
                   await window.api.model.addRemote({
                     remote,
                     baseUrl: payload.baseUrl,
@@ -548,6 +576,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                 }
               } catch (error) {
                 showToast(error instanceof Error ? `保存失败：${error.message}` : "保存失败", "err");
+              } finally {
+                setBusyAction(null);
               }
             }}
           >{editingModel ? "更新" : "保存"}</button>

@@ -28,6 +28,8 @@ export interface ChatMessage {
   role: "user" | "assistant";
   status: "streaming" | "done";
   blocks: ChatBlock[];
+  /** Model stream error on this message (e.g. "Provider finish_reason: error"). */
+  error?: string;
 }
 
 export interface ChatTabState {
@@ -40,8 +42,22 @@ export interface ChatTabState {
   sessionName?: string | null;
   booted: boolean;
   exited: boolean;
+  /** History has been fetched at least once (guards ready-signal re-ask). */
+  historyLoaded?: boolean;
   lastError?: string;
   pendingUserText?: string;
+  /** Model stream error → pi exponential-backoff retry progress. */
+  retryInfo?: { attempt: number; maxAttempts: number; errorMessage: string } | null;
+  /** Context compaction running (auto/manual). */
+  compacting?: boolean;
+  /** Pending steering messages (queue_update; delivered between turns). */
+  steeringQueue?: string[];
+  /** Pending follow-up messages (queue_update; delivered when agent settles). */
+  followUpQueue?: string[];
+  /** Queue delivery modes + auto compaction, from get_state. */
+  steeringMode?: string;
+  followUpMode?: string;
+  autoCompactionEnabled?: boolean;
 }
 
 interface ChatStore {
@@ -50,6 +66,7 @@ interface ChatStore {
   clear: (tabId: string) => void;
   applyEvent: (tabId: string, event: Record<string, unknown>) => void;
   initMessages: (tabId: string, messages: unknown[]) => void;
+  markHistoryLoading: (tabId: string) => void;
   sendPrompt: (tabId: string, text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>) => void;
   abort: (tabId: string) => void;
   markExited: (tabId: string, code: number) => void;
@@ -60,9 +77,69 @@ const emptyState = (): ChatTabState => ({
   isStreaming: false,
   booted: false,
   exited: false,
+  retryInfo: null,
+  compacting: false,
 });
 
 let localSeq = 0;
+
+// Streaming can produce hundreds of tiny deltas per second. Expose one
+// normal `applyEvent` Interface to callers, but coalesce visual-only deltas
+// behind this seam and commit them at most once per animation frame. Lifecycle
+// events (start/end/errors) remain immediate, so controls never feel delayed.
+const pendingStreamEvents = new Map<string, Map<string, Record<string, unknown>>>();
+const releasedStreamEvents = new WeakSet<object>();
+let streamFrame: number | ReturnType<typeof setTimeout> | null = null;
+const scheduleStreamFrame =
+  typeof requestAnimationFrame === "function"
+    ? (callback: FrameRequestCallback) => requestAnimationFrame(callback)
+    : (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 16);
+
+function streamEventKey(event: Record<string, unknown>): string | null {
+  if (event.type === "message_update") {
+    const update = event.assistantMessageEvent as { type?: string; contentIndex?: number } | undefined;
+    if (update?.type === "text_delta" || update?.type === "thinking_delta" || update?.type === "toolcall_delta") {
+      return `message:${update.type}:${update.contentIndex ?? 0}`;
+    }
+  }
+  if (event.type === "tool_execution_update" && typeof event.toolCallId === "string") return `tool:${event.toolCallId}`;
+  return null;
+}
+
+function flushQueuedStreamEvents(tabId: string): void {
+  const events = pendingStreamEvents.get(tabId);
+  if (!events) return;
+  pendingStreamEvents.delete(tabId);
+  for (const queued of events.values()) {
+    releasedStreamEvents.add(queued);
+    useChatStore.getState().applyEvent(tabId, queued);
+  }
+}
+
+function queueStreamEvent(tabId: string, key: string, event: Record<string, unknown>): void {
+  let tabEvents = pendingStreamEvents.get(tabId);
+  if (!tabEvents) pendingStreamEvents.set(tabId, (tabEvents = new Map()));
+  const previous = tabEvents.get(key);
+  if (previous?.type === "message_update" && event.type === "message_update") {
+    const oldUpdate = previous.assistantMessageEvent as Record<string, unknown>;
+    const nextUpdate = event.assistantMessageEvent as Record<string, unknown>;
+    // Merge contiguous text/thinking/tool argument deltas so one store update
+    // renders an entire frame's worth of model output.
+    tabEvents.set(key, {
+      ...event,
+      assistantMessageEvent: { ...nextUpdate, delta: `${oldUpdate.delta ?? ""}${nextUpdate.delta ?? ""}` },
+    });
+  } else {
+    // A tool partial result is a snapshot: only the newest one matters.
+    tabEvents.set(key, event);
+  }
+  if (streamFrame !== null) return;
+  streamFrame = scheduleStreamFrame(() => {
+    streamFrame = null;
+    const tabIds = [...pendingStreamEvents.keys()];
+    for (const id of tabIds) flushQueuedStreamEvents(id);
+  });
+}
 
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
@@ -169,6 +246,8 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   },
 
   clear: (tabId) => {
+    // A closed/switched session must never receive a stale rAF-batched delta.
+    pendingStreamEvents.delete(tabId);
     set((s) => {
       const states = { ...s.states };
       delete states[tabId];
@@ -201,11 +280,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           blocks: [{ kind: "text", contentIndex: 0, text: textOf(m.content), done: true }],
         });
       } else if (m.role === "assistant") {
+        const raw = m as { errorMessage?: string; stopReason?: string };
+        const error = raw.errorMessage || raw.stopReason === "error" ? (raw.errorMessage ?? "模型返回错误") : undefined;
         chatMessages.push({
           id: m.id ?? `hist-${chatMessages.length}`,
           role: "assistant",
           status: "done",
           blocks: blocksFromContent(m.content),
+          error,
         });
       } else if (m.role === "toolResult") {
         toolResults.push(m as ToolResultLike);
@@ -219,14 +301,41 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           ...s.states[tabId]!,
           messages: chatMessages,
           booted: true,
-          // A history reload (navigation/fork) always lands on an idle agent.
-          isStreaming: false,
+          historyLoaded: true,
+          // A history reload must not clear live output that arrived after
+          // the request was sent. The ChatView request generation decides
+          // whether this snapshot is still current before calling here.
+          isStreaming: s.states[tabId]!.isStreaming,
         },
       },
     }));
   },
 
+  markHistoryLoading: (tabId) => {
+    get().ensure(tabId);
+    set((s) => ({
+      states: { ...s.states, [tabId]: { ...s.states[tabId]!, historyLoaded: false } },
+    }));
+  },
+
   applyEvent: (tabId, event) => {
+    const streamKey = streamEventKey(event);
+    if (streamKey && !releasedStreamEvents.has(event)) {
+      queueStreamEvent(tabId, streamKey, event);
+      return;
+    }
+    if (releasedStreamEvents.has(event)) releasedStreamEvents.delete(event);
+    // Authoritative/lifecycle events are ordering barriers. Commit every
+    // preceding visual delta before they replace a final snapshot, finish a
+    // tool, advance to another assistant message, or settle the agent.
+    if (
+      event.type === "message_end" ||
+      event.type === "agent_settled" ||
+      event.type === "tool_execution_end" ||
+      (event.type === "message_start" && (event.message as { role?: string } | undefined)?.role === "assistant")
+    ) {
+      flushQueuedStreamEvents(tabId);
+    }
     get().ensure(tabId);
     const st = get().states[tabId]!;
     const type = event.type;
@@ -247,6 +356,9 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         modelProvider: model?.provider,
         thinkingLevel: (event.thinkingLevel as string | null | undefined) ?? undefined,
         sessionName: (event.sessionName as string | null) ?? undefined,
+        steeringMode: (event.steeringMode as string | undefined) ?? st.steeringMode,
+        followUpMode: (event.followUpMode as string | undefined) ?? st.followUpMode,
+        autoCompactionEnabled: (event.autoCompactionEnabled as boolean | undefined) ?? st.autoCompactionEnabled,
         booted: true,
       });
       return;
@@ -256,7 +368,50 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "agent_settled") {
-      patch({ isStreaming: false });
+      patch({ isStreaming: false, retryInfo: null, compacting: false, steeringQueue: [], followUpQueue: [] });
+      return;
+    }
+    if (type === "queue_update") {
+      const steering = Array.isArray(event.steering) ? (event.steering as string[]) : st.steeringQueue ?? [];
+      const followUp = Array.isArray(event.followUp) ? (event.followUp as string[]) : st.followUpQueue ?? [];
+      patch({ steeringQueue: steering, followUpQueue: followUp });
+      return;
+    }
+    if (type === "auto_retry_start") {
+      const attempt = event.attempt as number | undefined;
+      const maxAttempts = event.maxAttempts as number | undefined;
+      const errorMessage = (event.errorMessage as string | undefined) ?? "Unknown error";
+      patch({
+        retryInfo:
+          attempt !== undefined && maxAttempts !== undefined
+            ? { attempt, maxAttempts, errorMessage }
+            : null,
+        // Not a final error yet — pi is retrying with backoff.
+        lastError: undefined,
+      });
+      return;
+    }
+    if (type === "auto_retry_end") {
+      // success=false after exhausting retries: surface the final error.
+      // "Retry cancelled" is the user aborting — keep the banner silent.
+      const finalError = event.finalError as string | undefined;
+      const cancelled = finalError === "Retry cancelled";
+      patch({
+        retryInfo: null,
+        lastError: !cancelled && event.success === false && finalError ? finalError : undefined,
+      });
+      return;
+    }
+    if (type === "compaction_start") {
+      patch({ compacting: true, lastError: undefined });
+      return;
+    }
+    if (type === "compaction_end") {
+      patch({
+        compacting: false,
+        // Failed compaction is the terminal state for this turn.
+        lastError: event.errorMessage && !event.aborted ? (event.errorMessage as string) : undefined,
+      });
       return;
     }
     if (type === "message_start") {
@@ -299,12 +454,25 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     if (type === "message_end") {
       const m = messageOf(event.message);
       if (!m || m.role !== "assistant") return;
+      // Model stream errors (e.g. "Provider finish_reason: error") ride on
+      // the finished assistant message. Attach to the message so the error
+      // stays visible in history (a later successful retry emits another
+      // message_end without errorMessage and clears the transient banner).
+      const errMsg = (m as { errorMessage?: string; stopReason?: string }).errorMessage;
+      const stopReason = (m as { stopReason?: string }).stopReason;
+      const error = errMsg || stopReason === "error" ? (errMsg ?? "模型返回错误") : undefined;
+      patch({ lastError: error });
       patchMessages((msgs) => {
         const idx = msgs.length - 1;
         if (idx < 0 || msgs[idx]!.role !== "assistant") return msgs;
         return [
           ...msgs.slice(0, idx),
-          { ...msgs[idx]!, status: "done" as const, blocks: blocksFromContent(m.content) },
+          {
+            ...msgs[idx]!,
+            status: "done" as const,
+            blocks: blocksFromContent(m.content),
+            error,
+          },
         ];
       });
       return;
@@ -446,7 +614,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       patch({ lastError: typeof event.error === "string" ? event.error : "扩展错误" });
       return;
     }
-    // Ignore: response / turn_start / turn_end / queue_update / compaction_* /
+    // Ignore: response / turn_start / turn_end / compaction_* /
     // auto_retry_* / agent_end / bash_execution_update / summarization_retry_*
   },
 
@@ -475,6 +643,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   },
 
   abort: (tabId) => {
-    void window.api.tab.rpcSend(tabId, { type: "abort" });
+    // Escape in pi's TUI first aborts the active agent turn; if no turn is
+    // running it aborts the active bash command. The RPC path has separate
+    // commands, so mirror the effective cancellation rather than sending a
+    // terminal Escape byte to a headless process.
+    void window.api.tab.rpcSend(tabId, { type: "abort" }).catch(() => {});
+    void window.api.tab.rpcSend(tabId, { type: "abort_bash" }).catch(() => {});
   },
 }));

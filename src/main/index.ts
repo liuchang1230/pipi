@@ -1,25 +1,24 @@
-import { app, BrowserWindow, ipcMain, dialog } from "electron";
-import { isAbsolute, relative, sep, join, posix as posixPath, win32 as win32Path } from "node:path";
+import { app, BrowserWindow, ipcMain, dialog, powerMonitor, Menu, type MenuItemConstructorOptions } from "electron";
+import { isAbsolute, relative, sep, join, dirname, posix as posixPath, win32 as win32Path } from "node:path";
 import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { readFile, writeFile, mkdir, rm, rename, access } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
-import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, type FileOpResult } from "./file-tree";
+import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, imagePayloadOf, listDirChildren, readPreviewFromAbs, rasterImageMimeOf, isBinaryBuffer, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES, IMAGE_PREVIEW_MAX_BYTES, type FileOpResult } from "./file-tree";
 import { specForModel } from "../shared/model-specs";
 import { lookupModelSpecs } from "./specs-lookup";
 import {
   createTab, closeTab, closeAllTabs, getTab, listTabs, setActiveTab,
   resizeTab, writeTab, subscribeTab, getActiveTab, findSshBin,
   getRemoteBrowsePath, setRemoteBrowsePath, buildRemoteKey, setThemeMode,
-  hasNodeInstalled, hasGlobalPiInstalled, installGlobalPi, getPiDetectionDiagnostics, warmPiDetection, invalidatePiDetection,
-  onTabsChanged, setTabTitle, linkTabSession, listWslDistros,
+  hasGlobalPiInstalled, warmPiDetection, invalidatePiDetection,
+  startGlobalPiInstall, classifyInstallStage, installGlobalPiFromBundled,
+  onTabsChanged, setTabTitle, linkTabSession, listWslDistros, sanitizeRemoteAgentDir, remoteAgentDir,
+  restartTab, isPtyTabAlive,
   type TabInfo, type RemoteOpts, type WslOpts,
 } from "./pty";
-import {
-  ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp,
-  type RemoteThemeSyncResult,
-} from "./theme-sync";
+import { ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp, agentDir, type RemoteThemeSyncResult } from "./theme-sync";
 import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
@@ -30,7 +29,13 @@ import {
   setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
   type ExtensionUiRequest,
 } from "./rpc-session";
-import { checkPiUpdate, runPiUpdate } from "./update-check";
+import {
+  sdkSend, sdkUiResponse, sdkRequest, sdkOnExit, openSdkSession, closeSdkTab, getSdkTab, listSdkTabs, closeAllSdkSessions,
+  switchSdkToTerminal, switchTerminalToSdk,
+  prewarmSdkWorker,
+  setUiRequestHandler as setSdkUiRequestHandler,
+} from "./chat-backend/sdk-host";
+import { checkAppUpdate, checkPiUpdate, openAppUpdateDownload, runPiUpdate } from "./update-check";
 import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileContent, listGitCommits, getFileAt, type FileVersionEvent } from "./diff-session";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
@@ -43,7 +48,77 @@ interface RemoteModelListResponse {
 import { listRemoteHistory, saveRemoteHistory } from "./remote-history";
 
 let mainWindow: BrowserWindow | null = null;
+
+type WorkbenchCommand =
+  | "project:open"
+  | "remote:connect"
+  | "session:new"
+  | "session:close"
+  | "view:toggle-viewer"
+  | "view:toggle-theme"
+  | "models:configure"
+  | "help:shortcuts";
+
+/**
+ * Native menu adapter. The menu is deliberately small: it exposes only
+ * workbench actions that have a clear effect in this product, while native
+ * edit roles retain platform-standard text selection/copy/paste behavior.
+ */
+function sendWorkbenchCommand(command: WorkbenchCommand): void {
+  mainWindow?.webContents.send("workbench:command", command);
+}
+
+function installWorkbenchMenu(): void {
+  const template: MenuItemConstructorOptions[] = [
+    {
+      label: "项目",
+      submenu: [
+        { label: "打开本地项目…", accelerator: "Ctrl+O", click: () => sendWorkbenchCommand("project:open") },
+        { label: "连接远程服务器…", accelerator: "Ctrl+Shift+O", click: () => sendWorkbenchCommand("remote:connect") },
+        { type: "separator" },
+        { label: "新建会话", accelerator: "Ctrl+N", click: () => sendWorkbenchCommand("session:new") },
+        { label: "关闭当前会话", accelerator: "Ctrl+W", click: () => sendWorkbenchCommand("session:close") },
+      ],
+    },
+    {
+      label: "编辑",
+      submenu: [
+        { role: "undo" }, { role: "redo" }, { type: "separator" },
+        { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" },
+      ],
+    },
+    {
+      label: "视图",
+      submenu: [
+        { label: "显示/隐藏文件面板", accelerator: "Ctrl+Shift+P", click: () => sendWorkbenchCommand("view:toggle-viewer") },
+        { label: "切换深色/浅色主题", accelerator: "Ctrl+Shift+L", click: () => sendWorkbenchCommand("view:toggle-theme") },
+        { label: "模型配置…", accelerator: "Ctrl+,", click: () => sendWorkbenchCommand("models:configure") },
+        { type: "separator" },
+        { role: "togglefullscreen", label: "切换全屏" },
+      ],
+    },
+    {
+      label: "窗口",
+      submenu: [{ role: "minimize" }, { role: "zoom" }, { type: "separator" }, { role: "close" }],
+    },
+    {
+      label: "帮助",
+      submenu: [
+        { label: "快捷键说明", accelerator: "Ctrl+/", click: () => sendWorkbenchCommand("help:shortcuts") },
+        {
+          label: "关于 pipi",
+          click: () => void dialog.showMessageBox({
+            type: "info", title: "关于 pipi", message: "pipi", detail: "远程 AI 编程工作台\n版本 " + app.getVersion(),
+          }),
+        },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
 let remotePollTimer: NodeJS.Timeout | null = null;
+/** App-bundled extension files re-shipped at startup; drained by the renderer via update:extensions-synced. */
+let pendingExtensionSync: string[] = [];
 
 type RemoteSessionCacheEntry = {
   expiresAt: number;
@@ -79,7 +154,13 @@ type SftpLease = {
 
 const REMOTE_SESSION_CACHE_TTL_MS = 12_000;
 const REMOTE_FILE_TREE_CACHE_TTL_MS = 5_000;
-const SFTP_IDLE_TTL_MS = 20_000;
+// Idle TTL for the shared SFTP lease. 20s was too aggressive: every lease
+// expiry destroys the connection (client-side clean close → sshd logs
+// "Received disconnect :11"), and the next poll re-creates it — a fresh
+// server login on every cycle. That churn showed up in server logs as
+// "login, dies ~20s later, repeated every ~20s". 2 minutes keeps the
+// connection warm across polls/hydration while still reclaiming idle conns.
+const SFTP_IDLE_TTL_MS = 120_000;
 const REMOTE_SESSION_EAGER_PARSE_LIMIT = 0;
 const REMOTE_SESSION_HEAD_HYDRATE_LIMIT = 5;
 const REMOTE_SESSION_HYDRATE_BATCH_SIZE = 4;
@@ -172,6 +253,9 @@ function stableRemoteKey(remote: RemoteOpts): string {
       user: remote.user,
       port: remote.port ?? 22,
       path: remote.path ?? "~",
+      // Different agentDir = different data space (shared-account isolation):
+      // caches, leases and title links must not cross-contaminate.
+      agentDir: remote.agentDir ?? "",
     }))
     .digest("hex");
 }
@@ -479,6 +563,7 @@ async function wslScanSessionDir(
 }
 
 function createWindow() {
+  installWorkbenchMenu();
   mainWindow = new BrowserWindow({
     title: "pipi",
     // 用户提供的 图标.png 作为窗口图标（覆盖旧的 icon.ico/icon.png）。
@@ -487,6 +572,8 @@ function createWindow() {
     icon: join(__dirname, `../../resources/icon.${process.platform === "win32" ? "ico" : "png"}`),
     width: 1280,
     height: 820,
+    // Hidden until the renderer has painted → no white-flash on launch.
+    show: false,
     webPreferences: {
       preload: join(__dirname, "../preload/index.mjs"),
       contextIsolation: true,
@@ -494,6 +581,10 @@ function createWindow() {
       sandbox: false,
     },
   });
+  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  // If the renderer never paints (dev server down / broken build), show the
+  // window anyway so the failure is visible instead of an invisible app.
+  mainWindow.webContents.once("did-fail-load", () => mainWindow?.show());
   // Prevent renderer throttling when window is idle.
   // Without this, xterm.js timers drop to ~1 Hz after inactivity, freezing scroll.
   mainWindow.webContents.setBackgroundThrottling(false);
@@ -505,6 +596,17 @@ function createWindow() {
 }
 
 // --- Active-tab tracking: the sidebar follows the active tab's cwd. ----
+
+/** Whether local tabs should use the in-process SDK backend. */
+function sdkBackendEnabled(): boolean {
+  if (process.env.PIPI_SDK_BACKEND === "0") return false;
+  try {
+    return getSettings().pipi?.backend !== "rpc";
+  } catch {
+    return true;
+  }
+}
+
 function emitTabs() {
   // listTabs() includes RPC-backed tabs in the shared registry — exclude
   // them here; listRpcSessions() emits them with mode "rpc". Otherwise the
@@ -523,6 +625,7 @@ function emitTabs() {
     pi: t.remote ? t.remote.startPi !== false : true,
     isWsl: !!t.wsl,
     wslDistro: t.wsl?.distro,
+    remoteAgentDir: t.remote?.agentDir,
     mode: "pty" as const,
   }));
   const rpcTabs = listRpcSessions().map((s) => {
@@ -539,11 +642,30 @@ function emitTabs() {
       remotePort: t?.remote?.port ?? 22,
       isWsl: !!t?.wsl,
       wslDistro: t?.wsl?.distro,
+      remoteAgentDir: t?.remote?.agentDir,
       pi: true,
       mode: "rpc" as const,
     };
   });
-  mainWindow?.webContents.send("tabs:update", [...ptyTabs, ...rpcTabs]);
+  const sdkTabs = listSdkTabs().map((s) => {
+    const t = getTab(s.tabId);
+    return {
+      id: s.tabId,
+      cwd: t?.cwd ?? "",
+      sessionPath: t?.sessionPath,
+      title: t?.title ?? "",
+      isRemote: false,
+      remoteKey: undefined,
+      remoteHost: undefined,
+      remoteUser: undefined,
+      remotePort: 22,
+      isWsl: false,
+      wslDistro: undefined,
+      pi: true,
+      mode: "sdk" as const,
+    };
+  });
+  mainWindow?.webContents.send("tabs:update", [...ptyTabs, ...rpcTabs, ...sdkTabs]);
 }
 
 // pty.ts watches local session files and bumps tab titles; keep the renderer
@@ -584,10 +706,37 @@ if (process.platform === "win32") {
   app.setAppUserModelId("com.pipi.desktop");
 }
 
-app.whenReady().then(async () => {
+// Single-instance lock: a second launch must focus the existing window, not
+// spawn a second main process (two instances would both poll sessions and
+// fight over the SFTP lease pool).
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
+if (gotSingleInstanceLock) {
+  app.whenReady().then(async () => {
   // Ship app-bundled pi extensions (static working indicator etc.) BEFORE any
-  // tab can spawn pi, so every pi process auto-discovers them.
-  ensureShippedExtensions();
+  // tab can spawn pi, so every pi process auto-discovers them. The returned
+  // list of actually-written files feeds the chat-page update notice.
+  pendingExtensionSync = ensureShippedExtensions();
+  if (pendingExtensionSync.length > 0) {
+    console.log(`[extensions] updated: ${pendingExtensionSync.join(", ")}`);
+  }
+
+  // Pre-warm the SDK worker in the background (if enabled) so the FIRST local
+  // tab open doesn't pay the ~1.1s SDK import; model runtime infra initializes
+  // lazily on first open but the module graph is already hot.
+  if (sdkBackendEnabled()) {
+    setTimeout(() => prewarmSdkWorker(agentDir()), 0);
+  }
 
   // Extension UI sub-protocol → forwarded to the renderer, which renders
   // select/confirm/input/editor as native dialogs (UiDialog in ChatPane) and
@@ -597,9 +746,17 @@ app.whenReady().then(async () => {
       win.webContents.send(`tab:rpc-ui-request:${tabId}`, req);
     }
   });
+  {
+    setSdkUiRequestHandler((tabId, req) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.webContents.send(`tab:rpc-ui-request:${tabId}`, req);
+      }
+    });
+  }
 
   // Renderer answers for extension UI dialogs (value/confirmed/cancelled).
   ipcMain.handle("tab:rpc-ui-response", (_e, tabId: string, response: Record<string, unknown>) => {
+    if (getSdkTab(tabId)) return sdkUiResponse(tabId, response);
     return getRpcSession(tabId)?.send({ type: "extension_ui_response", ...response }) ?? false;
   });
 
@@ -609,87 +766,99 @@ app.whenReady().then(async () => {
     mainWindow?.webContents.send("session:local-updated", { cwd, sessions });
   });
 
-  async function showAppMessageBox(options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> {
-    const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
-    return win ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options);
+  // --- pi agent install (manual only, from the renderer's notice bar) ----
+  // `installInFlight` guards double installs when the user opens two tabs
+  // while the local copy install is still running.
+  let installInFlight: Promise<{ ok: boolean }> | null = null;
+
+  function sendInstallEvent(channel: string, payload: unknown): void {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, payload);
+    }
   }
 
-  async function ensurePiReady(): Promise<{ ok: true } | { ok: false; reason: string }> {
-    if (!hasNodeInstalled()) {
-      await showAppMessageBox({
-        type: "warning",
-        title: "未检测到 Node.js",
-        message: "使用 AI 终端前，需要先安装 Node.js 18 或更高版本。",
-        buttons: ["确定"],
-        defaultId: 0,
-      });
-      return { ok: false, reason: "node-missing" };
+  /**
+   * Install the global pi from the app's bundled copy (plain directory copy
+   * + shim write — no npm, no network, seconds). Streams begin/result events
+   * so the renderer's progress dialog shows the outcome.
+   */
+  async function runLocalPiInstall(): Promise<{ ok: boolean }> {
+    if (installInFlight) return installInFlight;
+    installInFlight = (async () => {
+      sendInstallEvent("pi-install:begin", {});
+      const r = await installGlobalPiFromBundled();
+      sendInstallEvent("pi-install:result", { ok: r.ok, error: r.ok ? undefined : r.error, cancelled: false });
+      return r.ok ? { ok: true } : { ok: false };
+    })();
+    try {
+      return await installInFlight;
+    } finally {
+      installInFlight = null;
     }
+  }
 
+  ipcMain.handle("pi-install:cancel", () => {
+    // Local copy installs finish in seconds and are not cancellable; kept
+    // as a no-op so the renderer's cancel button never throws.
+  });
+
+  /**
+   * Manual "install the global pi" action (from the renderer's notice bar;
+   * never auto-triggered). On success, drop the stale detection caches and
+   * re-warm so the freshly installed binary is picked up.
+   */
+  ipcMain.handle("pi-install:run", async (): Promise<{ ok: boolean }> => {
+    const install = await runLocalPiInstall();
+    if (install.ok) {
+      invalidatePiDetection();
+      warmPiDetection();
+    }
+    return install;
+  });
+
+  async function ensurePiReady(): Promise<{ ok: true; backend: "global" | "bundled-install" | "missing" }> {
+    // A missing/broken global pi must never block a local tab: we can
+    // re-install it locally from the app's bundled copy (plain directory
+    // copy + shim write — no npm, no network), which also gives users the
+    // `pi` command inside the terminal's shell.
     if (hasGlobalPiInstalled() || process.env.PI_CODING_AGENT === "true") {
-      return { ok: true };
+      return { ok: true, backend: "global" };
     }
-
-    const piDiag = getPiDetectionDiagnostics();
-    console.error("[pi-detect] failed", piDiag);
-
-    const result = await showAppMessageBox({
-      type: "question",
-      title: "未检测到 pi agent",
-      message: "使用 AI 终端前，需要先安装 pi agent。是否现在自动安装？",
-      detail: `将执行：npm install -g --ignore-scripts @earendil-works/pi-coding-agent\n\n诊断信息：\npiBin=${piDiag.piBin}\nPI_CODING_AGENT=${piDiag.piEnv ?? ""}\nstatus=${piDiag.status ?? "null"}\nerror=${piDiag.error ?? ""}\nstdout=${piDiag.stdout.trim()}\nstderr=${piDiag.stderr.trim()}`,
-      buttons: ["立即安装", "取消"],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (result.response !== 0) {
-      return { ok: false, reason: "install-cancelled" };
-    }
-
-    const installing = await showAppMessageBox({
-      type: "info",
-      title: "正在安装",
-      message: "正在安装 pi agent，请稍候。",
-      buttons: ["确定"],
-      defaultId: 0,
-    });
-    void installing;
-
-    const install = await installGlobalPi();
-    if (!install.ok) {
-      await showAppMessageBox({
-        type: "error",
-        title: "安装失败",
-        message: "自动安装 pi agent 失败。",
-        detail: `请手动执行：npm install -g --ignore-scripts @earendil-works/pi-coding-agent\n\n${install.error}`,
-        buttons: ["确定"],
-        defaultId: 0,
-      });
-      return { ok: false, reason: "install-failed" };
-    }
-
-    await showAppMessageBox({
-      type: "info",
-      title: "安装成功",
-      message: "pi agent 已安装完成，现在可以使用 AI 终端。",
-      buttons: ["确定"],
-      defaultId: 0,
-    });
-    // The detection caches were populated while pi was absent (bare-name
-    // fallback, piOk=false). Drop them so the freshly installed binary is
-    // picked up, then re-warm in the background.
+    // Authoritative re-check (bypass the startup-warm TTL cache) so a
+    // transient warm-time failure doesn't trigger a needless reinstall.
     invalidatePiDetection();
-    warmPiDetection();
-    return { ok: true };
+    if (hasGlobalPiInstalled() || process.env.PI_CODING_AGENT === "true") {
+      return { ok: true, backend: "global" };
+    }
+    // Reuse runLocalPiInstall: it streams begin/result events for the
+    // renderer's progress dialog AND guards against a concurrent manual
+    // install (double installs must never run).
+    const installed = await runLocalPiInstall();
+    if (installed.ok) {
+      console.log("[pi-detect] global pi missing — auto-installed from bundled copy");
+      invalidatePiDetection();
+      if (hasGlobalPiInstalled() || process.env.PI_CODING_AGENT === "true") {
+        return { ok: true, backend: "bundled-install" };
+      }
+    }
+    console.warn("[pi-detect] global pi unavailable and auto-install failed");
+    // Non-blocking notice (renderer shows it); no blocking install dialog.
+    sendInstallEvent("pi-install:notice", { backend: "missing" });
+    return { ok: true, backend: "missing" };
   }
 
   // --- Terminal / tabs ---
-  ipcMain.handle("tab:create", async (_e, opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean }; wsl?: { distro: string; path?: string }; themeMode?: ThemeMode }) => {
+  ipcMain.handle("tab:create", async (_e, opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; agentDir?: string }; wsl?: { distro: string; path?: string }; themeMode?: ThemeMode }) => {
+    // Default view is the TERMINAL (pty TUI) for all pi tabs — local, WSL,
+    // and remote. The chat view is now opt-in (TabBar「聊天视图」): local
+    // tabs switch to the in-process SDK backend, WSL/remote switch to
+    // `pi --mode rpc`. Only plain-shell connection tabs (startPi:false)
+    // skip pi entirely — they are createTab too, with a bare shell.
+    // Local tabs: ensurePiReady never blocks — the bundled pi is the
+    // fallback, so tabs always open. WSL/remote run pi INSIDE the
+    // distro/remote host, so the local machine's pi is irrelevant.
     if (!opts.remote && !opts.wsl) {
-      const ready = await ensurePiReady();
-      if (!ready.ok) {
-        throw new Error(ready.reason);
-      }
+      await ensurePiReady();
     }
     // Remote / WSL tabs always spawn from process.cwd(); also fix cwd if the
     // renderer accidentally passes a remote path (e.g. "/home/user").
@@ -700,48 +869,78 @@ app.whenReady().then(async () => {
     if (opts.wsl) {
       opts.wsl = { ...opts.wsl, path: resolveWslPath(opts.wsl.distro, opts.wsl.path || "~") };
     }
-    // Push the app-controlled themes to the remote BEFORE pi starts, so the
-    // very first session already renders with the app's theme. Best-effort:
-    // key-based connections without a password skip the sftp sync and the
-    // remote simply keeps its own config. Re-sync at most every few minutes.
+    // Validate the optional per-user remote data dir (keeps sessions/models
+    // isolated when several people share one SSH account). Invalid values are
+    // dropped silently — the remote falls back to ~/.pi/agent.
+    if (opts.remote?.agentDir) {
+      const clean = sanitizeRemoteAgentDir(opts.remote.agentDir);
+      opts.remote = { ...opts.remote, agentDir: clean ?? undefined };
+    }
+    // Chat is the default for pi sessions: local tabs use the in-process SDK
+    // when enabled; WSL/SSH use RPC inside their target OS. Plain SSH
+    // connection tabs (startPi:false) remain real terminal shells. Low-level
+    // createTab() remains the explicit terminal/recovery primitive.
+    const plainShell = opts.remote?.startPi === false;
+    let id: string;
+    if (plainShell) {
+      id = createTab(opts);
+    } else if (opts.remote || opts.wsl) {
+      id = createRpcTab(opts);
+    } else if (sdkBackendEnabled()) {
+      id = openSdkSession({ ...opts, agentDir: agentDir() });
+    } else {
+      id = createRpcTab(opts);
+    }
+    // Remote theme provisioning runs in the BACKGROUND — never block tab
+    // appearance on an SFTP round-trip (a dead/unreachable server used to
+    // delay the terminal by up to the 15s SFTP timeout). Best-effort:
+    // key-based connections without a password skip it (remote keeps its own
+    // config); the running pi picks the synced theme up next session.
     if (opts.remote?.password) {
       const syncKey = stableRemoteKey(opts.remote);
       const lastSync = remoteThemeSyncAt.get(syncKey) ?? 0;
       if (Date.now() - lastSync > REMOTE_THEME_SYNC_TTL_MS) {
-        try {
-          const lease = await getSftpLease(opts.remote);
-          const result: RemoteThemeSyncResult = await syncThemesViaSftp(lease.client, lease.homeDir);
-          lease.lastUsedAt = Date.now();
-          if (result.ok) {
-            remoteThemeSyncAt.set(syncKey, Date.now());
-            console.log(`[theme] remote synced ${result.uploaded.length} file(s) -> ${syncKey}`);
-          } else {
-            console.error(`[theme] remote sync partial/failed (${syncKey}):`, result.error ?? "unknown");
+        const remote = opts.remote; // narrowed for the async closure
+        void (async () => {
+          try {
+            const lease = await getSftpLease(remote);
+            const result: RemoteThemeSyncResult = await syncThemesViaSftp(lease.client, lease.homeDir, remote.agentDir);
+            lease.lastUsedAt = Date.now();
+            if (result.ok) {
+              remoteThemeSyncAt.set(syncKey, Date.now());
+              console.log(`[theme] remote synced ${result.uploaded.length} file(s) -> ${syncKey}`);
+            } else {
+              console.error(`[theme] remote sync partial/failed (${syncKey}):`, result.error ?? "unknown");
+            }
+          } catch (error) {
+            console.error(`[theme] remote sync failed (${syncKey}):`, error);
           }
-        } catch (error) {
-          console.error(`[theme] remote sync failed (${syncKey}):`, error);
-        }
+        })();
       }
     }
-    // All pi tabs run headless RPC (ChatPane) — local, WSL, and remote;
-    // only plain-shell connection tabs (startPi:false) keep the pty TUI.
-    const id = opts.remote && opts.remote.startPi === false ? createTab(opts) : createRpcTab(opts);
     if (opts.remote) saveRemoteHistory(opts.remote);
     emitTabs();
     emitActive();
     return id;
   });
   // App-owned theme mode; the renderer reports its dark/light toggle so
-  // every new pty (local + remote) renders with the app's choice.
+  // every new pty (local + remote) renders with the app's choice. Live
+  // switching of a RUNNING pi is driven by the renderer pushing pi's native
+  // terminal color-scheme report (CSI ?997 n) through the pty — see
+  // TerminalPane. The theme files stay canonical; no rewrite on toggle.
+
   ipcMain.handle("theme:set-mode", (_e, mode: ThemeMode) => {
     setThemeMode(mode);
     return true;
   });
   ipcMain.handle("tab:close", async (_e, id: string) => {
-    // RPC tabs are owned by rpc-session; pty tabs by pty.ts.
+    // SDK tabs are owned by chat-backend/sdk-host; RPC tabs by rpc-session;
+    // pty tabs by pty.ts.
     const tab = getTab(id);
     const remote = tab?.remote;
-    if (getRpcSession(id)) {
+    if (getSdkTab(id)) {
+      closeSdkTab(id);
+    } else if (getRpcSession(id)) {
       closeRpcTab(id);
     } else {
       closeTab(id);
@@ -761,6 +960,12 @@ app.whenReady().then(async () => {
     return ok;
   });
   ipcMain.handle("tab:write", (_e, id: string, data: string) => writeTab(id, data));
+  // Input is a hot path. Unlike invoke/handle, send/on has no Promise and no
+  // reply IPC for every key, so renderer event-loop pressure cannot build up
+  // while pi is repainting its TUI or emitting a lot of terminal output.
+  ipcMain.on("tab:input", (_e, id: string, data: string) => {
+    if (typeof id === "string" && typeof data === "string") writeTab(id, data);
+  });
   ipcMain.handle("tab:resize", (_e, id: string, cols: number, rows: number) => resizeTab(id, cols, rows));
   ipcMain.handle("tab:list", () => [
     ...listTabs().filter((t) => t.pty).map((t) => ({
@@ -787,6 +992,19 @@ app.whenReady().then(async () => {
         wslDistro: t?.wsl?.distro,
         pi: true,
         mode: "rpc" as const,
+      };
+    }),
+    ...listSdkTabs().map((s) => {
+      const t = getTab(s.tabId);
+      return {
+        id: s.tabId,
+        cwd: t?.cwd ?? "",
+        sessionPath: t?.sessionPath,
+        title: t?.title ?? "",
+        isRemote: false,
+        isWsl: false,
+        pi: true,
+        mode: "sdk" as const,
       };
     }),
   ]);
@@ -826,11 +1044,31 @@ app.whenReady().then(async () => {
     // Local-only by construction: the renderer skips auto-follow tree
     // refreshes for remote/WSL/preview origins, so the flag never fires here
     // for those (their 5s TTL adapters keep serving as before).
-    if (payload?.noCache) return fileTreeIndex.refresh(root);
-    const cachedTree = fileTreeIndex.cached(root);
+    if (payload?.noCache) return fileTreeIndex.refresh(localTreeKey(root, "."), () => listDirChildren(root, "."));
+    const cachedTree = fileTreeIndex.cached(localTreeKey(root, "."));
     if (cachedTree) return cachedTree;
-    return fileTreeIndex.refresh(root);
+    return fileTreeIndex.refresh(localTreeKey(root, "."), () => listDirChildren(root, "."));
   });
+
+  /** Lazy local tree: list ONE directory's children (shallow) on expand.
+   *  Local-only — remote/WSL trees navigate via remote.setBrowsePath and
+   *  their own 5s TTL adapters. rootPath is authoritative (local preview
+   *  under a remote ACTIVE tab must still list the local root), mirroring
+   *  file:list. The cache key is root-aware (paths in a listing are
+   *  root-relative) and relative to the project root. */
+  ipcMain.handle("file:list-dir", async (_e, payload?: { tabId?: string; rootPath?: string; relDir: string; noCache?: boolean }) => {
+    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+    if (!payload?.rootPath && (t?.remote || t?.wsl)) return [];
+    const root = payload?.rootPath ?? t?.cwd;
+    if (!root || !payload?.relDir) return [];
+    const key = localTreeKey(root, payload.relDir);
+    if (!payload.noCache) {
+      const cached = fileTreeIndex.cached(key);
+      if (cached) return cached;
+    }
+    return fileTreeIndex.refresh(key, () => listDirChildren(root, payload.relDir));
+  });
+
   ipcMain.handle("file:resolve-link", (_e, payload: { tabId?: string; rootPath?: string; currentPath?: string; href: string }) => {
     const rawHref = (payload.href || "").trim();
     if (!rawHref) return { ok: false as const };
@@ -902,15 +1140,8 @@ app.whenReady().then(async () => {
     // Local preview root is authoritative (see file:list).
     if (!payload.rootPath) {
       if (t?.wsl) {
-        const fullPath = wslFullPath(t, relPath);
         try {
-          const buf = await readFile(fullPath);
-          const isBin = buf.subarray(0, Math.min(8192, buf.length)).includes(0);
-          return {
-            content: isBin ? "[二进制文件]" : buf.toString("utf8"),
-            bytes: buf.length,
-            isBinary: isBin,
-          };
+          return await readPreviewFromAbs(wslFullPath(t, relPath), relPath);
         } catch (err) {
           return { content: `⚠️ 读取失败: ${err instanceof Error ? err.message : String(err)}`, bytes: 0, isBinary: false, error: String(err) };
         }
@@ -1042,11 +1273,31 @@ app.whenReady().then(async () => {
       await fn(t);
       if (t.remote) invalidateRemoteFileTree(t.remote);
       else if (t.wsl) invalidateWslFileTree(t.wsl.distro);
-      else fileTreeIndex.invalidate(t.cwd ?? process.cwd());
+      else invalidateLocalParent(t.cwd ?? process.cwd(), relPath);
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  /** Invalidate the cached listings that a mutation can have changed.
+   *  With lazy per-dir caching, the DIRECTORY holding `relPath` changed — plus
+   *  its ancestor chain (recursive mkdir/write creates intermediates, so the
+   *  root and every level in between may have gained an entry). */
+  function invalidateLocalParent(root: string, relPath: string): void {
+    let cur = dirname(relPath);
+    while (cur !== ".") {
+      fileTreeIndex.invalidate(localTreeKey(root, cur));
+      cur = dirname(cur);
+    }
+    fileTreeIndex.invalidate(localTreeKey(root, "."));
+  }
+
+  /** Cache key for a local dir listing: ROOT-aware — listings carry paths
+   *  relative to their root, so keying by the absolute dir alone would let
+   *  the same dir browsed under two roots serve wrong-relative paths. */
+  function localTreeKey(root: string, relDir: string): string {
+    return `${root}\u0000${relDir}`;
   }
 
   /** Local mutations in preview mode resolve against rootPath, not the tab cwd. */
@@ -1057,7 +1308,7 @@ app.whenReady().then(async () => {
     // Local preview root is authoritative; needs no tab at all.
     if (payload.rootPath) {
       const r = await writeFileContent(payload.rootPath, relPath, content);
-      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
@@ -1078,7 +1329,7 @@ app.whenReady().then(async () => {
     const relPath = payload.relPath;
     if (payload.rootPath) {
       const r = await createDirectory(payload.rootPath, relPath);
-      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
@@ -1099,7 +1350,7 @@ app.whenReady().then(async () => {
     const relPath = payload.relPath;
     if (payload.rootPath) {
       const r = await deletePath(payload.rootPath, relPath);
-      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
@@ -1121,7 +1372,7 @@ app.whenReady().then(async () => {
     const newName = (payload.newName ?? "").trim();
     if (payload.rootPath) {
       const r = await renamePath(payload.rootPath, relPath, newName);
-      if (r.ok) fileTreeIndex.invalidate(payload.rootPath);
+      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
     return mutateFile(payload.tabId, relPath, async (t) => {
@@ -1172,18 +1423,30 @@ app.whenReady().then(async () => {
       path: t.remoteBrowsePath ?? t.remote.path ?? "~",
       password: t.remote.password,
       startPi: t.remote.startPi,
+      agentDir: t.remote.agentDir,
     };
   });
 
-  ipcMain.handle("tab:alive", (_e, tabId: string) => !!getTab(tabId) || !!getRpcSession(tabId));
+  ipcMain.handle("tab:alive", (_e, tabId: string) => {
+    const tab = getTab(tabId);
+    // Real pty tabs: alive means the underlying process is STILL RUNNING
+    // (a crashed ssh.exe must not report connected). External tabs (RPC/SDK)
+    // have no pty — registered is their liveness.
+    if (tab?.pty) return isPtyTabAlive(tab);
+    return !!getTab(tabId) || !!getRpcSession(tabId) || !!getSdkTab(tabId);
+  });
 
   // --- RPC chat (local pi tabs) ---
   ipcMain.handle("tab:rpc-send", (_e, tabId: string, cmd: Record<string, unknown>) => {
+    const sdk = getSdkTab(tabId);
+    if (sdk) return sdkSend(tabId, cmd);
     const session = getRpcSession(tabId);
     return session ? session.send(cmd) : false;
   });
   ipcMain.handle("tab:rpc-switch-terminal", (_e, tabId: string) => {
-    const ok = switchRpcToTerminal(tabId);
+    // Chat → terminal: local SDK-backed chat tabs respawn the pty TUI;
+    // RPC-backed (remote/WSL) chat tabs switch to their pty pi too.
+    const ok = getSdkTab(tabId) ? switchSdkToTerminal(tabId, agentDir()) : switchRpcToTerminal(tabId);
     if (ok) {
       emitTabs();
       emitActive();
@@ -1191,7 +1454,17 @@ app.whenReady().then(async () => {
     return ok;
   });
   ipcMain.handle("tab:rpc-switch-chat", (_e, tabId: string) => {
-    const ok = switchTerminalToRpc(tabId);
+    if (getSdkTab(tabId)) return false;
+    const t = getTab(tabId);
+    // Terminal → chat: local pty pi tabs switch to the in-process SDK
+    // backend (fast, no extra process); WSL/remote tabs switch to
+    // `pi --mode rpc` inside the distro/remote host (agent tools must run in
+    // the same OS as the files). Backout: PIPI_SDK_BACKEND=0 sends local
+    // tabs down the RPC path too.
+    const ok =
+      t && !t.remote && !t.wsl && sdkBackendEnabled()
+        ? switchTerminalToSdk(tabId, agentDir())
+        : switchTerminalToRpc(tabId);
     if (ok) {
       emitTabs();
       emitActive();
@@ -1213,6 +1486,16 @@ app.whenReady().then(async () => {
   // --- pi / extension updates (RPC chat has no TUI update banner) ---
   ipcMain.handle("update:check", (_e, force?: boolean) => checkPiUpdate(force));
   ipcMain.handle("update:run", () => runPiUpdate());
+  ipcMain.handle("app-update:check", (_e, force?: boolean) => checkAppUpdate(force));
+  ipcMain.handle("app-update:download", (_e, url: string) => openAppUpdateDownload(url));
+  // App-bundled extensions that were actually re-shipped at startup (content
+  // changed). Pull-once: the renderer fetches this exactly once on mount, so
+  // dev HMR or window recreation does not re-notify.
+  ipcMain.handle("update:extensions-synced", () => {
+    const files = pendingExtensionSync;
+    pendingExtensionSync = [];
+    return { files };
+  });
 
   // --- WSL distro list ---
   ipcMain.handle("wsl:list-distros", () => listWslDistros());
@@ -1220,7 +1503,7 @@ app.whenReady().then(async () => {
   // --- Project list ---
   ipcMain.handle("project:list", () => listProjects());
   ipcMain.handle("project:add-local", (_e, cwd: string) => addLocalProject(cwd));
-  ipcMain.handle("project:add-remote", (_e, remote: { host: string; user: string; port?: number; path: string; password?: string }) => addRemoteProject(remote));
+  ipcMain.handle("project:add-remote", (_e, remote: { host: string; user: string; port?: number; path: string; password?: string; agentDir?: string }) => addRemoteProject(remote));
   ipcMain.handle("project:add-wsl", (_e, distro: string, path: string) => addWslProject(distro, path));
   ipcMain.handle("project:delete", (_e, id: string) => deleteProject(id));
   ipcMain.handle("model:list", () => listModels());
@@ -1242,12 +1525,12 @@ app.whenReady().then(async () => {
   ipcMain.handle("model:delete", (_e, id: string) => deleteModel(id));
   ipcMain.handle("model:check-sync", (_e, input: { provider: string; model: string }) => checkPiModelSync(input.provider, input.model));
   // --- Remote model configuration (SFTP write + SSH exec) ---
-  function remoteModelsFilePath(homeDir: string): string {
-    return posixPath.join(homeDir, ".pi", "agent", "models.json");
+  function remoteModelsFilePath(remote: RemoteOpts, homeDir: string): string {
+    return posixPath.join(remoteAgentDir(remote, homeDir), "models.json");
   }
 
-  function remoteAuthFilePath(homeDir: string): string {
-    return posixPath.join(homeDir, ".pi", "agent", "auth.json");
+  function remoteAuthFilePath(remote: RemoteOpts, homeDir: string): string {
+    return posixPath.join(remoteAgentDir(remote, homeDir), "auth.json");
   }
 
   async function readRemoteJson(client: SftpClient, path: string): Promise<Record<string, unknown> | null> {
@@ -1349,7 +1632,7 @@ app.whenReady().then(async () => {
   ipcMain.handle("model:list-remote", async (_e, remote: RemoteOpts) => {
     try {
       return await withSftp(remote, async (client, homeDir) => {
-        const obj = await readRemoteJson(client, remoteModelsFilePath(homeDir));
+        const obj = await readRemoteJson(client, remoteModelsFilePath(remote, homeDir));
         const providers = (obj && typeof obj.providers === "object" && !Array.isArray(obj.providers) ? obj.providers : {}) as Record<string, { baseUrl?: string; apiKey?: string; api?: string; authHeader?: boolean; headers?: Record<string, string>; oauth?: string; compat?: Record<string, unknown>; models?: Array<Record<string, unknown> & { id?: string }> }>;
         return Object.entries(providers).map(([provider, cfg]) => ({
           id: `remote-${provider}`,
@@ -1390,7 +1673,7 @@ app.whenReady().then(async () => {
     const specIds = [input.model, ...(input.availableModels ?? [])].map((s) => s.trim()).filter(Boolean);
     const overrides = await lookupModelSpecs(specIds);
     return await withSftp(input.remote, async (client, homeDir) => {
-      const modelsPath = remoteModelsFilePath(homeDir);
+      const modelsPath = remoteModelsFilePath(input.remote, homeDir);
       const obj = (await readRemoteJson(client, modelsPath)) ?? {};
       const providers = (obj && typeof obj.providers === "object" && !Array.isArray(obj.providers) ? obj.providers : {}) as Record<string, unknown>;
       obj.providers = providers;
@@ -1408,6 +1691,13 @@ app.whenReady().then(async () => {
           id,
           name: manual?.name ?? (prev?.name as string | undefined) ?? id,
           reasoning: manual?.reasoning ?? (prev?.reasoning as boolean | undefined) ?? /gpt-5|o1|o3|o4|deepseek-r|deepseek-v4|claude|gemini-2\.5/i.test(id),
+          ...(manual?.thinkingLevelMap
+            ? { thinkingLevelMap: manual.thinkingLevelMap }
+            : prev?.thinkingLevelMap
+            ? { thinkingLevelMap: prev.thinkingLevelMap }
+            : /deepseek-v4-(flash|pro)/i.test(id)
+            ? { thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high", max: "max" } }
+            : {}),
           input: manual?.input ?? (prev?.input as Array<"text" | "image"> | undefined) ?? ["text"],
           contextWindow: manual?.contextWindow ?? (prev?.contextWindow as number | undefined) ?? overrides[id]?.contextWindow ?? spec.contextWindow,
           maxTokens: manual?.maxTokens ?? (prev?.maxTokens as number | undefined) ?? overrides[id]?.maxTokens ?? spec.maxTokens,
@@ -1429,7 +1719,7 @@ app.whenReady().then(async () => {
       await writeRemoteJson(client, modelsPath, obj);
       const trimmedKey = input.apiKey?.trim();
       if (trimmedKey && trimmedKey !== "placeholder") {
-        const authPath = remoteAuthFilePath(homeDir);
+        const authPath = remoteAuthFilePath(input.remote, homeDir);
         const auth = (await readRemoteJson(client, authPath)) ?? {};
         (auth as Record<string, unknown>)[providerId] = { type: "api_key", key: trimmedKey };
         await writeRemoteJson(client, authPath, auth);
@@ -1442,14 +1732,14 @@ app.whenReady().then(async () => {
     const providerId = input.provider.trim();
     if (!providerId) return false;
     return await withSftp(input.remote, async (client, homeDir) => {
-      const modelsPath = remoteModelsFilePath(homeDir);
+      const modelsPath = remoteModelsFilePath(input.remote, homeDir);
       const obj = await readRemoteJson(client, modelsPath);
       if (obj && typeof obj.providers === "object" && !Array.isArray(obj.providers) && (obj.providers as Record<string, unknown>)[providerId] !== undefined) {
         const providers = obj.providers as Record<string, unknown>;
         delete providers[providerId];
         await writeRemoteJson(client, modelsPath, obj);
       }
-      const authPath = remoteAuthFilePath(homeDir);
+      const authPath = remoteAuthFilePath(input.remote, homeDir);
       const auth = await readRemoteJson(client, authPath);
       if (auth && (auth as Record<string, unknown>)[providerId] !== undefined) {
         const authObj = auth as Record<string, unknown>;
@@ -1546,7 +1836,7 @@ app.whenReady().then(async () => {
         return { ok: false, error: "本地没有 ~/.pi/agent/models.json 或 auth.json", copied: [] };
       }
       return await withSftp(remote, async (client, homeDir) => {
-        const piDir = posixPath.join(homeDir, ".pi", "agent");
+        const piDir = remoteAgentDir(remote, homeDir);
         const copied: string[] = [];
         try { await client.mkdir(piDir, true); } catch { /* ok */ }
         if (existsSync(modelsPath)) {
@@ -1887,9 +2177,9 @@ app.whenReady().then(async () => {
     | { ok: false; error: string };
 
   /** List + parse one remote session dir (metadata-only; eager limit 0). */
-  async function listRemoteSessionDir(client: SftpClient, homeDir: string, remoteCwd: string): Promise<{ sessions: SessionEntry[]; diagnostics: { resolvedCwd: string; sessionDir: string; fileCount: number } }> {
+  async function listRemoteSessionDir(client: SftpClient, homeDir: string, remoteCwd: string, agentDirOverride?: string): Promise<{ sessions: SessionEntry[]; diagnostics: { resolvedCwd: string; sessionDir: string; fileCount: number } }> {
     const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
-    const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolvedCwd));
+    const sessionDir = posixPath.join(remoteAgentDir({ agentDir: agentDirOverride } as RemoteOpts, homeDir), "sessions", encodeCwd(resolvedCwd));
     const items = await client.list(sessionDir);
     const files = items
       .filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl"))
@@ -1938,7 +2228,7 @@ app.whenReady().then(async () => {
     try {
       return await withSftp(remote, async (client, homeDir) => {
         try {
-          const result = await listRemoteSessionDir(client, homeDir, remoteCwd);
+          const result = await listRemoteSessionDir(client, homeDir, remoteCwd, remote.agentDir);
           return { ok: true as const, sessions: result.sessions, diagnostics: result.diagnostics };
         } catch (error) {
           return { ok: false as const, error: error instanceof Error ? error.message : String(error) };
@@ -1955,7 +2245,7 @@ app.whenReady().then(async () => {
       return await withSftp(remote, async (client, homeDir) => {
         try {
           const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
-          const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolvedCwd));
+          const sessionDir = posixPath.join(remoteAgentDir(remote, homeDir), "sessions", encodeCwd(resolvedCwd));
           const items = await client.list(sessionDir);
           const fileCount = items.filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl")).length;
           return { resolvedCwd, sessionDir, fileCount };
@@ -1977,7 +2267,7 @@ app.whenReady().then(async () => {
   ): Promise<SessionEntry[]> {
     if (endIndex <= startIndex) return currentSessions;
     return withSftp(remote, async (client, homeDir) => {
-      const sessionDir = posixPath.join(homeDir, ".pi", "agent", "sessions", encodeCwd(resolveRemotePath(remoteCwd, homeDir)));
+      const sessionDir = posixPath.join(remoteAgentDir(remote, homeDir), "sessions", encodeCwd(resolveRemotePath(remoteCwd, homeDir)));
       const hydratedRange = await Promise.all(currentSessions.slice(startIndex, endIndex).map(async (entry) => {
         try {
           const raw = await client.get(entry.path || posixPath.join(sessionDir, posixPath.basename(entry.path)));
@@ -2024,15 +2314,51 @@ app.whenReady().then(async () => {
         const full = filePath.startsWith("/")
           ? posixPath.normalize(filePath)
           : resolveRemotePath(posixPath.join(baseDir, filePath), homeDir);
-        const content = await client.get(full);
-        const buffer = Buffer.isBuffer(content) ? content : Buffer.from(String(content));
-        const bytes = buffer.byteLength;
-        const head = buffer.subarray(0, 8192);
-        const isBinary = head.includes(0);
+        const st = await client.stat(full);
+        const bytes = st.size;
+        if (bytes <= TEXT_PREVIEW_MAX_BYTES) {
+          const content = await client.get(full);
+          const buffer = Buffer.isBuffer(content) ? content : Buffer.from(String(content));
+          const isBinary = isBinaryBuffer(buffer);
+          return {
+            content: isBinary ? "(二进制文件，无法以文本显示)" : buffer.toString("utf8"),
+            bytes,
+            isBinary,
+            image: imagePayloadOf(buffer, filePath),
+            error: undefined as string | undefined,
+          };
+        }
+        // Oversize: pull only the head+tail ranges over the wire (no full
+        // transfer). readStreamOptions start/end are byte offsets — the
+        // @types/ssh2-sftp-client declarations are stale, but v12 passes the
+        // options straight to ssh2's createReadStream, which honors ranges.
+        const half = TEXT_PREVIEW_HALF_BYTES;
+        const rangeOpts = { readStreamOptions: { start: 0, end: half - 1 } } as unknown as Parameters<typeof client.get>[2];
+        const headRaw = await client.get(full, undefined, rangeOpts);
+        const tailRaw = await client.get(full, undefined, {
+          readStreamOptions: { start: bytes - half, end: bytes - 1 },
+        } as unknown as Parameters<typeof client.get>[2]);
+        const head = Buffer.isBuffer(headRaw) ? headRaw : Buffer.from(String(headRaw));
+        const tail = Buffer.isBuffer(tailRaw) ? tailRaw : Buffer.from(String(tailRaw));
+        if (isBinaryBuffer(head)) {
+          let image;
+          if (rasterImageMimeOf(filePath) && bytes <= IMAGE_PREVIEW_MAX_BYTES) {
+            const fullBuf = await client.get(full);
+            image = imagePayloadOf(Buffer.isBuffer(fullBuf) ? fullBuf : Buffer.from(String(fullBuf)), filePath);
+          }
+          return {
+            content: "(二进制文件，无法以文本显示)",
+            bytes,
+            isBinary: true,
+            image,
+            error: undefined as string | undefined,
+          };
+        }
         return {
-          content: isBinary ? "[二进制文件]" : buffer.toString("utf8"),
+          content: `${head.toString("utf8")}\n\n……\n\n${tail.toString("utf8")}`,
           bytes,
-          isBinary,
+          isBinary: false,
+          truncated: true,
           error: undefined as string | undefined,
         };
       });
@@ -2041,9 +2367,9 @@ app.whenReady().then(async () => {
     }
   }
 
-  // Provision the app-controlled themes into pi's config BEFORE the window
+  // Provision the app-controlled theme file into pi's config BEFORE the window
   // opens so the very first local tab already renders with the app's palette
-  // (pi hot-reloads these files and the settings auto-mapping on later edits).
+  // (pi hot-reloads the file on later mode flips).
   try {
     const written = ensureLocalThemeFiles();
     const settingsChanged = ensureLocalSettingsTheme();
@@ -2076,6 +2402,35 @@ app.whenReady().then(async () => {
   remotePollTimer = setInterval(() => {
     void refreshActiveRemoteTabTitles();
   }, 4000);
+
+  // --- ConPTY freeze self-healing ------------------------------------------
+  // Windows conhost's pipe can stall after a LONG lock/sleep (output freezes,
+  // input is swallowed — known OS bug). The renderer-side watchdog in pty.ts
+  // catches a stalled pty on the next keystroke; here we ALSO proactively
+  // rebuild every pty tab when the machine comes back from a long power event,
+  // so a terminal that was left unattended is already fresh when the user
+  // returns. Sessions survive (pi auto-saves to JSONL; restart resumes them).
+  let powerOffAt = 0;
+  const POWER_OFF_RESTART_MIN_MS = 10 * 60 * 1000; // ≥10min off → restart
+  function maybeRestartTabsAfterPower(label: string): void {
+    const dur = powerOffAt === 0 ? 0 : Date.now() - powerOffAt;
+    powerOffAt = 0;
+    if (dur < POWER_OFF_RESTART_MIN_MS) return; // brief lock/sleep — skip
+    console.log(`[power] ${label} lasted ${(dur / 60000).toFixed(1)} min — rebuilding pty tabs`);
+    for (const t of listTabs()) {
+      // Shell tabs (pi already exited / startPi:false) keep their plain
+      // shell — restarting them would respawn pi or kill a running job.
+      if (t.pty && !t.shellMode) restartTab(t.id);
+    }
+  }
+  powerMonitor.on("lock-screen", () => {
+    powerOffAt = Date.now();
+  });
+  powerMonitor.on("suspend", () => {
+    powerOffAt = Date.now();
+  });
+  powerMonitor.on("unlock-screen", () => maybeRestartTabsAfterPower("lock"));
+  powerMonitor.on("resume", () => maybeRestartTabsAfterPower("sleep"));
 
   // Back off per server after failures (unreachable host / session dir not
   // created yet) so one dead server can't block polling for others and we
@@ -2173,12 +2528,14 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
+} // gotSingleInstanceLock
 
 app.on("window-all-closed", async () => {
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopLocalSessionsPoll();
   closeAllTabs();
   closeAllRpcSessions();
+  closeAllSdkSessions();
   stopWatching();
   await Promise.all([...sftpLeases.values()].map((lease) => destroySftpLease(lease)));
   if (process.platform !== "darwin") app.quit();
@@ -2189,10 +2546,17 @@ app.on("before-quit", async () => {
   stopLocalSessionsPoll();
   closeAllTabs();
   closeAllRpcSessions();
+  closeAllSdkSessions();
   stopWatching();
   await Promise.all([...sftpLeases.values()].map((lease) => destroySftpLease(lease)));
 });
 
 process.on("unhandledRejection", (err) => {
   console.error("[main] unhandledRejection:", err);
+});
+// A synchronous throw inside a setInterval/fs.watch/timer callback (e.g. the
+// remote title poll) would otherwise CRASH the whole main process — the
+// terminal app dies with no recovery. Log and keep going.
+process.on("uncaughtException", (err) => {
+  console.error("[main] uncaughtException:", err);
 });

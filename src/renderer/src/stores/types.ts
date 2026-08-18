@@ -18,11 +18,13 @@ export interface TabInfo {
   remoteHost?: string;
   remoteUser?: string;
   remotePort?: number;
+  remoteAgentDir?: string;
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
-  /** rpc = headless ChatPane (local tabs); pty/undefined = terminal view. */
-  mode?: "rpc" | "pty";
+  /** rpc = headless ChatPane (remote/WSL); sdk = in-process ChatPane (local);
+   *  pty/undefined = terminal view. */
+  mode?: "rpc" | "sdk" | "pty";
 }
 
 export interface SessionItem {
@@ -54,6 +56,7 @@ export interface RemoteHistoryItem {
   port: number;
   password?: string;
   path?: string;
+  agentDir?: string;
   updatedAt: number;
 }
 

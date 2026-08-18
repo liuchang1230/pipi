@@ -24,8 +24,9 @@ export interface TabSummary {
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
-  /** rpc = headless ChatPane (local tabs); pty = terminal view. */
-  mode?: "rpc" | "pty";
+  /** rpc = headless ChatPane (remote/WSL); sdk = in-process ChatPane (local);
+   *  pty = terminal view (the default for new tabs). */
+  mode?: "rpc" | "sdk" | "pty";
 }
 
 export interface SessionListItem {
@@ -70,16 +71,19 @@ export interface RemoteTarget {
   port?: number;
   path?: string;
   password?: string;
+  agentDir?: string;
 }
 
 const api = {
   // --- Tabs / terminal ---
   tab: {
-    create: (opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; title?: string; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean }; wsl?: { distro: string; path?: string } }): Promise<string> =>
+    create: (opts: { cwd: string; sessionPath?: string; continueRecent?: boolean; title?: string; remote?: { host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; agentDir?: string }; wsl?: { distro: string; path?: string } }): Promise<string> =>
       ipcRenderer.invoke("tab:create", opts),
     close: (id: string): Promise<boolean> => ipcRenderer.invoke("tab:close", id),
     activate: (id: string): Promise<boolean> => ipcRenderer.invoke("tab:activate", id),
     write: (id: string, data: string): Promise<boolean> => ipcRenderer.invoke("tab:write", id, data),
+    /** Hot path for keystrokes: one-way IPC avoids one Promise/IPC reply per key. */
+    writeInput: (id: string, data: string): void => ipcRenderer.send("tab:input", id, data),
     resize: (id: string, cols: number, rows: number): Promise<boolean> =>
       ipcRenderer.invoke("tab:resize", id, cols, rows),
     alive: (id: string): Promise<boolean> => ipcRenderer.invoke("tab:alive", id),
@@ -87,6 +91,33 @@ const api = {
     /** Send a JSON command to a tab's RPC pi session (prompt/steer/abort/…). */
     rpcSend: (id: string, cmd: Record<string, unknown>): Promise<boolean> =>
       ipcRenderer.invoke("tab:rpc-send", id, cmd),
+    /**
+     * Send a command and resolve with its response frame. The main process
+     * forwards every response to the renderer, so the matching happens here:
+     * a unique id is attached, and the first response with that id wins.
+     */
+    rpcRequest: (id: string, cmd: Record<string, unknown>, timeoutMs = 15000): Promise<{ success: boolean; data?: unknown; error?: string }> => {
+      const reqId = `r${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      const channel = `tab:rpc-event:${id}`;
+      return new Promise((resolve) => {
+        const finish = (result: { success: boolean; data?: unknown; error?: string }) => {
+          clearTimeout(timer);
+          ipcRenderer.removeListener(channel, handler);
+          resolve(result);
+        };
+        const timer = setTimeout(() => finish({ success: false, error: "timeout" }), timeoutMs);
+        const handler = (_e: Electron.IpcRendererEvent, event: Record<string, unknown>) => {
+          if (event.type !== "response" || event.id !== reqId) return;
+          finish({ success: !!event.success, data: event.data, error: event.error as string | undefined });
+        };
+        ipcRenderer.on(channel, handler);
+        // Fail fast when the tab/session is gone instead of waiting the
+        // full timeout (tab:rpc-send resolves false, never rejects).
+        void ipcRenderer.invoke("tab:rpc-send", id, { ...cmd, id: reqId }).then((ok) => {
+          if (!ok) finish({ success: false, error: "tab unavailable" });
+        });
+      });
+    },
     /** Fall back from the chat view to the full TUI for this tab (same id). */
     rpcSwitchToTerminal: (id: string): Promise<string | null> =>
       ipcRenderer.invoke("tab:rpc-switch-terminal", id),
@@ -95,6 +126,11 @@ const api = {
       ipcRenderer.invoke("tab:rpc-switch-chat", id),
     waitUntilAlive: async (id: string, timeoutMs = 3000, intervalMs = 250): Promise<boolean> => {
       const startedAt = Date.now();
+      // Settle before the FIRST poll: a failing ssh.exe/wsl.exe (bad host,
+      // missing distro) dispatches its exit a few hundred ms after spawn —
+      // an immediate poll would see a still-running process and report
+      // "connected" before the crash is observable.
+      await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, 300)));
       while (Date.now() - startedAt < timeoutMs) {
         if (await ipcRenderer.invoke("tab:alive", id)) return true;
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
@@ -138,10 +174,44 @@ const api = {
   /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
   rpcUiResponse: (id: string, response: Record<string, unknown>): Promise<boolean> =>
     ipcRenderer.invoke("tab:rpc-ui-response", id, response),
+  appUpdate: {
+    check: (force?: boolean): Promise<{ current: string; latest: string | null; hasUpdate: boolean; downloadUrl?: string; releaseUrl?: string; notes?: string; error?: string }> =>
+      ipcRenderer.invoke("app-update:check", force),
+    download: (url: string): Promise<boolean> => ipcRenderer.invoke("app-update:download", url),
+  },
   update: {
     check: (force?: boolean): Promise<{ current: string | null; latest: string | null; hasUpdate: boolean; error?: string }> =>
       ipcRenderer.invoke("update:check", force),
     run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
+    getExtensionSynced: (): Promise<{ files: string[] }> => ipcRenderer.invoke("update:extensions-synced"),
+  },
+  /** pi agent: main streams begin/progress/result; renderer shows the
+   *  progress dialog and can cancel. `run` is the manual "install global
+   *  pi" action (never auto-triggered); `onNotice` fires when the global pi
+   *  is missing and the bundled pi is used instead. */
+  piInstall: {
+    run: (): Promise<{ ok: boolean; cancelled?: boolean }> => ipcRenderer.invoke("pi-install:run"),
+    cancel: (): Promise<void> => ipcRenderer.invoke("pi-install:cancel"),
+    onBegin: (callback: () => void): (() => void) => {
+      const h = () => callback();
+      ipcRenderer.on("pi-install:begin", h);
+      return () => ipcRenderer.removeListener("pi-install:begin", h);
+    },
+    onProgress: (callback: (p: { stage: string }) => void): (() => void) => {
+      const h = (_e: Electron.IpcRendererEvent, p: { stage: string }) => callback(p);
+      ipcRenderer.on("pi-install:progress", h);
+      return () => ipcRenderer.removeListener("pi-install:progress", h);
+    },
+    onResult: (callback: (r: { ok: boolean; error?: string; cancelled?: boolean }) => void): (() => void) => {
+      const h = (_e: Electron.IpcRendererEvent, r: { ok: boolean; error?: string; cancelled?: boolean }) => callback(r);
+      ipcRenderer.on("pi-install:result", h);
+      return () => ipcRenderer.removeListener("pi-install:result", h);
+    },
+    onNotice: (callback: (n: { backend: string }) => void): (() => void) => {
+      const h = (_e: Electron.IpcRendererEvent, n: { backend: string }) => callback(n);
+      ipcRenderer.on("pi-install:notice", h);
+      return () => ipcRenderer.removeListener("pi-install:notice", h);
+    },
   },
   diff: {
     list: (tabId: string): Promise<{ isGit: boolean; initialized?: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }> =>
@@ -163,6 +233,11 @@ const api = {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>
       ipcRenderer.invoke("theme:set-mode", mode),
   },
+  onWorkbenchCommand: (callback: (command: "project:open" | "remote:connect" | "session:new" | "session:close" | "view:toggle-viewer" | "view:toggle-theme" | "models:configure" | "help:shortcuts") => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, command: "project:open" | "remote:connect" | "session:new" | "session:close" | "view:toggle-viewer" | "view:toggle-theme" | "models:configure" | "help:shortcuts") => callback(command);
+    ipcRenderer.on("workbench:command", handler);
+    return () => ipcRenderer.removeListener("workbench:command", handler);
+  },
   onTabsUpdate: (callback: (tabs: TabSummary[]) => void): (() => void) => {
     const handler = (_e: Electron.IpcRendererEvent, tabs: TabSummary[]) => callback(tabs);
     ipcRenderer.on("tabs:update", handler);
@@ -179,6 +254,9 @@ const api = {
   file: {
     list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean): Promise<unknown> =>
       ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath, noCache }),
+    /** Lazy local tree: list one directory's children on expand. */
+    listDirChildren: (rootPath: string | undefined, tabId: string | undefined, relDir: string, noCache?: boolean): Promise<unknown> =>
+      ipcRenderer.invoke("file:list-dir", { rootPath, tabId, relDir, noCache }),
     resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }): Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }> =>
       ipcRenderer.invoke("file:resolve-link", input),
     read: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileReadResult> =>
@@ -213,7 +291,7 @@ const api = {
   project: {
     list: (): Promise<any[]> => ipcRenderer.invoke("project:list"),
     addLocal: (cwd: string): Promise<any> => ipcRenderer.invoke("project:add-local", cwd),
-    addRemote: (remote: { host: string; user: string; port?: number; path: string; password?: string }): Promise<any> =>
+    addRemote: (remote: { host: string; user: string; port?: number; path: string; password?: string; agentDir?: string }): Promise<any> =>
       ipcRenderer.invoke("project:add-remote", remote),
     delete: (id: string): Promise<boolean> => ipcRenderer.invoke("project:delete", id),
     addWsl: (distro: string, path: string): Promise<any> => ipcRenderer.invoke("project:add-wsl", distro, path),

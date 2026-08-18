@@ -30,9 +30,20 @@ export function ViewerPane() {
   const rightWidth = useLayoutStore((s) => s.rightWidth);
   const viewerCollapsed = useLayoutStore((s) => s.viewerCollapsed);
   const toggleViewer = useLayoutStore((s) => s.toggleViewer);
+  const wasCollapsedRef = useRef(viewerCollapsed);
 
   const [followSettingsState, setFollowSettingsState] = useState<"loading" | "ready" | "error">("loading");
   const [followMenuOpen, setFollowMenuOpen] = useState(false);
+
+  // A width transition gives xterm's ResizeObserver a stable sequence of
+  // dimensions instead of a single abrupt reflow when the preview collapses.
+  // That eliminates the visible one-to-two-frame terminal distortion.
+  useEffect(() => {
+    if (wasCollapsedRef.current === viewerCollapsed) return;
+    wasCollapsedRef.current = viewerCollapsed;
+    const timer = setTimeout(() => window.dispatchEvent(new Event("resize")), 180);
+    return () => clearTimeout(timer);
+  }, [viewerCollapsed]);
 
   // Refs so the stable auto-follow listener never reads stale closures.
   const currentFileRef = useRef<CurrentFile | null>(null);
@@ -161,7 +172,10 @@ export function ViewerPane() {
   );
 
   return (
-    <aside className={`viewer${viewerCollapsed ? " collapsed" : ""}`} style={viewerCollapsed ? undefined : { width: rightWidth }}>
+    <aside
+      className={`viewer${viewerCollapsed ? " collapsed" : ""}`}
+      style={{ width: viewerCollapsed ? 0 : rightWidth, transition: "width 160ms ease" }}
+    >
       <div className="viewer-header">
         <button className="viewer-toggle" onClick={toggleViewer} title={viewerCollapsed ? "展开预览" : "收起预览"} aria-label={viewerCollapsed ? "展开预览" : "收起预览"}>
           <span className="viewer-toggle-icon">{viewerCollapsed ? "❮" : "❯"}</span>

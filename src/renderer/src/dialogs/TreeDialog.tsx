@@ -141,8 +141,9 @@ const EDIT_TOOLS = new Set(["edit", "apply_patch", "write_file", "write"]);
 
 function isEditToolCall(tc: { name: string; args: unknown } | undefined): { path?: string } | null {
   if (!tc || !EDIT_TOOLS.has(tc.name)) return null;
-  const args = (tc.args ?? {}) as { path?: unknown };
+  const args = (tc.args ?? {}) as { path?: unknown; filePath?: unknown };
   if (typeof args.path === "string") return { path: args.path };
+  if (typeof args.filePath === "string") return { path: args.filePath };
   return {};
 }
 
@@ -222,6 +223,10 @@ export function TreeDialog({
     refresh();
     const off = window.api.onRpcEvent(tabId, (event) => {
       if (event.type !== "response" || event.command !== "get_tree") return;
+      // During navigation, ignore unrelated tree snapshots (initial refreshes
+      // or another consumer's request). They must not be able to complete the
+      // current navigation early.
+      if (pendingNavRequestId.current && event.id !== pendingNavRequestId.current) return;
       const data = event.data as TreeResponse;
       if (event.success && data.tree) {
         setTree(data.tree);
@@ -351,13 +356,14 @@ export function TreeDialog({
       for (const msg of st?.messages ?? []) {
         for (const b of msg.blocks) {
           if (b.kind !== "tool") continue;
-          let args: { path?: string; edits?: Array<{ oldText: string; newText: string }>; content?: string } = {};
+          let args: { path?: string; filePath?: string; edits?: Array<{ oldText: string; newText: string }>; content?: string } = {};
           try {
             args = JSON.parse(b.argsText || "{}");
           } catch {
             continue;
           }
-          if (!args.path || !isTarget(args.path)) continue;
+          const eventPath = args.path ?? args.filePath;
+          if (!eventPath || !isTarget(eventPath)) continue;
           if (b.name === "edit" && Array.isArray(args.edits) && args.edits.length) {
             events.push({ type: "edit", edits: args.edits });
           } else if ((b.name === "apply_patch" || b.name === "patch") && b.resultText) {
@@ -376,7 +382,7 @@ export function TreeDialog({
       }
       const r = await window.api.diff.history(tabId, path, events.slice(0, cutAt + 1));
       const target = r.versions[r.versions.length - 1];
-      if (!target || (!target.content && r.versions.length <= 1)) {
+      if (!target || (r.versions.length <= 1 && target.content === "")) {
         useUiStore.getState().showToast("无法重建该节点的文件状态", "err");
         return;
       }
@@ -396,19 +402,22 @@ export function TreeDialog({
   };
 
   const doNavigate = (summarize?: string, instructions?: string) => {
-    if (!selected) return;
+    if (!selected || navigatingId) return;
+    const targetId = selected.entry.id;
     setNavPhase("navigating");
-    setNavigatingId(selected.entry.id);
-    const args = [`/pipi-tree-nav`, selected.entry.id];
+    setNavigatingId(targetId);
+    const args = [`/pipi-tree-nav`, targetId];
     if (summarize) args.push("--summarize");
     if (instructions) args.push("--instructions", instructions);
     void window.api.tab.rpcSend(tabId, { type: "prompt", message: args.join(" ") });
     // Poll get_tree until the leaf moves (or timeout) — the extension command
     // executes synchronously inside pi, so this resolves quickly.
     const started = Date.now();
+    const requestId = `tree-nav-${started}`;
+    pendingNavRequestId.current = requestId;
     const timer = setInterval(() => {
-      void window.api.tab.rpcSend(tabId, { type: "get_tree" });
-      if (Date.now() - started > 15000) {
+      void window.api.tab.rpcSend(tabId, { type: "get_tree", id: requestId });
+      if (Date.now() - started > 30000) {
         clearInterval(timer);
         setNavPhase("idle");
         setNavigatingId(null);
@@ -420,7 +429,17 @@ export function TreeDialog({
   };
 
   const pendingNavTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pendingNavRequestId = useRef<string | null>(null);
   const prevLeafRef = useRef<string | null>(null);
+
+  // Always stop polling when the dialog closes or the tab changes.
+  useEffect(() => () => {
+    if (pendingNavTimer.current) {
+      clearInterval(pendingNavTimer.current);
+      pendingNavTimer.current = null;
+      pendingNavRequestId.current = null;
+    }
+  }, [tabId]);
 
   // Detect navigation completion via leafId change in the get_tree responses.
   useEffect(() => {
@@ -434,6 +453,7 @@ export function TreeDialog({
         clearInterval(pendingNavTimer.current);
         pendingNavTimer.current = null;
       }
+      pendingNavRequestId.current = null;
       const editorText = isUserMsg && selectedText ? selectedText : undefined;
       setNavPhase("idle");
       setNavigatingId(null);
@@ -443,7 +463,7 @@ export function TreeDialog({
     } else {
       prevLeafRef.current = leafId;
     }
-  }, [leafId]);
+  }, [leafId, navigatingId, selected, selectedText, isUserMsg, onNavigated, onClose]);
 
   // Initial selection: current leaf.
   useEffect(() => {

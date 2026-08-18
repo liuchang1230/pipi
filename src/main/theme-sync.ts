@@ -13,12 +13,24 @@
  * settings; in auto mode the terminal light/dark detection result picks
  * the half — and that detection reads the COLORFGBG env var, which the
  * app sets on every spawn. So the app owns the mode, not the terminal.
+ *
+ * Live switching of a RUNNING pi is NOT done here: the renderer pushes
+ * pi's native terminal color-scheme report (CSI ?997 n) through the pty
+ * (TerminalPane), which pi's autoSync listener applies immediately — no
+ * file writes on toggle.
+ *
+ * Remote (password-authed) servers are provisioned at connect via SFTP.
+ * Key-based remotes and WSL distros are not provisioned (the app cannot
+ * reach their ~/.pi/agent without credentials) — their pi keeps its own
+ * config and the live report only works if that config is already an auto
+ * mapping.
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type SftpClient from "ssh2-sftp-client";
 import { TERMINAL_THEMES, type ThemeMode } from "../shared/terminal-theme";
+import { remoteAgentDir } from "./pty";
 
 /** pi auto-mapping: light theme before the slash, dark after. */
 export const AUTO_THEME_SETTING = "pipi-light/pipi-dark";
@@ -124,17 +136,19 @@ export interface RemoteThemeSyncResult {
  */
 export async function syncThemesViaSftp(
   client: SftpClient,
-  homeDir: string
+  homeDir: string,
+  agentDirRemote?: string
 ): Promise<RemoteThemeSyncResult> {
   const uploaded: string[] = [];
-  const base = `${homeDir.replace(/\/+$/, "")}/.pi/agent`;
+  const base = remoteAgentDir({ agentDir: agentDirRemote }, homeDir);
   const themesRemote = `${base}/themes`;
   try {
     await client.mkdir(themesRemote, true);
     for (const mode of ["dark", "light"] as ThemeMode[]) {
       const theme = TERMINAL_THEMES[mode];
       const remotePath = `${themesRemote}/${theme.piName}.json`;
-      await client.put(JSON.stringify(theme.pi, null, 2) + "\n", remotePath);
+      // put() treats a string as a LOCAL file path → pass a Buffer for raw content.
+      await client.put(Buffer.from(JSON.stringify(theme.pi, null, 2) + "\n", "utf8"), remotePath);
       uploaded.push(remotePath);
     }
   } catch (error) {
@@ -177,7 +191,8 @@ export async function syncThemesViaSftp(
     const merged: Record<string, unknown> = settings ?? {};
     if (merged.theme !== AUTO_THEME_SETTING) {
       merged.theme = AUTO_THEME_SETTING;
-      await client.put(JSON.stringify(merged, null, 2) + "\n", settingsRemote);
+      // put() treats a string as a LOCAL file path → pass a Buffer for raw content.
+      await client.put(Buffer.from(JSON.stringify(merged, null, 2) + "\n", "utf8"), settingsRemote);
       uploaded.push(settingsRemote);
     }
   } catch (error) {

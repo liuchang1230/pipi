@@ -115,6 +115,8 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
           content: res.content,
           bytes: res.bytes,
           isBinary: res.isBinary,
+          image: res.image,
+          truncated: res.truncated,
           followed,
           tabId,
           rootPath,

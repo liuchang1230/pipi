@@ -6,14 +6,19 @@
  *  - `xterm`  → drives the xterm.js canvas (background, cursor, selection,
  *               and the ANSI 16-color palette so `ls`/`git`/shell colors
  *               match the app instead of the host terminal).
- *  - `pi`     → the full pi TUI theme JSON (51 tokens). Written to
- *               `~/.pi/agent/themes/<piName>.json` (local) and the same
- *               path on remote servers; pi discovers these files and hot-
- *               reloads them, so the app fully controls pi's colors.
+ *  - `pi`     → the full pi TUI theme JSON (51 tokens) per mode, written to
+ *               `~/.pi/agent/themes/pipi-dark.json` / `pipi-light.json`.
+ *               pi resolves the active half from the AUTO mapping in
+ *               settings.json (`pipi-light/pip-dark`) + COLORFGBG at spawn.
+ *  - LIVE switch: on a mode flip the renderer pushes pi's native terminal
+ *               color-scheme report (CSI ?997 ; 1 n = dark / 2 n = light)
+ *               through the pty; pi's autoSync listener re-resolves the auto
+ *               mapping and hot-swaps themes on every running pi (local,
+ *               remote, WSL) without touching any files.
  *  - `colorfgbg` → value of the COLORFGBG env var injected into the pi
  *               process. pi reads it during theme detection and it decides
- *               which half of the auto mapping (`pipi-light/pipi-dark`
- *               in settings.json) is active — the app picks the mode.
+ *               which half of the auto mapping is active at startup — the
+ *               app picks the mode.
  *
  * The two pi JSONs are based on pi's built-in dark/light themes (same
  * colors) but registered under unique names so pi treats them as custom
@@ -76,9 +81,9 @@ const dark = {
       accent: "#8abeb7",
       selectedBg: "#3a3a4a",
       userMsgBg: "#333d55",
-      toolPendingBg: "#282832",
-      toolSuccessBg: "#283228",
-      toolErrorBg: "#3c2828",
+      toolPendingBg: "#1e2a20",
+      toolSuccessBg: "#1f2c22",
+      toolErrorBg: "#2c2320",
       customMsgBg: "#26352b",
     },
     colors: {
@@ -136,8 +141,8 @@ const dark = {
       bashMode: "green",
     },
     export: {
-      pageBg: "#18181e",
-      cardBg: "#1e1e24",
+      pageBg: "#1f1f28",
+      cardBg: "#26262f",
       infoBg: "#3c3728",
     },
   },
@@ -179,9 +184,9 @@ const light = {
       lightGray: "#b0b0b0",
       selectedBg: "#d0d0e0",
       userMsgBg: "#dbe7f5",
-      toolPendingBg: "#e8e8f0",
-      toolSuccessBg: "#e8f0e8",
-      toolErrorBg: "#f0e8e8",
+      toolPendingBg: "#e2e8e3",
+      toolSuccessBg: "#e3e9e3",
+      toolErrorBg: "#e9e3e2",
       customMsgBg: "#e4f2e4",
     },
     colors: {
@@ -240,7 +245,7 @@ const light = {
     },
     export: {
       pageBg: "#f8f8f8",
-      cardBg: "#ffffff",
+      cardBg: "#f7f8fa",
       infoBg: "#fffae6",
     },
   },
