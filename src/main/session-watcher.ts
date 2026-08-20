@@ -67,6 +67,8 @@ export type FollowKind = "read" | "write";
 export interface FollowEvent {
   path: string;
   kind: FollowKind;
+  /** True when this is the one-time last-touched-file hint on watcher start. */
+  seed?: boolean;
 }
 
 export interface FollowStatus {
@@ -263,7 +265,7 @@ async function seedActiveFile(filePath: string): Promise<number> {
       const { events } = extractFromLine(line);
       if (events.length > 0) {
         const last = events[events.length - 1];
-        for (const l of listeners) l(last);
+        for (const l of listeners) l({ ...last, seed: true });
         return size;
       }
     }
@@ -435,16 +437,16 @@ async function drainChanges(st: WatchState, seed: boolean): Promise<void> {
 }
 
 /** Start watching a cwd's session directory. Switches if already watching. */
-export function startWatching(cwd: string): void {
+export function startWatching(cwd: string, agentDir?: string): void {
   stopWatching();
-  const dir = sessionDirFor(cwd);
+  const dir = sessionDirFor(cwd, agentDir);
   if (!existsSync(dir)) {
     // No sessions for this project yet — pi creates the session dir lazily.
     // Watch the parent and re-arm as soon as the dir appears.
     const parent = dirname(dir);
     try {
       const watcher = watch(parent, { persistent: false }, () => {
-        if (existsSync(dir)) startWatching(cwd);
+        if (existsSync(dir)) startWatching(cwd, agentDir);
       });
       state = {
         dir,

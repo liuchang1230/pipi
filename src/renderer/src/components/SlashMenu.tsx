@@ -5,6 +5,7 @@
  */
 import { memo, useEffect, useMemo, useRef } from "react";
 import { commandGroupLabel, filterCommands, sourceIcon, sourceLabel, type SessionCommand } from "../commands";
+import { Icon } from "./Icon";
 
 interface SlashMenuProps {
   commands: SessionCommand[];
@@ -45,7 +46,7 @@ export const SlashMenu = memo(function SlashMenu({ commands, query, selectedInde
                   onSelect(c);
                 }}
               >
-                <span className="slash-menu-icon">{sourceIcon(c.source)}</span>
+                <span className="slash-menu-icon"><Icon name={sourceIcon(c.source)} /></span>
                 <span className="slash-menu-name">/{c.name}</span>
                 <span className="slash-menu-desc">
                   {c.description ?? ""}

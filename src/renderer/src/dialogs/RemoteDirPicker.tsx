@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSessionsStore } from "../stores/sessionsStore";
 import type { FileNode } from "../stores/types";
+import { Icon } from "../components/Icon";
 
 export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: () => void }) {
   const [pickerPath, setPickerPath] = useState("~");
@@ -58,7 +59,7 @@ export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: ()
         <div className="dialog-title">选择项目目录</div>
         <div className="dialog-body">
           <div className="picker-path">
-            📂 <strong>{pickerPath.replace(/^\/home\/[^/]+/, "~")}</strong>
+            <Icon name="folder-open" /> <strong>{pickerPath.replace(/^\/home\/[^/]+/, "~")}</strong>
           </div>
           <div className="picker-list">
             {/* Always show .. unless at root */}
@@ -67,7 +68,7 @@ export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: ()
                 className="picker-row"
                 onClick={() => listDir(pickerPath === "~" ? "/" : (pickerPath.replace(/\/[^/]+$/, "") || "/"))}
               >
-                <span className="picker-icon">📁</span>
+                <span className="picker-icon"><Icon name="folder" /></span>
                 <span>..</span>
               </div>
             )}
@@ -83,7 +84,7 @@ export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: ()
                   onClick={() => e.type === "directory" && listDir(e.path)}
                   onDoubleClick={() => { if (e.type === "directory") { listDir(e.path).then(() => pickerSelect()); } }}
                 >
-                  <span className="picker-icon">{e.type === "directory" ? "📁" : "📄"}</span>
+                  <span className="picker-icon"><Icon name={e.type === "directory" ? "folder" : "file"} /></span>
                   <span>{e.name}</span>
                 </div>
               ))

@@ -11,6 +11,7 @@ import { openExternalSafe } from "./openExternal";
 import { useViewerStore } from "./stores/viewerStore";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import { Icon } from "./components/Icon";
 
 // Import the light theme globally. Dark-mode overrides live in styles.css
 // under [data-theme="dark"] so they scope correctly without theme-specific JS.
@@ -88,8 +89,8 @@ const MarkdownImage = memo(function MarkdownImage({
 
   if (isExternal) return <img src={src} alt={alt ?? ""} loading="lazy" />;
   if (dataUrl) return <img src={dataUrl} alt={alt ?? ""} loading="lazy" />;
-  if (failed) return <span className="markdown-img-failed" title={src}>🖼 图片加载失败</span>;
-  return <span className="markdown-img-loading">🖼 图片加载中…</span>;
+  if (failed) return <span className="markdown-img-failed" title={src}><Icon name="image" /> 图片加载失败</span>;
+  return <span className="markdown-img-loading"><Icon name="image" /> 图片加载中…</span>;
 });
 
 const Markdown = memo(function Markdown({ content, plainCode = false, disableStrikeThrough = false, className, onContextMenu, currentPath }: MarkdownProps) {

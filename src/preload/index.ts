@@ -5,6 +5,13 @@ export interface FileReadResult {
   content: string;
   bytes: number;
   isBinary: boolean;
+  truncated?: boolean;
+  image?: { mimeType: string; base64: string };
+  error?: string;
+}
+
+export interface FileMentionResult {
+  files: Array<{ path: string; type: "file" | "directory" }>;
   error?: string;
 }
 
@@ -27,6 +34,9 @@ export interface TabSummary {
   /** rpc = headless ChatPane (remote/WSL); sdk = in-process ChatPane (local);
    *  pty = terminal view (the default for new tabs). */
   mode?: "rpc" | "sdk" | "pty";
+  /** Connection shell tabs only: "ready" after the remote shell confirmed,
+   *  "failed" when ssh exited before that. */
+  sshState?: "ready" | "failed";
 }
 
 export interface SessionListItem {
@@ -136,6 +146,19 @@ const api = {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
       return await ipcRenderer.invoke("tab:alive", id);
+    },
+    /** Poll the honest SSH session state of a connection shell tab: "ready"
+     *  (remote shell confirmed via the __PIPI_READY__ marker), "failed"
+     *  (ssh exited / tab gone), or "timeout" when neither happened in time
+     *  (the tab may be waiting at a password prompt — it stays up for login). */
+    waitConnState: async (id: string, timeoutMs = 10000, intervalMs = 250): Promise<"ready" | "failed" | "timeout"> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const { state } = (await ipcRenderer.invoke("tab:conn-state", id)) as { state: "ready" | "failed" | "pending" | "gone" };
+        if (state === "ready" || state === "failed" || state === "gone") return state === "gone" ? "failed" : state;
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+      return "timeout";
     },
   },
   onTabData: (id: string, callback: (data: string) => void): (() => void) => {
@@ -259,8 +282,11 @@ const api = {
       ipcRenderer.invoke("file:list-dir", { rootPath, tabId, relDir, noCache }),
     resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }): Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }> =>
       ipcRenderer.invoke("file:resolve-link", input),
-    read: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileReadResult> =>
-      ipcRenderer.invoke("file:read", { tabId, relPath, rootPath }),
+    read: (tabId: string | undefined, relPath: string, rootPath?: string, mention?: boolean): Promise<FileReadResult> =>
+      ipcRenderer.invoke("file:read", { tabId, relPath, rootPath, mention }),
+    /** Bounded recursive file index for @-mention completion in the chat. */
+    searchMentions: (tabId: string, query: string): Promise<FileMentionResult> =>
+      ipcRenderer.invoke("file:search-mentions", { tabId, query }),
     write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string): Promise<FileOpResult> =>
       ipcRenderer.invoke("file:write", { tabId, relPath, content, rootPath }),
     mkdir: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
@@ -270,8 +296,8 @@ const api = {
     rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string): Promise<FileOpResult> =>
       ipcRenderer.invoke("file:rename", { tabId, relPath, newName, rootPath }),
   },
-  onAutoFollow: (callback: (ev: { path: string; kind: "read" | "write" }) => void): (() => void) => {
-    const handler = (_e: Electron.IpcRendererEvent, ev: { path: string; kind: "read" | "write" }) => callback(ev);
+  onAutoFollow: (callback: (ev: { path: string; kind: "read" | "write"; tabId?: string }) => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, ev: { path: string; kind: "read" | "write"; tabId?: string }) => callback(ev);
     ipcRenderer.on("file:autofollow", handler);
     return () => ipcRenderer.removeListener("file:autofollow", handler);
   },
@@ -357,6 +383,8 @@ const api = {
     getInfo: (tabId: string): Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; isWsl?: boolean } | null> =>
       ipcRenderer.invoke("remote:get-info", tabId),
     listHistory: (): Promise<any[]> => ipcRenderer.invoke("remote:list-history"),
+    deleteHistory: (target: { host: string; user: string; port: number; agentDir?: string }): Promise<boolean> =>
+      ipcRenderer.invoke("remote:delete-history", target),
   },
 
   wsl: {

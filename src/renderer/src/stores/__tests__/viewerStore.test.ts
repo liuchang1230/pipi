@@ -49,6 +49,30 @@ describe("openFile", () => {
     expect(useViewerStore.getState().fileLoading).toBe(false);
   });
 
+  it("keeps an opened preview when the active session context changes", () => {
+    const preview = {
+      path: "src/a.ts",
+      content: "hello",
+      bytes: 5,
+      isBinary: false,
+      followed: false,
+      tabId: "t1",
+    };
+    useViewerStore.setState({ currentFile: preview });
+
+    // Session activation only changes the workbench's active context. The
+    // viewer owns an independent file origin and must remain untouched.
+    useTabsStore.getState().applyActive({
+      id: "remote-tab",
+      cwd: "/home/user/project",
+      isRemote: true,
+      remoteDir: "/home/user/project",
+      remoteLabel: "user@host",
+    });
+
+    expect(useViewerStore.getState().currentFile).toEqual(preview);
+  });
+
   it("resolves reads against the tree origin in preview mode (rootPath wins)", async () => {
     const api = makeApi(async () => OK_FILE);
     // Preview: treeOrigin carries the preview root; main honors rootPath over

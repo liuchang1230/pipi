@@ -36,8 +36,8 @@ export function encodeCwd(cwd: string): string {
 }
 
 /** The session directory for a given cwd. */
-export function sessionDirFor(cwd: string): string {
-  return join(homedir(), ".pi", "agent", "sessions", encodeCwd(cwd));
+export function sessionDirFor(cwd: string, agentDir = join(homedir(), ".pi", "agent")): string {
+  return join(agentDir, "sessions", encodeCwd(cwd));
 }
 
 export function decodeCwd(encoded: string): string | null {
@@ -171,8 +171,8 @@ export function parseSessionFile(filePath: string): SessionEntry | null {
 }
 
 /** List sessions for a cwd, most recent first. */
-export function listSessions(cwd: string): SessionEntry[] {
-  const dir = sessionDirFor(cwd);
+export function listSessions(cwd: string, agentDir?: string): SessionEntry[] {
+  const dir = sessionDirFor(cwd, agentDir);
   if (!existsSync(dir)) return [];
   const entries: SessionEntry[] = [];
   for (const f of readdirSync(dir)) {
@@ -186,13 +186,13 @@ export function listSessions(cwd: string): SessionEntry[] {
 }
 
 /** The most recently modified session file for a cwd (the "active" one). */
-export function mostRecentSession(cwd: string): SessionEntry | null {
-  const list = listSessions(cwd);
+export function mostRecentSession(cwd: string, agentDir?: string): SessionEntry | null {
+  const list = listSessions(cwd, agentDir);
   return list[0] ?? null;
 }
 
-export function listLocalProjects(): string[] {
-  const root = join(homedir(), ".pi", "agent", "sessions");
+export function listLocalProjects(agentDir = join(homedir(), ".pi", "agent")): string[] {
+  const root = join(agentDir, "sessions");
   if (!existsSync(root)) return [];
   const projects = readdirSync(root)
     .map((name) => decodeCwd(name))

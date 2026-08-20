@@ -9,6 +9,7 @@
 import { useMemo, useCallback, useState, useEffect, useRef } from "react";
 import hljs from "highlight.js/lib/common";
 import Markdown from "./Markdown";
+import { Icon } from "./components/Icon";
 
 export interface CurrentFile {
   path: string;
@@ -246,7 +247,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
   if (!file) {
     return (
       <pre className="viewer-content" onContextMenu={handleContextMenu}>
-        （文件查看器 · 工具操作文件时自动跟随；可点 ✏️ 编辑，或点击左侧文件查看）
+        （文件查看器 · 工具操作文件时自动跟随；可点「编辑」，或点击左侧文件查看）
       </pre>
     );
   }
@@ -257,7 +258,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
         <>
           <span className="viewer-edit-hint">Ctrl+S 保存</span>
           <button className="btn btn-small btn-primary" onClick={save} disabled={saving}>
-            {saving ? "保存中…" : "💾 保存"}
+            {saving ? "保存中…" : (<><Icon name="save" /> 保存</>)}
           </button>
           <button className="btn btn-small" onClick={cancelEdit} disabled={saving}>
             取消
@@ -270,7 +271,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
           disabled={!canEdit}
           title={canEdit ? "编辑文件" : file?.truncated ? "文件过大（预览为截断内容），已锁定为只读" : "二进制文件或未打开文件，不可编辑"}
         >
-          ✏️ 编辑
+          <Icon name="pencil" /> 编辑
         </button>
       )}
     </div>
@@ -282,8 +283,8 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
         {actions}
         <pre className="viewer-content viewer-error" onContextMenu={handleContextMenu}>
           {file.error.includes("ENOENT")
-            ? "⚠️ 文件不存在（可能已被移动或删除）"
-            : `⚠️ 无法读取文件：${file.error}`}
+            ? "文件不存在（可能已被移动或删除）"
+            : `无法读取文件：${file.error}`}
         </pre>
       </div>
     );
@@ -320,7 +321,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
           />
         ) : (
           <div className="viewer-content viewer-image-too-large" onContextMenu={handleContextMenu}>
-            📎 图片文件（{(file.bytes / 1024 / 1024).toFixed(1)} MB）超过预览上限（10 MB），无法预览
+            图片文件（{(file.bytes / 1024 / 1024).toFixed(1)} MB）超过预览上限（10 MB），无法预览
           </div>
         )}
       </div>
@@ -331,7 +332,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     return (
       <div className="viewer-body">
         {actions}
-        <pre className="viewer-content" onContextMenu={handleContextMenu}>📎 二进制文件（{file.bytes.toLocaleString()} B）</pre>
+        <pre className="viewer-content" onContextMenu={handleContextMenu}>二进制文件（{file.bytes.toLocaleString()} B）</pre>
       </div>
     );
   }
@@ -340,7 +341,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
   // read-only (saving the truncated buffer would clobber the original).
   const truncatedNote = file.truncated ? (
     <div className="viewer-truncated-note">
-      ⚠️ 文件过大（{(file.bytes / 1024 / 1024).toFixed(1)} MB）：仅显示首尾各 512 KB，已锁定为只读
+      文件过大（{(file.bytes / 1024 / 1024).toFixed(1)} MB）：仅显示首尾各 512 KB，已锁定为只读
     </div>
   ) : null;
 
@@ -350,7 +351,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
         {actions}
         {truncatedNote}
         {rendered.plain && (
-          <div className="viewer-truncated-note">ℹ️ 为保持打开速度，此 Markdown 文件超过 160 KB，已跳过代码块语法高亮</div>
+          <div className="viewer-truncated-note">提示：为保持打开速度，此 Markdown 文件超过 160 KB，已跳过代码块语法高亮</div>
         )}
         <Markdown content={file.content} plainCode={rendered.plain} className="viewer-content" currentPath={file.path} onContextMenu={handleContextMenu} />
       </div>
@@ -362,7 +363,7 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
         {actions}
         {truncatedNote}
         {rendered.plain && (
-          <div className="viewer-truncated-note">ℹ️ 为保持打开速度，此源文件超过 160 KB，已跳过语法高亮</div>
+          <div className="viewer-truncated-note">提示：为保持打开速度，此源文件超过 160 KB，已跳过语法高亮</div>
         )}
         <pre className="viewer-content code-view" onContextMenu={handleContextMenu}>
           <code

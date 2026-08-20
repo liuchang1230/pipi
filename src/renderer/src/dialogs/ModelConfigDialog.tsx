@@ -9,6 +9,7 @@ import { useSessionsStore } from "../stores/sessionsStore";
 import { useUiStore } from "../stores/uiStore";
 import { formatTokens, specForModel } from "../../../shared/model-specs";
 import type { ModelEditorSpec, PiApi, PiInputType, ProviderEditorConfig } from "../../../shared/model-config-types";
+import { Icon } from "../components/Icon";
 
 interface ModelSpecEdit extends ModelEditorSpec {}
 
@@ -56,6 +57,17 @@ function computeInitialTarget(): ModelTarget {
     if (rh) {
       const idx = allHistory.indexOf(rh);
       target = { kind: "remote", index: idx, host: rh.host, user: rh.user, port: rh.port ?? 22, password: rh.password, path: rh.path, agentDir: rh.agentDir };
+    } else {
+      // The active tab is authoritative. History may be stale or absent, but
+      // the tab still carries the selected remote profile.
+      target = {
+        kind: "remote",
+        index: -1,
+        host: active.remoteHost,
+        user: active.remoteUser,
+        port: active.remotePort ?? 22,
+        agentDir: active.remoteAgentDir,
+      };
     }
   }
   return target;
@@ -157,7 +169,14 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const loadRemoteModels = useCallback(async (target: Extract<ModelTarget, { kind: "remote" }>) => {
     setModelRemoteLoading(true);
     try {
-      setModels(await window.api.model.listRemote({ host: target.host, user: target.user, port: target.port, password: target.password, path: target.path }));
+      setModels(await window.api.model.listRemote({
+        host: target.host,
+        user: target.user,
+        port: target.port,
+        password: target.password,
+        path: target.path,
+        agentDir: target.agentDir,
+      }));
     } catch (error) {
       setModels([]);
       showToast(error instanceof Error ? error.message : "读取远程配置失败", "err");
@@ -250,7 +269,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               <option value="local">本地电脑</option>
               {wslDistros.map((d) => (
                 <option key={`wsl-${d.name}`} value={`wsl:${d.name}`}>
-                  🐧 {d.name} (WSL)
+                  {d.name} (WSL)
                 </option>
               ))}
               {remoteHistory.map((h, i) => (
@@ -261,7 +280,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
             </select>
             <span className="dialog-hint">
               {modelTarget.kind === "remote"
-                ? `写入 ${modelTarget.user}@${modelTarget.host} 的 ~/.pi/agent/`
+                ? `写入 ${modelTarget.user}@${modelTarget.host} 的 ${modelTarget.agentDir || "~/.pi/agent"}/`
                 : modelTarget.kind === "wsl"
                 ? `写入 WSL ${modelTarget.distro} 的 ~/.pi/agent/`
                 : "写入本机 ~/.pi/agent/"}
@@ -307,7 +326,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
             </label>
             <div className="model-discover-row">
               <button className="btn" onClick={() => void handleDiscoverModels()} disabled={discoveringModels}>
-                {discoveringModels ? "检索中…" : "🔍 自动检索模型"}
+                {discoveringModels ? "检索中…" : (<><Icon name="search" /> 自动检索模型</>)}
               </button>
               {discoveredModels.length > 0 && <span className="model-discover-hint">已发现 {discoveredModels.length} 个模型</span>}
             </div>
@@ -477,7 +496,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                   setBusyAction(null);
                 }
               }}
-            >📋 从本机移植配置</button>
+            ><Icon name="clipboard" /> 从本机移植配置</button>
           )}
           <button
             className="btn btn-primary"
@@ -568,7 +587,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                 }
                 resetModelForm();
                 if (targetKindWsl) {
-                  showToast(`已保存到本机。点击「📋 从本机移植配置」同步到 WSL`, "ok");
+                  showToast(`已保存到本机。点击「从本机移植配置」同步到 WSL`, "ok");
                 } else if (modelTarget.kind === "remote") {
                   showToast(`模型配置已保存（${modelTarget.user}@${modelTarget.host}）`, "ok");
                 } else {

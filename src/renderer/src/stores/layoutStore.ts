@@ -5,7 +5,9 @@
 import { create } from "zustand";
 
 const LAYOUT_STORAGE_KEY = "pipi-layout";
-const DEFAULT_LAYOUT = { leftWidth: 260, rightWidth: 420, viewerCollapsed: false };
+// Narrower sidebar: 232 default / 190 floor (was 260/220). Saved layouts are
+// honored as-is; this only changes the default and the drag floor.
+const DEFAULT_LAYOUT = { leftWidth: 232, rightWidth: 420, viewerCollapsed: false };
 
 type PersistedLayout = Partial<typeof DEFAULT_LAYOUT>;
 
@@ -14,7 +16,7 @@ function readLayout(): typeof DEFAULT_LAYOUT {
   try {
     const value = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "null") as PersistedLayout | null;
     return {
-      leftWidth: typeof value?.leftWidth === "number" ? Math.max(220, Math.min(520, value.leftWidth)) : DEFAULT_LAYOUT.leftWidth,
+      leftWidth: typeof value?.leftWidth === "number" ? Math.max(190, Math.min(520, value.leftWidth)) : DEFAULT_LAYOUT.leftWidth,
       rightWidth: typeof value?.rightWidth === "number" ? Math.max(320, Math.min(900, value.rightWidth)) : DEFAULT_LAYOUT.rightWidth,
       viewerCollapsed: value?.viewerCollapsed === true,
     };
@@ -54,7 +56,7 @@ const initial = readLayout();
 export const useLayoutStore = create<LayoutState>()((set) => ({
   ...initial,
   setLeftWidth: (leftWidth) => set((state) => {
-    const next = { leftWidth: Math.max(220, Math.min(520, leftWidth)) };
+    const next = { leftWidth: Math.max(190, Math.min(520, leftWidth)) };
     saveLayout({ ...state, ...next });
     return next;
   }),

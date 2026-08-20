@@ -62,6 +62,27 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* Native control chrome (selects, checkboxes, scrollbars) follows the theme. */
+:root { color-scheme: light; }
+[data-theme="dark"] { color-scheme: dark; }
+
+/* SVG icons size with 1em and sit on the text baseline (replaces emoji). */
+.icon { display: inline-block; vertical-align: -0.135em; flex: 0 0 auto; }
+
+/* Thin theme-aware scrollbars — paint-only, no layout cost. */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text) 30%, transparent);
+}
+*::-webkit-scrollbar-corner { background: transparent; }
+
 html, body, #root {
   height: 100%;
   background: var(--bg);
@@ -147,7 +168,7 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   background: var(--bg-panel);
-  min-width: 220px;
+  min-width: 190px;
   overflow: hidden;
   flex: 0 0 auto;
 }
@@ -155,7 +176,7 @@ html, body, #root {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 10px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
@@ -184,9 +205,13 @@ html, body, #root {
   border: 1px solid transparent;
   color: var(--text);
   cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 4px 6px;
+  border-radius: 5px;
   font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 .icon-btn:hover { background: var(--border); }
 .sidebar-actions { display: flex; gap: 2px; }
@@ -201,7 +226,8 @@ html, body, #root {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--text-dim);
-  padding: 6px 10px 4px;
+  padding: 8px 12px 5px;
+  font-weight: 600;
   flex-shrink: 0;
 }
 .tree-path {
@@ -215,6 +241,7 @@ html, body, #root {
   flex-shrink: 0;
   border-bottom: 1px solid var(--border);
 }
+.tree-path-icon { margin-right: 4px; }
 .tree-scroll, .session-scroll {
   flex: 1;
   overflow-y: auto;
@@ -236,16 +263,22 @@ html, body, #root {
 .tree-row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 8px;
+  gap: 5px;
+  padding: 3px 6px 3px 0;
   cursor: pointer;
   white-space: nowrap;
   font-size: 12px;
 }
+/* Rounded hover pill only in the sidebar tree — the shared .tree-row class is
+   also used by the /tree dialog, which keeps its own flat row style. */
+.sidebar .tree-row {
+  margin: 0 4px;
+  border-radius: 5px;
+}
 .tree-row:hover { background: var(--hover); }
 .tree-row.tree-dir { color: var(--accent); }
 .tree-row.tree-dir .tree-name { font-weight: 500; }
-.tree-chevron { width: 10px; flex-shrink: 0; color: var(--text-dim); font-size: 9px; }
+.tree-chevron { width: 10px; flex-shrink: 0; color: var(--text-dim); font-size: 10px; }
 .tree-icon { font-size: 12px; flex-shrink: 0; }
 .tree-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tree-name.tree-muted { color: var(--muted, #9ca3af); font-style: italic; }
@@ -279,7 +312,9 @@ html, body, #root {
   flex-direction: column;
 }
 .ctx-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 7px;
   width: 100%;
   text-align: left;
   padding: 7px 10px;
@@ -291,6 +326,7 @@ html, body, #root {
   cursor: pointer;
   white-space: nowrap;
 }
+.ctx-menu-item-icon { font-size: 13px; }
 .ctx-menu-item:hover { background: var(--hover-medium); }
 .ctx-menu-item.danger { color: var(--danger); }
 .ctx-menu-item.danger:hover { background: rgba(243, 139, 168, 0.12); }
@@ -300,9 +336,15 @@ html, body, #root {
   margin-top: 10px;
 }
 .group-title {
-  padding: 4px 10px 6px;
+  padding: 6px 12px 5px;
   font-size: 11px;
+  font-weight: 600;
   color: var(--text-dim);
+}
+.group-title-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 .group-title-row {
   display: flex;
@@ -318,6 +360,7 @@ html, body, #root {
   height: 18px;
   line-height: 16px;
   cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 .group-add:hover {
   color: var(--text);
@@ -538,6 +581,33 @@ html, body, #root {
   margin-left: 2px;
   opacity: 0.8;
 }
+.remote-server-connection {
+  margin-bottom: 6px;
+}
+.remote-server-projects {
+  margin-left: 10px;
+  border-left: 1px solid var(--hover-strong);
+  padding-left: 4px;
+}
+.remote-server-connection > .project-row:not(.server-connected) {
+  opacity: 0.8;
+}
+.remote-server-connection > .project-row.server-connected {
+  color: var(--accent);
+}
+.server-connect-hint {
+  color: var(--accent);
+  font-size: 11px;
+  margin-left: 2px;
+  opacity: 0.8;
+}
+.server-connect-hint.failed {
+  color: var(--danger);
+  opacity: 1;
+}
+.server-connect-hint.connecting {
+  color: var(--text-dim);
+}
 .project-row {
   display: flex;
   align-items: center;
@@ -581,7 +651,7 @@ html, body, #root {
   cursor: not-allowed;
 }
 .project-icon {
-  width: 14px;
+  font-size: 13px;
   flex-shrink: 0;
 }
 .project-name {
@@ -602,7 +672,7 @@ html, body, #root {
 .session-row {
   display: flex;
   align-items: center;
-  padding: 4px 10px;
+  padding: 5px 10px;
   cursor: pointer;
   gap: 6px;
 }
@@ -640,7 +710,9 @@ html, body, #root {
 }
 
 .ctx-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 7px;
   width: 100%;
   padding: 6px 10px;
   background: none;
@@ -649,7 +721,9 @@ html, body, #root {
   color: var(--text);
   font-size: 13px;
   text-align: left;
+  white-space: nowrap;
   cursor: pointer;
+  transition: background 0.12s ease;
 }
 .ctx-item:hover { background: var(--hover-medium); }
 .ctx-danger { color: var(--danger); }
@@ -722,9 +796,9 @@ html, body, #root {
   box-shadow: 0 1px 0 var(--hover-strong);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
-  min-height: 34px;
-  padding: 2px 4px;
-  gap: 2px;
+  min-height: 38px;
+  padding: 3px 6px;
+  gap: 3px;
 }
 .tabs {
   display: flex;
@@ -739,14 +813,16 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
-  border-radius: 4px 4px 0 0;
+  padding: 5px 12px;
+  border-radius: 6px 6px 0 0;
   cursor: pointer;
   font-size: 12px;
   color: var(--text-dim);
   white-space: nowrap;
   border: 1px solid transparent;
+  transition: background 0.12s ease, color 0.12s ease;
 }
+.tab-remote-icon { display: inline-flex; }
 .tab:hover { background: var(--hover); }
 .tab.active {
   color: var(--text);
@@ -776,6 +852,39 @@ html, body, #root {
 .terminal-pane {
   position: absolute;
   inset: 0;
+}
+
+/* Connected-server landing page (covers the terminal after a successful
+   connect; the terminal stays mounted underneath — 打开服务器终端 lifts the
+   overlay, history intact). */
+.connect-notice {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+.connect-notice-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.connect-notice-sub {
+  font-size: 13px;
+  color: var(--text-dim);
+  max-width: 420px;
+  line-height: 1.6;
+}
+.connect-notice-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
 }
 .terminal-pane.hidden {
   visibility: hidden;
@@ -852,7 +961,7 @@ html, body, #root {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   gap: 8px;
@@ -1036,7 +1145,7 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
+  padding: 7px 14px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   background: var(--bg-panel);
@@ -1162,11 +1271,19 @@ html, body, #root {
   border: none;
   color: var(--text-dim);
   cursor: pointer;
-  font-size: 15px;
-  padding: 2px 8px;
+  font-size: 14px;
+  padding: 4px 7px;
   line-height: 1;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
 }
-.tab-remote:hover { color: var(--accent); }
+.tab-remote:hover {
+  color: var(--accent);
+  background: var(--hover);
+}
 
 /* Consistent keyboard navigation across the app's compact controls. */
 button:focus-visible,
@@ -1183,12 +1300,16 @@ textarea:focus-visible,
   border: 1px solid var(--border);
   color: var(--text);
   cursor: pointer;
-  font-size: 16px;
-  padding: 3px 12px;
+  font-size: 12px;
+  padding: 4px 12px;
   border-radius: 5px;
   line-height: 1.2;
   white-space: nowrap;
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 .tab-chat:hover {
   color: var(--accent);
@@ -1209,6 +1330,14 @@ textarea:focus-visible,
   align-items: center;
   justify-content: center;
   z-index: 100;
+}
+/* Extension UI dialogs (pi-rewind's "Restore Options" on tree navigation,
+   ask-user-question prompts, …) must stay ABOVE app dialogs like the tree
+   dialog — otherwise they render behind it and navigation hangs waiting for
+   an answer nobody can see. Below toasts (1000) so transient notices stay
+   visible. */
+.dialog-overlay.ui-dialog-overlay {
+  z-index: 500;
 }
 .dialog {
   background: var(--bg-panel);
@@ -1231,7 +1360,7 @@ textarea:focus-visible,
 .dialog-title {
   font-size: 16px;
   font-weight: 600;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 .dialog-tabs {
   display: flex;
@@ -1243,12 +1372,16 @@ textarea:focus-visible,
 .dialog-tab {
   padding: 6px 14px;
   border: 1px solid var(--border);
-  border-radius: 5px 5px 0 0;
+  border-radius: 6px 6px 0 0;
   background: var(--bg-input);
   color: var(--text-dim);
   font-size: 13px;
   cursor: pointer;
   border-bottom: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 .dialog-tab.active {
   background: var(--accent);
@@ -1268,7 +1401,7 @@ textarea:focus-visible,
   padding: 8px 10px;
   background: var(--bg-input);
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: 6px;
   color: var(--text);
   font-size: 13px;
   font-family: var(--mono);
@@ -1296,6 +1429,12 @@ textarea:focus-visible,
   padding: 4px 16px 8px;
   text-align: center;
 }
+.dialog-status-err {
+  color: var(--danger);
+}
+.dialog-status-connecting {
+  color: var(--text-dim);
+}
 .dialog-actions {
   display: flex;
   justify-content: flex-end;
@@ -1305,11 +1444,16 @@ textarea:focus-visible,
 .btn {
   padding: 6px 16px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: 6px;
   background: transparent;
   color: var(--text);
   cursor: pointer;
   font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 .btn:hover { border-color: var(--accent); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -1323,16 +1467,24 @@ textarea:focus-visible,
 
 /* --- Remote directory picker --- */
 .picker-path {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--accent);
   padding: 6px 10px;
   background: var(--bg-input);
-  border-radius: 5px;
+  border-radius: 6px;
   margin-bottom: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.picker-path strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 .picker-list {
   max-height: 260px;
@@ -1396,7 +1548,7 @@ textarea:focus-visible,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
+  padding: 7px 14px;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
 }
@@ -1683,6 +1835,41 @@ textarea:focus-visible,
   font-size: 11px;
   line-height: 1.45;
 }
+.chat-turn-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 26px;
+  padding: 0 3px 7px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.chat-turn-status.completed { color: #4caf72; }
+.chat-turn-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: chat-turn-spin .75s linear infinite;
+}
+@keyframes chat-turn-spin { to { transform: rotate(360deg); } }
+.chat-exited-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--danger) 6%, transparent);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.chat-exited-bar .chat-btn {
+  margin-left: auto;
+}
+.chat-exited-bar .chat-btn + .chat-btn {
+  margin-left: 0;
+}
 .chat-input-wrap {
   flex: 0 0 auto;
   border-top: 1px solid var(--border);
@@ -1741,6 +1928,10 @@ textarea:focus-visible,
   padding: 4px 14px;
   font-size: 12px;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 .chat-btn:hover:not(:disabled) {
   border-color: var(--accent);
@@ -1863,8 +2054,9 @@ textarea:focus-visible,
   margin-top: 16px;
 }
 
-/* --- Slash command popup (get_commands) --- */
-.slash-menu {
+/* --- Slash command and @file popup --- */
+.slash-menu,
+.file-mention-menu {
   position: absolute;
   left: 10px;
   right: 10px;
@@ -2712,4 +2904,176 @@ textarea:focus-visible,
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* --- Full questionnaire dialog (ask_user_question chat-view parity) --- */
+.qq-dialog {
+  width: min(760px, 92vw);
+}
+.qq-multi-badge {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--accent);
+  vertical-align: middle;
+}
+.qq-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+}
+.qq-tab {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.qq-tab:hover { border-color: var(--accent); }
+.qq-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.qq-tab.answered {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.qq-tab.answered.active { color: #fff; }
+.qq-tab-submit {
+  margin-left: 4px;
+}
+.qq-question {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.qq-layout {
+  display: flex;
+  gap: 16px;
+}
+.qq-options {
+  flex: 1;
+  min-width: 0;
+}
+.qq-layout.with-preview .qq-options {
+  flex: 1 1 60%;
+}
+.qq-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.qq-option:hover { border-color: var(--accent); }
+.qq-option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.qq-option input[type="radio"],
+.qq-option input[type="checkbox"] {
+  margin-top: 2px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.qq-option-body {
+  min-width: 0;
+  flex: 1;
+}
+.qq-option-label {
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-word;
+}
+.qq-option-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.qq-custom-input {
+  margin-top: 8px;
+}
+.qq-preview-pane {
+  flex: 1 1 40%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  max-height: 340px;
+  display: flex;
+  flex-direction: column;
+}
+.qq-preview-title {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}
+.qq-preview-body {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-y: auto;
+  min-height: 0;
+}
+.qq-submit {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.qq-summary-row {
+  display: flex;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.qq-summary-row:last-child { border-bottom: none; }
+.qq-summary-row.unanswered { background: color-mix(in srgb, var(--warning, #e5c07b) 8%, transparent); }
+.qq-summary-q {
+  flex-shrink: 0;
+  min-width: 44px;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding-top: 1px;
+}
+.qq-summary-a {
+  color: var(--text);
+  word-break: break-word;
+}
+.qq-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+.qq-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.qq-footer-nav {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
 }

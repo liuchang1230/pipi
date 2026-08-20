@@ -1,8 +1,10 @@
 // Small UI primitives for the file tree: right-click context menu + prompt/confirm dialogs.
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Icon, type IconName } from "./components/Icon";
 
 export interface CtxMenuItem {
   label: string;
+  icon?: IconName;
   danger?: boolean;
   onSelect: () => void;
 }
@@ -35,7 +37,7 @@ export function FileContextMenu({
   }, [onClose]);
 
   const menuW = 176;
-  const menuH = items.length * 33 + 8;
+  const menuH = items.length * 34 + 8;
   const left = Math.max(4, Math.min(x, window.innerWidth - menuW - 4));
   const top = Math.max(4, Math.min(y, window.innerHeight - menuH - 4));
 
@@ -61,6 +63,7 @@ export function FileContextMenu({
               item.onSelect();
             }}
           >
+            {item.icon && <Icon name={item.icon} className="ctx-menu-item-icon" />}
             {item.label}
           </button>
         ))}

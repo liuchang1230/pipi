@@ -25,6 +25,9 @@ export interface TabInfo {
   /** rpc = headless ChatPane (remote/WSL); sdk = in-process ChatPane (local);
    *  pty/undefined = terminal view. */
   mode?: "rpc" | "sdk" | "pty";
+  /** Connection shell tabs only: "ready" after the remote shell confirmed
+   *  (__PIPI_READY__ marker), "failed" when ssh exited before that. */
+  sshState?: "ready" | "failed";
 }
 
 export interface SessionItem {
@@ -46,6 +49,7 @@ export interface ProjectListItem {
   port?: number;
   path?: string;
   password?: string;
+  agentDir?: string;
   distro?: string;
 }
 
@@ -70,6 +74,7 @@ export interface ProjectGroup {
   user?: string;
   port?: number;
   password?: string;
+  agentDir?: string;
   sessions: SessionItem[];
   disabled?: boolean;
   error?: string;
@@ -79,6 +84,29 @@ export interface ProjectGroup {
     sessionDir: string;
     fileCount: number;
   };
+}
+
+/** Honest connection status of an SSH server node in the sidebar. */
+export type ServerStatus = "connected" | "connecting" | "failed" | "disconnected";
+
+/** An SSH server as a sidebar connection node (the 远程服务器 section): the
+ *  server itself plus the project folders hanging under it. Mirrors
+ *  WslConnectionGroup for WSL distros. */
+export interface RemoteServerGroup {
+  key: string;
+  host: string;
+  user: string;
+  port: number;
+  agentDir?: string;
+  password?: string;
+  path?: string;
+  label: string;
+  /** connected = confirmed (ready marker or an open pi session tab);
+   *  connecting = connection shell tab exists but not confirmed yet;
+   *  failed = ssh exited before confirming; disconnected = no tab. */
+  status: ServerStatus;
+  tabId?: string;
+  projects: ProjectGroup[];
 }
 
 /** A WSL distro as a connection node: distro + its project folders. */

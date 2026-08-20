@@ -100,6 +100,7 @@ function ensureWorker(): Worker {
         // Session file created by pi — link it for title/sidebar sync, and
         // FORWARD the get_state response so the renderer's onRpcEvent handler
         // sees it (RPC backend forwards every response; SDK mode must too).
+        forwardEvent(msg.tabId, { type: "app_phase", phase: "ready" });
         void sdkRequest(msg.tabId, { type: "get_state" }).then((res) => {
           const data = res.data as { sessionFile?: string; sessionName?: string } | undefined;
           if (res.success && data) {

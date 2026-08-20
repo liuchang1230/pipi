@@ -50,7 +50,7 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
   const title = req.title || "pi";
 
   return (
-    <div className="dialog-overlay" onClick={cancel}>
+    <div className="dialog-overlay ui-dialog-overlay" onClick={cancel}>
       <div className="dialog ui-dialog" onClick={(e) => e.stopPropagation()} onKeyDown={onKeyDown}>
         <div className="dialog-title">{title}</div>
         <div className="dialog-body">

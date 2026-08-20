@@ -33,7 +33,7 @@ import { useTreeStore } from "./stores/treeStore";
 import { useViewerStore } from "./stores/viewerStore";
 import { useUiStore } from "./stores/uiStore";
 import { useLayoutStore } from "./stores/layoutStore";
-import type { SessionItem } from "./stores/types";
+import type { RemoteServerGroup, SessionItem, RemoteHistoryItem } from "./stores/types";
 
 /** Renders the app-wide toast from uiStore (transient, 3s auto-dismiss). */
 function ToastHost() {
@@ -187,9 +187,9 @@ export default function App() {
         return;
       }
       if (r) {
-        // Watcher is stopped for remote/WSL tabs; nothing will replace the viewer
-        // content, so clear the previous (local) file to avoid a stale view.
-        useViewerStore.getState().setCurrentFile(null);
+        // The file preview is workbench state, independent of the active
+        // session/tab. Its captured tab/root origin keeps reads and saves
+        // pointed at the file that was originally opened.
         const browsePath = (await window.api.remote.getBrowsePath(id)) ?? c;
         const remoteInfo = await window.api.remote.getInfo(id);
         // Skip redundant reload only when re-activating the SAME tab at the SAME
@@ -203,7 +203,7 @@ export default function App() {
           cwd: browsePath,
           isRemote: true,
           remoteDir: browsePath,
-          remoteLabel: remoteInfo && (remoteInfo as any).isWsl ? `🐧 ${(remoteInfo as any).host}` : remoteInfo ? `${remoteInfo.user}@${remoteInfo.host}` : "远程",
+          remoteLabel: remoteInfo && (remoteInfo as any).isWsl ? `WSL ${(remoteInfo as any).host}` : remoteInfo ? `${remoteInfo.user}@${remoteInfo.host}` : "远程",
         });
         remoteDirRef.current = browsePath;
         if (!sameTabSamePath || wasPreview) void useTreeStore.getState().loadTree(browsePath, id);
@@ -280,18 +280,79 @@ export default function App() {
     });
   }, [handleSelectDir]);
 
-  // --- Remote directory picker openers -------------------------------------
-  const handleAddRemoteProject = useCallback(async () => {
-    // SSH section +: find an SSH connection tab (never a WSL tab).
+  // --- Remote server nodes + directory pickers ---------------------------
+  /** "远程服务器" section header +: open the connect dialog (new server). */
+  const handleAddRemoteServer = useCallback(() => setShowRemote(true), []);
+
+  /** Ensure a connection tab exists for a server node; returns its tab id.
+   *  Reuses an open tab (any tab with the same remoteKey), otherwise spawns a
+   *  connection shell tab (startPi:false) and waits for the honest SSH state:
+   *  ready (remote shell confirmed) vs failed (ssh exited) vs timeout (tab is
+   *  up, probably waiting at a password prompt — the terminal is the login
+   *  surface). Never claims "已连接" without the ready marker. */
+  const serverConnectingRef = useRef<Set<string>>(new Set());
+  const ensureRemoteConnection = useCallback(async (server: RemoteServerGroup): Promise<string | null> => {
     const tabs = useTabsStore.getState().tabs;
-    const remoteTab = tabs.find((t) => t.isRemote && !t.isWsl);
-    if (!remoteTab) {
-      useUiStore.getState().showToast("未连接远程终端，先点击顶部的 🌐 连接远程。\n连接成功后，再点这里的 + 选择远程项目目录。", "err");
-      return;
+    // Reuse an open tab, preferring the connection shell tab ("· 连接") so
+    // the server node opens the server's terminal rather than a chat view.
+    // Never reuse a FAILED shell tab (ssh exited before the ready marker):
+    // the renderer may still hold it briefly after main drops it, and
+    // activating a dead tab would silently no-op.
+    const candidates = tabs.filter((t) => t.isRemote && !t.isWsl && t.remoteKey === server.key && t.sshState !== "failed");
+    const existing = candidates.find((t) => t.title.endsWith(" · 连接")) ?? candidates[0];
+    if (existing) return existing.id;
+    if (serverConnectingRef.current.has(server.key)) return null; // in flight
+    serverConnectingRef.current.add(server.key);
+    try {
+      const id = await window.api.tab.create({
+        cwd: useTabsStore.getState().cwd || ".",
+        remote: {
+          host: server.host,
+          user: server.user,
+          port: server.port,
+          password: server.password,
+          path: server.path || undefined,
+          agentDir: server.agentDir,
+          startPi: false,
+        },
+      });
+      const state = await window.api.tab.waitConnState(id, 10000, 250);
+      if (state === "failed") {
+        useUiStore.getState().showToast(`连接失败: ${server.user}@${server.host}（请检查地址/密码/免密配置）`, "err");
+        return null;
+      }
+      if (state === "ready") useUiStore.getState().showToast(`已连接到 ${server.user}@${server.host}`, "ok");
+      else useUiStore.getState().showToast(`已发起连接；如服务器要求密码，请在终端标签页输入`, "ok");
+      // tab:create already persisted the history entry on the main side;
+      // refresh the renderer copy so the node survives restarts with password.
+      window.api.remote.listHistory().then((list) => useSessionsStore.getState().setRemoteHistory(list as RemoteHistoryItem[])).catch(() => {});
+      return id;
+    } catch (e) {
+      useUiStore.getState().showToast(`连接 ${server.user}@${server.host} 失败: ${e instanceof Error ? e.message : String(e)}`, "err");
+      return null;
+    } finally {
+      serverConnectingRef.current.delete(server.key);
     }
-    pickerTabRef.current = remoteTab.id;
-    setShowRemotePicker(true);
   }, []);
+
+  /** Server node click: activate its shell tab, or connect if not connected.
+   *  Resolves true when the server is (or just became) connected — the
+   *  sidebar expands the node's projects on success. */
+  const handleConnectServer = useCallback(async (server: RemoteServerGroup): Promise<boolean> => {
+    const tabId = await ensureRemoteConnection(server);
+    if (!tabId) return false;
+    const ok = await window.api.tab.activate(tabId);
+    if (ok) useTabsStore.getState().setActiveTab(tabId);
+    return ok;
+  }, [ensureRemoteConnection]);
+
+  /** Server node +: browse THAT server's directories (never the first tab). */
+  const handleAddRemoteProjectForServer = useCallback(async (server: RemoteServerGroup) => {
+    const tabId = await ensureRemoteConnection(server);
+    if (!tabId) return;
+    pickerTabRef.current = tabId;
+    setShowRemotePicker(true);
+  }, [ensureRemoteConnection]);
 
   /** Connect a WSL distro: activate its tab if open, otherwise create one. */
   /** In-flight WSL connects: a double-click must not open two tabs for one
@@ -348,7 +409,7 @@ export default function App() {
   const onRightPaneResizerDown = useCallback(() => { rightPaneDragRef.current = true; }, []);
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
-      if (leftPaneDragRef.current) pendingPaneWidthsRef.current.left = Math.max(220, Math.min(520, e.clientX));
+      if (leftPaneDragRef.current) pendingPaneWidthsRef.current.left = Math.max(190, Math.min(520, e.clientX));
       if (rightPaneDragRef.current && !useLayoutStore.getState().viewerCollapsed) {
         pendingPaneWidthsRef.current.right = Math.max(320, Math.min(900, window.innerWidth - e.clientX));
       }
@@ -383,7 +444,9 @@ export default function App() {
         theme={theme}
         toggleTheme={toggleTheme}
         onNewLocalProject={() => void handleSelectDir()}
-        onAddRemoteProject={() => void handleAddRemoteProject()}
+        onAddRemoteServer={handleAddRemoteServer}
+        onConnectServer={handleConnectServer}
+        onAddRemoteProjectForServer={(server) => void handleAddRemoteProjectForServer(server)}
         onWslConnect={(distro) => void connectWslDistro(distro)}
         onAddWslProject={(distro) => void addWslProject(distro)}
       />

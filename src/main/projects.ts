@@ -172,7 +172,12 @@ export function addRemoteProject(remote: { host: string; user: string; port?: nu
   const projects = readProjects();
   const now = Date.now();
   const port = remote.port ?? 22;
-  const existing = projects.find((p) => p.type === "remote" && p.host === remote.host && p.user === remote.user && p.port === port && p.path === remote.path);
+  const existing = projects.find((p) => p.type === "remote"
+    && p.host === remote.host
+    && p.user === remote.user
+    && p.port === port
+    && p.path === remote.path
+    && (p.agentDir ?? "") === (remote.agentDir ?? ""));
   if (existing) return existing;
   const entry: ProjectEntry = {
     id: `remote-${now}`,

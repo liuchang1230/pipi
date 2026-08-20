@@ -13,10 +13,23 @@ import { useChatStore, type ChatBlock, type ChatMessage } from "../stores/chatSt
 import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
+import {
+  QuestionnaireDialog,
+  buildFlushResponse,
+  buildFlushSteps,
+  extractSentinelLabel,
+  parseQuestionsFromArgs,
+  walkerTitleStarts,
+  type QAnswer,
+  type QQuestion,
+} from "../dialogs/QuestionnaireDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
 import { DiffView, editsToDiff, isDiffish } from "../components/DiffView";
 import { SlashMenu } from "../components/SlashMenu";
 import { SkillChips } from "../components/SkillChips";
+import { FileMentionMenu } from "../components/FileMentionMenu";
+import { Icon } from "../components/Icon";
+import { fileMentionPaths, fileMentionTokenAt, filterFileMentions, replaceFileMention, type FileMention } from "../file-mentions";
 import {
   commandTokenAt,
   fetchCommands,
@@ -317,6 +330,7 @@ const HIDDEN_TIMELINE = {
   messages: [] as ChatMessage[],
   isStreaming: false,
   booted: false,
+  bootStage: undefined as "connecting" | "starting" | "ready" | undefined,
   compacting: false,
   retryInfo: null,
   steeringQueue: [] as string[],
@@ -336,6 +350,7 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut }: { tabId
       messages: st.messages,
       isStreaming: st.isStreaming,
       booted: st.booted,
+      bootStage: st.bootStage,
       compacting: !!st.compacting,
       retryInfo: st.retryInfo ?? null,
       steeringQueue: st.steeringQueue ?? HIDDEN_TIMELINE.steeringQueue,
@@ -389,7 +404,7 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut }: { tabId
     }} onWheel={(e) => {
       if (e.deltaY < 0 && e.currentTarget.scrollTop < 80) revealOlder();
     }}>
-      {!timeline.booted && !bootTimedOut && <div className="chat-placeholder">正在启动 pi…</div>}
+      {!timeline.booted && !bootTimedOut && <div className="chat-placeholder">{timeline.bootStage === "connecting" ? "正在连接远程 Pi…" : "正在启动 Pi…"}</div>}
       {!timeline.booted && bootTimedOut && <div className="chat-error-banner">pi 启动超时（远程服务器可能未安装 pi，或连接失败）。可切换到终端视图排查。</div>}
       {messages.length === 0 && timeline.booted && <div className="chat-placeholder">输入问题开始对话（鼠标可直接点击、选中、编辑输入内容）</div>}
       {hiddenCount > 0 && <div className="chat-load-older" onClick={revealOlder}>↑ 更早的消息已折叠（还有 {hiddenCount} 条）— 点击或滚动到顶部加载</div>}
@@ -406,6 +421,28 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut }: { tabId
 
 // --- Main view --------------------------------------------------------------
 
+/**
+ * Find the currently-running ask_user_question tool call in the tab's chat
+ * stream and parse its full question set. Used to recognize the walker's
+ * first dialog and open the full questionnaire instead of tiny per-question
+ * dialogs.
+ */
+function findRunningAskUserQuestion(tabId: string): QQuestion[] | null {
+  const st = useChatStore.getState().states[tabId];
+  if (!st) return null;
+  for (let mi = st.messages.length - 1; mi >= 0; mi--) {
+    const msg = st.messages[mi];
+    if (!msg || msg.role !== "assistant") continue;
+    for (const b of msg.blocks) {
+      if (b.kind === "tool" && b.name === "ask_user_question" && b.status === "streaming") {
+        const qs = parseQuestionsFromArgs(b.argsText);
+        if (qs && qs.length > 0) return qs;
+      }
+    }
+  }
+  return null;
+}
+
 export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId: string; active?: boolean }) {
   const state = useChatStore(useShallow((s) => {
     const st = s.states[tabId];
@@ -415,6 +452,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     return {
       isStreaming: st.isStreaming,
       exited: st.exited,
+      exitCode: st.exitCode,
       booted: st.booted,
       modelName: st.modelName,
       modelId: st.modelId,
@@ -429,11 +467,32 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       steeringMode: st.steeringMode,
       followUpMode: st.followUpMode,
       autoCompactionEnabled: st.autoCompactionEnabled,
+      turn: st.turn,
     };
   }));
   const activeTab = useTabsStore((s) => s.activeTab);
   const [input, setInput] = useState("");
   const [uiReq, setUiReq] = useState<UiRequest | null>(null);
+  // Full multi-question UI for ask_user_question (parity with the TUI): the
+  // first walker dialog is held unanswered while the user fills the
+  // questionnaire; submit/cancel then answers the walker's dialogs in order.
+  const [questionnaire, setQuestionnaire] = useState<{
+    questions: QQuestion[];
+    firstReq: UiRequest;
+    sentinelLabel?: string;
+  } | null>(null);
+  const [questionnaireSubmitting, setQuestionnaireSubmitting] = useState(false);
+  const questionnaireRef = useRef<{
+    questions: QQuestion[];
+    firstReq: UiRequest;
+    sentinelLabel?: string;
+  } | null>(null);
+  const flushRef = useRef<{
+    steps: Array<{ qi: number; kind: "select" | "multi" | "custom" }>;
+    nextIndex: number;
+    questions: QQuestion[];
+    answers: Record<number, QAnswer>;
+  } | null>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [thinkMenuOpen, setThinkMenuOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
@@ -441,6 +500,8 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [treeOpen, setTreeOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
+  const [completionVisible, setCompletionVisible] = useState(false);
+  const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [stats, setStats] = useState<{ tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; context?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | null>(null);
   const [modelList, setModelList] = useState<Array<{ id: string; name?: string; provider?: string }>>([]);
   const [thinkingLevels, setThinkingLevels] = useState<string[]>([]);
@@ -449,6 +510,15 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
+  const [mentionOpen, setMentionOpen] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState("");
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionFiles, setMentionFiles] = useState<FileMention[]>([]);
+  const [mentionsLoading, setMentionsLoading] = useState(false);
+  const [attachingFiles, setAttachingFiles] = useState(false);
+  const mentionRequestRef = useRef(0);
+  const mentionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const attachingFilesRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   /** Double-fire guard: Enter/button double-hits within 300ms are slips. */
   const lastSendAtRef = useRef(0);
@@ -461,17 +531,39 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   // Auto-focus the input when this chat becomes the visible tab (new tab via
   // "+" or switching back). Without it, typing right after clicking "+"
   // goes nowhere — the focus is still on the button.
+  // Also refocus when the window regains OS focus (mirrors TerminalView): a
+  // blur/refocus cycle must hand the keyboard back to the chat input.
+  // `wasActive` latches only AFTER a focus attempt, so a failed mount-time
+  // focus (tabs:update arriving before tabs:active, dialog stealing focus)
+  // can retry on the next activation instead of being skipped forever.
   const wasActive = useRef(false);
   useEffect(() => {
-    if (activeTab === tabId) {
-      if (!wasActive.current) {
-        const t = setTimeout(() => taRef.current?.focus(), 30);
-        wasActive.current = true;
-        return () => clearTimeout(t);
-      }
-    } else {
+    if (activeTab !== tabId) {
       wasActive.current = false;
+      return;
     }
+    const focusInput = () => {
+      const ta = taRef.current;
+      if (!ta || ta.disabled) return;
+      ta.focus();
+      wasActive.current = true;
+    };
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let retryFrame: number | null = null;
+    if (!wasActive.current) {
+      // Slight delay so the textarea exists after a fresh mount; retry once
+      // on the next frame if the focus didn't take.
+      timer = setTimeout(() => {
+        focusInput();
+        if (!wasActive.current) retryFrame = requestAnimationFrame(focusInput);
+      }, 30);
+    }
+    window.addEventListener("focus", focusInput);
+    return () => {
+      if (timer) clearTimeout(timer);
+      if (retryFrame !== null) cancelAnimationFrame(retryFrame);
+      window.removeEventListener("focus", focusInput);
+    };
   }, [activeTab, tabId]);
 
   const requestHistory = useCallback(() => {
@@ -486,6 +578,79 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       useChatStore.getState().initMessages(tabId, data.messages ?? []);
     });
   }, [tabId]);
+
+  // --- ask_user_question full-questionnaire plumbing -----------------------
+  // The rpiv extension's RPC walker emits one select/input dialog per
+  // question with no back navigation. We hold the FIRST dialog unanswered,
+  // show QuestionnaireDialog built from the tool call args, then answer the
+  // walker's sequential dialogs from the collected answers on submit.
+  const respondToUi = (req: UiRequest, payload: Record<string, unknown>) => {
+    void window.api.rpcUiResponse(tabId, { id: req.id, ...payload });
+  };
+  const closeQuestionnaire = () => {
+    flushRef.current = null;
+    questionnaireRef.current = null;
+    setQuestionnaireSubmitting(false);
+    setQuestionnaire(null);
+  };
+  /** Answer one walker dialog from the flush plan. False = dialog not ours. */
+  const tryFlushStep = (req: UiRequest, flush: NonNullable<typeof flushRef.current>): boolean => {
+    const step = flush.steps[flush.nextIndex];
+    if (!step) return false;
+    const q = flush.questions[step.qi];
+    if (!q || !walkerTitleStarts(req.title, q)) return false;
+    const payload = buildFlushResponse(step, flush.answers[step.qi]!, req.options ?? []);
+    if (payload === null) return false;
+    respondToUi(req, payload);
+    flush.nextIndex++;
+    if (flush.nextIndex >= flush.steps.length) closeQuestionnaire();
+    return true;
+  };
+  /** Open the full questionnaire when the walker's first dialog arrives. */
+  const tryOpenQuestionnaire = (req: UiRequest): boolean => {
+    if (req.method !== "select" && req.method !== "input") return false;
+    const questions = findRunningAskUserQuestion(tabId);
+    if (!questions) return false;
+    if (!walkerTitleStarts(req.title, questions[0]!)) return false;
+    questionnaireRef.current = {
+      questions,
+      firstReq: req,
+      // The walker's sentinel label follows the host locale — mirror it in
+      // the custom-answer row instead of hardcoding English.
+      sentinelLabel: extractSentinelLabel(req.options),
+    };
+    setQuestionnaire(questionnaireRef.current);
+    return true;
+  };
+  const handleQuestionnaireSubmit = (answers: Record<number, QAnswer>) => {
+    const open = questionnaireRef.current;
+    if (!open) return;
+    // Re-entry guard: a held Enter + button click in the same tick must not
+    // rebuild the flush plan mid-flush (answers would mis-map to dialogs).
+    if (flushRef.current) return;
+    const steps = buildFlushSteps(open.questions, answers);
+    if (steps.length === 0) {
+      closeQuestionnaire();
+      return;
+    }
+    setQuestionnaireSubmitting(true);
+    flushRef.current = { steps, nextIndex: 0, questions: open.questions, answers };
+    // Answer the held first dialog now; subsequent dialogs arrive via offUi.
+    if (!tryFlushStep(open.firstReq, flushRef.current)) {
+      // Practically unreachable (title already matched at open; the walker
+      // always sends options). Abort honestly — surfacing it as a normal
+      // dialog could let a later dialog re-open a misaligned questionnaire.
+      respondToUi(open.firstReq, { cancelled: true });
+      closeQuestionnaire();
+    }
+  };
+  const handleQuestionnaireCancel = () => {
+    const open = questionnaireRef.current;
+    if (!open) return;
+    // Dismissing any dialog cancels the whole walker (mirrors Esc in the TUI).
+    respondToUi(open.firstReq, { cancelled: true });
+    closeQuestionnaire();
+  };
 
   useEffect(() => {
     useChatStore.getState().ensure(tabId);
@@ -589,7 +754,22 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           taRef.current?.focus();
         });
       });
-      if (!consumed) setUiReq(req);
+      if (!consumed) {
+        // While flushing answers back, every incoming dialog belongs to the
+        // walker — answer it from the flush plan. An unexpected dialog shape
+        // aborts the walker honestly (mismatch is essentially impossible;
+        // answering out of order would corrupt the question mapping).
+        const flush = flushRef.current;
+        if (flush) {
+          if (tryFlushStep(req, flush)) return;
+          respondToUi(req, { cancelled: true });
+          closeQuestionnaire();
+          return;
+        }
+        // First walker dialog → open the full questionnaire instead.
+        if (!questionnaireRef.current && tryOpenQuestionnaire(req)) return;
+        setUiReq(req);
+      }
     });
 
     // Boot history when this tab is first shown. The main process already
@@ -646,8 +826,78 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     return () => clearTimeout(timer);
   }, [tabId]);
 
+  useEffect(() => () => {
+    if (completionTimer.current) clearTimeout(completionTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (state?.turn.phase !== "completed") return;
+    setCompletionVisible(true);
+    if (completionTimer.current) clearTimeout(completionTimer.current);
+    completionTimer.current = setTimeout(() => setCompletionVisible(false), 2500);
+  }, [state?.turn.phase]);
+
   const isStreaming = !!state?.isStreaming;
   const exited = !!state?.exited;
+
+  // Reconnect and continue the same session: close the dead tab and spawn a
+  // fresh backend (same remote profile / session file). Pi sessions live on
+  // disk, so resuming is cheap — the process itself cannot be revived.
+  const resumeSession = async () => {
+    if (switchBusy) return;
+    setSwitchBusy(true);
+    try {
+      const tabsState = useTabsStore.getState();
+      const tab = tabsState.tabs.find((t) => t.id === tabId);
+      const info = await window.api.remote.getInfo(tabId);
+      const cwd = tabsState.cwd || ".";
+      await window.api.tab.close(tabId);
+      useChatStore.getState().clear(tabId);
+      let id: string;
+      if ((info as { isWsl?: boolean } | null)?.isWsl) {
+        const w = info as { host: string; path?: string };
+        id = await window.api.tab.create({ cwd, sessionPath: tab?.sessionPath, wsl: { distro: w.host, path: w.path } });
+      } else if (info) {
+        id = await window.api.tab.create({
+          cwd,
+          sessionPath: tab?.sessionPath,
+          remote: {
+            host: info.host,
+            user: info.user,
+            port: info.port,
+            path: info.path,
+            password: info.password,
+            startPi: info.startPi,
+            agentDir: (info as { agentDir?: string }).agentDir,
+          },
+        });
+      } else {
+        id = await window.api.tab.create({ cwd, sessionPath: tab?.sessionPath, continueRecent: tab?.sessionPath ? undefined : true });
+      }
+      useTabsStore.getState().selectTab(id);
+    } catch (e) {
+      useUiStore.getState().showToast(`重新连接失败: ${e instanceof Error ? e.message : String(e)}`, "err");
+    } finally {
+      setSwitchBusy(false);
+    }
+  };
+  const phase = state?.turn.phase ?? "booting";
+  const phaseLabel: Record<string, string> = {
+    booting: "正在启动 Pi…",
+    ready: "已就绪",
+    submitting: "已发送，等待 Pi 开始处理…",
+    thinking: "正在思考…",
+    streaming: "正在回复…",
+    tool: state?.turn.detail ?? "正在执行工具…",
+    retrying: "模型暂时不可用，正在重试…",
+    compacting: "正在压缩上下文…",
+    queued: state?.turn.detail ?? "消息已排队",
+    cancelling: "正在停止…",
+    completed: "✓ Agent 已完成",
+    failed: state?.turn.detail ?? "本轮出现错误",
+    exited: "Pi 已退出",
+  };
+  const phaseActive = !["ready", "completed", "failed", "exited"].includes(phase);
 
   const grow = () => {
     const ta = taRef.current;
@@ -830,9 +1080,45 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       });
       return;
     }
-    useChatStore.getState().sendPrompt(tabId, text);
-    setInput("");
+    if (attachingFilesRef.current) return;
+    attachingFilesRef.current = true;
+    setAttachingFiles(true);
+    const mentionedPaths = fileMentionPaths(text);
+    const attachments: string[] = [];
+    const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+    let attachmentChars = 0;
+    try {
+    for (const path of mentionedPaths.slice(0, 8)) {
+      const result = await window.api.file.read(tabId, path, undefined, true);
+      if (result.error) {
+        useUiStore.getState().showToast(`无法引用 @${path}`, "err");
+        continue;
+      }
+      if (result.image) {
+        images.push({ type: "image", data: result.image.base64, mimeType: result.image.mimeType });
+        attachments.push(`\n\n[已附加图片：${path}]`);
+      } else if (!result.isBinary) {
+        const remaining = 120_000 - attachmentChars;
+        if (remaining <= 0) break;
+        const content = result.content.slice(0, remaining);
+        attachmentChars += content.length;
+        attachments.push(`\n\n<file path="${path}">\n${content}${result.truncated ? "\n[文件过大，内容已截断]" : ""}\n</file>`);
+      } else {
+        useUiStore.getState().showToast(`@${path} 是不支持的二进制文件`, "err");
+      }
+    }
+    // Keep the authored @path in the visible chat history; only Pi receives
+    // the expanded <file> context, matching the native TUI's UX.
+    useChatStore.getState().sendPrompt(tabId, `${text}${attachments.join("")}`, images.length ? images : undefined, text);
+    setInput((current) => current === input ? "" : current);
     setSlashOpen(false);
+    setMentionOpen(false);
+    } catch (error) {
+      useUiStore.getState().showToast(`读取引用文件失败: ${error instanceof Error ? error.message : String(error)}`, "err");
+    } finally {
+      attachingFilesRef.current = false;
+      setAttachingFiles(false);
+    }
     requestAnimationFrame(() => {
       if (taRef.current) taRef.current.style.height = "auto";
       taRef.current?.focus();
@@ -912,9 +1198,45 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   const skillCommands = useMemo(() => commands.filter((c) => c.source === "skill"), [commands]);
   const extCommands = useMemo(() => commands.filter((c) => c.source === "extension"), [commands]);
 
+  const insertMention = (file: FileMention) => {
+    const ta = taRef.current;
+    const caret = ta?.selectionStart ?? input.length;
+    const token = fileMentionTokenAt(input, caret);
+    if (!token) return;
+    const nextValue = replaceFileMention(input, token, file.path);
+    // Selecting a file completes the mention. Invalidate the in-flight query
+    // before changing the controlled textarea; otherwise its response can
+    // keep the old completion lifecycle alive while the user continues typing.
+    if (mentionTimerRef.current) clearTimeout(mentionTimerRef.current);
+    mentionTimerRef.current = null;
+    mentionRequestRef.current += 1;
+    setInput(nextValue);
+    setMentionOpen(false);
+    setSlashOpen(false);
+    requestAnimationFrame(() => {
+      const editor = taRef.current;
+      if (editor) {
+        editor.focus();
+        editor.setSelectionRange(nextValue.length, nextValue.length);
+      }
+      grow();
+    });
+  };
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // IME composition: Enter/Arrow keys belong to the composition, not the
     // popup. Bail before any slash handling so committing Chinese text works.
+    if (!e.nativeEvent.isComposing && mentionOpen) {
+      const list = filterFileMentions(mentionFiles, mentionQuery);
+      if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => list.length ? (i + 1) % list.length : 0); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => list.length ? (i - 1 + list.length) % list.length : 0); return; }
+      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+        const file = list[Math.min(mentionIndex, Math.max(list.length - 1, 0))];
+        if (file) { e.preventDefault(); insertMention(file); return; }
+        if (e.key === "Tab") return;
+      }
+      if (e.key === "Escape") { e.preventDefault(); setMentionOpen(false); return; }
+    }
     if (!e.nativeEvent.isComposing && slashOpen) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -951,7 +1273,39 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
 
   /** Recompute the slash popup state from the caret position (typing,
    *  caret-only moves via arrows/clicks — onChange alone misses those). */
-  const syncSlash = (v: string, caret: number) => {
+  const syncInputMenus = (v: string, caret: number) => {
+    const mention = fileMentionTokenAt(v, caret);
+    if (mention) {
+      setMentionQuery(mention.query);
+      setMentionOpen(true);
+      setMentionIndex(0);
+      setSlashOpen(false);
+      if (mentionTimerRef.current) clearTimeout(mentionTimerRef.current);
+      const request = ++mentionRequestRef.current;
+      setMentionsLoading(true);
+      mentionTimerRef.current = setTimeout(() => {
+        mentionTimerRef.current = null;
+        void window.api.file.searchMentions(tabId, mention.query).then((result) => {
+          if (request !== mentionRequestRef.current) return;
+          // A transient remote/SFTP failure must not erase usable candidates
+          // and masquerade as an empty search result.
+          if (result.error) {
+            useUiStore.getState().showToast(result.error, "err");
+            return;
+          }
+          setMentionFiles(result.files);
+        }).catch(() => {
+          if (request === mentionRequestRef.current) useUiStore.getState().showToast("搜索项目文件失败", "err");
+        }).finally(() => {
+          if (request === mentionRequestRef.current) setMentionsLoading(false);
+        });
+      }, 180);
+      return;
+    }
+    if (mentionTimerRef.current) clearTimeout(mentionTimerRef.current);
+    mentionTimerRef.current = null;
+    mentionRequestRef.current += 1;
+    setMentionOpen(false);
     const token = commandTokenAt(v, caret);
     if (token) {
       setSlashQuery(token.query);
@@ -1211,8 +1565,8 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
                 .map((c) => `/${c.name}${c.description ? ` — ${c.description}` : ""}`)
                 .join("\n")}
             >
-              🧩 {extCommands.length} 扩展
-            </span>
+            <Icon name="puzzle" /> {extCommands.length} 扩展
+          </span>
           )}
         </div>
         <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
@@ -1227,7 +1581,31 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
 
       <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} />
 
+      {exited && (
+        <div className="chat-exited-bar">
+          <span>{state?.exitCode === 0 ? "Pi 已正常退出，会话已保存在服务器上" : `Pi 进程异常退出（code ${state?.exitCode ?? "?"}）`}</span>
+          <button className="chat-btn" onClick={resumeSession} disabled={switchBusy}>继续此会话</button>
+          <button className="chat-btn" onClick={switchToTerminal} disabled={switchBusy}>终端视图</button>
+        </div>
+      )}
+
       <div className="chat-input-wrap">
+        {(phaseActive || completionVisible) && (
+          <div className={`chat-turn-status ${phase === "completed" ? "completed" : ""}`}>
+            {phaseActive && <span className="chat-turn-spinner" />}
+            <span>{phaseLabel[phase]}</span>
+          </div>
+        )}
+        {mentionOpen && (
+          <FileMentionMenu
+            files={mentionFiles}
+            query={mentionQuery}
+            selectedIndex={Math.min(mentionIndex, Math.max(filterFileMentions(mentionFiles, mentionQuery).length - 1, 0))}
+            loading={mentionsLoading}
+            onSelect={insertMention}
+            onHover={setMentionIndex}
+          />
+        )}
         {slashOpen && (
           <SlashMenu
             commands={visibleCommands}
@@ -1242,12 +1620,12 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           ref={taRef}
           className="chat-textarea"
           value={input}
-          placeholder={exited ? "pi 已退出，请切换到终端视图" : isStreaming ? "agent 运行中 — Enter 排队发送" : "输入消息…（Shift+Enter 换行）"}
+          placeholder={exited ? "pi 已退出，请切换到终端视图" : phase === "submitting" ? "消息已发送，等待 Pi 响应…" : phase === "cancelling" ? "正在停止当前任务…" : isStreaming ? "agent 运行中 — Enter 排队发送" : "输入消息…（Shift+Enter 换行）"}
           onChange={(e) => {
             const v = e.target.value;
             setInput(v);
             grow();
-            syncSlash(v, e.target.selectionStart ?? v.length);
+            syncInputMenus(v, e.target.selectionStart ?? v.length);
           }}
           onKeyDown={onKeyDown}
           onKeyUp={(e) => {
@@ -1255,14 +1633,20 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
             // the popup query in sync so Enter inserts what the popup shows.
             if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") {
               const ta = taRef.current;
-              if (ta) syncSlash(ta.value, ta.selectionStart ?? ta.value.length);
+              if (ta) syncInputMenus(ta.value, ta.selectionStart ?? ta.value.length);
             }
           }}
           onClick={() => {
             const ta = taRef.current;
-            if (ta) syncSlash(ta.value, ta.selectionStart ?? ta.value.length);
+            if (ta) syncInputMenus(ta.value, ta.selectionStart ?? ta.value.length);
           }}
-          onBlur={() => setSlashOpen(false)}
+          onBlur={() => {
+            if (mentionTimerRef.current) clearTimeout(mentionTimerRef.current);
+            mentionTimerRef.current = null;
+            mentionRequestRef.current += 1;
+            setSlashOpen(false);
+            setMentionOpen(false);
+          }}
           onPaste={onPaste}
           disabled={exited}
           rows={1}
@@ -1285,28 +1669,41 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
               : "用量将在首轮对话后显示"}
           </span>
           <span className="chat-input-hint">
-            {isStreaming ? "Enter 排队（steer）· Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行 · / 命令可用"}
+            {phase === "cancelling" ? "正在停止…" : isStreaming ? "Enter 排队（steer）· Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行 · @ 引用文件 · / 命令"}
           </span>
           {isStreaming && (
-            <button className="chat-btn stop" onClick={() => useChatStore.getState().abort(tabId)}>
-              ■ 停止
+            <button className="chat-btn stop" onClick={() => useChatStore.getState().abort(tabId)} disabled={phase === "cancelling"}>
+              {phase === "cancelling" ? "正在停止…" : "■ 停止"}
             </button>
           )}
-          <button className="chat-btn send" onClick={send} disabled={!input.trim() || exited}>
+          <button className="chat-btn send" onClick={send} disabled={!input.trim() || exited || attachingFiles}>
             发送
           </button>
         </div>
       </div>
       {uiReq && <UiDialog tabId={tabId} req={uiReq} onClose={() => setUiReq(null)} />}
+      {questionnaire && (
+        <QuestionnaireDialog
+          questions={questionnaire.questions}
+          submitting={questionnaireSubmitting}
+          active={active}
+          sentinelLabel={questionnaire.sentinelLabel}
+          onSubmit={handleQuestionnaireSubmit}
+          onCancel={handleQuestionnaireCancel}
+        />
+      )}
       {treeOpen && (
         <TreeDialog
           tabId={tabId}
           onClose={() => setTreeOpen(false)}
           onNavigated={(editorText) => {
-            // Navigation switched the leaf: reload history. The input box
-            // follows the target — user-message targets restore their text
-            // (TUI /tree behavior), anything else clears stale text.
-            void window.api.tab.rpcSend(tabId, { type: "get_messages" });
+            // Navigation switched the leaf: reload history. requestHistory()
+            // (rpcRequest → initMessages) is the ONLY path that actually
+            // refreshes the transcript — a bare rpcSend(get_messages)
+            // response is dropped by the event handlers, leaving the chat
+            // stuck at the end of the old branch. get_state keeps the
+            // session-behavior fields in sync.
+            requestHistory();
             void window.api.tab.rpcSend(tabId, { type: "get_state" });
             setInput(editorText ?? "");
             if (editorText) {

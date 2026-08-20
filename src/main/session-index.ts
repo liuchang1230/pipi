@@ -50,6 +50,16 @@ export class SessionIndex {
   private inflight = new Map<string, Promise<SessionEntry[]>>();
   private pollTimer: NodeJS.Timeout | null = null;
   private polledCwd: string | null = null;
+  private agentDir = join(homedir(), ".pi", "agent");
+
+  setAgentDir(agentDir: string): void {
+    if (this.agentDir === agentDir) return;
+    this.agentDir = agentDir;
+    this.snapshots.clear();
+    this.lists.clear();
+    this.refreshedAt.clear();
+    this.inflight.clear();
+  }
 
   /** Sync peek. Returns undefined when the cache is stale or absent. */
   cached(cwd: string): SessionEntry[] | undefined {
@@ -76,7 +86,7 @@ export class SessionIndex {
   }
 
   private async doRefresh(cwd: string): Promise<SessionEntry[]> {
-    const dir = sessionDirFor(cwd);
+    const dir = sessionDirFor(cwd, this.agentDir);
     let snap: DirSnapshotEntry[];
     try {
       if (!existsSync(dir)) {
@@ -237,7 +247,7 @@ export class SessionIndex {
   }
 }
 
-/** The session directory for a given cwd (pi's encoded dir under ~/.pi/agent/sessions). */
-function sessionDirFor(cwd: string): string {
-  return join(homedir(), ".pi", "agent", "sessions", encodeCwd(cwd));
+/** Kept local for compatibility with older imports; use the selected profile. */
+function sessionDirFor(cwd: string, agentDir = join(homedir(), ".pi", "agent")): string {
+  return join(agentDir, "sessions", encodeCwd(cwd));
 }

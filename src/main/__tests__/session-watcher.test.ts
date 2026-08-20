@@ -274,6 +274,34 @@ describe("startWatching end-to-end", () => {
     }
   });
 
+  it("marks the one-time last-touched-file hint as a seed", async () => {
+    const base = mkdtempSync(join(tmpdir(), "pipi-watch-home-"));
+    try {
+      mockHomedir = base;
+      const cwd = join(base, "seed-project");
+      const sessionDir = sessionDirFor(cwd);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(join(sessionDir, "s-1.jsonl"), toolLine("/last-touched.txt", "write") + "\n");
+
+      const seed = await new Promise<FollowEvent | null>((resolve) => {
+        const off = onFilePath((event) => {
+          off();
+          resolve(event);
+        });
+        startWatching(cwd);
+        setTimeout(() => {
+          off();
+          resolve(null);
+        }, 2000);
+      });
+
+      expect(seed).toMatchObject({ path: "/last-touched.txt", kind: "write", seed: true });
+    } finally {
+      mockHomedir = "";
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("does not replay history when an append lands inside the seed window", async () => {
     const base = mkdtempSync(join(tmpdir(), "pipi-watch-home-"));
     try {

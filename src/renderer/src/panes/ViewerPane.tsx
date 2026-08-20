@@ -129,7 +129,10 @@ export function ViewerPane() {
   }, [activeTab, isRemote]);
 
   useEffect(() => {
-    const off = window.api.onAutoFollow(({ path, kind }) => {
+    const off = window.api.onAutoFollow(({ path, kind, tabId }) => {
+      // The preview is workbench state. Ignore a watcher seed/event from a
+      // session that has ceased to be active while it was in flight.
+      if (tabId && tabId !== useTabsStore.getState().activeTab) return;
       // Preview mode: the tree+viewer show another project; the active tab's
       // pi activity must not hijack them.
       if (useTreeStore.getState().treeOrigin?.rootPath) return;

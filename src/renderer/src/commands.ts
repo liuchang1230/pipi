@@ -4,6 +4,8 @@
  * the chat view can surface something much closer to native pi.
  */
 
+import type { IconName } from "./components/Icon";
+
 export type SessionCommandSource = "extension" | "prompt" | "skill" | "builtin";
 
 export interface SessionCommand {
@@ -130,18 +132,18 @@ const SOURCE_LABEL: Record<SessionCommandSource, string> = {
   skill: "技能",
 };
 
-const SOURCE_ICON: Record<SessionCommandSource, string> = {
-  builtin: "⚙",
-  extension: "🧩",
-  prompt: "📄",
-  skill: "📘",
+const SOURCE_ICON: Record<SessionCommandSource, IconName> = {
+  builtin: "gear",
+  extension: "puzzle",
+  prompt: "file-text",
+  skill: "book-open",
 };
 
 export function sourceLabel(source: SessionCommandSource): string {
   return SOURCE_LABEL[source];
 }
 
-export function sourceIcon(source: SessionCommandSource): string {
+export function sourceIcon(source: SessionCommandSource): IconName {
   return SOURCE_ICON[source];
 }
 

@@ -1,7 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog, powerMonitor, Menu, type MenuItemConstructorOptions } from "electron";
+import { spawn } from "node:child_process";
 import { isAbsolute, relative, sep, join, dirname, posix as posixPath, win32 as win32Path } from "node:path";
 import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
-import { readFile, writeFile, mkdir, rm, rename, access } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, rename, access, readdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
@@ -45,7 +46,7 @@ import { addLocalProject, addRemoteProject, addWslProject, addModel, updateModel
 interface RemoteModelListResponse {
   data?: Array<{ id?: string }>;
 }
-import { listRemoteHistory, saveRemoteHistory } from "./remote-history";
+import { listRemoteHistory, saveRemoteHistory, deleteRemoteHistory } from "./remote-history";
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -626,6 +627,7 @@ function emitTabs() {
     isWsl: !!t.wsl,
     wslDistro: t.wsl?.distro,
     remoteAgentDir: t.remote?.agentDir,
+    sshState: t.sshState,
     mode: "pty" as const,
   }));
   const rpcTabs = listRpcSessions().map((s) => {
@@ -676,6 +678,10 @@ function emitActive() {
   const t = getActiveTab();
   if (t) {
     const cwd = t.wsl ? (t.wsl.path || "~") : t.remote ? (t.remoteBrowsePath || t.remote.path || "~") : t.cwd;
+    // Select the profile before consulting the cache. Otherwise the first
+    // activation after switching profiles can briefly expose the previous
+    // profile's local sessions.
+    if (!t.remote && !t.wsl) sessionIndex.setAgentDir(agentDir());
     // Attach a warm cached session list for local tabs so the renderer can
     // skip the session:list round-trip entirely (see SessionIndex.cached).
     const sessions = t.remote || t.wsl ? undefined : sessionIndex.cached(cwd);
@@ -689,7 +695,8 @@ function emitActive() {
       stopWatching();
       stopLocalSessionsPoll();
     } else {
-      startWatching(t.cwd);
+      sessionIndex.setAgentDir(agentDir());
+      startWatching(t.cwd, agentDir());
       startLocalSessionsPoll(t.cwd);
     }
     return;
@@ -974,6 +981,7 @@ if (gotSingleInstanceLock) {
       isWsl: !!t.wsl,
       wslDistro: t.wsl?.distro,
       pi: t.remote ? t.remote.startPi !== false : true,
+      sshState: t.sshState,
       mode: "pty" as const,
     })),
     ...listRpcSessions().map((s) => {
@@ -1134,7 +1142,182 @@ if (gotSingleInstanceLock) {
     return { ok: true as const, relPath, tabId: payload.rootPath ? undefined : t?.id, rootPath: payload.rootPath };
   });
 
-  ipcMain.handle("file:read", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
+  /** Returns the actual remote command/cwd and its stdout/stderr for support.
+   * Deliberately bounded to 8 KB so diagnostic data cannot freeze the UI. */
+  ipcMain.handle("file:diagnose-mentions", async (_e, payload: { tabId?: string }) => {
+    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+    if (!t) return { report: "@file diagnose\ntab unavailable", error: "tab unavailable" };
+    const kind = t.remote ? "SSH" : t.wsl ? "WSL" : "local";
+    if (!t.remote) return { report: `@file diagnose\nkind: ${kind}\ntab cwd: ${t.wsl?.path ?? t.cwd}\nUse the local/WSL search path; no SSH diagnostic required.` };
+    const remote = t.remote;
+    const sq = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+    const shellCwd = (value: string) => value === "~" ? '"$HOME"' : value.startsWith("~/") ? `"$HOME"/${sq(value.slice(2))}` : sq(value);
+    const command = `printf 'pwd='; pwd; printf '\\nHOME=%s\\n' "$HOME"; command -v fd || true; find . -path './.git' -prune -o -mindepth 1 -maxdepth 2 -print | head -n 20`;
+    const remoteCommand = `cd -- ${shellCwd(remote.path || "~")} && ${command}`;
+    try {
+      let stdout = ""; let stderr = ""; let code: number | null = null;
+      if (remote.password) {
+        await new Promise<void>((resolve, reject) => {
+          const conn = new SshClient();
+          conn.on("ready", () => conn.exec(remoteCommand, (err, stream) => {
+            if (err) { reject(err); return; }
+            stream.setEncoding("utf8"); stream.stderr?.setEncoding("utf8");
+            stream.on("data", (data: string) => { stdout += data; }); stream.stderr?.on("data", (data: string) => { stderr += data; });
+            stream.on("close", (exit: number | undefined) => { code = exit ?? 0; conn.end(); resolve(); });
+          }));
+          conn.on("error", reject);
+          conn.connect({ host: remote.host, port: remote.port ?? 22, username: remote.user, password: remote.password, readyTimeout: 10000 });
+        });
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn(findSshBin(), ["-p", String(remote.port ?? 22), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", `${remote.user}@${remote.host}`, remoteCommand]);
+          child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (data: string) => { stdout += data; }); child.stderr.on("data", (data: string) => { stderr += data; });
+          child.on("close", (exit) => { code = exit; resolve(); }); child.on("error", reject);
+        });
+      }
+      const report = [`@file diagnose`, `kind: SSH`, `target: ${remote.user}@${remote.host}:${remote.port ?? 22}`, `configured cwd: ${remote.path || "~"}`, `command: ${remoteCommand}`, `exit: ${code}`, "--- stdout ---", stdout.slice(0, 8192) || "(empty)", "--- stderr ---", stderr.slice(0, 8192) || "(empty)"].join("\n");
+      return { report, ...(code === 0 ? {} : { error: `remote command exited ${code}` }) };
+    } catch (e) {
+      return { report: `@file diagnose\nkind: SSH\ntarget: ${remote.user}@${remote.host}:${remote.port ?? 22}\nconfigured cwd: ${remote.path || "~"}\nerror: ${e instanceof Error ? e.message : String(e)}`, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** Query-driven, Pi-like @file search. It uses fd on the machine where the
+   * agent runs (and falls back to find when fd is absent), so candidates are
+   * not limited by a browser-side recursive index. */
+  ipcMain.handle("file:search-mentions", async (_e, payload: { tabId?: string; query?: string }) => {
+    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+    if (!t) return { files: [], error: "tab unavailable" };
+    const query = (payload?.query ?? "").replace(/[\r\n\0]/g, "").slice(0, 240);
+    const sq = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+    // Shell single-quoting a literal `~` prevents home expansion. Remote and
+    // WSL projects commonly use `~` / `~/project`, so turn those forms into
+    // an explicit $HOME expression before constructing `cd`.
+    const shellCwd = (value: string) => value === "~" ? '"$HOME"' : value.startsWith("~/") ? `"$HOME"/${sq(value.slice(2))}` : sq(value);
+    const parse = (output: string) => output.split("\n").filter(Boolean).slice(0, 100).map((line) => ({
+      path: line.endsWith("/") ? line.slice(0, -1) : line,
+      type: line.endsWith("/") ? "directory" as const : "file" as const,
+    }));
+    const shell = `if command -v fd >/dev/null 2>&1; then fd --hidden --follow --exclude .git --max-results 100 --type f --type d ${query ? sq(query) : ""}; else find . -path './.git' -prune -o -path './.git/*' -prune -o -mindepth 1 \( -type d -printf '%P/\\n' -o -type f -printf '%P\\n' \) | ${query ? `grep -i -F -- ${sq(query)}` : "cat"} | head -n 100; fi`;
+    // Windows-local projects use Windows cwd paths. Running `bash -lc cd
+    // D:\\...` is invalid and previously made their result set always empty.
+    const localSearch = async () => {
+      const needle = query.toLocaleLowerCase();
+      const files: Array<{ path: string; type: "file" | "directory" }> = [];
+      const walk = async (dir: string, rel: string): Promise<void> => {
+        if (files.length >= 100) return;
+        let entries;
+        try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) {
+          if (files.length >= 100 || entry.name === ".git") continue;
+          if (!entry.isDirectory() && !entry.isFile()) continue;
+          const path = rel ? `${rel}/${entry.name}` : entry.name;
+          const type = entry.isDirectory() ? "directory" as const : "file" as const;
+          if (!needle || path.toLocaleLowerCase().includes(needle)) files.push({ path, type });
+          if (entry.isDirectory()) await walk(join(dir, entry.name), path);
+        }
+      };
+      await walk(t.cwd, "");
+      return files;
+    };
+    try {
+      let stdout = "";
+      if (t.remote) {
+        // Do not create a second SSH shell just for completion. It has a
+        // different startup environment from the live pi process (notably
+        // PATH/fd availability) and failures looked like "no matches". The
+        // Search through SFTP, but fan out each directory level in parallel.
+        // The old depth-first walk made an SSH round-trip per directory, so a
+        // match in a second-level directory waited behind every sibling.
+        const remote = t.remote;
+        const needle = query.toLocaleLowerCase();
+        const files: Array<{ path: string; type: "file" | "directory" }> = [];
+        await withSftp(remote, async (client, homeDir) => {
+          const root = resolveRemotePath(remote.path || "~", homeDir);
+          let pending: Array<{ abs: string; rel: string }> = [{ abs: root, rel: "" }];
+          const maxDepth = 32;
+          while (pending.length && files.length < 100) {
+            const level = pending;
+            pending = [];
+            const listings = await Promise.all(level.map(async (dir) => {
+              try { return { dir, entries: await client.list(dir.abs) }; } catch { return { dir, entries: [] as Awaited<ReturnType<typeof client.list>> }; }
+            }));
+            for (const { dir, entries } of listings) {
+              const depth = dir.rel ? dir.rel.split("/").length : 0;
+              for (const entry of entries) {
+                if (files.length >= 100 || entry.name === "." || entry.name === ".." || entry.name === ".git") continue;
+                const path = dir.rel ? `${dir.rel}/${entry.name}` : entry.name;
+                const type = entry.type === "d" ? "directory" as const : "file" as const;
+                if (!needle || path.toLocaleLowerCase().includes(needle)) files.push({ path, type });
+                if (entry.type === "d" && depth < maxDepth) pending.push({ abs: posixPath.join(dir.abs, entry.name), rel: path });
+              }
+            }
+          }
+        });
+        return { files };
+      } else if (t.wsl) {
+        stdout = await new Promise<string>((resolve, reject) => {
+          const child = spawn("wsl.exe", ["-d", t.wsl!.distro, "--", "bash", "-lc", `cd -- ${shellCwd(t.wsl!.path || "~")} && ${shell}`]);
+          let out = ""; child.stdout.setEncoding("utf8"); child.stdout.on("data", (data: string) => { out += data; });
+          child.on("close", (code) => code === 0 ? resolve(out) : reject(new Error(`wsl exited ${code}`))); child.on("error", reject);
+        });
+      } else {
+        return { files: await localSearch() };
+      }
+      return { files: parse(stdout) };
+    } catch (e) {
+      return { files: [], error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /** Legacy bounded project index used by the file tree. */
+  ipcMain.handle("file:list-mentions", async (_e, payload: { tabId?: string }) => {
+    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+    if (!t) return { files: [], error: "tab unavailable" };
+    const files: Array<{ path: string; type: "file" | "directory" }> = [];
+    const ignored = new Set([".git", "node_modules", "dist", "build", ".next", ".cache"]);
+    const limit = 2_000;
+    const walk = async (dir: string, rel: string, list: (p: string) => Promise<Array<{ name: string; type: "file" | "directory" }>>) => {
+      if (files.length >= limit) return;
+      let entries: Array<{ name: string; type: "file" | "directory" }>;
+      try { entries = await list(dir); } catch { return; }
+      for (const entry of entries) {
+        if (files.length >= limit || ignored.has(entry.name)) continue;
+        if (entry.name.startsWith(".") && entry.name !== ".env" && entry.name !== ".gitignore") continue;
+        const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+        files.push({ path: childRel, type: entry.type });
+        if (entry.type === "directory" && childRel.split("/").length < 9) await walk(`${dir}/${entry.name}`, childRel, list);
+      }
+    };
+    try {
+      if (t.remote) {
+        const remote = t.remote;
+        await withSftp(remote, async (client, homeDir) => {
+          const root = resolveRemotePath(remote.path ?? "~", homeDir);
+          await walk(root, "", async (dir) => (await client.list(dir)).flatMap((item: { name: string; type: string }) =>
+            item.name === "." || item.name === ".." ? [] : [{ name: item.name, type: item.type === "d" ? "directory" as const : "file" as const }],
+          ));
+        });
+      } else if (t.wsl) {
+        const wsl = t.wsl;
+        const root = resolveWslPath(wsl.distro, wsl.path || "~");
+        await walk(root, "", async (dir): Promise<Array<{ name: string; type: "file" | "directory" }>> =>
+          (await readdir(wslToWinPath(wsl.distro, dir), { withFileTypes: true }))
+            .flatMap((item): Array<{ name: string; type: "file" | "directory" }> => item.isDirectory() ? [{ name: item.name, type: "directory" }] : item.isFile() ? [{ name: item.name, type: "file" }] : []));
+      } else {
+        await walk(t.cwd, "", async (dir): Promise<Array<{ name: string; type: "file" | "directory" }>> =>
+          (await readdir(dir, { withFileTypes: true }))
+            .flatMap((item): Array<{ name: string; type: "file" | "directory" }> => item.isDirectory() ? [{ name: item.name, type: "directory" }] : item.isFile() ? [{ name: item.name, type: "file" }] : []));
+      }
+      files.sort((a, b) => a.path.localeCompare(b.path));
+      return { files, ...(files.length >= limit ? { error: `仅显示前 ${limit} 个文件` } : {}) };
+    } catch (e) {
+      return { files: [], error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("file:read", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string; mention?: boolean }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
     const relPath = payload.relPath;
     // Local preview root is authoritative (see file:list).
@@ -1147,7 +1330,9 @@ if (gotSingleInstanceLock) {
         }
       }
       if (t?.remote) {
-        return remoteReadFile(t.remote, relPath, t.remoteBrowsePath ?? t.remote.path ?? "~");
+        // @-mentions always address the tab's project cwd, never the mutable
+        // file-browser directory. This also enforces a project-root boundary.
+        return remoteReadFile(t.remote, relPath, t.remote.path ?? "~", !!payload.mention);
       }
     }
     return readFileContent(payload.rootPath ?? t?.cwd ?? process.cwd(), relPath).catch((err) => ({
@@ -1434,6 +1619,19 @@ if (gotSingleInstanceLock) {
     // have no pty — registered is their liveness.
     if (tab?.pty) return isPtyTabAlive(tab);
     return !!getTab(tabId) || !!getRpcSession(tabId) || !!getSdkTab(tabId);
+  });
+
+  // Honest SSH connect state for connection shell tabs (startPi:false):
+  // "ready" only after the remote __PIPI_READY__ marker (auth + shell up),
+  // "failed" when ssh exited before the marker, "pending" while the session
+  // is still establishing (may be waiting at a password prompt).
+  ipcMain.handle("tab:conn-state", (_e, tabId: string) => {
+    const t = getTab(tabId);
+    if (!t) return { state: "gone" };
+    if (!t.shellMode) return { state: "pending" }; // pi/WSL tabs: no marker
+    if (t.sshState === "ready") return { state: "ready" };
+    if (t.sshState === "failed" || (t.pty && !isPtyTabAlive(t))) return { state: "failed" };
+    return { state: "pending" };
   });
 
   // --- RPC chat (local pi tabs) ---
@@ -1794,6 +1992,7 @@ if (gotSingleInstanceLock) {
     return [...new Set(models)].sort((a, b) => a.localeCompare(b));
   });
   ipcMain.handle("remote:list-history", () => listRemoteHistory());
+  ipcMain.handle("remote:delete-history", (_e, target: { host: string; user: string; port: number; agentDir?: string }) => deleteRemoteHistory(target));
 
   // --- Model transplant: copy local pi models/auth to WSL or remote ---
   function readLocalPiConfigs(): { modelsPath: string; authPath: string } {
@@ -1870,6 +2069,7 @@ if (gotSingleInstanceLock) {
       }
     }
     const dir = cwd ?? t?.cwd ?? process.cwd();
+    sessionIndex.setAgentDir(agentDir());
     // Serve from the SessionIndex cache when fresh; otherwise parse async
     // (cooperative, snapshot-incremental) so the click path never blocks the
     // main-process event loop.
@@ -1877,7 +2077,7 @@ if (gotSingleInstanceLock) {
     if (cached) return cached;
     return sessionIndex.refresh(dir);
   });
-  ipcMain.handle("session:list-projects", () => listLocalProjects());
+  ipcMain.handle("session:list-projects", () => listLocalProjects(agentDir()));
   ipcMain.handle("session:set-remote-hydration-paused", (_e, tabId: string, remoteCwd: string, paused: boolean) => {
     const t = getTab(tabId);
     if (!t?.remote) return false;
@@ -2006,8 +2206,14 @@ if (gotSingleInstanceLock) {
   });
 
   // --- Auto-follow: pi's file operations → right panel ---
-  onFilePath(({ path, kind }) => {
-    mainWindow?.webContents.send("file:autofollow", { path, kind });
+  onFilePath(({ path, kind, seed }) => {
+    // A session activation must not move the workbench-level preview to that
+    // session's last touched file. Live activity is attributed to its tab so
+    // events that race a later activation can also be discarded in renderer.
+    if (seed) return;
+    const active = getActiveTab();
+    if (!active || active.remote || active.wsl) return;
+    mainWindow?.webContents.send("file:autofollow", { path, kind, tabId: active.id });
   });
   onStatus((status) => {
     mainWindow?.webContents.send("file:autofollow-status", status);
@@ -2305,15 +2511,19 @@ if (gotSingleInstanceLock) {
     };
   }
 
-  async function remoteReadFile(remote: RemoteOpts, filePath: string, baseDir: string) {
+  async function remoteReadFile(remote: RemoteOpts, filePath: string, baseDir: string, requireWithinBase = false) {
     try {
       if (/^[A-Za-z]:[\\/]/.test(filePath)) {
         throw new Error(`remote tab cannot open local path: ${filePath}`);
       }
       return await withSftp(remote, async (client, homeDir) => {
+        const base = resolveRemotePath(baseDir, homeDir);
         const full = filePath.startsWith("/")
           ? posixPath.normalize(filePath)
-          : resolveRemotePath(posixPath.join(baseDir, filePath), homeDir);
+          : posixPath.normalize(posixPath.join(base, filePath));
+        if (requireWithinBase && full !== base && !full.startsWith(`${base}/`)) {
+          throw new Error("引用文件不能位于项目目录之外");
+        }
         const st = await client.stat(full);
         const bytes = st.size;
         if (bytes <= TEXT_PREVIEW_MAX_BYTES) {

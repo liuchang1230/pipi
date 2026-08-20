@@ -9,7 +9,12 @@
  */
 declare module "@earendil-works/pi-coding-agent" {
   export class ModelRuntime {
-    static create(): Promise<ModelRuntime>;
+    static create(options?: {
+      authPath?: string;
+      modelsPath?: string | null;
+      modelsStorePath?: string;
+      allowModelNetwork?: boolean;
+    }): Promise<ModelRuntime>;
     modelRegistry: unknown;
     refresh(opts: { signal: AbortSignal }): Promise<unknown>;
     getAvailableSnapshot(): Array<{ id: string; provider: string; name?: string; [k: string]: unknown }>;

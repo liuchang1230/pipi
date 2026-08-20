@@ -17,16 +17,19 @@ import {
   remoteSessionCacheKey,
   buildRemoteKey,
 } from "../stores/sessionsStore";
+import { groupRemoteServers } from "../stores/remote-servers";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
 import { useUiStore } from "../stores/uiStore";
 import { useLayoutStore } from "../stores/layoutStore";
+import { Icon, type IconName } from "../components/Icon";
 import type {
   FileNode,
   ProjectGroup,
   SessionItem,
   WslConnectionGroup,
   RemoteHydrationState,
+  RemoteServerGroup,
 } from "../stores/types";
 
 type Updater<T> = T | ((prev: T) => T);
@@ -35,12 +38,14 @@ interface SidebarPaneProps {
   theme: "dark" | "light";
   toggleTheme: () => void;
   onNewLocalProject: () => void;
-  onAddRemoteProject: () => void;
+  onAddRemoteServer: () => void;
+  onConnectServer: (server: RemoteServerGroup) => Promise<boolean> | void;
+  onAddRemoteProjectForServer: (server: RemoteServerGroup) => void;
   onWslConnect: (distro: string) => void;
   onAddWslProject: (distro: string) => void;
 }
 
-export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemoteProject, onWslConnect, onAddWslProject }: SidebarPaneProps) {
+export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemoteServer, onConnectServer, onAddRemoteProjectForServer, onWslConnect, onAddWslProject }: SidebarPaneProps) {
   // --- Tab context (drives active states) ---
   const isRemote = useTabsStore((s) => s.isRemote);
   const cwd = useTabsStore((s) => s.cwd);
@@ -70,6 +75,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const projectErrors = useSessionsStore((s) => s.projectErrors);
   const projectDiagnostics = useSessionsStore((s) => s.projectDiagnostics);
   const remoteSessions = useSessionsStore((s) => s.remoteSessions);
+  const remoteHistory = useSessionsStore((s) => s.remoteHistory);
   const setRemoteSessions = useSessionsStore((s) => s.setRemoteSessions);
   const remoteHydration = useSessionsStore((s) => s.remoteHydration);
   const setRemoteHydration = useSessionsStore((s) => s.setRemoteHydration);
@@ -115,7 +121,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   // --- Remote hydration: main's background hydration → per-project caches ---
   useEffect(() => {
     const off = window.api.session.onRemoteUpdated(({ tabId, remoteCwd, sessions }) => {
-      setRemoteSessions((prev) => ({ ...prev, [remoteSessionCacheKey(tabId, remoteCwd)]: sessions as SessionItem[] }));
+      setRemoteSessions((prev) => ({ ...prev, [remoteSessionCacheKey(tabId, remoteCwd, tabs.find((t) => t.id === tabId)?.remoteAgentDir ?? "")]: sessions as SessionItem[] }));
       setProjectSessions((prev) => {
         const next = { ...prev };
         for (const project of projects) {
@@ -466,44 +472,22 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
     [projects, projectSessions],
   );
 
-  const connectedRemoteKeys = useMemo(
+  // SSH servers as connection nodes (user@host), each with its project
+  // folders underneath — mirrors the WSL section. Derived in one place from
+  // saved history + projects + open tabs (see remote-servers.ts).
+  const remoteServers = useMemo<RemoteServerGroup[]>(
     () =>
-      new Set(
-        tabs
-          .filter((t) => t.isRemote && t.remoteKey)
-          .map((t) => t.remoteKey as string),
-      ),
-    [tabs],
-  );
-
-  const remoteProjectGroups = useMemo<ProjectGroup[]>(
-    () =>
-      projects
-        .filter((p) => p.type === "remote" && p.path && p.host && p.user)
-        .map((p) => {
-          const projectRemoteKey = buildRemoteKey(p.host, p.user, p.port, (p as { agentDir?: string }).agentDir);
-          const connectionTab = tabs.find((t) => t.isRemote && t.remoteKey === projectRemoteKey);
-          const tab = connectionTab;
-          const connected = connectedRemoteKeys.has(projectRemoteKey);
-          const isHydratingTarget = remoteHydration.tabId === tab?.id && remoteHydration.remoteCwd === p.path;
-          return {
-            key: p.id,
-            label: p.name,
-            cwd: p.path!,
-            type: "remote" as const,
-            tabId: tab?.id,
-            host: p.host,
-            user: p.user,
-            port: p.port,
-            password: p.password,
-            sessions: projectSessions[p.id] ?? (tab ? (remoteSessions[remoteSessionCacheKey(tab.id, p.path!)] ?? []) : []),
-            disabled: !connected,
-            error: projectErrors[p.id],
-            hydrationPhase: isHydratingTarget ? remoteHydration.phase : "idle",
-            diagnostics: projectDiagnostics[p.id],
-          };
-        }),
-    [projects, tabs, connectedRemoteKeys, projectSessions, remoteSessions, remoteHydration, projectErrors, projectDiagnostics],
+      groupRemoteServers({
+        projects,
+        remoteHistory,
+        tabs,
+        projectSessions,
+        remoteSessions,
+        projectErrors,
+        projectDiagnostics,
+        remoteHydration,
+      }),
+    [projects, remoteHistory, tabs, projectSessions, remoteSessions, projectErrors, projectDiagnostics, remoteHydration],
   );
 
   // WSL: distro is a CONNECTION node (like an SSH host); its projects are the
@@ -551,7 +535,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const sessionOwnerRef = useRef<ProjectGroup[]>([]);
   sessionOwnerRef.current = [
     ...localProjectGroups,
-    ...remoteProjectGroups,
+    ...remoteServers.flatMap((s) => s.projects),
     ...wslConnections.flatMap((c) => c.projects),
   ];
 
@@ -599,7 +583,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         handleBatchDelete={handleBatchDeleteClick}
         setSelectedSessions={setSelectedSessions}
         localProjectGroups={localProjectGroups}
-        remoteProjectGroups={remoteProjectGroups}
+        remoteServers={remoteServers}
         wslConnections={wslConnections}
         onWslConnect={onWslConnect}
         onAddWslProject={onAddWslProject}
@@ -620,7 +604,9 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         onNewLocalProject={onNewLocalProject}
         onDeleteProject={deleteProject}
         onNewProjectSession={newProjectSession}
-        onAddRemoteProject={onAddRemoteProject}
+        onAddRemoteServer={onAddRemoteServer}
+        onConnectServer={onConnectServer}
+        onAddRemoteProjectForServer={onAddRemoteProjectForServer}
         onOpenSession={openSession}
         onOpenRemoteSession={openRemoteSession}
         onDeleteSession={deleteSession}
@@ -643,8 +629,8 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         <>
           <div className="ctx-backdrop" onClick={() => setCtxMenuSession(null)} />
           <div className="ctx-menu" style={{ left: ctxMenuPos.x, top: ctxMenuPos.y }}>
-            <button className="ctx-item" onClick={handleRenameStart}>✏️ 重命名</button>
-            <button className="ctx-item ctx-danger" onClick={handleCtxDelete}>🗑 删除</button>
+            <button className="ctx-item" onClick={handleRenameStart}><Icon name="pencil" /> 重命名</button>
+            <button className="ctx-item ctx-danger" onClick={handleCtxDelete}><Icon name="trash" /> 删除</button>
           </div>
         </>
       )}
@@ -681,12 +667,12 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
           y={treeCtx.y}
           onClose={closeTreeMenu}
           items={[
-            { label: "📄 新建文件", onSelect: () => setFilePrompt({ kind: "file", title: "新建文件", node: treeCtx.node }) },
-            { label: "📁 新建文件夹", onSelect: () => setFilePrompt({ kind: "dir", title: "新建文件夹", node: treeCtx.node }) },
+            { label: "新建文件", icon: "file" as const, onSelect: () => setFilePrompt({ kind: "file", title: "新建文件", node: treeCtx.node }) },
+            { label: "新建文件夹", icon: "folder" as const, onSelect: () => setFilePrompt({ kind: "dir", title: "新建文件夹", node: treeCtx.node }) },
             ...(treeCtx.node
               ? [
-                  { label: "✏️ 重命名", onSelect: () => setFilePrompt({ kind: "rename", title: "重命名", node: treeCtx.node }) },
-                  { label: "🗑 删除", danger: true, onSelect: () => setFileConfirm({ node: treeCtx.node! }) },
+                  { label: "重命名", icon: "pencil" as const, onSelect: () => setFilePrompt({ kind: "rename", title: "重命名", node: treeCtx.node }) },
+                  { label: "删除", icon: "trash" as const, danger: true, onSelect: () => setFileConfirm({ node: treeCtx.node! }) },
                 ]
               : []),
           ]}
@@ -741,7 +727,7 @@ interface SidebarProps {
   handleBatchDelete: () => void;
   setSelectedSessions: (next: Set<string>) => void;
   localProjectGroups: ProjectGroup[];
-  remoteProjectGroups: ProjectGroup[];
+  remoteServers: RemoteServerGroup[];
   wslConnections: WslConnectionGroup[];
   onWslConnect: (distro: string) => void;
   onAddWslProject: (distro: string) => void;
@@ -762,7 +748,9 @@ interface SidebarProps {
   onNewLocalProject: () => void;
   onDeleteProject: (project: ProjectGroup) => void;
   onNewProjectSession: (project: ProjectGroup) => void;
-  onAddRemoteProject: () => void;
+  onAddRemoteServer: () => void;
+  onConnectServer: (server: RemoteServerGroup) => Promise<boolean> | void;
+  onAddRemoteProjectForServer: (server: RemoteServerGroup) => void;
   onOpenSession: (session: SessionItem, projectCwd?: string) => void;
   onOpenRemoteSession: (tabId: string, projectCwd: string, session: SessionItem) => void;
   onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
@@ -783,7 +771,7 @@ const Sidebar = memo(function Sidebar({
   handleBatchDelete,
   setSelectedSessions,
   localProjectGroups,
-  remoteProjectGroups,
+  remoteServers,
   isRemote,
   cwd,
   remoteDir,
@@ -801,7 +789,9 @@ const Sidebar = memo(function Sidebar({
   onNewLocalProject,
   onDeleteProject,
   onNewProjectSession,
-  onAddRemoteProject,
+  onAddRemoteServer,
+  onConnectServer,
+  onAddRemoteProjectForServer,
   onOpenSession,
   onOpenRemoteSession,
   onDeleteSession,
@@ -830,7 +820,7 @@ const Sidebar = memo(function Sidebar({
         <span className="sidebar-title" title={isRemote && remoteDir ? remoteDir : cwd}>项目与会话</span>
         <div className="sidebar-actions">
           <button className="icon-btn" onClick={toggleTheme} title={theme === "dark" ? "浅色主题" : "深色主题"}>
-            {theme === "dark" ? "☀️" : "🌙"}
+            <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
         </div>
       </div>
@@ -865,12 +855,11 @@ const Sidebar = memo(function Sidebar({
             onSelectAllSessions={onSelectAllSessions}
             onToggleSessionSelect={onToggleSessionSelect}
           />
-          <ProjectGroupSection
-            title="远程项目"
-            emptyText="（暂无远程项目）"
-            addTitle="新增远程项目"
-            onAdd={onAddRemoteProject}
-            projects={remoteProjectGroups}
+          <RemoteServerSection
+            title="远程服务器"
+            titleIcon="globe"
+            emptyText="（暂无服务器，点 + 连接）"
+            servers={remoteServers}
             expandedProjects={expandedProjects}
             projectLoading={projectLoading}
             projectSessionStatus={projectSessionStatus}
@@ -880,16 +869,17 @@ const Sidebar = memo(function Sidebar({
             onToggleProject={onToggleProject}
             onDeleteProject={onDeleteProject}
             onNewProjectSession={onNewProjectSession}
-            onOpenSession={undefined}
             onOpenRemoteSession={onOpenRemoteSession}
             onDeleteSession={onDeleteSession}
-            onHandleSessionCtx={undefined}
             onSelectAllSessions={onSelectAllSessions}
             onToggleSessionSelect={onToggleSessionSelect}
-            isRemoteSection
+            onAddServer={onAddRemoteServer}
+            onConnectServer={onConnectServer}
+            onAddProjectForServer={onAddRemoteProjectForServer}
           />
           <WslConnectionSection
-            title="🐧 WSL"
+            title="WSL"
+            titleIcon="penguin"
             emptyText="（暂无 WSL 连接）"
             connections={wslConnections}
             expandedProjects={expandedProjects}
@@ -915,7 +905,7 @@ const Sidebar = memo(function Sidebar({
         <div className="panel-label">当前项目文件</div>
         {(isRemote ? remoteDir : cwd) ? (
           <div className="tree-path" title={isRemote ? remoteDir! : cwd}>
-            📂 {(isRemote ? remoteDir! : cwd).replace(/^\/home\/[^/]+/, "~")}
+            <Icon name="folder-open" className="tree-path-icon" /> {(isRemote ? remoteDir! : cwd).replace(/^\/home\/[^/]+/, "~")}
           </div>
         ) : null}
         <div className="tree-scroll" onContextMenu={(e) => onTreeCtx(e, null)}>
@@ -945,6 +935,7 @@ const Sidebar = memo(function Sidebar({
 
 interface ProjectGroupSectionProps {
   title: string;
+  titleIcon?: IconName;
   emptyText: string;
   addTitle: string;
   onAdd: () => void;
@@ -1010,14 +1001,14 @@ const ProjectItem = memo(function ProjectItem({
       <div
         className={`project-row${active ? " active" : ""}${disabled ? " disabled" : ""}`}
         onClick={() => {
-          // WSL projects: clicking a disconnected project should auto-connect
-          // its distro (handled inside toggleProject) rather than no-op.
-          if (!disabled || isWslSection) onToggleProject(project);
+          // WSL / server projects: clicking a disconnected project auto-connects
+          // its host (handled inside toggleProject) rather than no-op.
+          if (!disabled || isWslSection || isRemoteSection) onToggleProject(project);
         }}
         title={disabled ? `未连接：${isWslSection ? project.host : `${project.user}@${project.host}`}` : isWslSection ? `🐧 ${project.host}:${project.cwd}` : isRemoteSection ? `${project.user}@${project.host}:${project.cwd}` : project.cwd}
       >
         <span className="tree-chevron">{expanded ? "▾" : "▸"}</span>
-        <span className="project-icon">{isWslSection ? "🐧" : isRemoteSection ? "🌐" : "📁"}</span>
+        <span className="project-icon"><Icon name={isWslSection ? "penguin" : isRemoteSection ? "globe" : "folder"} /></span>
         <span className="project-name">{project.label}</span>
         <button className="row-action" disabled={disabled} onClick={(e) => { e.stopPropagation(); onNewProjectSession(project); }} title={disabled ? "请先连接远程" : "新建会话"}>+</button>
         <button className="row-delete" onClick={(e) => { e.stopPropagation(); onDeleteProject(project); }} title="删除项目">×</button>
@@ -1052,6 +1043,7 @@ const ProjectItem = memo(function ProjectItem({
 
 const ProjectGroupSection = memo(function ProjectGroupSection({
   title,
+  titleIcon,
   emptyText,
   addTitle,
   onAdd,
@@ -1076,7 +1068,7 @@ const ProjectGroupSection = memo(function ProjectGroupSection({
 }: ProjectGroupSectionProps) {
   return (
     <div className="group-block">
-      <div className="group-title group-title-row"><span>{title}</span><button className="group-add" onClick={onAdd} title={addTitle}>+</button></div>
+      <div className="group-title group-title-row"><span className="group-title-label">{titleIcon && <Icon name={titleIcon} />}{title}</span><button className="group-add" onClick={onAdd} title={addTitle}>+</button></div>
       {projects.length === 0 ? <div className="placeholder">{emptyText}</div> : projects.map((project) => (
         <ProjectItem
           key={project.key}
@@ -1106,6 +1098,7 @@ const ProjectGroupSection = memo(function ProjectGroupSection({
 
 interface WslConnectionSectionProps {
   title: string;
+  titleIcon?: IconName;
   emptyText: string;
   connections: WslConnectionGroup[];
   expandedProjects: Set<string>;
@@ -1128,7 +1121,7 @@ interface WslConnectionSectionProps {
 /** WSL sidebar section: each distro is a connection node with a + that opens
  *  the folder picker; projects (folders) hang beneath it. */
 const WslConnectionSection = memo(function WslConnectionSection({
-  title, emptyText, connections, expandedProjects, projectLoading,
+  title, titleIcon, emptyText, connections, expandedProjects, projectLoading,
   projectSessionStatus, selectedSessions, activeSessionPath, isProjectActive,
   onToggleProject, onDeleteProject, onNewProjectSession, onOpenRemoteSession,
   onDeleteSession, onSelectAllSessions, onToggleSessionSelect,
@@ -1145,7 +1138,7 @@ const WslConnectionSection = memo(function WslConnectionSection({
   };
   return (
     <div className="group-block">
-      <div className="group-title"><span>{title}</span></div>
+      <div className="group-title"><span className="group-title-label">{titleIcon && <Icon name={titleIcon} />}{title}</span></div>
       {connections.length === 0 ? <div className="placeholder">{emptyText}</div> : connections.map((conn) => {
         const isOpen = openConnections.has(conn.distro);
         return (
@@ -1161,7 +1154,7 @@ const WslConnectionSection = memo(function WslConnectionSection({
               title={conn.connected ? `🐧 ${conn.distro}（点击收起/展开）` : `连接 ${conn.distro}`}
             >
               <span className="tree-chevron">{isOpen ? "▾" : "▸"}</span>
-              <span className="project-icon">🐧</span>
+              <span className="project-icon"><Icon name="penguin" /></span>
               <span className="project-name">{conn.distro}</span>
               {!conn.connected && <span className="wsl-connect-hint">连接</span>}
               <button
@@ -1181,6 +1174,129 @@ const WslConnectionSection = memo(function WslConnectionSection({
                     expanded={expandedProjects.has(project.key)}
                     isRemoteSection
                     isWslSection
+                    active={isProjectActive(project)}
+                    projectLoading={projectLoading}
+                    projectSessionStatus={projectSessionStatus}
+                    selectedSessions={selectedSessions}
+                    activeSessionPath={activeSessionPath}
+                    onToggleProject={onToggleProject}
+                    onDeleteProject={onDeleteProject}
+                    onNewProjectSession={onNewProjectSession}
+                    onOpenRemoteSession={onOpenRemoteSession}
+                    onDeleteSession={onDeleteSession}
+                    onSelectAllSessions={onSelectAllSessions}
+                    onToggleSessionSelect={onToggleSessionSelect}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
+interface RemoteServerSectionProps {
+  title: string;
+  titleIcon?: IconName;
+  emptyText: string;
+  servers: RemoteServerGroup[];
+  expandedProjects: Set<string>;
+  projectLoading: Record<string, boolean>;
+  projectSessionStatus: Record<string, "idle" | "loading" | "ready" | "empty" | "error">;
+  selectedSessions: Set<string>;
+  activeSessionPath: string | null;
+  isProjectActive: (project: ProjectGroup) => boolean;
+  onToggleProject: (project: ProjectGroup) => void;
+  onDeleteProject: (project: ProjectGroup) => void;
+  onNewProjectSession: (project: ProjectGroup) => void;
+  onOpenRemoteSession?: (tabId: string, projectCwd: string, session: SessionItem) => void;
+  onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
+  onSelectAllSessions: (sessions: SessionItem[]) => void;
+  onToggleSessionSelect: (path: string) => void;
+  onAddServer: () => void;
+  onConnectServer: (server: RemoteServerGroup) => Promise<boolean> | void;
+  onAddProjectForServer: (server: RemoteServerGroup) => void;
+}
+
+/** SSH server section: each server (user@host) is a connection node with its
+ *  project folders hanging beneath it — mirrors the WSL section. The header +
+ *  opens the connect dialog; each node's + browses THAT server's directories
+ *  (the old picker always targeted the first remote tab, which made a second
+ *  server impossible to reach). */
+const RemoteServerSection = memo(function RemoteServerSection({
+  title, titleIcon, emptyText, servers, expandedProjects, projectLoading,
+  projectSessionStatus, selectedSessions, activeSessionPath, isProjectActive,
+  onToggleProject, onDeleteProject, onNewProjectSession, onOpenRemoteSession,
+  onDeleteSession, onSelectAllSessions, onToggleSessionSelect,
+  onAddServer, onConnectServer, onAddProjectForServer,
+}: RemoteServerSectionProps) {
+  const [openServers, setOpenServers] = useState<Set<string>>(new Set());
+  const toggleServer = (key: string) => {
+    setOpenServers((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  return (
+    <div className="group-block">
+      <div className="group-title group-title-row">
+        <span className="group-title-label">{titleIcon && <Icon name={titleIcon} />}{title}</span>
+        <button className="group-add" onClick={onAddServer} title="连接新的服务器">+</button>
+      </div>
+      {servers.length === 0 ? <div className="placeholder">{emptyText}</div> : servers.map((server) => {
+        const isOpen = openServers.has(server.key);
+        const status = server.status;
+        const hint =
+          status === "connecting" ? "连接中…" :
+          status === "failed" ? "连接失败" :
+          status === "disconnected" ? "未连接" : null;
+        return (
+          <div key={server.key} className="remote-server-connection">
+            <div
+              className={`project-row${status === "connected" ? " server-connected" : ""}`}
+              onClick={() => {
+                if (status !== "connected") {
+                  // Connect (or reconnect after a failure), then reveal the
+                  // projects once the shell is confirmed alive.
+                  const p = onConnectServer(server) as Promise<boolean> | undefined;
+                  if (p?.then) void p.then((ok) => { if (ok) toggleServer(server.key); });
+                  return;
+                }
+                // Connected: activate the server's shell tab AND toggle the projects.
+                void onConnectServer(server);
+                toggleServer(server.key);
+              }}
+              title={status === "connected" ? `${server.label}（点击收起/展开）` : `连接 ${server.label}`}
+            >
+              <span className="tree-chevron">{isOpen ? "▾" : "▸"}</span>
+              <span className="project-icon"><Icon name="globe" /></span>
+              <span className="project-name">{server.label}</span>
+              {hint && <span className={`server-connect-hint${status === "failed" ? " failed" : status === "connecting" ? " connecting" : ""}`}>{hint}</span>}
+              <button
+                className="row-action"
+                onClick={(e) => { e.stopPropagation(); void onAddProjectForServer(server); }}
+                title={`在 ${server.label} 中选择目录创建项目`}
+              >+</button>
+              <button
+                className="row-delete"
+                onClick={(e) => { e.stopPropagation(); void useSessionsStore.getState().deleteServer(server); }}
+                title={`删除服务器 ${server.label}`}
+              >×</button>
+            </div>
+            {isOpen && (
+              <div className="remote-server-projects">
+                {server.projects.length === 0 ? (
+                  <div className="placeholder">暂无项目，点击右侧 + 选择目录</div>
+                ) : server.projects.map((project) => (
+                  <ProjectItem
+                    key={project.key}
+                    project={project}
+                    expanded={expandedProjects.has(project.key)}
+                    isRemoteSection
                     active={isProjectActive(project)}
                     projectLoading={projectLoading}
                     projectSessionStatus={projectSessionStatus}
@@ -1254,12 +1370,12 @@ const TreeRow = memo(function TreeRow({ node, depth, isExpanded, expandedPaths, 
     <>
       <div
         className={`tree-row${isDir ? " tree-dir" : ""}`}
-        style={{ paddingLeft: `${depth * 14 + 8}px` }}
+        style={{ paddingLeft: `${depth * 12 + 6}px` }}
         onClick={() => (isDir ? onToggle(node.path) : onOpen(node.path, false))}
         onContextMenu={(e) => onContextMenu(e, node)}
       >
         <span className="tree-chevron">{isDir ? (isExpanded ? "▾" : "▸") : ""}</span>
-        <span className="tree-icon">{isDir ? (isExpanded ? "📂" : "📁") : "📄"}</span>
+        <span className="tree-icon"><Icon name={isDir ? (isExpanded ? "folder-open" : "folder") : "file"} /></span>
         <span className="tree-name">{node.name}</span>
       </div>
       {isDir && isExpanded && node.children && (
@@ -1277,7 +1393,7 @@ const TreeRow = memo(function TreeRow({ node, depth, isExpanded, expandedPaths, 
       )}
       {/* Lazy tree: an expanded dir whose children haven't loaded yet. */}
       {isDir && isExpanded && node.children === undefined && (
-        <div className="tree-row" style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}>
+        <div className="tree-row" style={{ paddingLeft: `${(depth + 1) * 12 + 6}px` }}>
           <span className="tree-name tree-muted">…加载中</span>
         </div>
       )}

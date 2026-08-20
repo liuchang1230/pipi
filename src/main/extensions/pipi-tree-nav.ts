@@ -1,10 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * pipi 随 app 分发的扩展：会话树导航桥。
+ * pipi 随 app 分发的扩展：会话树导航桥（RPC 后端专用）。
  *
- * RPC 模式没有 navigate_tree 命令，但扩展命令的 ctx.navigateTree() 可用
- * （等价 TUI /tree 的导航：原地切换 leaf，可选分支摘要）。聊天界面通过
+ * 本地 SDK 聊天 tab 已改用原生 `navigate_tree` RPC 命令（sdk-worker.ts，
+ * 直接调 session.navigateTree，静默导航）。但 `pi --mode rpc`（远程/WSL）
+ * 没有 navigate_tree 命令，扩展命令的 ctx.navigateTree() 可用（等价 TUI
+ * /tree 的导航：原地切换 leaf，可选分支摘要）。聊天界面通过
  * `/pipi-tree-nav` 调用它，实现与 /tree 一致的操作语义。
  *
  * 用法：/pipi-tree-nav <entryId> [--summarize] [--instructions <文本>]

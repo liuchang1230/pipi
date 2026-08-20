@@ -5,6 +5,7 @@
  */
 import { memo } from "react";
 import { sourceIcon, type SessionCommand } from "../commands";
+import { Icon } from "./Icon";
 
 interface SkillChipsProps {
   skills: SessionCommand[];
@@ -25,7 +26,7 @@ export const SkillChips = memo(function SkillChips({ skills, onInsert }: SkillCh
             onInsert(s.name);
           }}
         >
-          {sourceIcon(s.source)} {s.name}
+          <Icon name={sourceIcon(s.source)} /> {s.name}
         </button>
       ))}
     </div>

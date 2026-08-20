@@ -38,6 +38,20 @@ export function listRemoteHistory(): RemoteHistoryEntry[] {
   return readHistory().sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+/** Remove a saved connection matching the server key (host+user+port+
+ *  agentDir). Returns false when nothing matched. Used by the sidebar's
+ *  "删除服务器" cascade — deleting just the projects would leave the history
+ *  entry (and thus the server node) alive. */
+export function deleteRemoteHistory(target: { host: string; user: string; port: number; agentDir?: string }): boolean {
+  const list = readHistory();
+  const next = list.filter(
+    (i) => !(i.host === target.host && i.user === target.user && i.port === target.port && (i.agentDir ?? "") === (target.agentDir ?? "")),
+  );
+  if (next.length === list.length) return false;
+  writeHistory(next);
+  return true;
+}
+
 export function saveRemoteHistory(entry: { host: string; user: string; port?: number; password?: string; path?: string; agentDir?: string }): RemoteHistoryEntry {
   const list = readHistory();
   const port = entry.port ?? 22;

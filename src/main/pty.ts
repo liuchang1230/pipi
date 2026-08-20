@@ -162,7 +162,7 @@ function maybeLinkBlankTab(id: string): void {
   let files: string[];
   let dir: string;
   try {
-    dir = sessionDirFor(t.cwd);
+    dir = sessionDirFor(t.cwd, t.remote?.agentDir);
     files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
   } catch {
     return;
@@ -934,6 +934,14 @@ export interface TabInfo {
    *  auto-restart is DISABLED for these — a quiet shell may be running a
    *  long silent command, and killing it would lose work. */
   shellMode?: boolean;
+  /** SSH session state for connection shell tabs (startPi:false). "ready" is
+   *  set only after the remote prints the __PIPI_READY__ marker (auth passed,
+   *  remote bash actually started); "failed" when the ssh process exits
+   *  before the marker. Absent until then = still connecting. */
+  sshState?: "ready" | "failed";
+  /** Incomplete trailing line of pty output (no newline yet) used to spot the
+   *  ready-marker line across chunk boundaries and strip it from the stream. */
+  sshLineBuf?: string;
   // Stall watchdog clocks (Windows ConPTY freeze after long lock/sleep).
   // Absent for non-pty (RPC/SDK) tabs — the watchdog only covers pty tabs.
   lastOutputAt?: number;
@@ -1376,6 +1384,7 @@ export function listTabs(): TabInfo[] {
     remoteBrowsePath: t.remoteBrowsePath,
     remoteKey: t.remoteKey,
     wsl: t.wsl,
+    sshState: t.sshState,
     createdAt: t.createdAt,
   }));
 }
@@ -1660,6 +1669,7 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
   const port = String(r.port ?? 22);
   const sshArgs = [
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=10",
     "-o", "ServerAliveInterval=30",
     // Keepalive robustness: tolerate 3 missed keepalive replies (~90s) before
     // declaring the server dead, and send TCP-level keepalives so NAT/firewall
@@ -1685,7 +1695,13 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
   const agentDirEnv = r.agentDir ? ` export PI_CODING_AGENT_DIR=${r.agentDir};` : "";
   const shellPath = cdArg(r.path || "~");
   const inner = r.startPi === false
-    ? `exec bash -i`
+    // Echo the ready marker as a PLAIN line (no backslash escapes — those
+    // get mangled by the ssh→bash quoting layers on Windows). The main
+    // process strips the marker line from the pty stream before forwarding,
+    // so the user never sees it. The marker is the ONLY positive "ssh
+    // session really established" signal: a password prompt or a hanging
+    // handshake keeps ssh.exe alive without a session.
+    ? `echo __PIPI_READY__; exec bash -i`
     : opts.sessionPath
       // sessionArg already ends with the `pi ...` invocation.
       ? sessionArg(opts.sessionPath)
@@ -1739,12 +1755,34 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
   setSessionWatcher(tab); // no-op for remote (sync happens via SFTP in index.ts)
 
   term.onData((data) => {
+    // Connection-only shell tab: strip the ready-marker line from the stream
+    // so the user never sees it (the marker is echoed as a plain line), and
+    // flip sshState once it arrives.
+    if (tab.shellMode && tab.sshState !== "ready") {
+      const res = stripMarkerLine(tab.sshLineBuf, data);
+      tab.sshLineBuf = res.restBuf;
+      if (res.forward) streamTabData(id, res.forward);
+      if (res.ready) {
+        // Flush any marker-prefix tail that followed the marker line before
+        // dropping the buffer (only reachable with a pathological double echo).
+        if (res.restBuf) streamTabData(id, res.restBuf);
+        tab.sshState = "ready";
+        tab.sshLineBuf = undefined;
+        emitTabsChanged(); // renderer sidebar/tab bar learn the real state
+      }
+      return;
+    }
     streamTabData(id, data);
   });
   term.onExit(({ exitCode }) => {
     flushTabStream(id);
     const cur = tabs.get(id);
     if (!cur || cur.pty !== term) return; // stale pty (replaced by restart)
+    // Connection tab that never reached the ready marker: the session never
+    // established — record it for posterity, then drop the tab. The renderer
+    // MUST get a tabs:update AFTER the delete, or the dead tab lingers and a
+    // later reconnect reuses the zombie instead of spawning a fresh ssh.
+    if (cur.shellMode && cur.sshState !== "ready") cur.sshState = "failed";
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:exit:${id}`, exitCode);
     }
@@ -1753,7 +1791,55 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
     if (activeId === id) {
       activeId = tabs.size > 0 ? [...tabs.keys()][tabs.size - 1] : null;
     }
+    emitTabsChanged();
   });
 
   return id;
+}
+
+/**
+ * Line-buffer strip of the remote ready-marker line. Pure and unit-testable.
+ *
+ * The marker is echoed as its own line (`__PIPI_READY__`); ConPTY delivers
+ * `\r\n` line endings, so matching is per-line with trimming (handles both
+ * `\n` and `\r\n` and stray indentation). The marker line is removed from
+ * the stream before forwarding (the user never sees it); everything else
+ * forwards immediately except an incomplete tail that could be the marker
+ * itself split across chunks.
+ */
+export function stripMarkerLine(buf: string | undefined, chunk: string): { forward: string; restBuf: string; ready: boolean } {
+  const text = (buf ?? "") + chunk;
+  const lastLf = text.lastIndexOf("\n");
+  const complete = lastLf < 0 ? "" : text.slice(0, lastLf + 1);
+  let rest = lastLf < 0 ? text : text.slice(lastLf + 1);
+  let forward = complete;
+
+  // The incomplete tail is held back ONLY while it could be the marker split
+  // across chunks (a trailing \r is part of CRLF, so strip it before the
+  // prefix check). Everything else forwards immediately — prompts and user
+  // input must never be delayed.
+  const restNorm = rest.endsWith("\r") ? rest.slice(0, -1) : rest;
+  if (restNorm !== "" && "__PIPI_READY__".startsWith(restNorm)) {
+    // keep buffering
+  } else {
+    forward += rest;
+    rest = "";
+  }
+
+  // Drop any COMPLETE line that is exactly the marker (trimmed matching
+  // absorbs \r\n endings, trailing \r, and indentation).
+  let ready = false;
+  if (forward.includes("\n")) {
+    const kept: string[] = [];
+    for (const line of forward.split("\n")) {
+      if (line.trim() === "__PIPI_READY__") {
+        ready = true;
+      } else {
+        kept.push(line);
+      }
+    }
+    forward = kept.join("\n");
+  }
+
+  return { forward, restBuf: rest, ready };
 }

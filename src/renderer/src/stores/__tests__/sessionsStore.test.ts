@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionsStore, sessionLabel, remoteSessionCacheKey, buildRemoteKey } from "../sessionsStore";
 import { useTabsStore } from "../tabsStore";
 import { useTreeStore } from "../treeStore";
-import type { SessionItem, ProjectListItem } from "../types";
+import type { SessionItem, ProjectListItem, RemoteHistoryItem, RemoteServerGroup } from "../types";
 
 const SESSION: SessionItem = {
   path: "/sessions/x.jsonl",
@@ -40,6 +40,8 @@ function makeApi(opts: { sessionList?: (cwd?: string) => Promise<SessionItem[]> 
     remote: {
       getInfo: vi.fn(async () => null as { host: string; user: string; port?: number; path?: string; password?: string; isWsl?: boolean } | null),
       setBrowsePath: vi.fn(async () => true),
+      listHistory: vi.fn(async () => [] as RemoteHistoryItem[]),
+      deleteHistory: vi.fn(async () => true),
     },
     file: {
       list: vi.fn(async () => [] as ProjectListItem[]),
@@ -80,7 +82,8 @@ describe("helpers", () => {
     expect(sessionLabel({ ...SESSION, name: null, firstMessage: "" })).toBe("正在加载会话信息…");
   });
   it("cache keys and remote keys are stable", () => {
-    expect(remoteSessionCacheKey("t1", "/a/b")).toBe("t1:/a/b");
+    expect(remoteSessionCacheKey("t1", "/a/b")).toBe("t1::/a/b");
+    expect(remoteSessionCacheKey("t1", "/a/b", "~/pi-czy/agent")).not.toBe(remoteSessionCacheKey("t1", "/a/b", "~/.pi/agent"));
     expect(buildRemoteKey("h", "u", 22)).toBe("u@h:22");
     expect(buildRemoteKey()).toBe("@:22");
   });
@@ -301,6 +304,64 @@ describe("toggleProject (explorer orchestration)", () => {
     expect(useTreeStore.getState().treeOrigin).toEqual({ tabId: "tab-1", dirPath: "/w/proj", isRemote: true });
   });
 
+  it("SSH project without an open tab auto-connects a shell tab", async () => {
+    const api = makeApi();
+    const sshProject = {
+      key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
+      host: "h", user: "u", port: 22, password: "p", sessions: [],
+    };
+    await useSessionsStore.getState().toggleProject(sshProject);
+    expect(api.tab.create).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/proj",
+      remote: { host: "h", user: "u", port: 22, path: "/r", password: "p", startPi: false },
+    }));
+    expect(api.remote.setBrowsePath).toHaveBeenCalledWith("tab-1", "/r");
+    expect(useTreeStore.getState().treeOrigin).toEqual({ tabId: "tab-1", dirPath: "/r", isRemote: true });
+  });
+
+  it("rapid double-clicks on a disconnected SSH project create exactly one tab", async () => {
+    const api = makeApi();
+    let resolveCreate!: (value: string) => void;
+    api.tab.create.mockImplementation(() => new Promise<string>((r) => (resolveCreate = r)));
+    const sshProject = {
+      key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
+      host: "h", user: "u", port: 22, password: "p", sessions: [],
+    };
+    const p1 = useSessionsStore.getState().toggleProject(sshProject);
+    const p2 = useSessionsStore.getState().toggleProject(sshProject); // second click while first is in flight
+    resolveCreate("tab-1");
+    await Promise.all([p1, p2]);
+    expect(api.tab.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("failed SSH auto-connect rolls back expansion and marks the project as error", async () => {
+    const api = makeApi();
+    api.tab.create.mockRejectedValue(new Error("connection refused"));
+    const sshProject = {
+      key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
+      host: "h", user: "u", port: 22, password: "p", sessions: [],
+    };
+    useSessionsStore.setState({ expandedProjects: new Set() });
+    await useSessionsStore.getState().toggleProject(sshProject);
+    const s = useSessionsStore.getState();
+    // No eternal "远程会话加载中…": expansion reverted, error surfaced.
+    expect(s.expandedProjects.has("sp")).toBe(false);
+    expect(s.projectSessionStatus.sp).toBe("error");
+    expect(s.projectErrors.sp).toBe("connection refused");
+  });
+
+  it("a failed auto-connect releases the in-flight guard so a retry reconnects", async () => {
+    const api = makeApi();
+    api.tab.create.mockRejectedValueOnce(new Error("boom")).mockResolvedValueOnce("tab-2");
+    const sshProject = {
+      key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
+      host: "h", user: "u", port: 22, password: "p", sessions: [],
+    };
+    await useSessionsStore.getState().toggleProject(sshProject);
+    await useSessionsStore.getState().toggleProject(sshProject);
+    expect(api.tab.create).toHaveBeenCalledTimes(2);
+  });
+
   it("newProjectSession: local project opens and immediately shows a plain tab", async () => {
     const api = makeApi();
     await useSessionsStore.getState().newProjectSession({ key: "p1", label: "P1", cwd: "/p1", type: "local" as const, sessions: [] });
@@ -347,5 +408,41 @@ describe("project catalog actions", () => {
     await useSessionsStore.getState().addWslProject("Ubuntu", "/w/proj");
     expect(api.project.addWsl).toHaveBeenCalledWith("Ubuntu", "/w/proj");
     expect(useSessionsStore.getState().projects.some((p) => p.type === "wsl" && p.distro === "Ubuntu")).toBe(true);
+  });
+});
+
+describe("deleteServer (cascade)", () => {
+  it("closes the server's tabs, removes its projects and the saved connection", async () => {
+    vi.stubGlobal("confirm", () => true);
+    const api = makeApi();
+    useTabsStore.setState({
+      tabs: [
+        { id: "shell", cwd: ".", title: "root@h1 · 连接", isRemote: true, remoteKey: "root@h1:22", remoteHost: "h1", remoteUser: "root", pi: true, mode: "pty" },
+        { id: "session", cwd: ".", title: "my session", isRemote: true, remoteKey: "root@h1:22", remoteHost: "h1", remoteUser: "root", pi: true, mode: "rpc" },
+        { id: "other", cwd: ".", title: "x", pi: true, mode: "sdk" },
+      ] as any,
+    });
+    const server: RemoteServerGroup = {
+      key: "root@h1:22", host: "h1", user: "root", port: 22, label: "root@h1", status: "connected", tabId: "shell",
+      projects: [
+        { key: "p1", label: "app", cwd: "/srv/app", type: "remote", host: "h1", user: "root", port: 22, sessions: [] },
+      ],
+    };
+    await useSessionsStore.getState().deleteServer(server);
+    expect(api.tab.close).toHaveBeenCalledWith("shell");
+    expect(api.tab.close).toHaveBeenCalledWith("session");
+    expect(api.tab.close).not.toHaveBeenCalledWith("other");
+    expect(api.project.delete).toHaveBeenCalledWith("p1");
+    expect(api.remote.deleteHistory).toHaveBeenCalledWith({ host: "h1", user: "root", port: 22, agentDir: undefined });
+  });
+
+  it("cancels the whole cascade when the confirm is declined", async () => {
+    vi.stubGlobal("confirm", () => false);
+    const api = makeApi();
+    const server: RemoteServerGroup = { key: "root@h1:22", host: "h1", user: "root", port: 22, label: "root@h1", status: "connected", projects: [] };
+    await useSessionsStore.getState().deleteServer(server);
+    expect(api.tab.close).not.toHaveBeenCalled();
+    expect(api.project.delete).not.toHaveBeenCalled();
+    expect(api.remote.deleteHistory).not.toHaveBeenCalled();
   });
 });

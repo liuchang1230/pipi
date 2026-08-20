@@ -24,6 +24,11 @@ export interface FileReadResult {
   error?: string;
 }
 
+export interface FileMentionResult {
+  files: Array<{ path: string; type: "file" | "directory" }>;
+  error?: string;
+}
+
 export type FileOpResult = { ok: true } | { ok: false; error: string };
 
 export interface TabSummary {
@@ -40,6 +45,9 @@ export interface TabSummary {
   pi: boolean;
   /** rpc = headless ChatPane (local tabs); pty = terminal view. */
   mode?: "rpc" | "sdk" | "pty";
+  /** Connection shell tabs only: "ready" after the remote shell confirmed,
+   *  "failed" when ssh exited before that. */
+  sshState?: "ready" | "failed";
 }
 
 export interface SessionListItem {
@@ -113,6 +121,8 @@ export interface RemoteTarget {
 export interface AutoFollowEvent {
   path: string;
   kind: "read" | "write";
+  /** Local tab that produced this event; absent for older main processes. */
+  tabId?: string;
 }
 
 export interface AutoFollowStatus {
@@ -150,6 +160,8 @@ declare global {
         alive: (id: string) => Promise<boolean>;
         list: () => Promise<TabSummary[]>;
         waitUntilAlive: (id: string, timeoutMs?: number, intervalMs?: number) => Promise<boolean>;
+        /** Honest SSH session state for connection shell tabs: "ready" | "failed" | "timeout". */
+        waitConnState: (id: string, timeoutMs?: number, intervalMs?: number) => Promise<"ready" | "failed" | "timeout">;
         /** Send a JSON command to a tab's RPC pi session (prompt/steer/abort/…). */
         rpcSend: (id: string, cmd: Record<string, unknown>) => Promise<boolean>;
         /** Send a command and resolve with its response frame (id-matched). */
@@ -208,7 +220,8 @@ declare global {
         /** Lazy local tree: list one directory's children on expand. */
         listDirChildren: (rootPath: string | undefined, tabId: string | undefined, relDir: string, noCache?: boolean) => Promise<FileNode[]>;
         resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }) => Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }>;
-        read: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileReadResult>;
+        read: (tabId: string | undefined, relPath: string, rootPath?: string, mention?: boolean) => Promise<FileReadResult>;
+        searchMentions: (tabId: string, query: string) => Promise<FileMentionResult>;
         write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string) => Promise<FileOpResult>;
         mkdir: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
         delete: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
@@ -257,6 +270,7 @@ declare global {
         getBrowsePath: (tabId: string) => Promise<string | null>;
         getInfo: (tabId: string) => Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; agentDir?: string; isWsl?: boolean } | null>;
         listHistory: () => Promise<RemoteHistoryItem[]>;
+        deleteHistory: (target: { host: string; user: string; port: number; agentDir?: string }) => Promise<boolean>;
       };
       wsl: {
         listDistros: () => Promise<Array<{ name: string; default: boolean; running: boolean; version: number }>>;

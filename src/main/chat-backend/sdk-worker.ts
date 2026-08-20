@@ -27,6 +27,8 @@
 import { parentPort } from "node:worker_threads";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
+import { join } from "node:path";
+import { decideCmdRouting, queueAtCapacity } from "./sdk-queue";
 
 // --- Undici worker polyfill ------------------------------------------------
 // undici 8.x (a pi-coding-agent dep) reads `markAsUncloneable` off
@@ -108,34 +110,45 @@ type HostMessage = OpenRequest | CmdRequest | UiResponseRequest | CloseRequest |
 
 // --- Shared global infrastructure (created once) ---------------------------
 
-let sharedRuntime: ModelRuntimeT | null = null;
-let sharedSettings: SettingsManagerT | null = null;
-let initPromise: Promise<void> | null = null;
+const runtimes = new Map<string, ModelRuntimeT>();
+const initPromises = new Map<string, Promise<void>>();
+
+function encodeCwd(cwd: string): string {
+  const stripped = cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-");
+  return `--${stripped}--`;
+}
 
 async function ensureSharedInfra(agentDir: string): Promise<void> {
+  let initPromise = initPromises.get(agentDir);
   if (!initPromise) {
     initPromise = (async () => {
-      sharedRuntime = await ModelRuntime.create();
+      const runtime = await ModelRuntime.create({
+        authPath: join(agentDir, "auth.json"),
+        modelsPath: join(agentDir, "models.json"),
+        modelsStorePath: join(agentDir, "models-store.json"),
+      });
+      runtimes.set(agentDir, runtime);
       // Warm the model registry so get_available_models is instant later.
-      void sharedRuntime.refresh({ signal: AbortSignal.timeout(15_000) }).catch(() => {});
+      void runtime.refresh({ signal: AbortSignal.timeout(15_000) }).catch(() => {});
       // Theme singleton: extensions (e.g. pi-rewind's ui helpers) call
       // theme.fg(...) via the global Proxy, which throws "Cannot read
       // properties of undefined (reading 'fg')" unless initTheme() ran.
       // RPC mode gets this from main.js; the SDK worker must do it itself.
-      sharedSettings = SettingsManager.create(process.cwd(), agentDir);
+      const settings = SettingsManager.create(process.cwd(), agentDir);
       try {
-        initTheme(sharedSettings.getTheme());
+        initTheme(settings.getTheme());
       } catch (e) {
         console.error("[sdk-worker] initTheme failed:", e instanceof Error ? e.message : String(e));
       }
     })().catch((e) => {
       // Failed infra must not poison every later open: reset so the next
       // open retries instead of failing forever.
-      initPromise = null;
-      sharedRuntime = null;
-      sharedSettings = null;
+      runtimes.delete(agentDir);
+      // Allow a later tab to retry after a transient initialization failure.
+      if (initPromises.get(agentDir) === initPromise) initPromises.delete(agentDir);
       throw e;
     });
+    initPromises.set(agentDir, initPromise);
   }
   await initPromise;
 }
@@ -152,6 +165,12 @@ interface TabSession {
 }
 
 const tabs = new Map<string, TabSession>();
+
+/** Commands that arrived while a tab was still opening (boot-time
+ *  get_messages/get_state from the renderer, or an early user prompt).
+ *  Replayed FIFO once the session is registered — without this the worker
+ *  answers "Tab session not found" and the first prompt is silently lost. */
+const openingCmds = new Map<string, HostMessage[]>();
 
 function post(m: unknown): void {
   parentPort?.postMessage(m);
@@ -478,6 +497,26 @@ async function handleCommand(ts: TabSession, command: Record<string, unknown>): 
     }
     case "get_tree":
       return success(id, "get_tree", { tree: session.sessionManager.getTree(), leafId: session.sessionManager.getLeafId() });
+    // Native session-tree navigation. Equivalent to the /tree extension
+    // bridge (ctx.navigateTree) but WITHOUT routing through the prompt
+    // channel: navigateTree() is an internal session operation, so nothing
+    // is recorded as a user message and no agent turn is started — the
+    // chat just lands at the target position and waits for user input.
+    case "navigate_tree": {
+      const entryId = command.entryId as string | undefined;
+      if (!entryId) return error(id, "navigate_tree", "entryId is required");
+      try {
+        const result = await session.navigateTree(entryId, {
+          summarize: command.summarize as boolean | undefined,
+          customInstructions: command.customInstructions as string | undefined,
+          replaceInstructions: command.replaceInstructions as boolean | undefined,
+          label: command.label as string | undefined,
+        });
+        return success(id, "navigate_tree", result);
+      } catch (e) {
+        return error(id, "navigate_tree", e instanceof Error ? e.message : String(e));
+      }
+    }
     case "get_last_assistant_text":
       return success(id, "get_last_assistant_text", { text: session.getLastAssistantText() });
     case "set_session_name": {
@@ -528,11 +567,14 @@ async function openTab(req: OpenRequest): Promise<void> {
     const infraMs = performance.now() - infraStartedAt;
 
     const sessionStartedAt = performance.now();
+    // SessionManager defaults to ~/.pi/agent/sessions. Pass the profile's
+    // session directory explicitly so SDK tabs do not resume another profile.
+    const sessionDir = join(req.agentDir, "sessions", encodeCwd(req.cwd));
     const sessionManager = req.sessionPath
-      ? SessionManager.open(req.sessionPath, undefined, req.cwd)
+      ? SessionManager.open(req.sessionPath, sessionDir, req.cwd)
       : req.continueRecent
-        ? SessionManager.continueRecent(req.cwd)
-        : SessionManager.create(req.cwd);
+        ? SessionManager.continueRecent(req.cwd, sessionDir)
+        : SessionManager.create(req.cwd, sessionDir);
     const sessionMs = performance.now() - sessionStartedAt;
 
     const servicesStartedAt = performance.now();
@@ -540,7 +582,8 @@ async function openTab(req: OpenRequest): Promise<void> {
       const services = await createAgentSessionServices({
         cwd,
         agentDir,
-        modelRuntime: sharedRuntime!,
+        modelRuntime: runtimes.get(agentDir)!,
+        // ModelRuntime is cached per agentDir so models/auth never cross profiles.
         // NOTE: agent-session-services creates its own per-cwd DefaultResource
         // Loader (the resourceLoader key is not honored) — that is correct for
         // project-scoped skills/prompts/settings, so we only share ModelRuntime.
@@ -589,6 +632,26 @@ async function openTab(req: OpenRequest): Promise<void> {
         console.error(`[sdk-worker] event post failed for ${ts.tabId}:`, e instanceof Error ? e.message : String(e));
       }
     });
+    // Replay commands that arrived while this tab was still opening (an
+    // early prompt must not be lost; the renderer's boot-time get_messages
+    // also benefits). Runs AFTER the event subscription is installed so a
+    // replayed prompt's streamed events reach the renderer. handleCommand is
+    // async but each replays independently, like normal post-registration
+    // traffic.
+    const queued = openingCmds.get(req.tabId);
+    if (queued) {
+      openingCmds.delete(req.tabId);
+      for (const q of queued) {
+        if (q.kind !== "cmd") continue;
+        void handleCommand(ts, q.cmd)
+          .then((resp) => {
+            if (resp) post({ kind: "resp", tabId: req.tabId, resp });
+          })
+          .catch((e: Error) => {
+            post({ kind: "resp", tabId: req.tabId, resp: error(q.cmd.id as string | undefined, String(q.cmd.type ?? "unknown"), e.message) });
+          });
+      }
+    }
     void (async () => {
       try {
         await rebindSession(ts);
@@ -602,6 +665,16 @@ async function openTab(req: OpenRequest): Promise<void> {
     post({ kind: "opened", tabId: req.tabId });
   } finally {
     opening.delete(req.tabId);
+    // The open was cancelled/failed — the tab never registered. Fail any
+    // queued commands honestly instead of leaving them hanging forever.
+    const queued = openingCmds.get(req.tabId);
+    if (queued) {
+      openingCmds.delete(req.tabId);
+      for (const q of queued) {
+        if (q.kind !== "cmd") continue;
+        post({ kind: "resp", tabId: req.tabId, resp: error(q.cmd.id as string | undefined, String(q.cmd.type ?? "unknown"), "Tab session not found") });
+      }
+    }
   }
 }
 
@@ -652,11 +725,35 @@ parentPort?.on("message", (msg: HostMessage) => {
   }
   if (msg.kind === "cmd") {
     const ts = tabs.get(msg.tabId);
-    if (!ts || ts.closing) {
+    const route = decideCmdRouting({
+      registered: !!ts,
+      closing: !!ts?.closing,
+      opening: opening.has(msg.tabId),
+    });
+    if (route === "queue") {
+      // Tab still opening — queue instead of dropping (the renderer's
+      // boot-time get_messages/get_state and an early prompt would
+      // otherwise be lost to "Tab session not found").
+      const list = openingCmds.get(msg.tabId);
+      if (list) {
+        if (queueAtCapacity(list.length)) {
+          post({ kind: "resp", tabId: msg.tabId, resp: error(msg.cmd.id as string | undefined, String(msg.cmd.type ?? "unknown"), "command queue overflow") });
+        } else {
+          list.push(msg);
+        }
+      } else {
+        openingCmds.set(msg.tabId, [msg]);
+      }
+      return;
+    }
+    if (route === "drop") {
       post({ kind: "resp", tabId: msg.tabId, resp: error(msg.cmd.id as string | undefined, String(msg.cmd.type ?? "unknown"), "Tab session not found") });
       return;
     }
-    void handleCommand(ts, msg.cmd)
+    // route === "run" ⇒ the tab is registered and not closing; the routing
+    // helper can't narrow `ts` for us (separate function call), assert here.
+    const tsRegistered = ts!;
+    void handleCommand(tsRegistered, msg.cmd)
       .then((resp) => {
         if (resp) post({ kind: "resp", tabId: msg.tabId, resp });
       })

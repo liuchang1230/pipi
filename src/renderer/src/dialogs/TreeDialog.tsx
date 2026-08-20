@@ -4,10 +4,12 @@
  *  - per-type entry labels (user:/assistant:/[tool]/[model]/[compaction]/…)
  *  - active-branch-first ordering, single-child chains rendered flat
  *  - current leaf pre-selected, search filter, fold/unfold
- *  - navigate to a point (via the pipi-tree-nav extension command bridge,
- *    which calls ctx.navigateTree — the RPC protocol has no native command),
- *    with the same "Summarize branch?" choice as /tree; fork kept as the
- *    "start new branch" action (equivalent to /fork).
+ *  - navigate to a point (SDK tabs: native `navigate_tree` RPC — a silent
+ *    session operation, nothing enters the prompt channel; RPC-backed
+ *    remote/WSL tabs: pipi-tree-nav extension command bridge, since
+ *    upstream pi has no native command), with the same "Summarize branch?"
+ *    choice as /tree; fork kept as the "start new branch" action
+ *    (equivalent to /fork).
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
@@ -222,6 +224,44 @@ export function TreeDialog({
   useEffect(() => {
     refresh();
     const off = window.api.onRpcEvent(tabId, (event) => {
+      if (event.type === "response" && event.command === "navigate_tree") {
+        if (pendingNavRequestId.current && event.id === pendingNavRequestId.current) {
+          if (!event.success) {
+            // Native navigation errors (e.g. entry not found / agent still
+            // streaming) arrive as a failed response frame — surface them
+            // instead of waiting out the polling timeout.
+            if (pendingNavTimer.current) {
+              clearInterval(pendingNavTimer.current);
+              pendingNavTimer.current = null;
+            }
+            pendingNavRequestId.current = null;
+            setNavPhase("idle");
+            setNavigatingId(null);
+            useUiStore.getState().showToast(`导航失败: ${String(event.error ?? "未知错误")}`, "err");
+          } else {
+            // Success: session.navigateTree resolved — any extension prompt
+            // (e.g. pi-rewind's "Restore Options" during session_before_tree)
+            // was answered as part of it. Finish immediately instead of
+            // relying on the leaf-change poll, which never fires when the
+            // target's parent equals the current leaf. Only a
+            // cancelled/aborted navigation needs handling here.
+            const data = event.data as { cancelled?: boolean; aborted?: boolean } | undefined;
+            if (data?.cancelled || data?.aborted) {
+              if (pendingNavTimer.current) {
+                clearInterval(pendingNavTimer.current);
+                pendingNavTimer.current = null;
+              }
+              pendingNavRequestId.current = null;
+              setNavPhase("idle");
+              setNavigatingId(null);
+              useUiStore.getState().showToast(data.aborted ? "摘要已中止" : "导航已取消", "ok");
+            } else {
+              completionRef.current();
+            }
+          }
+        }
+        return;
+      }
       if (event.type !== "response" || event.command !== "get_tree") return;
       // During navigation, ignore unrelated tree snapshots (initial refreshes
       // or another consumer's request). They must not be able to complete the
@@ -406,19 +446,41 @@ export function TreeDialog({
     const targetId = selected.entry.id;
     setNavPhase("navigating");
     setNavigatingId(targetId);
-    const args = [`/pipi-tree-nav`, targetId];
-    if (summarize) args.push("--summarize");
-    if (instructions) args.push("--instructions", instructions);
-    void window.api.tab.rpcSend(tabId, { type: "prompt", message: args.join(" ") });
-    // Poll get_tree until the leaf moves (or timeout) — the extension command
-    // executes synchronously inside pi, so this resolves quickly.
+    // SDK tabs navigate via the native `navigate_tree` RPC: a direct session
+    // operation, so NOTHING is sent through the prompt channel — no command
+    // text, no user message, no agent turn; the chat just lands at the
+    // target and waits for input. RPC-backed tabs (remote/WSL, upstream pi
+    // has no native command) fall back to the pipi-tree-nav extension bridge.
+    const tab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
     const started = Date.now();
     const requestId = `tree-nav-${started}`;
     pendingNavRequestId.current = requestId;
+    const cmd: Record<string, unknown> =
+      tab?.mode === "sdk"
+        ? {
+            type: "navigate_tree",
+            id: requestId,
+            entryId: targetId,
+            summarize: summarize ? true : undefined,
+            customInstructions: instructions,
+          }
+        : {
+            type: "prompt",
+            message: `/pipi-tree-nav ${targetId}${summarize ? " --summarize" : ""}${instructions ? ` --instructions ${instructions}` : ""}`,
+          };
+    void window.api.tab.rpcSend(tabId, cmd);
+    // Poll get_tree until the leaf moves (or timeout) — navigateTree executes
+    // synchronously inside pi, so this resolves quickly.
     const timer = setInterval(() => {
       void window.api.tab.rpcSend(tabId, { type: "get_tree", id: requestId });
-      if (Date.now() - started > 30000) {
+      // The timeout is a backstop for a worker that never answers. A human
+      // answering an extension prompt during navigation (e.g. pi-rewind's
+      // "Restore Options") can legitimately extend the wait, so give plain
+      // navigation a generous 60s (summarize runs a model call: 180s).
+      if (Date.now() - started > (summarize ? 180_000 : 60_000)) {
         clearInterval(timer);
+        pendingNavTimer.current = null;
+        pendingNavRequestId.current = null;
         setNavPhase("idle");
         setNavigatingId(null);
         useUiStore.getState().showToast("导航超时", "err");
@@ -431,6 +493,24 @@ export function TreeDialog({
   const pendingNavTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const pendingNavRequestId = useRef<string | null>(null);
   const prevLeafRef = useRef<string | null>(null);
+
+  // Fresh view of the navigation completion. The onRpcEvent handler is
+  // registered once (deps [tabId]), so it must not capture stale props or
+  // state — this ref is reassigned on every render with the latest values.
+  const completionRef = useRef<() => void>(() => {});
+  completionRef.current = () => {
+    if (pendingNavTimer.current) {
+      clearInterval(pendingNavTimer.current);
+      pendingNavTimer.current = null;
+    }
+    pendingNavRequestId.current = null;
+    setNavPhase("idle");
+    setNavigatingId(null);
+    useUiStore.getState().showToast("已导航到目标位置", "ok");
+    const editorText = isUserMsg && selectedText ? selectedText : undefined;
+    onNavigated?.(editorText);
+    onClose();
+  };
 
   // Always stop polling when the dialog closes or the tab changes.
   useEffect(() => () => {

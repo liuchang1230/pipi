@@ -36,7 +36,7 @@ import { remoteAgentDir } from "./pty";
 export const AUTO_THEME_SETTING = "pipi-light/pipi-dark";
 
 export function agentDir(): string {
-  return join(homedir(), ".pi", "agent");
+  return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
 
 export function themesDir(): string {

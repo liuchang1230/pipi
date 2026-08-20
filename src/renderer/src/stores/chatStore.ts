@@ -32,9 +32,34 @@ export interface ChatMessage {
   error?: string;
 }
 
+export type TurnPhase =
+  | "booting"
+  | "ready"
+  | "submitting"
+  | "thinking"
+  | "streaming"
+  | "tool"
+  | "retrying"
+  | "compacting"
+  | "queued"
+  | "cancelling"
+  | "completed"
+  | "failed"
+  | "exited";
+
+export interface TurnStatus {
+  phase: TurnPhase;
+  startedAt?: number;
+  lastActivityAt?: number;
+  completedAt?: number;
+  detail?: string;
+}
+
 export interface ChatTabState {
   messages: ChatMessage[];
+  /** True from Pi's agent_start until authoritative agent_settled. */
   isStreaming: boolean;
+  turn: TurnStatus;
   modelName?: string;
   modelId?: string;
   modelProvider?: string;
@@ -42,6 +67,10 @@ export interface ChatTabState {
   sessionName?: string | null;
   booted: boolean;
   exited: boolean;
+  /** Normal (0) or abnormal exit code from the backend process. */
+  exitCode?: number;
+  /** Boot progress from the backend (connecting → ready). */
+  bootStage?: "connecting" | "starting" | "ready";
   /** History has been fetched at least once (guards ready-signal re-ask). */
   historyLoaded?: boolean;
   lastError?: string;
@@ -67,7 +96,9 @@ interface ChatStore {
   applyEvent: (tabId: string, event: Record<string, unknown>) => void;
   initMessages: (tabId: string, messages: unknown[]) => void;
   markHistoryLoading: (tabId: string) => void;
-  sendPrompt: (tabId: string, text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>) => void;
+  /** displayText is kept in the chat bubble; message is the private expanded
+   * payload sent to Pi (for example @file contents). */
+  sendPrompt: (tabId: string, message: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, displayText?: string) => Promise<void>;
   abort: (tabId: string) => void;
   markExited: (tabId: string, code: number) => void;
 }
@@ -75,6 +106,7 @@ interface ChatStore {
 const emptyState = (): ChatTabState => ({
   messages: [],
   isStreaming: false,
+  turn: { phase: "booting" },
   booted: false,
   exited: false,
   retryInfo: null,
@@ -153,6 +185,17 @@ function textOf(content: unknown): string {
       .join("");
   }
   return "";
+}
+
+/** Restore the authored @mention view from an expanded prompt: pi (and this
+ * workbench) embed attached files as `<file name/path="…">…content…</file>`.
+ * The chat history must not render that content — collapse it back to `@path`. */
+function collapseFileAttachments(text: string): string {
+  const collapsed = text.replace(/<file (?:name|path)="([^"]+)">[\s\S]*?<\/file>/g, (_, path: string) => {
+    const isAbsolute = /^\//.test(path) || /^[A-Za-z]:[\\/]/.test(path);
+    return `@${isAbsolute ? (path.split("/").pop() ?? path) : path}`;
+  });
+  return collapsed.replace(/\[已附加图片：([^\]]+)\]/g, (_, path: string) => `@${path}`);
 }
 
 /** Does this text look like a git/unified diff already? */
@@ -260,7 +303,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     set((s) => ({
       states: {
         ...s.states,
-        [tabId]: { ...s.states[tabId]!, isStreaming: false, exited: true, lastError: `pi 进程已退出 (code ${code})` },
+        [tabId]: {
+          ...s.states[tabId]!,
+          isStreaming: false,
+          exited: true,
+          lastError: `pi 进程已退出 (code ${code})`,
+          exitCode: code,
+          turn: { phase: "exited", lastActivityAt: Date.now(), detail: `进程退出（code ${code}）` },
+        },
       },
     }));
   },
@@ -277,7 +327,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           id: m.id ?? `hist-${chatMessages.length}`,
           role: "user",
           status: "done",
-          blocks: [{ kind: "text", contentIndex: 0, text: textOf(m.content), done: true }],
+          blocks: [{ kind: "text", contentIndex: 0, text: collapseFileAttachments(textOf(m.content)), done: true }],
         });
       } else if (m.role === "assistant") {
         const raw = m as { errorMessage?: string; stopReason?: string };
@@ -348,6 +398,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         states: { ...s.states, [tabId]: { ...s.states[tabId]!, messages: fn(s.states[tabId]!.messages) } },
       }));
 
+    if (type === "app_phase") {
+      const phase = event.phase;
+      if (phase === "connecting" || phase === "starting" || phase === "ready") {
+        patch({ bootStage: phase });
+      }
+      return;
+    }
     if (type === "state_ready") {
       const model = (event.model ?? null) as { name?: string; id?: string; provider?: string } | null;
       patch({
@@ -360,21 +417,45 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         followUpMode: (event.followUpMode as string | undefined) ?? st.followUpMode,
         autoCompactionEnabled: (event.autoCompactionEnabled as boolean | undefined) ?? st.autoCompactionEnabled,
         booted: true,
+        bootStage: "ready",
+        turn: st.isStreaming ? st.turn : { phase: "ready", lastActivityAt: Date.now() },
       });
       return;
     }
     if (type === "agent_start") {
-      patch({ isStreaming: true, lastError: undefined });
+      patch({
+        isStreaming: true,
+        lastError: undefined,
+        turn: { phase: "thinking", startedAt: Date.now(), lastActivityAt: Date.now() },
+      });
       return;
     }
     if (type === "agent_settled") {
-      patch({ isStreaming: false, retryInfo: null, compacting: false, steeringQueue: [], followUpQueue: [] });
+      patch({
+        isStreaming: false,
+        retryInfo: null,
+        compacting: false,
+        steeringQueue: [],
+        followUpQueue: [],
+        pendingUserText: undefined,
+        turn: st.lastError || st.turn.phase === "failed"
+          ? { phase: "failed", lastActivityAt: Date.now(), detail: st.turn.detail ?? st.lastError }
+          : { phase: "completed", completedAt: Date.now(), lastActivityAt: Date.now() },
+      });
       return;
     }
     if (type === "queue_update") {
       const steering = Array.isArray(event.steering) ? (event.steering as string[]) : st.steeringQueue ?? [];
       const followUp = Array.isArray(event.followUp) ? (event.followUp as string[]) : st.followUpQueue ?? [];
-      patch({ steeringQueue: steering, followUpQueue: followUp });
+      patch({
+        steeringQueue: steering,
+        followUpQueue: followUp,
+        // A queue is secondary information: don't hide visible output/tool
+        // activity behind a generic "queued" status.
+        turn: !st.isStreaming && (steering.length || followUp.length)
+          ? { phase: "queued", lastActivityAt: Date.now(), detail: `已排队 ${steering.length + followUp.length} 条消息` }
+          : st.turn,
+      });
       return;
     }
     if (type === "auto_retry_start") {
@@ -388,6 +469,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
             : null,
         // Not a final error yet — pi is retrying with backoff.
         lastError: undefined,
+        turn: { phase: "retrying", lastActivityAt: Date.now(), detail: `第 ${attempt ?? "?"}/${maxAttempts ?? "?"} 次重试` },
       });
       return;
     }
@@ -403,7 +485,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "compaction_start") {
-      patch({ compacting: true, lastError: undefined });
+      patch({ compacting: true, lastError: undefined, turn: { phase: "compacting", lastActivityAt: Date.now(), detail: "正在压缩上下文" } });
       return;
     }
     if (type === "compaction_end") {
@@ -411,6 +493,9 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         compacting: false,
         // Failed compaction is the terminal state for this turn.
         lastError: event.errorMessage && !event.aborted ? (event.errorMessage as string) : undefined,
+        turn: event.errorMessage && !event.aborted
+          ? { phase: "failed", lastActivityAt: Date.now(), detail: event.errorMessage as string }
+          : st.turn,
       });
       return;
     }
@@ -418,6 +503,10 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       const m = messageOf(event.message);
       if (!m) return;
       if (m.role === "user") {
+        // The optimistic bubble already shows the authored @path form. When
+        // pi echoes the full expanded prompt back, keep the display version
+        // instead of letting the file contents leak into the transcript.
+        const display = st.pendingUserText && st.pendingUserText.trim() ? st.pendingUserText : collapseFileAttachments(textOf(m.content));
         patchMessages((msgs) => {
           const last = msgs[msgs.length - 1];
           // Replace the optimistic user bubble with the real entry.
@@ -428,7 +517,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
                 id: m.id ?? last.id,
                 role: "user" as const,
                 status: "done" as const,
-                blocks: [{ kind: "text" as const, contentIndex: 0, text: textOf(m.content), done: true }],
+                blocks: [{ kind: "text" as const, contentIndex: 0, text: display, done: true }],
               },
             ];
           }
@@ -438,7 +527,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
               id: m.id ?? `msg-${localSeq++}`,
               role: "user" as const,
               status: "done" as const,
-              blocks: [{ kind: "text" as const, contentIndex: 0, text: textOf(m.content), done: true }],
+              blocks: [{ kind: "text" as const, contentIndex: 0, text: display, done: true }],
             },
           ];
         });
@@ -516,10 +605,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
 
         switch (ev.type) {
           case "text_start":
+            // First visible text proves the model is responding; distinguish it
+            // from the opaque pre-response thinking interval.
+            patch({ turn: { phase: "streaming", lastActivityAt: Date.now(), detail: "正在回复" } });
             ensureBlock("text");
             (block as { kind: "text"; done: boolean }).done = false;
             break;
           case "text_delta":
+            patch({ turn: { phase: "streaming", lastActivityAt: Date.now(), detail: "正在回复" } });
             ensureBlock("text");
             (block as { kind: "text"; text: string }).text += ev.delta ?? "";
             break;
@@ -532,6 +625,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
             }
             break;
           case "thinking_start":
+            patch({ turn: { phase: "thinking", lastActivityAt: Date.now(), detail: "正在思考" } });
             ensureBlock("thinking");
             (block as { kind: "thinking"; done: boolean }).done = false;
             break;
@@ -548,6 +642,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
             }
             break;
           case "toolcall_start":
+            patch({ turn: { phase: "tool", lastActivityAt: Date.now(), detail: "正在准备工具调用" } });
             ensureBlock("tool");
             {
               const t = block as { kind: "tool"; toolCallId?: string; name?: string };
@@ -579,6 +674,15 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "tool_execution_start" || type === "tool_execution_update" || type === "tool_execution_end") {
+      if (type === "tool_execution_start") {
+        patch({
+          turn: {
+            phase: "tool",
+            lastActivityAt: Date.now(),
+            detail: typeof event.toolName === "string" ? `正在执行 ${event.toolName}` : "正在执行工具",
+          },
+        });
+      }
       const toolCallId = event.toolCallId as string | undefined;
       if (!toolCallId) return;
       patchMessages((msgs) => {
@@ -611,38 +715,69 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "extension_error") {
-      patch({ lastError: typeof event.error === "string" ? event.error : "扩展错误" });
+      patch({
+        lastError: typeof event.error === "string" ? event.error : "扩展错误",
+        turn: { phase: "failed", lastActivityAt: Date.now(), detail: typeof event.error === "string" ? event.error : "扩展错误" },
+      });
       return;
     }
     // Ignore: response / turn_start / turn_end / compaction_* /
     // auto_retry_* / agent_end / bash_execution_update / summarization_retry_*
   },
 
-  sendPrompt: (tabId, text, images) => {
+  sendPrompt: async (tabId, message, images, displayText = message) => {
     get().ensure(tabId);
     const st = get().states[tabId]!;
     if (st.exited) return;
     const id = `local-${++localSeq}`;
-    // Optimistic user bubble; message_start replaces it with the real entry.
+    // The visible user bubble deliberately differs from the private prompt
+    // payload when @mentions expanded a file. Pi will echo the payload in its
+    // message_start event, so pendingUserText keeps reconciliation on the
+    // display-safe version as well.
     set((s) => ({
       states: {
         ...s.states,
         [tabId]: {
           ...s.states[tabId]!,
+          pendingUserText: displayText,
+          turn: { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
           messages: [
             ...s.states[tabId]!.messages,
-            { id, role: "user", status: "done", blocks: [{ kind: "text", contentIndex: 0, text, done: true }] },
+            { id, role: "user", status: "done", blocks: [{ kind: "text", contentIndex: 0, text: displayText, done: true }] },
           ],
         },
       },
     }));
     const cmd: Record<string, unknown> = st.isStreaming
-      ? { type: "prompt", message: text, images, streamingBehavior: "steer" }
-      : { type: "prompt", message: text, images };
-    void window.api.tab.rpcSend(tabId, cmd);
+      ? { type: "prompt", message, images, streamingBehavior: "steer" }
+      : { type: "prompt", message, images };
+    const sent = await window.api.tab.rpcSend(tabId, cmd);
+    if (!sent) {
+      set((s) => ({
+        states: {
+          ...s.states,
+          [tabId]: {
+            ...s.states[tabId]!,
+            pendingUserText: undefined,
+            lastError: "消息未能发送到 Pi，请重试或切换到终端视图检查连接。",
+            turn: { phase: "failed", lastActivityAt: Date.now(), detail: "发送失败" },
+          },
+        },
+      }));
+    }
   },
 
   abort: (tabId) => {
+    get().ensure(tabId);
+    set((s) => ({
+      states: {
+        ...s.states,
+        [tabId]: {
+          ...s.states[tabId]!,
+          turn: { phase: "cancelling", lastActivityAt: Date.now(), detail: "正在停止…" },
+        },
+      },
+    }));
     // Escape in pi's TUI first aborts the active agent turn; if no turn is
     // running it aborts the active bash command. The RPC path has separate
     // commands, so mirror the effective cancellation rather than sending a

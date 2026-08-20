@@ -271,6 +271,8 @@ export class RpcSession {
       );
     } else if (opts.remote) {
       const r = opts.remote;
+      // Pi derives sessions from agentDir/sessions/<encoded-cwd>; do not pass
+      // a flat session directory or the app's session index cannot find them.
       const agentDirEnv = r.agentDir ? `export PI_CODING_AGENT_DIR=${r.agentDir}; ` : "";
       const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : "pi --mode rpc";
       const remoteCmd = `cd ${cdArg(r.path || "~")} && bash -ic '${agentDirEnv}${inner}'`;
@@ -432,7 +434,11 @@ export function createRpcTab(opts: CreateTabOptions): string {
     wsl,
     createdAt: Date.now(),
   };
+  if (remote) tab.remoteKey = `${remote.user}@${remote.host}:${remote.port ?? 22}${remote.agentDir ? `[${remote.agentDir}]` : ""}`;
   registerExternalTab(tab);
+  // App-level boot stage: lets the chat UI show the actual connect phase
+  // instead of an opaque spinner (remote pi can take 15-20s to boot).
+  forwardEvent(id, { type: "app_phase", phase: "connecting" });
 
   const session = new RpcSession(id, opts);
   sessions.set(id, session);
@@ -454,6 +460,7 @@ export function createRpcTab(opts: CreateTabOptions): string {
       linkTabSession(id, data.sessionFile);
     }
     if (data.sessionName) setTabTitle(id, data.sessionName);
+    forwardEvent(id, { type: "app_phase", phase: "ready" });
     forwardEvent(id, {
       type: "state_ready",
       model: data.model ?? null,

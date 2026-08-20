@@ -87,7 +87,7 @@ export const useTabsStore = create<TabsState>()((set, get) => ({
           });
           get().showTabImmediately(
             { id, cwd: remotePath, title: remote.host, isRemote: true, isWsl: true, wslDistro: remote.host, pi: true, mode: "rpc" },
-            { cwd: remotePath, isRemote: true, remoteDir: remotePath, remoteLabel: `🐧 ${remote.host}` },
+            { cwd: remotePath, isRemote: true, remoteDir: remotePath, remoteLabel: `WSL ${remote.host}` },
           );
         } else {
           const id = await window.api.tab.create({
