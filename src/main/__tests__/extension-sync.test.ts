@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ensureShippedExtensions, syncExtensionsViaSftp, SHIPPED_EXTENSIONS } from "../extension-sync";
+import { ensureShippedExtensions, syncExtensionsViaSftp, buildSshInstallCommand, SHIPPED_EXTENSIONS } from "../extension-sync";
 
 let dirs: string[] = [];
 
@@ -45,6 +45,19 @@ describe("ensureShippedExtensions", () => {
     writeFileSync(target, "// tampered\n", "utf8");
     expect(ensureShippedExtensions(dir)).toEqual([updated[0]]);
     expect(existsSync(target)).toBe(true);
+  });
+});
+
+describe("buildSshInstallCommand", () => {
+  it("produces a quote-free install command covering every shipped extension", () => {
+    const cmd = buildSshInstallCommand();
+    expect(cmd.startsWith("mkdir -p $HOME/.pi/agent/extensions && ")).toBe(true);
+    // The command crosses Windows spawn → ssh.exe → remote bash: any quote
+    // would need escaping, so the command must be entirely quote-free.
+    expect(cmd).not.toMatch(/['"]/);
+    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
+      expect(cmd).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/extensions/${fileName}`);
+    }
   });
 });
 

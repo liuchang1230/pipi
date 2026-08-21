@@ -24,7 +24,7 @@ import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
 import { SessionIndex } from "./session-index";
-import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp } from "./extension-sync";
+import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand } from "./extension-sync";
 import {
   closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
   setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
@@ -543,6 +543,64 @@ async function syncWslExtensions(distro: string): Promise<void> {
   }
 }
 
+/** Last-shipped content digest per key-auth server: a re-connect with
+ *  unchanged shipped extensions skips the ssh round-trip entirely; an app
+ *  upgrade changes the digest and re-syncs on the next connect. */
+const remoteKeyExtSyncHash = new Map<string, string>();
+
+/**
+ * Ship app-bundled pi extensions to a KEY-AUTH (passwordless) remote over
+ * ssh.exe — the app holds no SFTP credentials for those servers, but ssh.exe
+ * already carries the session (rpc-session.ts runs `pi --mode rpc` through
+ * it). BatchMode=yes makes a server that actually requires a password fail
+ * fast instead of hanging at a prompt; failures are logged, never fatal.
+ * Runs in the background from tab:create (= the connect action), so "right
+ * after the user connects" is exactly when the extension lands — the next
+ * pi start picks it up. agentDir overrides are skipped (the remote command
+ * would need to expand a custom data dir; rare enough to stay manual).
+ */
+function syncKeyAuthExtensions(remote: RemoteOpts): void {
+  if (remote.agentDir) {
+    console.log(`[extensions] key-auth remote with agentDir override — manual install required (${stableRemoteKey(remote)})`);
+    return;
+  }
+  const digest = createHash("sha256")
+    .update(SHIPPED_EXTENSIONS.map((e) => e.content).join("\u0000"))
+    .digest("hex");
+  const key = stableRemoteKey(remote);
+  if (remoteKeyExtSyncHash.get(key) === digest) return;
+  const sshBin = findSshBin() ?? "ssh.exe";
+  const proc = spawn(
+    sshBin,
+    [
+      "-o", "BatchMode=yes",
+      "-o", "ConnectTimeout=10",
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-p", String(remote.port ?? 22),
+      `${remote.user}@${remote.host}`,
+      buildSshInstallCommand(),
+    ],
+    { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] },
+  );
+  const timer = setTimeout(() => {
+    try {
+      proc.kill();
+    } catch {
+      /* already dead */
+    }
+  }, 20000);
+  proc.on("error", () => clearTimeout(timer));
+  proc.on("exit", (code) => {
+    clearTimeout(timer);
+    if (code === 0) {
+      remoteKeyExtSyncHash.set(key, digest);
+      console.log(`[extensions] key-auth remote synced -> ${key}`);
+    } else {
+      console.error(`[extensions] key-auth remote sync failed (${key}) exit=${code}`);
+    }
+  });
+}
+
 // --- WSL session scan (direct \\\\wsl$ UNC filesystem reads) ---
 // WSL sessions are plain files on the local disk, so the 4s title poll can
 // read them directly — the WSL counterpart of the SSH poll (SFTP) and the
@@ -971,10 +1029,9 @@ if (gotSingleInstanceLock) {
     }
     // Remote provisioning runs in the BACKGROUND — never block tab
     // appearance on an SFTP round-trip (a dead/unreachable server used to
-    // delay the terminal by up to the 15s SFTP timeout). Best-effort:
-    // key-based connections without a password skip it (remote keeps its own
-    // config); the running pi picks the synced theme/extension up next
-    // session. Extensions are content-compared per file, so they sync on
+    // delay the terminal by up to the 15s SFTP timeout). Best-effort: the
+    // running pi picks the synced theme/extension up next session.
+    // Extensions are content-compared per file, so they sync on
     // every connect (no TTL): an app update reaches the server on the next
     // tab open.
     if (opts.remote?.password) {
@@ -1005,6 +1062,13 @@ if (gotSingleInstanceLock) {
           console.error(`[remote] provisioning failed (${syncKey}):`, error);
         }
       })();
+    }
+    // Key-auth remotes: no SFTP credentials, but ssh.exe already carries the
+    // session — ship extensions over a BatchMode ssh (fails fast if the
+    // server actually needs a password). Same "connect → provision" timing
+    // as the password path; content-digest gate keeps reconnects free.
+    if (opts.remote && !opts.remote.password) {
+      syncKeyAuthExtensions(opts.remote);
     }
     // WSL: same extension provisioning, via the \\wsl$ UNC filesystem.
     // (Theme sync deliberately skips WSL — the distro keeps its own settings;

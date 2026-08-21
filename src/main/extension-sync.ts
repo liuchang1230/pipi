@@ -65,6 +65,26 @@ export interface RemoteExtensionsSyncResult {
 }
 
 /**
+ * Build the remote-shell command that installs the shipped extensions into a
+ * Linux server's ~/.pi/agent/extensions. Content is base64-embedded so no
+ * quoting/newline escaping crosses the ssh→bash layers; the command itself
+ * avoids quotes entirely ($HOME expands in the remote shell; the default
+ * agent path has no spaces). Used by the key-auth remote sync — there the
+ * app has no SFTP credentials, so provisioning goes over ssh.exe with
+ * BatchMode instead (see syncKeyAuthExtensions in index.ts).
+ */
+export function buildSshInstallCommand(extensions: ShippedExtension[] = SHIPPED_EXTENSIONS): string {
+  const base = "$HOME/.pi/agent/extensions";
+  const writes = extensions
+    .map(({ fileName, content }) => {
+      const b64 = Buffer.from(content, "utf8").toString("base64");
+      return `echo ${b64} | base64 -d > ${base}/${fileName}`;
+    })
+    .join(" && ");
+  return `mkdir -p ${base} && ${writes}`;
+}
+
+/**
  * Upload the shipped extensions to a remote server's agent extensions dir
  * over an already-connected sftp session (mirrors syncThemesViaSftp in
  * theme-sync.ts). Content-compared per file: an unchanged remote file is
