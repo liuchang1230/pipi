@@ -655,6 +655,14 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   useEffect(() => {
     useChatStore.getState().ensure(tabId);
     const offEvent = window.api.onRpcEvent(tabId, (event) => {
+      if (event.type === "rpc_no_output") {
+        // Main's zero-output watchdog: the remote produced no bytes at all
+        // (auth hang / .bashrc block / pi missing) — same conclusion as the
+        // 30s boot timer, but definitive and earlier.
+        const st = useChatStore.getState().states[tabId];
+        if (!st?.booted && !st?.exited) setBootTimedOut(true);
+        return;
+      }
       if (event.type === "response" && event.command === "get_available_models") {
         const data = event.data as { models?: Array<{ id: string; name?: string; provider?: string }> } | undefined;
         if (data?.models) setModelList(data.models);

@@ -253,6 +253,9 @@ export class RpcSession {
   private buffer = "";
   private exited = false;
   private pendingResponses = new Set<(r: RpcResponse) => void>();
+  /** Zero-output watchdog state (see constructor). */
+  private sawOutput = false;
+  private noOutputTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(id: string, opts: CreateTabOptions) {
     this.id = id;
@@ -300,11 +303,32 @@ export class RpcSession {
     }
 
     this.transport.stdout.setEncoding("utf8");
-    this.transport.stdout.on("data", (chunk: string) => this.onChunk(chunk));
+    this.transport.stdout.on("data", (chunk: string) => {
+      this.sawOutput = true;
+      if (this.noOutputTimer) {
+        clearTimeout(this.noOutputTimer);
+        this.noOutputTimer = null;
+      }
+      this.onChunk(chunk);
+    });
     this.transport.onExit((code) => {
       console.log(`[rpc] tab ${id} exited: ${code}`);
+      if (this.noOutputTimer) {
+        clearTimeout(this.noOutputTimer);
+        this.noOutputTimer = null;
+      }
       this.emitExit(code);
     });
+    // Zero-output watchdog: a password remote whose auth/exec stalls (wrong
+    // password hangs in ssh2, bash -ic blocks on a slow .bashrc, pi missing)
+    // produces NOT A SINGLE BYTE and never answers any command — the renderer
+    // would otherwise spin forever. 40s is generous (remote pi boots 15-20s).
+    this.noOutputTimer = setTimeout(() => {
+      this.noOutputTimer = null;
+      if (this.exited || this.sawOutput) return;
+      console.error(`[rpc] tab ${id} produced no output in 40s — auth/exec stalled`);
+      forwardEvent(id, { type: "rpc_no_output", seconds: 40 });
+    }, 40000);
   }
 
   /** Send a command (JSONL to stdin). Returns false if the process is gone. */

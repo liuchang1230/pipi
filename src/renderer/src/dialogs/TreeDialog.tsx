@@ -331,6 +331,16 @@ export function TreeDialog({
     }, 3000);
     refreshTimerRef.current = timer;
     const off = window.api.onRpcEvent(tabId, (event) => {
+      if (event.type === "rpc_no_output") {
+        // Remote pi produced ZERO bytes (ssh2 auth hang / exec stalled /
+        // bash -ic blocked on .bashrc / pi missing). Only surface when the
+        // file snapshot couldn't paint either — a shown tree stays useful.
+        if (treeStatusRef.current === "loading") {
+          setTreeStatus("error");
+          setError("远程 pi 完全无输出（40s 无任何数据）。可能原因：远程服务器未安装 pi-agent / 登录脚本(.bashrc)卡住 / SSH 通道未建立，或保存的密码认证失败。请切到终端视图确认登录与 pi 安装。");
+        }
+        return;
+      }
       if (event.type === "response" && event.command === "navigate_tree") {
         if (pendingNavRequestId.current && event.id === pendingNavRequestId.current) {
           if (!event.success) {
@@ -403,6 +413,8 @@ export function TreeDialog({
   // messages but whose tree is empty is an anomaly (auto-refresh retries);
   // a session with no messages is a genuinely blank session.
   const hasMessages = useChatStore((s) => (s.states[tabId]?.messages?.length ?? 0) > 0);
+  /** pi process reported exited (e.g. RPC auth failed on a password remote). */
+  const exited = useChatStore((s) => s.states[tabId]?.exited ?? false);
 
   // Tool-call lookup for toolResult rows.
   const toolCalls = useMemo(() => {
@@ -698,7 +710,23 @@ export function TreeDialog({
             placeholder="搜索消息…"
           />
           <div className="tree-scroll">
-            {filtered.length === 0 && treeStatus === "loading" && (
+            {exited && filtered.length === 0 && (
+              <div className="tree-empty">
+                pi 进程已退出，无法读取会话树。常见原因：远程密码认证失败（应用内保存的密码可能已过期/变更）或连接断开。请在「远程服务器」设置里更新密码，或切到终端视图确认登录状态。
+                <button
+                  className="btn tree-retry"
+                  onClick={() => {
+                    setTreeStatus("loading");
+                    setError(null);
+                    setSlowTicks(0);
+                    void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+                  }}
+                >
+                  重试
+                </button>
+              </div>
+            )}
+            {!exited && filtered.length === 0 && treeStatus === "loading" && (
               <div className="tree-empty">
                 {slowTicks >= 10
                   ? `远程 pi 响应较慢（已等待 ${slowTicks * 3}s）${fileAttemptRef.current.error ? `· 会话文件读取失败（${fileAttemptRef.current.error}）` : ""}…可能原因：服务器繁忙 / 会话较大 / pi 启动中。再等一会会自动出现，或切到终端视图查看。`
