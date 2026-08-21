@@ -326,7 +326,8 @@ export function TreeDialog({
       // keeps retrying underneath — a late response flips back to "ready".
       if (treeStatusRef.current === "loading" && Date.now() - lastResponseAtRef.current > 45000) {
         setTreeStatus("error");
-        setError("远程 pi 未响应（已等待较长时间）。请检查服务器 pi 版本（会话树需 ≥0.80.3）、网络连接或 pi 进程是否存活；可切到终端视图查看，或重开会话。正在后台自动重试…");
+        const fileErr = fileAttemptRef.current.error ? ` · 会话文件读取失败（${fileAttemptRef.current.error}）` : "";
+        setError(`远程 pi 未响应（已等待较长时间）${fileErr}。请检查服务器 pi 版本（会话树需 ≥0.80.3）、网络连接或 pi 进程是否存活；可切到终端视图查看，或重开会话。正在后台自动重试…`);
       }
     }, 3000);
     refreshTimerRef.current = timer;
