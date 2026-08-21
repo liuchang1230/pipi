@@ -268,6 +268,7 @@ export function TreeDialog({
     const sendRefresh = () => {
       void window.api.tab.rpcSend(tabId, { type: "get_tree" })
         .then((ok) => {
+          window.api.debug.log(`TreeDialog(${tabId}) get_tree sent ok=${ok}`);
           if (!ok && !pendingNavRequestId.current) {
             setTreeStatus("error");
             setError("会话不可用（标签页未就绪或已退出）");
@@ -282,6 +283,7 @@ export function TreeDialog({
     const tryFileSnapshot = () => {
       void window.api.tree.fromFile(tabId)
         .then((res) => {
+          window.api.debug.log(`TreeDialog(${tabId}) fromFile ok=${res.ok} ${res.error ?? ""} tree=${Array.isArray(res.tree) ? res.tree.length : "?"}`);
           fileAttemptRef.current = { error: res.ok ? "" : String(res.error ?? ""), at: Date.now() };
           // Skip when live data already arrived, OR while a navigation is in
           // flight — the snapshot's stale leaf must not trip the navigation
@@ -405,6 +407,7 @@ export function TreeDialog({
       if (event.success && data.tree) {
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
+        window.api.debug.log(`TreeDialog(${tabId}) get_tree RESPONSE roots=${data.tree.length} leaf=${data.leafId ?? "null"}`);
         setTree(data.tree);
         setLeafId(data.leafId ?? null);
         setError(null);

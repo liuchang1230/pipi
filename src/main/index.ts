@@ -27,6 +27,7 @@ import { parseTreeFileAsync, buildFileTree } from "./tree-from-file";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex } from "./session-index";
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
+import { debugLog } from "./debug-log";
 import {
   closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
   setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
@@ -1827,10 +1828,18 @@ if (gotSingleInstanceLock) {
   // --- RPC chat (local pi tabs) ---
   ipcMain.handle("tab:rpc-send", (_e, tabId: string, cmd: Record<string, unknown>) => {
     const sdk = getSdkTab(tabId);
-    if (sdk) return sdkSend(tabId, cmd);
+    if (sdk) {
+      const ok = sdkSend(tabId, cmd);
+      debugLog("rpc-send", `tab ${tabId} ${String(cmd.type)} -> sdk ok=${ok}`);
+      return ok;
+    }
     const session = getRpcSession(tabId);
-    return session ? session.send(cmd) : false;
+    const ok = session ? session.send(cmd) : false;
+    debugLog("rpc-send", `tab ${tabId} ${String(cmd.type)} -> rpc ok=${ok} (session=${!!session})`);
+    return ok;
   });
+  // Renderer-side diagnostics (tree dialog actions) land in the same log file.
+  ipcMain.on("debug:log", (_e, msg: unknown) => debugLog("renderer", String(msg ?? "")));
   // Session tree straight from the session file — the fast paint path for
   // the chat tree dialog. The RPC get_tree path can be slow while the
   // remote pi is still booting (or unresponsive if it died), but the
@@ -1893,6 +1902,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   ipcMain.handle("tree:from-file", async (_e, tabId: string) => {
     const tab = getTab(tabId);
     let sessionPath: string | null | undefined = tab?.sessionPath;
+    const pathSource = sessionPath ? "linked" : "missing";
     if (tab && !sessionPath) {
       // pi never reported its session file — its command loop may be stalled
       // (rpc-mode only attaches the stdin reader after boot completes, so a
@@ -1901,7 +1911,11 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
       // session file for the tab's cwd ourselves; no pi round-trip needed.
       sessionPath = await findRecentSessionFile(tab);
     }
-    if (!tab || !sessionPath) return { ok: false, error: "no session file" };
+    if (!tab || !sessionPath) {
+      debugLog("tree", `tab ${tabId} from-file FAILED (${pathSource})`);
+      return { ok: false, error: "no session file" };
+    }
+    debugLog("tree", `tab ${tabId} from-file start (${pathSource}) path=${sessionPath}`);
     try {
       let content: string;
       if (tab.wsl) {
@@ -1924,9 +1938,11 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
       }
       const { entries, leafId } = await parseTreeFileAsync(content);
       const { tree } = buildFileTree(entries);
+      debugLog("tree", `tab ${tabId} from-file OK entries=${entries.length} roots=${tree.length}`);
       return { ok: true, tree, leafId };
     } catch (e) {
       console.error(`[tree] from-file failed for tab ${tabId}:`, e instanceof Error ? e.message : String(e));
+      debugLog("tree", `tab ${tabId} from-file ERROR ${e instanceof Error ? e.message : String(e)}`);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });

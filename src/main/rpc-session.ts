@@ -22,6 +22,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
+import { debugLog } from "./debug-log";
 import {
   closeTab, createTab, getGlobalPiBin, getTab, linkTabSession, registerExternalTab, setTabTitle, unregisterExternalTab,
   type CreateTabOptions, type RemoteOpts, type TabInfo, type WslOpts,
@@ -112,6 +113,7 @@ class Ssh2Transport implements RpcTransport {
     // but RPC never connects" symptom). Answer the prompts with the stored
     // password so both auth paths work.
     this.conn.on("keyboard-interactive", (_name, _instructions, _lang, _prompts, finish) => {
+      debugLog("rpc", `${label} keyboard-interactive (${_prompts.length} prompts) -> answering with stored password`);
       finish((remote.password ? [remote.password] : []) as string[]);
     });
     this.conn.on("error", (err) => {
@@ -271,6 +273,7 @@ export class RpcSession {
   private junkLines: string[] = [];
   private responsesSeen = 0;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
+  private firstOutputLogged = false;
 
   constructor(id: string, opts: CreateTabOptions) {
     this.id = id;
@@ -329,10 +332,15 @@ export class RpcSession {
         clearTimeout(this.noOutputTimer);
         this.noOutputTimer = null;
       }
+      if (this.firstOutputLogged === false) {
+        this.firstOutputLogged = true;
+        debugLog("rpc", `tab ${id} FIRST BYTES: ${JSON.stringify(chunk.slice(0, 80))}`);
+      }
       this.onChunk(chunk);
     });
     this.transport.onExit((code) => {
       console.log(`[rpc] tab ${id} exited: ${code}`);
+      debugLog("rpc", `tab ${id} EXIT ${code}`);
       if (this.noOutputTimer) {
         clearTimeout(this.noOutputTimer);
         this.noOutputTimer = null;
@@ -347,6 +355,7 @@ export class RpcSession {
       this.noOutputTimer = null;
       if (this.exited || this.sawOutput) return;
       console.error(`[rpc] tab ${id} produced no output in 40s — auth/exec stalled`);
+      debugLog("rpc", `tab ${id} NO-OUTPUT-40s`);
       forwardEvent(id, { type: "rpc_no_output", seconds: 40 });
     }, 40000);
     // Stalled-connection diagnosis: bytes ARE flowing but pi never answers
@@ -357,13 +366,19 @@ export class RpcSession {
       this.stallTimer = null;
       if (this.exited || this.responsesSeen > 0) return;
       console.error(`[rpc] tab ${id} no JSONL response in 60s (sawOutput=${this.sawOutput}) junk=${JSON.stringify(this.junkLines)}`);
+      debugLog("rpc", `tab ${id} STALLED-60s sawOutput=${this.sawOutput} junk=${JSON.stringify(this.junkLines)}`);
       forwardEvent(id, { type: "rpc_stalled", sawOutput: this.sawOutput, junkLines: this.junkLines });
     }, 60000);
+    debugLog("rpc", `tab ${id} SPAWNED ${label} (password=${!!opts.remote?.password} wsl=${!!opts.wsl} sessionPath=${opts.sessionPath ?? "-"})`);
   }
 
   /** Send a command (JSONL to stdin). Returns false if the process is gone. */
   send(cmd: RpcCommand): boolean {
-    if (this.exited || !this.transport.stdin.writable) return false;
+    if (this.exited || !this.transport.stdin.writable) {
+      debugLog("rpc", `tab ${this.id} SEND ${String(cmd.type)} DROPPED (exited=${this.exited} writable=${this.transport.stdin.writable})`);
+      return false;
+    }
+    debugLog("rpc", `tab ${this.id} SEND ${String(cmd.type)}${cmd.id ? ` id=${String(cmd.id)}` : ""}`);
     this.transport.stdin.write(JSON.stringify(cmd) + "\n");
     return true;
   }
@@ -419,6 +434,7 @@ export class RpcSession {
     const type = msg.type;
     if (type === "response") {
       this.responsesSeen++;
+      debugLog("rpc", `tab ${this.id} RESP ${String(msg.command)} success=${msg.success}${msg.id ? ` id=${String(msg.id)}` : ""}${msg.error ? ` err=${String(msg.error).slice(0, 120)}` : ""}`);
       this.pendingResponses.forEach((cb) => cb(msg as unknown as RpcResponse));
       forwardEvent(this.id, msg);
       return;

@@ -258,6 +258,10 @@ const api = {
     fromFile: (tabId: string): Promise<{ ok: boolean; tree?: unknown[]; leafId?: string | null; error?: string }> =>
       ipcRenderer.invoke("tree:from-file", tabId),
   },
+  debug: {
+    /** Append a renderer-side diagnostic line to the main-process log file. */
+    log: (msg: string): void => ipcRenderer.send("debug:log", msg),
+  },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>
       ipcRenderer.invoke("theme:set-mode", mode),
