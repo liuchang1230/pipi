@@ -1696,6 +1696,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         <TreeDialog
           tabId={tabId}
           onClose={() => setTreeOpen(false)}
+          onOpenTerminal={() => {
+            setTreeOpen(false);
+            void switchToTerminal();
+          }}
           onNavigated={(editorText) => {
             // Navigation switched the leaf: reload history. requestHistory()
             // (rpcRequest → initMessages) is the ONLY path that actually

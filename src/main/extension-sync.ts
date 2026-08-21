@@ -2,18 +2,31 @@
  * Ship app-bundled pi extensions to ~/.pi/agent/extensions/ so every pi
  * spawned by a tab picks them up via auto-discovery (see docs/extensions.md).
  *
+ * The same files are also provisioned to REMOTE (password-authed SFTP) and
+ * WSL agent dirs — RPC-backed remote/WSL chat tabs navigate the session tree
+ * through the pipi-tree-nav extension command (upstream pi's rpc-mode has no
+ * native `navigate_tree` RPC), so the extension must exist on the machine
+ * that runs pi, not just the app's local install.
+ *
  * Source of truth: the files in src/main/extensions/, embedded at build time
  * via Vite `?raw` imports (no packaging/asar concerns).
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import type SftpClient from "ssh2-sftp-client";
+import { remoteAgentDir } from "./pty";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 
 const EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
 
-const SHIPPED: Array<{ fileName: string; content: string }> = [
+export interface ShippedExtension {
+  fileName: string;
+  content: string;
+}
+
+export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-static-indicator.ts", content: staticIndicatorSource },
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
 ];
@@ -28,7 +41,7 @@ const SHIPPED: Array<{ fileName: string; content: string }> = [
  */
 export function ensureShippedExtensions(dir = EXTENSIONS_DIR): string[] {
   const updated: string[] = [];
-  for (const { fileName, content } of SHIPPED) {
+  for (const { fileName, content } of SHIPPED_EXTENSIONS) {
     try {
       mkdirSync(dir, { recursive: true });
       const target = join(dir, fileName);
@@ -43,4 +56,54 @@ export function ensureShippedExtensions(dir = EXTENSIONS_DIR): string[] {
     }
   }
   return updated;
+}
+
+export interface RemoteExtensionsSyncResult {
+  ok: boolean;
+  error?: string;
+  uploaded: string[];
+}
+
+/**
+ * Upload the shipped extensions to a remote server's agent extensions dir
+ * over an already-connected sftp session (mirrors syncThemesViaSftp in
+ * theme-sync.ts). Content-compared per file: an unchanged remote file is
+ * skipped, so this is cheap enough to run on every password-authed connect
+ * — an app update reaches the server on the next tab open without waiting
+ * for a TTL. The whole upload is wrapped in one try/catch (any failure
+ * returns ok:false with the files uploaded so far), matching the theme
+ * sync's failure contract.
+ */
+export async function syncExtensionsViaSftp(
+  client: SftpClient,
+  homeDir: string,
+  agentDirRemote?: string,
+): Promise<RemoteExtensionsSyncResult> {
+  const uploaded: string[] = [];
+  const base = remoteAgentDir({ agentDir: agentDirRemote }, homeDir);
+  const extDir = `${base}/extensions`;
+  try {
+    await client.mkdir(extDir, true);
+    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
+      const remotePath = `${extDir}/${fileName}`;
+      let current: string | Buffer | undefined;
+      try {
+        current = (await client.get(remotePath)) as string | Buffer | undefined;
+      } catch {
+        current = undefined; // not present yet → upload
+      }
+      const currentText = current === undefined ? "" : Buffer.isBuffer(current) ? current.toString("utf8") : String(current);
+      if (currentText === content) continue;
+      // put() treats a string as a LOCAL file path → pass a Buffer for raw content.
+      await client.put(Buffer.from(content, "utf8"), remotePath);
+      uploaded.push(remotePath);
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      uploaded,
+    };
+  }
+  return { ok: true, uploaded };
 }

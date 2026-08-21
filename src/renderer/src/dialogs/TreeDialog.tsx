@@ -10,6 +10,13 @@
  *    upstream pi has no native command), with the same "Summarize branch?"
  *    choice as /tree; fork kept as the "start new branch" action
  *    (equivalent to /fork).
+ *
+ * Self-healing fetch: the tree is re-asked every 3s while the dialog is
+ * open (paused during navigation), so a remote/WSL pi still booting, a
+ * dropped first request, or a worker hiccup fills in instead of leaving a
+ * stale empty tree; explicit failures show an error + retry, and a truly
+ * blank session gets its own empty-state copy instead of a misleading
+ * "（无匹配）".
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
@@ -64,6 +71,14 @@ function textOf(content: unknown): string {
 
 function normalize(s: string): string {
   return s.replace(/[\n\t]/g, " ").trim();
+}
+
+/** Turn raw get_tree failures into user-facing copy. */
+function friendlyTreeError(raw: string): string {
+  if (/unknown command/i.test(raw)) {
+    return "pi 版本过低：会话树需要 get_tree 命令（pi ≥ 0.80.3）";
+  }
+  return raw;
 }
 
 function formatToolCall(name: string, args: unknown): string {
@@ -201,10 +216,13 @@ type SummaryChoice = "none" | "auto" | "custom";
 export function TreeDialog({
   tabId,
   onClose,
+  onOpenTerminal,
   onNavigated,
 }: {
   tabId: string;
   onClose: () => void;
+  /** Switch to the terminal view (TUI), where the native /tree lives. */
+  onOpenTerminal?: () => void;
   /** Called after a successful navigation; editorText = the replayed/fill text. */
   onNavigated?: (editorText?: string) => void;
 }) {
@@ -218,11 +236,41 @@ export function TreeDialog({
   const [customInstr, setCustomInstr] = useState("");
   const [navigatingId, setNavigatingId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-
-  const refresh = () => void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+  // Tree fetch state machine: "loading" until the first get_tree response
+  // (remote/WSL pi takes 15-20s to boot, so this can be a long wait),
+  // "error" on an explicit failure, "ready" after any successful snapshot.
+  // The dialog re-asks on an interval (below) so a slow boot or a dropped
+  // first request heals itself instead of sitting on an empty tree.
+  const [treeStatus, setTreeStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [slowTicks, setSlowTicks] = useState(0); // ~3s each; drives the "still loading" hint
+  const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    refresh();
+    // Initial fetch + auto-refresh loop. get_tree answers may be delayed
+    // (RPC boot) or never arrive (worker crash / tab gone mid-open): the
+    // loop re-asks every 3s while the dialog is open (paused during
+    // navigation — the navigation poll owns get_tree then) and surfaces an
+    // explicit error when rpcSend reports the tab is gone.
+    const sendRefresh = () => {
+      void window.api.tab.rpcSend(tabId, { type: "get_tree" })
+        .then((ok) => {
+          if (!ok && !pendingNavRequestId.current) {
+            setTreeStatus("error");
+            setError("会话不可用（标签页未就绪或已退出）");
+          }
+        })
+        .catch(() => {
+          // IPC rejected (e.g. window torn down mid-invoke): stay on the
+          // current state; the interval keeps retrying and heals on success.
+        });
+    };
+    sendRefresh();
+    const timer = setInterval(() => {
+      if (pendingNavRequestId.current) return; // navigation poll owns get_tree
+      sendRefresh();
+      setSlowTicks((n) => n + 1);
+    }, 3000);
+    refreshTimerRef.current = timer;
     const off = window.api.onRpcEvent(tabId, (event) => {
       if (event.type === "response" && event.command === "navigate_tree") {
         if (pendingNavRequestId.current && event.id === pendingNavRequestId.current) {
@@ -272,12 +320,26 @@ export function TreeDialog({
         setTree(data.tree);
         setLeafId(data.leafId ?? null);
         setError(null);
+        setTreeStatus("ready");
+        setSlowTicks(0);
       } else {
-        setError(String(event.error ?? "获取会话树失败"));
+        setTreeStatus("error");
+        setError(friendlyTreeError(String(event.error ?? "获取会话树失败")));
       }
     });
-    return () => off();
+    return () => {
+      off();
+      if (refreshTimerRef.current) {
+        clearInterval(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    };
   }, [tabId]);
+
+  // Corroboration for the empty-tree state: a session whose chat has
+  // messages but whose tree is empty is an anomaly (auto-refresh retries);
+  // a session with no messages is a genuinely blank session.
+  const hasMessages = useChatStore((s) => (s.states[tabId]?.messages?.length ?? 0) > 0);
 
   // Tool-call lookup for toolResult rows.
   const toolCalls = useMemo(() => {
@@ -564,7 +626,7 @@ export function TreeDialog({
       <div className="dialog tree-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">会话树（/tree）</div>
         <div className="dialog-body">
-          {error && <div className="tree-error">{error}</div>}
+          {error && tree.length > 0 && <div className="tree-error">{error}</div>}
           <input
             ref={searchRef}
             className="dialog-input tree-search"
@@ -573,7 +635,31 @@ export function TreeDialog({
             placeholder="搜索消息…"
           />
           <div className="tree-scroll">
-            {filtered.length === 0 && <div className="tree-empty">（无匹配）</div>}
+            {filtered.length === 0 && treeStatus === "loading" && (
+              <div className="tree-empty">加载中{slowTicks >= 3 ? "（远程 pi 启动可能较慢，请稍候…）" : "…"}</div>
+            )}
+            {filtered.length === 0 && treeStatus === "error" && (
+              <div className="tree-empty">
+                加载失败：{error ?? "未知错误"}
+                <button
+                  className="btn tree-retry"
+                  onClick={() => {
+                    setTreeStatus("loading");
+                    setError(null);
+                    setSlowTicks(0);
+                    void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+                  }}
+                >
+                  重试
+                </button>
+              </div>
+            )}
+            {filtered.length === 0 && treeStatus === "ready" && tree.length === 0 && (
+              <div className="tree-empty">
+                {hasMessages ? "会话树为空，正在自动刷新…" : "空会话：尚无消息。发送第一条消息后，这里会显示分支树。"}
+              </div>
+            )}
+            {filtered.length === 0 && treeStatus === "ready" && tree.length > 0 && <div className="tree-empty">（无匹配）</div>}
             {filtered.map((f) => {
               const e = f.node.entry;
               const d = entryDisplay(f.node, toolCalls);
@@ -711,6 +797,19 @@ export function TreeDialog({
           {navPhase === "navigating" && <div className="tree-detail">正在导航（{navigatingId === selected?.entry.id ? "等待 pi 切换分支…" : ""}）</div>}
         </div>
         <div className="ui-dialog-actions">
+          {onOpenTerminal && (
+            <span className="tree-native-hint">完整分支能力（标签/折叠/搜索/快捷键）在终端视图的原生 /tree 中</span>
+          )}
+          <button
+            className="btn"
+            onClick={() => {
+              onClose();
+              onOpenTerminal?.();
+            }}
+            disabled={!!navigatingId}
+          >
+            终端视图 /tree
+          </button>
           <button className="btn" onClick={onClose} disabled={!!navigatingId}>
             关闭
           </button>

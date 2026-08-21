@@ -2053,6 +2053,12 @@ textarea:focus-visible,
   gap: 8px;
   margin-top: 16px;
 }
+.tree-native-hint {
+  margin-right: auto;
+  align-self: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
 
 /* --- Slash command and @file popup --- */
 .slash-menu,
@@ -2219,6 +2225,14 @@ textarea:focus-visible,
   color: var(--text-dim);
   font-size: 12px;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.tree-retry {
+  font-size: 12px;
+  padding: 3px 12px;
 }
 .tree-error {
   padding: 8px 12px;

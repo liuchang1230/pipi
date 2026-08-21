@@ -24,7 +24,7 @@ import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
 import { SessionIndex } from "./session-index";
-import { ensureShippedExtensions } from "./extension-sync";
+import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp } from "./extension-sync";
 import {
   closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
   setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
@@ -464,12 +464,83 @@ function getWslHome(distro: string): string {
   return `/home/${distro.split("-")[0].toLowerCase()}`;
 }
 
+/** Async (non-blocking) variant of getWslHome for background provisioning:
+ *  same cache, so a sync call earlier in the click path makes this resolve
+ *  instantly; on timeout/error falls back to the same un-cached guess. Never
+ *  blocks the main-process event loop (spawn, not spawnSync). */
+function getWslHomeAsync(distro: string): Promise<string> {
+  const cached = wslHomeCache.get(distro);
+  if (cached) return Promise.resolve(cached);
+  const fallback = `/home/${distro.split("-")[0].toLowerCase()}`;
+  return new Promise((resolve) => {
+    const proc = spawn("wsl.exe", ["-d", distro, "--", "bash", "-c", "echo $HOME"], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let out = "";
+    const timer = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {
+        /* already dead */
+      }
+      resolve(fallback);
+    }, 5000);
+    proc.stdout?.on("data", (d: Buffer | string) => {
+      out += d.toString();
+    });
+    proc.on("error", () => {
+      clearTimeout(timer);
+      resolve(fallback);
+    });
+    proc.on("close", () => {
+      clearTimeout(timer);
+      const home = out.trim();
+      if (home) wslHomeCache.set(distro, home);
+      resolve(home || fallback);
+    });
+  });
+}
+
 /** Resolve a WSL path that may start with ~ to an absolute Linux path. */
 function resolveWslPath(distro: string, linuxPath: string): string {
   let p = linuxPath.trim();
   if (p === "~" || p === "") return getWslHome(distro);
   if (p.startsWith("~/")) return getWslHome(distro) + "/" + p.slice(2);
   return p;
+}
+
+/**
+ * Ship app-bundled pi extensions into a WSL distro's ~/.pi/agent/extensions
+ * via the \\wsl$ UNC filesystem (the app already reads WSL sessions this
+ * way — see wslScanSessionDir). RPC-backed WSL chat tabs navigate the
+ * session tree through the pipi-tree-nav extension command, which must
+ * exist on the DISTRO side; without it the navigation prompt falls through
+ * to a normal LLM turn. Content-compared, so it is a no-op once in sync;
+ * fully async (non-blocking home resolution + fs/promises), failures are
+ * logged, never fatal.
+ */
+async function syncWslExtensions(distro: string): Promise<void> {
+  try {
+    const home = await getWslHomeAsync(distro);
+    const winHome = wslToWinPath(distro, home);
+    const extDir = join(winHome, ".pi", "agent", "extensions");
+    await mkdir(extDir, { recursive: true });
+    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
+      const target = join(extDir, fileName);
+      let current: string | null = null;
+      try {
+        current = await readFile(target, "utf8");
+      } catch {
+        current = null; // not present yet → write
+      }
+      if (current === content) continue;
+      await writeFile(target, content, "utf8");
+      console.log(`[extensions] wrote WSL ${distro}: ${target}`);
+    }
+  } catch (e) {
+    console.error(`[extensions] WSL ${distro} sync failed:`, e instanceof Error ? e.message : String(e));
+  }
 }
 
 // --- WSL session scan (direct \\\\wsl$ UNC filesystem reads) ---
@@ -898,32 +969,48 @@ if (gotSingleInstanceLock) {
     } else {
       id = createRpcTab(opts);
     }
-    // Remote theme provisioning runs in the BACKGROUND — never block tab
+    // Remote provisioning runs in the BACKGROUND — never block tab
     // appearance on an SFTP round-trip (a dead/unreachable server used to
     // delay the terminal by up to the 15s SFTP timeout). Best-effort:
     // key-based connections without a password skip it (remote keeps its own
-    // config); the running pi picks the synced theme up next session.
+    // config); the running pi picks the synced theme/extension up next
+    // session. Extensions are content-compared per file, so they sync on
+    // every connect (no TTL): an app update reaches the server on the next
+    // tab open.
     if (opts.remote?.password) {
       const syncKey = stableRemoteKey(opts.remote);
       const lastSync = remoteThemeSyncAt.get(syncKey) ?? 0;
-      if (Date.now() - lastSync > REMOTE_THEME_SYNC_TTL_MS) {
-        const remote = opts.remote; // narrowed for the async closure
-        void (async () => {
-          try {
-            const lease = await getSftpLease(remote);
+      const themeDue = Date.now() - lastSync > REMOTE_THEME_SYNC_TTL_MS;
+      const remote = opts.remote; // narrowed for the async closure
+      void (async () => {
+        try {
+          const lease = await getSftpLease(remote);
+          if (themeDue) {
             const result: RemoteThemeSyncResult = await syncThemesViaSftp(lease.client, lease.homeDir, remote.agentDir);
-            lease.lastUsedAt = Date.now();
             if (result.ok) {
               remoteThemeSyncAt.set(syncKey, Date.now());
               console.log(`[theme] remote synced ${result.uploaded.length} file(s) -> ${syncKey}`);
             } else {
               console.error(`[theme] remote sync partial/failed (${syncKey}):`, result.error ?? "unknown");
             }
-          } catch (error) {
-            console.error(`[theme] remote sync failed (${syncKey}):`, error);
           }
-        })();
-      }
+          const extResult = await syncExtensionsViaSftp(lease.client, lease.homeDir, remote.agentDir);
+          lease.lastUsedAt = Date.now();
+          if (extResult.ok) {
+            console.log(`[extensions] remote synced ${extResult.uploaded.length} file(s) -> ${syncKey}`);
+          } else {
+            console.error(`[extensions] remote sync partial/failed (${syncKey}):`, extResult.error ?? "unknown");
+          }
+        } catch (error) {
+          console.error(`[remote] provisioning failed (${syncKey}):`, error);
+        }
+      })();
+    }
+    // WSL: same extension provisioning, via the \\wsl$ UNC filesystem.
+    // (Theme sync deliberately skips WSL — the distro keeps its own settings;
+    // extensions are needed for the tree-nav bridge, so ship them regardless.)
+    if (opts.wsl) {
+      void syncWslExtensions(opts.wsl.distro);
     }
     if (opts.remote) saveRemoteHistory(opts.remote);
     emitTabs();
