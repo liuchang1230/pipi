@@ -341,6 +341,21 @@ export function TreeDialog({
         }
         return;
       }
+      if (event.type === "rpc_stalled") {
+        // Bytes ARE flowing but pi never answers a command — the login shell
+        // is likely stuck (bash -ic sources .bashrc, which can hang under
+        // pipes) or the remote pi is unresponsive. The junk lines distinguish
+        // "shell noise" from "silence".
+        if (treeStatusRef.current === "loading") {
+          const junk = Array.isArray((event as { junkLines?: unknown }).junkLines) ? ((event as { junkLines?: unknown }).junkLines as string[]) : [];
+          const detail = junk.length > 0
+            ? `远程登录脚本输出（非 pi 数据）：${junk.join(" | ").slice(0, 300)}`
+            : "远程有字节流出但 pi 无任何应答";
+          setTreeStatus("error");
+          setError(`远程 pi 未应答（60s）· ${detail}。常见原因：服务器 .bashrc 在无终端管道下卡住（pi 未启动）、或远程 pi 异常。请切到终端视图确认登录与 pi --version。`);
+        }
+        return;
+      }
       if (event.type === "response" && event.command === "navigate_tree") {
         if (pendingNavRequestId.current && event.id === pendingNavRequestId.current) {
           if (!event.success) {

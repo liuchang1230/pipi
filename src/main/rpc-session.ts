@@ -266,6 +266,11 @@ export class RpcSession {
   /** Zero-output watchdog state (see constructor). */
   private sawOutput = false;
   private noOutputTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Non-JSONL bytes received (e.g. a .bashrc echo or "command not found")
+   *  — kept for the stalled-connection diagnosis. */
+  private junkLines: string[] = [];
+  private responsesSeen = 0;
+  private stallTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(id: string, opts: CreateTabOptions) {
     this.id = id;
@@ -344,6 +349,16 @@ export class RpcSession {
       console.error(`[rpc] tab ${id} produced no output in 40s — auth/exec stalled`);
       forwardEvent(id, { type: "rpc_no_output", seconds: 40 });
     }, 40000);
+    // Stalled-connection diagnosis: bytes ARE flowing but pi never answers
+    // (login shell stuck in .bashrc under pipes, or pi booted into an
+    // unresponsive state). 60s, checked once; the junk lines tell us whether
+    // it's the shell (non-JSONL echo) or pi itself.
+    this.stallTimer = setTimeout(() => {
+      this.stallTimer = null;
+      if (this.exited || this.responsesSeen > 0) return;
+      console.error(`[rpc] tab ${id} no JSONL response in 60s (sawOutput=${this.sawOutput}) junk=${JSON.stringify(this.junkLines)}`);
+      forwardEvent(id, { type: "rpc_stalled", sawOutput: this.sawOutput, junkLines: this.junkLines });
+    }, 60000);
   }
 
   /** Send a command (JSONL to stdin). Returns false if the process is gone. */
@@ -391,6 +406,10 @@ export class RpcSession {
         const msg = JSON.parse(line) as Record<string, unknown>;
         this.onMessage(msg);
       } catch (e) {
+        // Non-JSONL bytes: a .bashrc echo, "command not found", MOTD, etc.
+        // Remember a few — they diagnose a stalled connection (pi never
+        // started because the login shell is stuck or pi is missing).
+        if (this.junkLines.length < 5) this.junkLines.push(line.slice(0, 300));
         console.error(`[rpc] tab ${this.id} bad JSONL line:`, e instanceof Error ? e.message : String(e), line.slice(0, 200));
       }
     }
@@ -399,6 +418,7 @@ export class RpcSession {
   private onMessage(msg: Record<string, unknown>): void {
     const type = msg.type;
     if (type === "response") {
+      this.responsesSeen++;
       this.pendingResponses.forEach((cb) => cb(msg as unknown as RpcResponse));
       forwardEvent(this.id, msg);
       return;
