@@ -254,6 +254,10 @@ export function TreeDialog({
   const rpcTreeArrivedRef = useRef(false);
   /** True while the shown tree is the file snapshot (RPC not yet answered). */
   const [fileSnapshot, setFileSnapshot] = useState(false);
+  /** Last from-file attempt outcome — only "no session file" (tab's session
+   *  path not linked yet, pi still booting) is worth retrying; a real read
+   *  failure would just repeat the same SFTP/ssh cost. */
+  const fileAttemptRef = useRef<{ error: string; at: number }>({ error: "", at: 0 });
 
   useEffect(() => {
     // Initial fetch + auto-refresh loop. get_tree answers may be delayed
@@ -275,28 +279,32 @@ export function TreeDialog({
         });
     };
     sendRefresh();
+    const tryFileSnapshot = () => {
+      void window.api.tree.fromFile(tabId)
+        .then((res) => {
+          fileAttemptRef.current = { error: res.ok ? "" : String(res.error ?? ""), at: Date.now() };
+          // Skip when live data already arrived, OR while a navigation is in
+          // flight — the snapshot's stale leaf must not trip the navigation
+          // completion detector (which fires on leafId change + navigatingId).
+          if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.tree)) {
+            setTree(res.tree as TreeNode[]);
+            setLeafId(res.leafId ?? null);
+            setError(null);
+            setTreeStatus("ready");
+            setSlowTicks(0);
+            setFileSnapshot(true);
+          }
+        })
+        .catch(() => {
+          fileAttemptRef.current = { error: "", at: Date.now() };
+          // File read unavailable (session not yet linked, transient SFTP
+          // failure) — the RPC path below is the fallback.
+        });
+    };
     // Fast first paint from the session file — no pi round-trip, so a
     // remote pi still booting (or dead) can't hold the tree hostage. The
-    // RPC get_tree refresh below then corrects leaf/streaming state; the
-    // file snapshot is discarded if live data already arrived first.
-    void window.api.tree.fromFile(tabId)
-      .then((res) => {
-        // Skip when live data already arrived, OR while a navigation is in
-        // flight — the snapshot's stale leaf must not trip the navigation
-        // completion detector (which fires on leafId change + navigatingId).
-        if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.tree)) {
-          setTree(res.tree as TreeNode[]);
-          setLeafId(res.leafId ?? null);
-          setError(null);
-          setTreeStatus("ready");
-          setSlowTicks(0);
-          setFileSnapshot(true);
-        }
-      })
-      .catch(() => {
-        // File read unavailable (key-auth remote, session not yet linked) —
-        // the RPC path below is the fallback.
-      });
+    // RPC get_tree refresh below then corrects leaf/streaming state.
+    tryFileSnapshot();
     // First-response boost: a dropped/late first request should not leave
     // the dialog spinning for a full 3s interval; re-ask once shortly after
     // mount when still loading (no-op once a response flipped us to ready).
@@ -307,6 +315,12 @@ export function TreeDialog({
       if (pendingNavRequestId.current) return; // navigation poll owns get_tree
       sendRefresh();
       setSlowTicks((n) => n + 1);
+      // The tab's session file may only become linkable AFTER pi answers
+      // get_state (continueRecent / new remote sessions). If the last file
+      // attempt said "no session file", retry now that pi had time to boot.
+      if (treeStatusRef.current === "loading" && fileAttemptRef.current.error === "no session file" && Date.now() - fileAttemptRef.current.at > 15000) {
+        tryFileSnapshot();
+      }
       // No response for a long time while we still have nothing to show:
       // stop the infinite spinner and surface a diagnosis. The interval
       // keeps retrying underneath — a late response flips back to "ready".

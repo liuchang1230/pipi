@@ -456,7 +456,11 @@ export function createRpcTab(opts: CreateTabOptions): string {
       console.warn(`[rpc] tab ${id} get_state failed:`, res.error ?? "no data");
       return;
     }
-    if (data.sessionFile && !tab.sessionPath && !remote && !wsl) {
+    if (data.sessionFile && !tab.sessionPath) {
+      // Remote/WSL included: pi's reported session file lives on the SERVER
+      // (or inside the distro) — that path is exactly what the SFTP / ssh /
+      // UNC file-read paths need (tree:from-file). The local file watcher is
+      // a no-op for remote/wsl tabs, so linking is safe there.
       linkTabSession(id, data.sessionFile);
     }
     if (data.sessionName) setTabTitle(id, data.sessionName);
