@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ensureShippedExtensions, syncExtensionsViaSftp, buildSshInstallCommand, SHIPPED_EXTENSIONS } from "../extension-sync";
+import { ensureShippedExtensions, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand, SHIPPED_EXTENSIONS } from "../extension-sync";
 
 let dirs: string[] = [];
 
@@ -58,6 +58,21 @@ describe("buildSshInstallCommand", () => {
     for (const { fileName, content } of SHIPPED_EXTENSIONS) {
       expect(cmd).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/extensions/${fileName}`);
     }
+  });
+});
+
+describe("buildSshCatCommand", () => {
+  it("embeds the path as base64 and cats the decoded result", () => {
+    const path = "/home/user/.pi/agent/sessions/--D-其余文件-项目-agent--/x.jsonl";
+    const cmd = buildSshCatCommand(path);
+    const b64 = Buffer.from(path, "utf8").toString("base64");
+    expect(cmd).toContain(b64);
+    expect(cmd).toContain("cat \"$P\"");
+    // The raw path must not appear — it would need quoting to cross the
+    // Windows spawn → ssh.exe → bash chain (spaces / CJK).
+    expect(cmd).not.toContain(path);
+    // Round-trip: the embedded b64 decodes back to the path.
+    expect(Buffer.from(b64, "base64").toString("utf8")).toBe(path);
   });
 });
 

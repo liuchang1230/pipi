@@ -26,7 +26,7 @@ import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } fro
 import { parseTreeFileAsync, buildFileTree } from "./tree-from-file";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex } from "./session-index";
-import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand } from "./extension-sync";
+import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
 import {
   closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
   setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
@@ -555,6 +555,49 @@ const remoteKeyExtSyncHash = new Map<string, string>();
  * pi start picks it up. agentDir overrides are skipped (the remote command
  * would need to expand a custom data dir; rare enough to stay manual).
  */
+/** Read a remote file over ssh.exe (key-auth remotes have no SFTP lease, but
+ *  ssh.exe already carries the session). BatchMode fails fast on servers that
+ *  actually need a password; returns "" on any failure (never throws). The
+ *  remote path is base64-embedded via buildSshCatCommand, so quoting cannot
+ *  break the Windows spawn → ssh.exe → bash chain. */
+function sshCatRemoteFile(remote: RemoteOpts, remotePath: string, timeoutMs = 30000): Promise<string> {
+  return new Promise((resolve) => {
+    const sshBin = findSshBin() ?? "ssh.exe";
+    const proc = spawn(
+      sshBin,
+      [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-p", String(remote.port ?? 22),
+        `${remote.user}@${remote.host}`,
+        buildSshCatCommand(remotePath),
+      ],
+      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    const timer = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {
+        /* already dead */
+      }
+      resolve("");
+    }, timeoutMs);
+    proc.stdout?.on("data", (d: Buffer | string) => {
+      out += d.toString();
+    });
+    proc.on("error", () => {
+      clearTimeout(timer);
+      resolve("");
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? out : "");
+    });
+  });
+}
+
 function syncKeyAuthExtensions(remote: RemoteOpts): void {
   if (remote.agentDir) {
     console.log(`[extensions] key-auth remote with agentDir override — manual install required (${stableRemoteKey(remote)})`);
@@ -1797,19 +1840,23 @@ if (gotSingleInstanceLock) {
     const tab = getTab(tabId);
     const sessionPath = tab?.sessionPath;
     if (!tab || !sessionPath) return { ok: false, error: "no session file" };
-    // Key-auth remotes have no SFTP lease — a connect attempt would hang for
-    // the readyTimeout; fall back to the RPC get_tree path for those.
-    if (tab.remote && !tab.remote.password) return { ok: false, error: "key-auth remote" };
     try {
       let content: string;
       if (tab.wsl) {
         content = await readFile(wslToWinPath(tab.wsl.distro, sessionPath), "utf8");
       } else if (tab.remote) {
-        const lease = await getSftpLease(tab.remote);
-        const buf = (await lease.client.get(sessionPath)) as string | Buffer;
-        lease.lastUsedAt = Date.now();
-        scheduleSftpLeaseCleanup(lease);
-        content = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
+        if (tab.remote.password) {
+          const lease = await getSftpLease(tab.remote);
+          const buf = (await lease.client.get(sessionPath)) as string | Buffer;
+          lease.lastUsedAt = Date.now();
+          scheduleSftpLeaseCleanup(lease);
+          content = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
+        } else {
+          // Key-auth remote: no SFTP lease — read the session file over
+          // ssh.exe instead (works even when the remote pi is dead).
+          content = await sshCatRemoteFile(tab.remote, sessionPath);
+          if (!content) return { ok: false, error: "key-auth remote read failed" };
+        }
       } else {
         content = await readFile(sessionPath, "utf8");
       }
@@ -1817,6 +1864,7 @@ if (gotSingleInstanceLock) {
       const { tree } = buildFileTree(entries);
       return { ok: true, tree, leafId };
     } catch (e) {
+      console.error(`[tree] from-file failed for tab ${tabId}:`, e instanceof Error ? e.message : String(e));
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });

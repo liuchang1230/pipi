@@ -64,6 +64,15 @@ export interface RemoteExtensionsSyncResult {
   uploaded: string[];
 }
 
+/** Build the remote-shell command that cats a file whose path is
+ *  base64-embedded — quote-free across Windows spawn → ssh.exe → bash, using
+ *  the SAME pattern rpc-session.ts's sessionArg uses for --session paths in
+ *  production (`printf %s '<b64>' | base64 -d` + `"$P"`). */
+export function buildSshCatCommand(remotePath: string): string {
+  const b64 = Buffer.from(remotePath, "utf8").toString("base64");
+  return `P="$(printf %s '${b64}' | base64 -d 2>/dev/null || printf %s '${b64}' | base64 -D 2>/dev/null)"; cat "$P"`;
+}
+
 /**
  * Build the remote-shell command that installs the shipped extensions into a
  * Linux server's ~/.pi/agent/extensions. Content is base64-embedded so no
