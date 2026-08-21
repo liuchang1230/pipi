@@ -297,7 +297,8 @@ export function TreeDialog({
             setFileSnapshot(true);
           }
         })
-        .catch(() => {
+        .catch((err) => {
+          window.api.debug.log(`TreeDialog(${tabId}) fromFile REJECTED ${err instanceof Error ? err.message : String(err)}`);
           fileAttemptRef.current = { error: "", at: Date.now() };
           // File read unavailable (session not yet linked, transient SFTP
           // failure) — the RPC path below is the fallback.
@@ -334,6 +335,11 @@ export function TreeDialog({
     }, 3000);
     refreshTimerRef.current = timer;
     const off = window.api.onRpcEvent(tabId, (event) => {
+      // Entry diagnostics: which events actually reach this handler (a
+      // response here proves the event channel is alive end-to-end).
+      if (event.type === "response") {
+        window.api.debug.log(`TreeDialog(${tabId}) EVENT resp ${String(event.command)}${event.success === false ? " success=false" : ""}${event.id ? ` id=${String(event.id)}` : ""}`);
+      }
       if (event.type === "rpc_no_output") {
         // Remote pi produced ZERO bytes (ssh2 auth hang / exec stalled /
         // bash -ic blocked on .bashrc / pi missing). Only surface when the
