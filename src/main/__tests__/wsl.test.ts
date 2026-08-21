@@ -2,7 +2,7 @@
 // regex are the trickiest part of the async WSL-distro conversion, so they
 // get direct coverage (no electron/node-pty needed).
 import { describe, expect, it } from "vitest";
-import { parseWslDistroList } from "../wsl";
+import { parseWslDistroList, wslToWinPath } from "../wsl";
 
 const UTF16 = (s: string) => Buffer.from("\ufeff" + s, "utf16le");
 
@@ -34,5 +34,23 @@ describe("parseWslDistroList", () => {
   it("skips lines without a version column (the format regex requires it)", () => {
     const out = Buffer.from("Ubuntu    Running\n", "utf8");
     expect(parseWslDistroList(out)).toEqual([]);
+  });
+});
+
+describe("wslToWinPath", () => {
+  it("converts a Linux path to a \\wsl$\<distro> UNC path", () => {
+    expect(wslToWinPath("Ubuntu", "/home/user/.pi/agent/sessions/x")).toBe("\\\\wsl$\\Ubuntu\\home\\user\\.pi\\agent\\sessions\\x");
+  });
+
+  it("passes an already-UNC path through unchanged (no double wsl$ prefix)", () => {
+    const unc = "\\\\wsl$\\Ubuntu\\home\\user\\.pi\\agent\\sessions\\x";
+    expect(wslToWinPath("Ubuntu", unc)).toBe(unc);
+    // Trailing slashes are still normalized away.
+    expect(wslToWinPath("Ubuntu", unc + "\\\\")).toBe(unc);
+  });
+
+  it("handles ~ and ~/ prefixes with the /home fallback", () => {
+    expect(wslToWinPath("Ubuntu", "~")).toBe("\\\\wsl$\\Ubuntu\\home");
+    expect(wslToWinPath("Ubuntu", "~/x")).toBe("\\\\wsl$\\Ubuntu\\home\\x");
   });
 });

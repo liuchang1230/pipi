@@ -2414,6 +2414,11 @@ textarea:focus-visible,
   font-size: 11px;
   color: var(--text-dim);
 }
+.tree-snapshot-note {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--warning, #e6b450);
+}
 .tree-empty {
   padding: 16px;
   color: var(--text-dim);

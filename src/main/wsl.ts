@@ -10,6 +10,22 @@ export interface WslDistro {
   version: number;
 }
 
+/** Convert a Linux path inside a WSL distro to a Windows UNC path, or return
+ *  an already-UNC path unchanged (WSL session paths handed to the app may
+ *  already be \\wsl$\<distro>\… — e.g. sidebar session paths). Trailing
+ *  slashes are stripped; `~`/`~/…` fall back to /home like the legacy
+ *  behavior. Pure + exported for unit tests. */
+export function wslToWinPath(distro: string, linuxPath: string): string {
+  let p = linuxPath.trim();
+  // Already a UNC path → pass through untouched (minus trailing slashes).
+  if (/^\\\\wsl\$\\/i.test(p)) return p.replace(/\\+$/, "");
+  if (p === "~") p = "/home";
+  else if (p.startsWith("~/")) p = "/home/" + p.slice(2);
+  // Build UNC path: \\wsl$\<distro>\<linux_path>
+  const parts = p.replace(/\//g, "\\").replace(/^\\/, "");
+  return `\\\\wsl$\\${distro}\\${parts}`.replace(/\\+$/, "");
+}
+
 /** Parse `wsl.exe -l -v` output. wsl.exe emits UTF-16LE when stdout is not a
  *  console; detect via BOM or interleaved null bytes, else treat as UTF-8. */
 export function parseWslDistroList(stdout: Buffer): WslDistro[] {

@@ -252,6 +252,12 @@ const api = {
     at: (tabId: string, path: string, rev?: string): Promise<{ content: string; error?: string }> =>
       ipcRenderer.invoke("diff:at", tabId, path, rev),
   },
+  tree: {
+    /** Session tree parsed straight from the session file (fast paint;
+     *  get_tree over RPC remains the live/authoritative refresher). */
+    fromFile: (tabId: string): Promise<{ ok: boolean; tree?: unknown[]; leafId?: string | null; error?: string }> =>
+      ipcRenderer.invoke("tree:from-file", tabId),
+  },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>
       ipcRenderer.invoke("theme:set-mode", mode),

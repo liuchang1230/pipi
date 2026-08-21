@@ -23,6 +23,8 @@ import { ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp, age
 import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
+import { parseTreeFileAsync, buildFileTree } from "./tree-from-file";
+import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex } from "./session-index";
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand } from "./extension-sync";
 import {
@@ -429,16 +431,10 @@ async function getSftpLease(remote: RemoteOpts): Promise<SftpLease> {
 
 /** Convert a Linux path inside a WSL distro to a Windows UNC path.
  *  NOTE: callers must pre-resolve `~` (via resolveWslPath / getWslHome) before
- *  calling this; the `~` special-casing below is a defensive fallback only. */
-function wslToWinPath(distro: string, linuxPath: string): string {
-  // Normalize: strip trailing slash, handle ~ prefix
-  let p = linuxPath.trim();
-  if (p === "~") p = "/home";
-  else if (p.startsWith("~/")) p = "/home/" + p.slice(2);
-  // Build UNC path: \\wsl$\<distro>\<linux_path>
-  const parts = p.replace(/\//g, "\\").replace(/^\\/, "");
-  return `\\\\wsl$\\${distro}\\${parts}`.replace(/\\+$/, "");
-}
+ *  calling this; the `~` special-casing below is a defensive fallback only.
+ *  Already-UNC paths (e.g. sidebar session paths) pass through unchanged.
+ *  Shared with wsl.ts (unit-tested there). */
+// (implemented in ./wsl as wslToWinPath; re-exported for local call sites)
 
 /** Get the WSL user's home directory via `wsl.exe`. Cached per distro — but
  *  only successful results are cached, so a cold-start timeout/failure is
@@ -1791,6 +1787,38 @@ if (gotSingleInstanceLock) {
     if (sdk) return sdkSend(tabId, cmd);
     const session = getRpcSession(tabId);
     return session ? session.send(cmd) : false;
+  });
+  // Session tree straight from the session file — the fast paint path for
+  // the chat tree dialog. The RPC get_tree path can be slow while the
+  // remote pi is still booting (or unresponsive if it died), but the
+  // append-only JSONL is always readable: local disk, SFTP (password
+  // remotes), \\wsl$ UNC. Falls back to the RPC path on any failure.
+  ipcMain.handle("tree:from-file", async (_e, tabId: string) => {
+    const tab = getTab(tabId);
+    const sessionPath = tab?.sessionPath;
+    if (!tab || !sessionPath) return { ok: false, error: "no session file" };
+    // Key-auth remotes have no SFTP lease — a connect attempt would hang for
+    // the readyTimeout; fall back to the RPC get_tree path for those.
+    if (tab.remote && !tab.remote.password) return { ok: false, error: "key-auth remote" };
+    try {
+      let content: string;
+      if (tab.wsl) {
+        content = await readFile(wslToWinPath(tab.wsl.distro, sessionPath), "utf8");
+      } else if (tab.remote) {
+        const lease = await getSftpLease(tab.remote);
+        const buf = (await lease.client.get(sessionPath)) as string | Buffer;
+        lease.lastUsedAt = Date.now();
+        scheduleSftpLeaseCleanup(lease);
+        content = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
+      } else {
+        content = await readFile(sessionPath, "utf8");
+      }
+      const { entries, leafId } = await parseTreeFileAsync(content);
+      const { tree } = buildFileTree(entries);
+      return { ok: true, tree, leafId };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
   });
   ipcMain.handle("tab:rpc-switch-terminal", (_e, tabId: string) => {
     // Chat → terminal: local SDK-backed chat tabs respawn the pty TUI;

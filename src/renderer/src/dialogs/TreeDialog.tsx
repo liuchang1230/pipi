@@ -244,6 +244,16 @@ export function TreeDialog({
   const [treeStatus, setTreeStatus] = useState<"loading" | "ready" | "error">("loading");
   const [slowTicks, setSlowTicks] = useState(0); // ~3s each; drives the "still loading" hint
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Mirrors for timers/closures that must not capture stale render values.
+  const treeStatusRef = useRef(treeStatus);
+  treeStatusRef.current = treeStatus;
+  /** When the last get_tree response (any outcome) arrived — stall detection. */
+  const lastResponseAtRef = useRef(Date.now());
+  /** True once a LIVE get_tree response applied — file snapshot must not
+   *  overwrite newer live data (e.g. RPC answered before the file read). */
+  const rpcTreeArrivedRef = useRef(false);
+  /** True while the shown tree is the file snapshot (RPC not yet answered). */
+  const [fileSnapshot, setFileSnapshot] = useState(false);
 
   useEffect(() => {
     // Initial fetch + auto-refresh loop. get_tree answers may be delayed
@@ -265,10 +275,45 @@ export function TreeDialog({
         });
     };
     sendRefresh();
+    // Fast first paint from the session file — no pi round-trip, so a
+    // remote pi still booting (or dead) can't hold the tree hostage. The
+    // RPC get_tree refresh below then corrects leaf/streaming state; the
+    // file snapshot is discarded if live data already arrived first.
+    void window.api.tree.fromFile(tabId)
+      .then((res) => {
+        // Skip when live data already arrived, OR while a navigation is in
+        // flight — the snapshot's stale leaf must not trip the navigation
+        // completion detector (which fires on leafId change + navigatingId).
+        if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.tree)) {
+          setTree(res.tree as TreeNode[]);
+          setLeafId(res.leafId ?? null);
+          setError(null);
+          setTreeStatus("ready");
+          setSlowTicks(0);
+          setFileSnapshot(true);
+        }
+      })
+      .catch(() => {
+        // File read unavailable (key-auth remote, session not yet linked) —
+        // the RPC path below is the fallback.
+      });
+    // First-response boost: a dropped/late first request should not leave
+    // the dialog spinning for a full 3s interval; re-ask once shortly after
+    // mount when still loading (no-op once a response flipped us to ready).
+    const boostTimer = setTimeout(() => {
+      if (treeStatusRef.current === "loading" && !pendingNavRequestId.current) sendRefresh();
+    }, 1500);
     const timer = setInterval(() => {
       if (pendingNavRequestId.current) return; // navigation poll owns get_tree
       sendRefresh();
       setSlowTicks((n) => n + 1);
+      // No response for a long time while we still have nothing to show:
+      // stop the infinite spinner and surface a diagnosis. The interval
+      // keeps retrying underneath — a late response flips back to "ready".
+      if (treeStatusRef.current === "loading" && Date.now() - lastResponseAtRef.current > 45000) {
+        setTreeStatus("error");
+        setError("远程 pi 未响应（已等待较长时间）。请检查服务器 pi 版本（会话树需 ≥0.80.3）、网络连接或 pi 进程是否存活；可切到终端视图查看，或重开会话。正在后台自动重试…");
+      }
     }, 3000);
     refreshTimerRef.current = timer;
     const off = window.api.onRpcEvent(tabId, (event) => {
@@ -311,12 +356,15 @@ export function TreeDialog({
         return;
       }
       if (event.type !== "response" || event.command !== "get_tree") return;
+      lastResponseAtRef.current = Date.now();
       // During navigation, ignore unrelated tree snapshots (initial refreshes
       // or another consumer's request). They must not be able to complete the
       // current navigation early.
       if (pendingNavRequestId.current && event.id !== pendingNavRequestId.current) return;
       const data = event.data as TreeResponse;
       if (event.success && data.tree) {
+        rpcTreeArrivedRef.current = true;
+        setFileSnapshot(false);
         setTree(data.tree);
         setLeafId(data.leafId ?? null);
         setError(null);
@@ -329,6 +377,7 @@ export function TreeDialog({
     });
     return () => {
       off();
+      clearTimeout(boostTimer);
       if (refreshTimerRef.current) {
         clearInterval(refreshTimerRef.current);
         refreshTimerRef.current = null;
@@ -636,7 +685,13 @@ export function TreeDialog({
           />
           <div className="tree-scroll">
             {filtered.length === 0 && treeStatus === "loading" && (
-              <div className="tree-empty">加载中{slowTicks >= 3 ? "（远程 pi 启动可能较慢，请稍候…）" : "…"}</div>
+              <div className="tree-empty">
+                {slowTicks >= 10
+                  ? `远程 pi 响应较慢（已等待 ${slowTicks * 3}s）…可能原因：服务器繁忙 / 会话较大 / pi 启动中。再等一会会自动出现，或切到终端视图查看。`
+                  : slowTicks >= 3
+                    ? `正在从远程读取会话树…（已等待 ${slowTicks * 3}s，远程 pi 启动可能较慢）`
+                    : "加载中…"}
+              </div>
             )}
             {filtered.length === 0 && treeStatus === "error" && (
               <div className="tree-empty">
@@ -729,6 +784,9 @@ export function TreeDialog({
             ({filtered.findIndex((f) => f.node.entry.id === selectedId) + 1 || 0}/{filtered.length})
             {query && " · 过滤中"} {folded.size > 0 && " · 有折叠"} · 单击选中 · 双击折叠/展开
           </div>
+          {fileSnapshot && (
+            <div className="tree-snapshot-note">树来自会话文件快照 · 正在同步实时状态（远程 pi 未就绪时先显示存档数据）</div>
+          )}
 
           {selected && navPhase === "idle" && (
             <div className="tree-detail">

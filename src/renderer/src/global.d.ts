@@ -209,6 +209,11 @@ declare global {
         commits: (tabId: string, path: string) => Promise<{ rev: string; subject: string }[]>;
         at: (tabId: string, path: string, rev?: string) => Promise<{ content: string; error?: string }>;
       };
+      tree: {
+        /** Session tree parsed straight from the session file (fast paint;
+         *  get_tree over RPC remains the live/authoritative refresher). */
+        fromFile: (tabId: string) => Promise<{ ok: boolean; tree?: unknown[]; leafId?: string | null; error?: string }>;
+      };
       onWorkbenchCommand: (callback: (command: "project:open" | "remote:connect" | "session:new" | "session:close" | "view:toggle-viewer" | "view:toggle-theme" | "models:configure" | "help:shortcuts") => void) => () => void;
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
       onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;
