@@ -701,7 +701,7 @@ export function TreeDialog({
             {filtered.length === 0 && treeStatus === "loading" && (
               <div className="tree-empty">
                 {slowTicks >= 10
-                  ? `远程 pi 响应较慢（已等待 ${slowTicks * 3}s）…可能原因：服务器繁忙 / 会话较大 / pi 启动中。再等一会会自动出现，或切到终端视图查看。`
+                  ? `远程 pi 响应较慢（已等待 ${slowTicks * 3}s）${fileAttemptRef.current.error ? `· 会话文件读取失败（${fileAttemptRef.current.error}）` : ""}…可能原因：服务器繁忙 / 会话较大 / pi 启动中。再等一会会自动出现，或切到终端视图查看。`
                   : slowTicks >= 3
                     ? `正在从远程读取会话树…（已等待 ${slowTicks * 3}s，远程 pi 启动可能较慢）`
                     : "加载中…"}

@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, powerMonitor, Menu, type MenuItemC
 import { spawn } from "node:child_process";
 import { isAbsolute, relative, sep, join, dirname, posix as posixPath, win32 as win32Path } from "node:path";
 import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
-import { readFile, writeFile, mkdir, rm, rename, access, readdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, rename, access, readdir, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
@@ -22,7 +22,7 @@ import {
 import { ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp, agentDir, type RemoteThemeSyncResult } from "./theme-sync";
 import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
-import { encodeCwd, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
+import { encodeCwd, sessionDirFor, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
 import { parseTreeFileAsync, buildFileTree } from "./tree-from-file";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex } from "./session-index";
@@ -1836,9 +1836,71 @@ if (gotSingleInstanceLock) {
   // remote pi is still booting (or unresponsive if it died), but the
   // append-only JSONL is always readable: local disk, SFTP (password
   // remotes), \\wsl$ UNC. Falls back to the RPC path on any failure.
+/** Newest .jsonl in a local/UNC dir (by mtime). Null when none/error. */
+async function latestJsonlInDir(dir: string): Promise<string | null> {
+  let files: string[];
+  try {
+    files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    return null;
+  }
+  let best: { path: string; mtime: number } | null = null;
+  for (const f of files) {
+    try {
+      const st = await stat(join(dir, f));
+      if (!best || st.mtimeMs > best.mtime) best = { path: join(dir, f), mtime: st.mtimeMs };
+    } catch {
+      /* transient lock while pi appends */
+    }
+  }
+  return best?.path ?? null;
+}
+
+/**
+ * Locate the most recent session JSONL for a tab when tab.sessionPath is
+ * missing (pi's get_state never resolved). Mirrors where pi stores sessions:
+ * <agentDir>/sessions/<encodeCwd(cwd)>/. Key-auth remotes are skipped (would
+ * need an ssh ls round-trip; rare combination) — they keep the RPC fallback.
+ */
+async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
+  try {
+    if (tab.wsl) {
+      const home = await getWslHomeAsync(tab.wsl.distro);
+      const cwd = resolveWslPath(tab.wsl.distro, tab.wsl.path || "~");
+      const dir = join(wslToWinPath(tab.wsl.distro, home), ".pi", "agent", "sessions", encodeCwd(cwd));
+      return await latestJsonlInDir(dir);
+    }
+    if (tab.remote) {
+      if (!tab.remote.password) return null; // key-auth: no SFTP lease
+      const lease = await getSftpLease(tab.remote);
+      const cwd = resolveRemotePath(tab.remote.path ?? "~", lease.homeDir);
+      const sessionDir = posixPath.join(remoteAgentDir(tab.remote, lease.homeDir), "sessions", encodeCwd(cwd));
+      const list = (await lease.client.list(sessionDir)) as Array<{ name: string; type: string; modifyTime: number }>;
+      lease.lastUsedAt = Date.now();
+      scheduleSftpLeaseCleanup(lease);
+      const newest = list
+        .filter((f) => f.name.endsWith(".jsonl") && f.type !== "d")
+        .sort((a, b) => (b.modifyTime ?? 0) - (a.modifyTime ?? 0))[0];
+      return newest ? posixPath.join(sessionDir, newest.name) : null;
+    }
+    return await latestJsonlInDir(sessionDirFor(tab.cwd, agentDir()));
+  } catch (e) {
+    console.error("[tree] findRecentSessionFile failed:", e instanceof Error ? e.message : String(e));
+    return null;
+  }
+}
+
   ipcMain.handle("tree:from-file", async (_e, tabId: string) => {
     const tab = getTab(tabId);
-    const sessionPath = tab?.sessionPath;
+    let sessionPath: string | null | undefined = tab?.sessionPath;
+    if (tab && !sessionPath) {
+      // pi never reported its session file — its command loop may be stalled
+      // (rpc-mode only attaches the stdin reader after boot completes, so a
+      // hung boot queues EVERY command: get_state never resolves → sessionPath
+      // never links → the file fast path had no path). Locate the most recent
+      // session file for the tab's cwd ourselves; no pi round-trip needed.
+      sessionPath = await findRecentSessionFile(tab);
+    }
     if (!tab || !sessionPath) return { ok: false, error: "no session file" };
     try {
       let content: string;
