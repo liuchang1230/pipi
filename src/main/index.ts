@@ -23,7 +23,7 @@ import { ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp, age
 import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, sessionDirFor, listLocalProjects, parseSessionText, type SessionEntry } from "./session-list";
-import { parseTreeFileAsync, buildFileTree } from "./tree-from-file";
+import { parseTreeFileAsync } from "./tree-from-file";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex } from "./session-index";
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
@@ -1937,9 +1937,12 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
         content = await readFile(sessionPath, "utf8");
       }
       const { entries, leafId } = await parseTreeFileAsync(content);
-      const { tree } = buildFileTree(entries);
-      debugLog("tree", `tab ${tabId} from-file OK entries=${entries.length} roots=${tree.length}`);
-      return { ok: true, tree, leafId };
+      debugLog("tree", `tab ${tabId} from-file OK entries=${entries.length}`);
+      // Flat entries (not a nested tree): a long linear session nests deeper
+      // than Electron's contextBridge 1000-level limit when serialized as a
+      // tree — the renderer rebuilds the tree from parentId (shared
+      // buildTreeFromEntries).
+      return { ok: true, entries, leafId };
     } catch (e) {
       console.error(`[tree] from-file failed for tab ${tabId}:`, e instanceof Error ? e.message : String(e));
       debugLog("tree", `tab ${tabId} from-file ERROR ${e instanceof Error ? e.message : String(e)}`);

@@ -253,9 +253,10 @@ const api = {
       ipcRenderer.invoke("diff:at", tabId, path, rev),
   },
   tree: {
-    /** Session tree parsed straight from the session file (fast paint;
-     *  get_tree over RPC remains the live/authoritative refresher). */
-    fromFile: (tabId: string): Promise<{ ok: boolean; tree?: unknown[]; leafId?: string | null; error?: string }> =>
+    /** Session tree parsed straight from the session file — flat entries
+     *  (parentId chains) + leafId; the renderer rebuilds the nested tree.
+     *  Flat transport avoids contextBridge's 1000-level nesting limit. */
+    fromFile: (tabId: string): Promise<{ ok: boolean; entries?: unknown[]; leafId?: string | null; error?: string }> =>
       ipcRenderer.invoke("tree:from-file", tabId),
   },
   debug: {

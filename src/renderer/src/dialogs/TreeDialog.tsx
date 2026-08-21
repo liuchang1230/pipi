@@ -22,6 +22,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
+import { buildTreeFromEntries, type TreeEntry as FlatTreeEntry } from "../../../shared/tree-build";
 
 interface TreeEntry {
   id: string;
@@ -73,10 +74,10 @@ function normalize(s: string): string {
   return s.replace(/[\n\t]/g, " ").trim();
 }
 
-/** Turn raw get_tree failures into user-facing copy. */
+/** Turn raw get_entries failures into user-facing copy. */
 function friendlyTreeError(raw: string): string {
   if (/unknown command/i.test(raw)) {
-    return "pi 版本过低：会话树需要 get_tree 命令（pi ≥ 0.80.3）";
+    return "pi 版本过低：会话树需要 get_entries/get_tree 命令（pi ≥ 0.80.3）";
   }
   return raw;
 }
@@ -266,9 +267,12 @@ export function TreeDialog({
     // navigation — the navigation poll owns get_tree then) and surfaces an
     // explicit error when rpcSend reports the tab is gone.
     const sendRefresh = () => {
-      void window.api.tab.rpcSend(tabId, { type: "get_tree" })
+      // get_entries (flat) instead of get_tree (nested): Electron's
+      // contextBridge rejects trees nested deeper than 1000 levels, which a
+      // long linear session is. The renderer rebuilds the tree from entries.
+      void window.api.tab.rpcSend(tabId, { type: "get_entries" })
         .then((ok) => {
-          window.api.debug.log(`TreeDialog(${tabId}) get_tree sent ok=${ok}`);
+          window.api.debug.log(`TreeDialog(${tabId}) get_entries sent ok=${ok}`);
           if (!ok && !pendingNavRequestId.current) {
             setTreeStatus("error");
             setError("会话不可用（标签页未就绪或已退出）");
@@ -283,13 +287,13 @@ export function TreeDialog({
     const tryFileSnapshot = () => {
       void window.api.tree.fromFile(tabId)
         .then((res) => {
-          window.api.debug.log(`TreeDialog(${tabId}) fromFile ok=${res.ok} ${res.error ?? ""} tree=${Array.isArray(res.tree) ? res.tree.length : "?"}`);
+          window.api.debug.log(`TreeDialog(${tabId}) fromFile ok=${res.ok} ${res.error ?? ""} entries=${Array.isArray(res.entries) ? res.entries.length : "?"}`);
           fileAttemptRef.current = { error: res.ok ? "" : String(res.error ?? ""), at: Date.now() };
           // Skip when live data already arrived, OR while a navigation is in
           // flight — the snapshot's stale leaf must not trip the navigation
           // completion detector (which fires on leafId change + navigatingId).
-          if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.tree)) {
-            setTree(res.tree as TreeNode[]);
+          if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.entries)) {
+            setTree(buildTreeFromEntries(res.entries as FlatTreeEntry[]).tree);
             setLeafId(res.leafId ?? null);
             setError(null);
             setTreeStatus("ready");
@@ -403,18 +407,18 @@ export function TreeDialog({
         }
         return;
       }
-      if (event.type !== "response" || event.command !== "get_tree") return;
+      if (event.type !== "response" || event.command !== "get_entries") return;
       lastResponseAtRef.current = Date.now();
       // During navigation, ignore unrelated tree snapshots (initial refreshes
       // or another consumer's request). They must not be able to complete the
       // current navigation early.
       if (pendingNavRequestId.current && event.id !== pendingNavRequestId.current) return;
-      const data = event.data as TreeResponse;
-      if (event.success && data.tree) {
+      const data = event.data as { entries?: unknown[]; leafId?: string | null; error?: string };
+      if (event.success && Array.isArray(data.entries)) {
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
-        window.api.debug.log(`TreeDialog(${tabId}) get_tree RESPONSE roots=${data.tree.length} leaf=${data.leafId ?? "null"}`);
-        setTree(data.tree);
+        window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE entries=${data.entries.length} leaf=${data.leafId ?? "null"}`);
+        setTree(buildTreeFromEntries(data.entries as FlatTreeEntry[]).tree);
         setLeafId(data.leafId ?? null);
         setError(null);
         setTreeStatus("ready");
@@ -592,7 +596,7 @@ export function TreeDialog({
       if (w.ok) {
         useUiStore.getState().showToast(`已回退 ${path} 到「${target.label}」`, "ok");
         // Reload the tree so leaf diff markers stay consistent.
-        void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+        void window.api.tab.rpcSend(tabId, { type: "get_entries" });
       } else {
         useUiStore.getState().showToast(`回退失败: ${w.error ?? ""}`, "err");
       }
@@ -634,7 +638,7 @@ export function TreeDialog({
     // Poll get_tree until the leaf moves (or timeout) — navigateTree executes
     // synchronously inside pi, so this resolves quickly.
     const timer = setInterval(() => {
-      void window.api.tab.rpcSend(tabId, { type: "get_tree", id: requestId });
+      void window.api.tab.rpcSend(tabId, { type: "get_entries", id: requestId });
       // The timeout is a backstop for a worker that never answers. A human
       // answering an extension prompt during navigation (e.g. pi-rewind's
       // "Restore Options") can legitimately extend the wait, so give plain
@@ -744,7 +748,7 @@ export function TreeDialog({
                     setTreeStatus("loading");
                     setError(null);
                     setSlowTicks(0);
-                    void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+                    void window.api.tab.rpcSend(tabId, { type: "get_entries" });
                   }}
                 >
                   重试
@@ -769,7 +773,7 @@ export function TreeDialog({
                     setTreeStatus("loading");
                     setError(null);
                     setSlowTicks(0);
-                    void window.api.tab.rpcSend(tabId, { type: "get_tree" });
+                    void window.api.tab.rpcSend(tabId, { type: "get_entries" });
                   }}
                 >
                   重试
