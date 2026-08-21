@@ -105,6 +105,15 @@ class Ssh2Transport implements RpcTransport {
         stream.on("close", (code: number | undefined) => this.exitCb?.(code ?? 0));
       });
     });
+    // Many servers (PAM configs) authenticate via keyboard-interactive
+    // rather than plain "password". OpenSSH clients fall back automatically;
+    // the ssh2 lib only tries "password" unless tryKeyboard is set — without
+    // it the handshake hangs with ZERO output (the exact "password is right
+    // but RPC never connects" symptom). Answer the prompts with the stored
+    // password so both auth paths work.
+    this.conn.on("keyboard-interactive", (_name, _instructions, _lang, _prompts, finish) => {
+      finish((remote.password ? [remote.password] : []) as string[]);
+    });
     this.conn.on("error", (err) => {
       console.error(`[rpc] ${label} ssh error:`, err.message);
       this.exitCb?.(-1);
@@ -114,6 +123,7 @@ class Ssh2Transport implements RpcTransport {
       port: remote.port ?? 22,
       username: remote.user,
       password: remote.password,
+      tryKeyboard: true,
       // Matches the app's ssh.exe StrictHostKeyChecking=accept-new stance.
       hostVerifier: () => true,
       readyTimeout: 20000,
