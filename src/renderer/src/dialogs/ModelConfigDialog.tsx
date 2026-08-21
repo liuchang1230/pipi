@@ -8,6 +8,7 @@ import { useTabsStore } from "../stores/tabsStore";
 import { useSessionsStore } from "../stores/sessionsStore";
 import { useUiStore } from "../stores/uiStore";
 import { formatTokens, specForModel } from "../../../shared/model-specs";
+import { MODEL_PRESETS, type ModelPreset } from "../../../shared/model-presets";
 import type { ModelEditorSpec, PiApi, PiInputType, ProviderEditorConfig } from "../../../shared/model-config-types";
 import { Icon } from "../components/Icon";
 
@@ -109,6 +110,21 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     setDiscoveredModels([]);
     setEditingModel(null);
     setSpecEdits({});
+  }, []);
+
+  /** 一键模板：填连接信息（API Key 留空由用户粘贴），清掉编辑态。 */
+  const applyPreset = useCallback((preset: ModelPreset) => {
+    setEditingModel(null);
+    setModelName(preset.name);
+    setModelBaseUrl(preset.baseUrl);
+    setModelApi(preset.api ?? "openai-completions");
+    setAuthHeader(true);
+    setAdvancedJson("");
+    setModelProvider(preset.provider);
+    setModelIdValue(preset.model);
+    setDiscoveredModels(preset.availableModels ?? []);
+    setSpecEdits(preset.spec ? { [preset.model]: { ...preset.spec } } : {});
+    showToast(`已填入 ${preset.label} 模板，请补 API Key`, "ok");
   }, []);
 
   const editModel = useCallback((item: ModelConfigItem) => {
@@ -286,6 +302,20 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                 : "写入本机 ~/.pi/agent/"}
             </span>
             {editingModel && <span className="dialog-hint editing-note">正在编辑：{editingModel.provider || editingModel.name}</span>}
+          </div>
+
+          {/* 快速模板：一键填入国内合规渠道的连接信息，只需补 API Key */}
+          <div className="dialog-section">
+            <div className="section-title">
+              快速模板 <span className="dialog-hint">（一键填入连接信息，只需补 API Key；自定义 OpenAI 兼容端点直接用下方表单）</span>
+            </div>
+            <div className="preset-row">
+              {MODEL_PRESETS.map((p) => (
+                <button key={p.key} className="btn preset-chip" title={p.hint} onClick={() => applyPreset(p)}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* Provider 连接 */}

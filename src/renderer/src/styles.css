@@ -446,6 +446,16 @@ html, body, #root {
   margin-top: 12px;
   padding-top: 10px;
 }
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+.preset-chip {
+  font-size: 12px;
+  padding: 4px 12px;
+}
 .dialog-section:first-of-type { border-top: none; margin-top: 8px; padding-top: 0; }
 .section-title {
   font-size: 12px;

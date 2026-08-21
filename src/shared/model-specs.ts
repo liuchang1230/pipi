@@ -34,6 +34,10 @@ const MODEL_SPECS: Record<string, ModelSpec> = {
   "deepseek-reasoner": { contextWindow: 128000, maxTokens: 8192 },
   "deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
   "deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
+  // Domestic OpenAI-compatible channels (lowercased ids; siliconflow ids keep
+  // the org prefix, e.g. "deepseek-ai/DeepSeek-V3")
+  "qwen/qwen2.5-7b-instruct": { contextWindow: 32768, maxTokens: 8192 },
+  "glm-4-flash": { contextWindow: 128000, maxTokens: 4096 },
   // Anthropic public (200k context / 64k output)
   "claude-opus-4-6": { contextWindow: 200000, maxTokens: 64000 },
   "claude-opus-4-7": { contextWindow: 200000, maxTokens: 64000 },
