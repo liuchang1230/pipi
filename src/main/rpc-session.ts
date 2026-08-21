@@ -282,11 +282,16 @@ export class RpcSession {
       if (r.password) {
         this.transport = new Ssh2Transport(r, remoteCmd, label);
       } else {
-        // Key auth: system ssh.exe handles ~/.ssh keys + agent, no TTY needed.
+        // Key auth: system ssh.exe handles ~/.ssh keys + agent, no TTY
+        // needed. BatchMode=yes: if the server actually REQUIRES a password
+        // (no key accepted), fail fast instead of hanging at an impossible
+        // interactive prompt inside pipes (a stuck ssh.exe would make every
+        // RPC command time out silently).
         const sshBin = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "OpenSSH", "ssh.exe");
         this.transport = new ChildProcessTransport(
           existsSync(sshBin) ? sshBin : "ssh.exe",
           [
+            "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ServerAliveInterval=30",
             "-p", String(r.port ?? 22),
