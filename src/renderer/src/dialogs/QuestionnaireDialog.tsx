@@ -216,7 +216,10 @@ export function QuestionnaireDialog({ questions, submitting, active, sentinelLab
 
   const enterCustom = (i: number) => {
     if (submitting) return;
-    setCustomMode((m) => ({ ...m, [i]: true }));
+    // Toggle: clicking the row again (or Esc in the input, or picking an
+    // option) leaves custom mode; the previously chosen option highlights
+    // return, so no selection is lost.
+    setCustomMode((m) => ({ ...m, [i]: !m[i] }));
   };
 
   const allAnswered = questions.every((_, i) => answered[i] === true);
@@ -270,7 +273,9 @@ export function QuestionnaireDialog({ questions, submitting, active, sentinelLab
 
   const q = tab < submitTab ? questions[tab]! : null;
   const previewQ = q && !isMulti(tab) && q.options.some((o) => o.preview && o.preview.length > 0) ? q : null;
-  const previewIdx = previewQ ? focusOf(tab) : -1;
+  // Preview follows the clicked option; nothing is focused while in custom
+  // mode (the user is writing their own answer, no option preview applies).
+  const previewIdx = previewQ && !inCustom(tab) ? (focus[tab] ?? -1) : -1;
   const previewOpt =
     previewQ && previewIdx >= 0 && previewIdx < previewQ.options.length ? previewQ.options[previewIdx] : undefined;
 
@@ -308,7 +313,14 @@ export function QuestionnaireDialog({ questions, submitting, active, sentinelLab
             <div className={`qq-layout${previewQ ? " with-preview" : ""}`}>
               <div className="qq-options">
                 {q.options.map((opt, idx) => {
-                  const sel = isMulti(tab) ? (selected[tab] ?? []).includes(idx) : focusOf(tab) === idx;
+                  // Single-select: exactly one highlight, and none until the
+                  // user actually picks (no invisible default). Custom mode
+                  // clears every option highlight — only the "Type something."
+                  // row is blue then. Multi keeps its checkbox state so leaving
+                  // custom mode restores it.
+                  const sel =
+                    !inCustom(tab) &&
+                    (isMulti(tab) ? (selected[tab] ?? []).includes(idx) : focus[tab] === idx);
                   return (
                     <div
                       key={idx}
