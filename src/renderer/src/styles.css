@@ -275,6 +275,20 @@ html, body, #root {
   margin: 0 4px;
   border-radius: 5px;
 }
+.sidebar .tree-row.previewed {
+  background: var(--accent-dim, rgba(138, 190, 183, 0.14));
+  color: var(--text);
+  outline: 1px solid var(--accent-muted, rgba(138, 190, 183, 0.35));
+}
+.tree-previewed-badge {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--accent, #8abeb7);
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  padding: 0 5px;
+  flex: 0 0 auto;
+}
 .tree-row:hover { background: var(--hover); }
 .tree-row.tree-dir { color: var(--accent); }
 .tree-row.tree-dir .tree-name { font-weight: 500; }
@@ -1876,6 +1890,31 @@ textarea:focus-visible,
 }
 .chat-exited-bar .chat-btn {
   margin-left: auto;
+}
+.chat-working-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+.chat-working-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-working-elapsed {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.chat-working-stop {
+  font-size: 12px;
+  padding: 2px 10px;
 }
 .chat-exited-bar .chat-btn + .chat-btn {
   margin-left: 0;

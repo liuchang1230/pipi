@@ -1366,10 +1366,13 @@ interface TreeRowProps {
 
 const TreeRow = memo(function TreeRow({ node, depth, isExpanded, expandedPaths, onToggle, onOpen, onContextMenu }: TreeRowProps) {
   const isDir = node.type === "directory";
+  // The previewed file (right pane) is highlighted so its tree row is
+  // unambiguous; auto-follow (pi editing) and manual clicks both set it.
+  const previewed = useTreeStore((s) => s.previewPath) === node.path;
   return (
     <>
       <div
-        className={`tree-row${isDir ? " tree-dir" : ""}`}
+        className={`tree-row${isDir ? " tree-dir" : ""}${previewed ? " previewed" : ""}`}
         style={{ paddingLeft: `${depth * 12 + 6}px` }}
         onClick={() => (isDir ? onToggle(node.path) : onOpen(node.path, false))}
         onContextMenu={(e) => onContextMenu(e, node)}
@@ -1377,6 +1380,7 @@ const TreeRow = memo(function TreeRow({ node, depth, isExpanded, expandedPaths, 
         <span className="tree-chevron">{isDir ? (isExpanded ? "▾" : "▸") : ""}</span>
         <span className="tree-icon"><Icon name={isDir ? (isExpanded ? "folder-open" : "folder") : "file"} /></span>
         <span className="tree-name">{node.name}</span>
+        {previewed && <span className="tree-previewed-badge" title="右侧预览中">预览</span>}
       </div>
       {isDir && isExpanded && node.children && (
         <>{node.children.map((c) => (

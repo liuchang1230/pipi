@@ -29,6 +29,11 @@ interface TreeState {
   fileTreeError: string | null;
   remoteTreeCache: Record<string, FileNode[]>;
   treeOrigin: TreeOrigin | null;
+  /** Currently previewed file path (right pane) — highlighted in the tree. */
+  previewPath: string | null;
+  setPreviewPath: (path: string | null) => void;
+  /** Expand every ancestor of a file so its row is visible + highlightable. */
+  revealPath: (relPath: string) => Promise<void>;
   setTree: (updater: Updater<FileNode[]>) => void;
   setExpanded: (updater: Updater<Set<string>>) => void;
   setFileTreeStatus: (status: "idle" | "loading" | "refreshing" | "error") => void;
@@ -98,6 +103,19 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
   fileTreeError: null,
   remoteTreeCache: {},
   treeOrigin: null,
+  previewPath: null,
+  setPreviewPath: (previewPath) => set({ previewPath }),
+  revealPath: async (relPath) => {
+    // Expand every ancestor directory so the file's row becomes visible
+    // (deep files live inside collapsed branches by default).
+    const parts = relPath.split("/");
+    parts.pop(); // drop the file name
+    let cur = "";
+    for (const part of parts) {
+      cur = cur ? `${cur}/${part}` : part;
+      if (cur) await get().expandDir(cur, true).catch(() => {});
+    }
+  },
   setTree: (updater) => set((s) => ({ tree: apply(s.tree, updater) })),
   setExpanded: (updater) => set((s) => ({ expanded: apply(s.expanded, updater) })),
   setFileTreeStatus: (fileTreeStatus) => set({ fileTreeStatus }),

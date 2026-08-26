@@ -127,6 +127,10 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
       // Opening a file always reveals the viewer, even if the user had
       // collapsed it (a click means they want to see the content).
       useLayoutStore.getState().setViewerCollapsed(false);
+      // Highlight the file in the left tree (expand ancestors so it's
+      // visible) — the user must know which file the preview shows.
+      void useTreeStore.getState().revealPath(relPath);
+      useTreeStore.getState().setPreviewPath(relPath);
     } catch (error) {
       if (seq === openReq.seq) {
         useUiStore.getState().showToast(error instanceof Error ? error.message : "读取文件失败", "err");

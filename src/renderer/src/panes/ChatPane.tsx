@@ -30,6 +30,11 @@ import { SkillChips } from "../components/SkillChips";
 import { FileMentionMenu } from "../components/FileMentionMenu";
 import { Icon } from "../components/Icon";
 import { fileMentionPaths, fileMentionTokenAt, filterFileMentions, replaceFileMention, type FileMention } from "../file-mentions";
+
+/** "65" → "1m 5s" (running-time display). */
+function fmtElapsed(s: number): string {
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
 import {
   commandTokenAt,
   fetchCommands,
@@ -907,6 +912,19 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   };
   const phaseActive = !["ready", "completed", "failed", "exited"].includes(phase);
 
+  // Live elapsed clock while the agent is working — the "已运行 Xs" on the
+  // banner makes a long think/tool run obviously alive instead of hung.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!phaseActive) {
+      setElapsed(0);
+      return;
+    }
+    const t = setInterval(() => setElapsed((n) => n + 1), 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phaseActive, phase]);
+
   const grow = () => {
     const ta = taRef.current;
     if (!ta) return;
@@ -1099,7 +1117,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     for (const path of mentionedPaths.slice(0, 8)) {
       const result = await window.api.file.read(tabId, path, undefined, true);
       if (result.error) {
-        useUiStore.getState().showToast(`无法引用 @${path}`, "err");
+        // Silent degrade: keep the authored @path in the message text — pi
+        // has its own read tool and can fetch the file itself. Blocking with
+        // an error toast was wrong: an unreferencable file is not the user's
+        // mistake to fix, and the mention is still useful to the agent.
         continue;
       }
       if (result.image) {
@@ -1111,9 +1132,9 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         const content = result.content.slice(0, remaining);
         attachmentChars += content.length;
         attachments.push(`\n\n<file path="${path}">\n${content}${result.truncated ? "\n[文件过大，内容已截断]" : ""}\n</file>`);
-      } else {
-        useUiStore.getState().showToast(`@${path} 是不支持的二进制文件`, "err");
       }
+      // Binary (or oversized image beyond the preview cap): same silent
+      // degrade — the @path text stays, pi fetches it with its own tools.
     }
     // Keep the authored @path in the visible chat history; only Pi receives
     // the expanded <file> context, matching the native TUI's UX.
@@ -1586,6 +1607,23 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       </div>
 
       <ChatNotices />
+
+      {/* Long-running agent indicator: without it a multi-minute think/tool
+       *  run looks hung. The banner carries the phase + a live elapsed
+       *  clock so "still working" is explicit. */}
+      {phaseActive && (
+        <div className={`chat-working-banner${phase === "tool" ? " tool" : ""}`}>
+          <span className="chat-turn-spinner" />
+          <span className="chat-working-text">
+            {phaseLabel[phase]}
+            {phase === "tool" && state?.turn.detail ? `：${state.turn.detail}` : ""}
+          </span>
+          <span className="chat-working-elapsed">已运行 {fmtElapsed(elapsed)}</span>
+          <button className="chat-btn chat-working-stop" onClick={() => useChatStore.getState().abort(tabId)} disabled={phase === "cancelling"}>
+            {phase === "cancelling" ? "正在停止…" : "停止"}
+          </button>
+        </div>
+      )}
 
       <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} />
 
