@@ -662,6 +662,16 @@ html, body, #root {
 .row-delete:hover {
   color: var(--danger);
 }
+/* The remote-server connection row has a terminal button AND the "+" add
+   button, both styled .row-action (margin-left:auto). Make the terminal
+   button the right-anchor and keep + / × flush against it, instead of the
+   free space being split between the two auto margins. */
+.server-terminal-btn {
+  margin-left: auto;
+}
+.server-add-btn {
+  margin-left: 0;
+}
 .session-delete {
   font-size: 11px;
 }
@@ -878,38 +888,8 @@ html, body, #root {
   inset: 0;
 }
 
-/* Connected-server landing page (covers the terminal after a successful
-   connect; the terminal stays mounted underneath — 打开服务器终端 lifts the
-   overlay, history intact). */
-.connect-notice {
-  position: absolute;
-  inset: 0;
-  z-index: 5;
-  background: var(--bg);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 24px;
-  text-align: center;
-}
-.connect-notice-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text);
-}
-.connect-notice-sub {
-  font-size: 13px;
-  color: var(--text-dim);
-  max-width: 420px;
-  line-height: 1.6;
-}
-.connect-notice-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 6px;
-}
+/* Connection tabs that aren't the active one stay mounted (the SSH pty must
+   survive) but are invisible; the active tab is painted. */
 .terminal-pane.hidden {
   visibility: hidden;
   pointer-events: none;
@@ -921,6 +901,23 @@ html, body, #root {
   position: absolute;
   inset: 0;
   background: var(--terminal-bg);
+}
+
+/* Shown in the middle pane when no tab is actively open (e.g. only a
+   background connection tab exists). Hidden tabs stay mounted underneath
+   to keep the SSH pty alive; this hint overlays them safely. */
+.terminal-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+  padding: 24px;
+  pointer-events: none;
+  z-index: 2;
 }
 .terminal-container .xterm {
   width: 100%;
@@ -1869,6 +1866,13 @@ textarea:focus-visible,
   font-size: 12px;
 }
 .chat-turn-status.completed { color: #4caf72; }
+/* Merged running status lives above the input; the elapsed clock makes a
+   long think/tool run obviously alive instead of hung. */
+.chat-turn-elapsed {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
 .chat-turn-spinner {
   width: 10px;
   height: 10px;
@@ -1890,31 +1894,6 @@ textarea:focus-visible,
 }
 .chat-exited-bar .chat-btn {
   margin-left: auto;
-}
-.chat-working-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 14px;
-  border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--text);
-  font-size: 12px;
-  flex: 0 0 auto;
-}
-.chat-working-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.chat-working-elapsed {
-  margin-left: auto;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-.chat-working-stop {
-  font-size: 12px;
-  padding: 2px 10px;
 }
 .chat-exited-bar .chat-btn + .chat-btn {
   margin-left: 0;
@@ -2002,13 +1981,17 @@ textarea:focus-visible,
 }
 
 /* --- Chat model switch menu --- */
-.chat-header-left {
+.chat-header-left,
+.chat-header-right {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
   /* No overflow:hidden here — the model menu is absolutely positioned below
      the header and would be clipped ("clicking 模型 does nothing"). */
+}
+.chat-header-right {
+  flex: 0 0 auto;
 }
 .chat-model-switch-wrap {
   position: relative;
@@ -2647,6 +2630,22 @@ textarea:focus-visible,
 .chat-notice-close:hover {
   color: var(--text);
 }
+/* Update-result states: success (ok) vs failure (err), shown in both the
+   chat notice bar and the global banner after "立即更新". */
+.chat-notice.update.ok {
+  border-color: #4caf72;
+}
+.chat-notice.update.ok .chat-notice-text {
+  color: #4caf72;
+}
+.chat-notice.update.err {
+  border-color: var(--danger);
+}
+.chat-notice.update.err .chat-notice-text {
+  color: var(--danger);
+}
+.update-banner-row.ok { color: #4caf72; }
+.update-banner-row.err { color: var(--danger); }
 
 /* --- File-changes dialog (git diff / tool-diff fallback) --- */
 .diff-dialog {
@@ -2977,6 +2976,79 @@ textarea:focus-visible,
 /* --- Full questionnaire dialog (ask_user_question chat-view parity) --- */
 .qq-dialog {
   width: min(760px, 92vw);
+}
+/* Dragged out of the flex-centered overlay: fix to the dragged position. */
+.qq-dialog.positioned {
+  position: fixed;
+  margin: 0;
+}
+.qq-dialog.dragging {
+  transition: none;
+  user-select: none;
+}
+/* Title bar doubles as the drag handle. */
+.qq-title-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: move;
+  user-select: none;
+}
+.qq-title-spacer {
+  flex: 1;
+}
+.qq-icon-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.qq-icon-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.qq-icon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* Minimized pill — docked just ABOVE the chat input bar (textarea min-height
+   40 + padding 18 + border 2 + input-bar ~22 + wrap paddings ≈ 82px tall), so
+   it never sits on the textarea the user types into. z-index 600 clears the
+   dialog overlays (500) and toasts (1000) stay above. */
+.qq-collapsed-bar {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 100px;
+  z-index: 600;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 18px;
+  border: 1px solid var(--accent);
+  border-radius: 20px;
+  background: var(--bg-panel);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.qq-collapsed-bar:hover {
+  border-color: var(--accent);
+}
+.qq-collapsed-actions {
+  color: var(--text-dim);
+  font-size: 12px;
 }
 .qq-multi-badge {
   margin-left: 8px;

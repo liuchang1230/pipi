@@ -1,5 +1,5 @@
-// Left-pane file tree state. loadTree/navigateRemoteDir live here as store
-// actions so they read the active tab via getState() instead of re-creating
+// Left-pane file tree state. Its actions live here so they read the active
+// tab via getState() instead of re-creating
 // callbacks per render; a monotonic request id prevents a slow listing for
 // tab A from clobbering a newer one for tab B.
 import { create } from "zustand";
@@ -41,11 +41,10 @@ interface TreeState {
   setRemoteTreeCache: (updater: Updater<Record<string, FileNode[]>>) => void;
   setTreeOrigin: (origin: TreeOrigin | null) => void;
   loadTree: (dirPath?: string, tabId?: string, rootPath?: string, options?: { isRemote?: boolean; force?: boolean; noCache?: boolean }) => Promise<void>;
-  /** Lazy local tree: fetch + inject the children of an expanded directory. */
+  /** Fetch + inject the children of an expanded directory (local, SSH, WSL). */
   expandDir: (relDir: string, force?: boolean) => Promise<void>;
   /** Re-list the tree at its current origin (keeps previews consistent). */
   refresh: () => Promise<void>;
-  navigateRemoteDir: (dirPath: string) => Promise<void>;
 }
 
 const treeReqSeq = { current: 0 };
@@ -148,7 +147,7 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
 
   expandDir: async (relDir, force = false) => {
     const origin = get().treeOrigin;
-    if (!origin || origin.isRemote) return; // remote navigates via navigateRemoteDir
+    if (!origin) return;
     const { rootPath, tabId } = origin;
     if (!rootPath && !tabId) return;
     const node = findNode(get().tree, relDir);
@@ -157,6 +156,8 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
     const seq = (expandSeqs.get(relDir) ?? 0) + 1;
     expandSeqs.set(relDir, seq);
     try {
+      // The main process selects local, SSH, or WSL from this origin's tab.
+      // `relDir` is root-relative locally and absolute on SSH/WSL.
       const nodes = (await window.api.file.listDirChildren(rootPath, tabId, relDir, force ? true : undefined)) as FileNode[];
       if (expandSeqs.get(relDir) !== seq) return; // superseded by a newer expand of THIS dir
       const cur = get();
@@ -250,12 +251,4 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
     }
   },
 
-  navigateRemoteDir: async (dirPath) => {
-    const tabs = useTabsStore.getState();
-    if (!tabs.activeTab || !tabs.isRemote) return;
-    const ok = await window.api.remote.setBrowsePath(tabs.activeTab, dirPath);
-    if (!ok) return;
-    useTabsStore.setState({ remoteDir: dirPath, cwd: dirPath });
-    await get().loadTree(dirPath, tabs.activeTab);
-  },
 }));

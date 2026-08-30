@@ -64,13 +64,14 @@ function ViewerExpandButton() {
 function UpdateBanner() {
   const appUpdateInfo = useUiStore((s) => s.appUpdateInfo);
   const updateInfo = useUiStore((s) => s.updateInfo);
+  const updateResult = useUiStore((s) => s.updateResult);
+  const piUpdating = useUiStore((s) => s.piUpdating);
   const extNotice = useUiStore((s) => s.extNotice);
-  const [busy, setBusy] = useState(false);
   const tabs = useTabsStore((s) => s.tabs);
   const activeTab = useTabsStore((s) => s.activeTab);
   const activeIsChat = !!tabs.find((t) => t.id === activeTab && (t.mode === "rpc" || t.mode === "sdk"));
 
-  if ((!appUpdateInfo && !updateInfo && !extNotice) || activeIsChat) return null;
+  if ((!appUpdateInfo && !updateInfo && !extNotice && !updateResult) || activeIsChat) return null;
   return (
     <div className="update-banner">
       {appUpdateInfo && (
@@ -99,31 +100,34 @@ function UpdateBanner() {
           <button className="update-banner-close" onClick={() => useUiStore.getState().setExtNotice(null)} title="关闭">×</button>
         </div>
       )}
-      {updateInfo && (
+      {updateResult ? (
+        <div className={`update-banner-row${updateResult.ok ? " ok" : " err"}`}>
+          <span>
+            {updateResult.ok
+              ? `pi agent 更新成功：已更新到 ${updateResult.version ?? "最新版"}，请重启标签页生效`
+              : `pi agent 更新失败：${updateResult.error ?? "未知错误"}`}
+          </span>
+          <button className="update-banner-close" onClick={() => useUiStore.getState().setUpdateResult(null)} title="关闭">×</button>
+        </div>
+      ) : updateInfo ? (
         <div className="update-banner-row">
           <span>
-            pi 有新版本：{updateInfo.current} → {updateInfo.latest}（含扩展包更新）
+            {piUpdating
+              ? "正在更新 pi agent 和扩展包…"
+              : updateInfo.latest
+                ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
+                : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
           </span>
           <button
             className="btn btn-primary update-banner-btn"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              const r = await window.api.update.run();
-              setBusy(false);
-              if (r.ok) {
-                useUiStore.getState().setUpdateInfo(null);
-                useUiStore.getState().showToast("更新完成，请重启标签页生效", "ok");
-              } else {
-                useUiStore.getState().showToast(`更新失败: ${r.error ?? r.output.slice(0, 120)}`, "err");
-              }
-            }}
+            disabled={piUpdating}
+            onClick={() => void useUiStore.getState().runPiUpdate()}
           >
-            {busy ? "更新中…" : "立即更新"}
+            {piUpdating ? "更新中…" : "立即更新"}
           </button>
           <button className="update-banner-close" onClick={() => useUiStore.getState().setUpdateInfo(null)} title="关闭">×</button>
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -169,7 +173,12 @@ export default function App() {
       }
     }).catch(() => {});
     window.api.update.check().then((r) => {
-      if (r.hasUpdate) useUiStore.getState().setUpdateInfo({ current: r.current, latest: r.latest });
+      if (r.hasUpdate) {
+        // A fresh detection replaces any stale previous result (e.g. an old
+        // undismissed success/failure notice) with the new offer.
+        useUiStore.getState().setUpdateResult(null);
+        useUiStore.getState().setUpdateInfo({ current: r.current, latest: r.latest, extensions: r.extensions ?? [] });
+      }
     }).catch(() => {});
     window.api.update.getExtensionSynced().then((r) => {
       if (r.files.length > 0) useUiStore.getState().setExtNotice({ files: r.files });
@@ -299,7 +308,7 @@ export default function App() {
     // the renderer may still hold it briefly after main drops it, and
     // activating a dead tab would silently no-op.
     const candidates = tabs.filter((t) => t.isRemote && !t.isWsl && t.remoteKey === server.key && t.sshState !== "failed");
-    const existing = candidates.find((t) => t.title.endsWith(" · 连接")) ?? candidates[0];
+    const existing = candidates.find((t) => t.kind === "connection") ?? candidates[0];
     if (existing) return existing.id;
     if (serverConnectingRef.current.has(server.key)) return null; // in flight
     serverConnectingRef.current.add(server.key);
@@ -335,15 +344,21 @@ export default function App() {
     }
   }, []);
 
-  /** Server node click: activate its shell tab, or connect if not connected.
-   *  Resolves true when the server is (or just became) connected — the
-   *  sidebar expands the node's projects on success. */
+  /** Server node click reuses or creates a visible connection tab, then
+   * signals success so the sidebar expands the node's projects. The mounted
+   * SSH terminal remains the authentication surface while it is connecting. */
   const handleConnectServer = useCallback(async (server: RemoteServerGroup): Promise<boolean> => {
     const tabId = await ensureRemoteConnection(server);
-    if (!tabId) return false;
+    return !!tabId;
+  }, [ensureRemoteConnection]);
+
+  /** Explicitly focus a server's raw shell terminal. Connection tabs are
+   * already visible in the tab bar; this is a direct navigation shortcut. */
+  const handleOpenServerTerminal = useCallback(async (server: RemoteServerGroup): Promise<void> => {
+    const tabId = await ensureRemoteConnection(server);
+    if (!tabId) return;
     const ok = await window.api.tab.activate(tabId);
     if (ok) useTabsStore.getState().setActiveTab(tabId);
-    return ok;
   }, [ensureRemoteConnection]);
 
   /** Server node +: browse THAT server's directories (never the first tab). */
@@ -446,6 +461,7 @@ export default function App() {
         onNewLocalProject={() => void handleSelectDir()}
         onAddRemoteServer={handleAddRemoteServer}
         onConnectServer={handleConnectServer}
+        onOpenServerTerminal={(server) => void handleOpenServerTerminal(server)}
         onAddRemoteProjectForServer={(server) => void handleAddRemoteProjectForServer(server)}
         onWslConnect={(distro) => void connectWslDistro(distro)}
         onAddWslProject={(distro) => void addWslProject(distro)}

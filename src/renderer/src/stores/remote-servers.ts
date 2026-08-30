@@ -40,11 +40,10 @@ function serverLabel(host: string, user: string, port: number, agentDir?: string
   return agentDir ? `${base}${portSuffix} · ${agentDir}` : `${base}${portSuffix}`;
 }
 
-/** A connection-only shell tab (bare ssh, startPi:false, "· 连接" title) vs
- *  a pi session tab. Connection tabs keep their title (syncRemoteTabTitles
- *  excludes them), so the title is a reliable marker. */
+/** A connection-only shell tab vs a pi session tab. Main assigns the
+ * classification when it creates the tab; presentation never parses titles. */
 function isConnectionTab(t: TabInfo): boolean {
-  return t.title.endsWith(" · 连接");
+  return t.kind === "connection";
 }
 
 export interface GroupRemoteServersParams {

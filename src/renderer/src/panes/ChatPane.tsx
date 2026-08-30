@@ -262,9 +262,10 @@ const MessageView = memo(function MessageView({ message }: { message: ChatMessag
 function ChatNotices() {
   const appUpdateInfo = useUiStore((s) => s.appUpdateInfo);
   const updateInfo = useUiStore((s) => s.updateInfo);
+  const updateResult = useUiStore((s) => s.updateResult);
+  const piUpdating = useUiStore((s) => s.piUpdating);
   const extNotice = useUiStore((s) => s.extNotice);
-  const [busy, setBusy] = useState(false);
-  if (!appUpdateInfo && !updateInfo && !extNotice) return null;
+  if (!appUpdateInfo && !updateInfo && !extNotice && !updateResult) return null;
   return (
     <div className="chat-notices">
       {appUpdateInfo && (
@@ -291,31 +292,34 @@ function ChatNotices() {
           <button className="chat-notice-close" onClick={() => useUiStore.getState().setExtNotice(null)} title="关闭">×</button>
         </div>
       )}
-      {updateInfo && (
+      {updateResult ? (
+        <div className={`chat-notice update${updateResult.ok ? " ok" : " err"}`}>
+          <span className="chat-notice-text">
+            {updateResult.ok
+              ? `pi agent 更新成功：已更新到 ${updateResult.version ?? "最新版"}，请重启标签页生效`
+              : `pi agent 更新失败：${updateResult.error ?? "未知错误"}`}
+          </span>
+          <button className="chat-notice-close" onClick={() => useUiStore.getState().setUpdateResult(null)} title="关闭">×</button>
+        </div>
+      ) : updateInfo ? (
         <div className="chat-notice update">
           <span className="chat-notice-text">
-            pi 有新版本：{updateInfo.current} → {updateInfo.latest}（含扩展包更新）
+            {piUpdating
+              ? "正在更新 pi agent 和扩展包…"
+              : updateInfo.latest
+                ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
+                : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
           </span>
           <button
             className="btn btn-primary chat-notice-btn"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              const r = await window.api.update.run();
-              setBusy(false);
-              if (r.ok) {
-                useUiStore.getState().setUpdateInfo(null);
-                useUiStore.getState().showToast("更新完成，请重启标签页生效", "ok");
-              } else {
-                useUiStore.getState().showToast(`更新失败: ${r.error ?? r.output.slice(0, 120)}`, "err");
-              }
-            }}
+            disabled={piUpdating}
+            onClick={() => void useUiStore.getState().runPiUpdate()}
           >
-            {busy ? "更新中…" : "立即更新"}
+            {piUpdating ? "更新中…" : "立即更新"}
           </button>
           <button className="chat-notice-close" onClick={() => useUiStore.getState().setUpdateInfo(null)} title="关闭">×</button>
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -503,6 +507,33 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [modelView, setModelView] = useState<"providers" | "models">("providers");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+  // Click-away dismiss for the header dropdowns (模型/思考/会话): opening one
+  // and clicking anywhere else — transcript, 分支, tree — must close it instead
+  // of leaving it hanging. pointerdown (capture) fires before the buttons' own
+  // click handlers, so re-clicking a button to toggle still works: only clicks
+  // outside the header menu container close the menus. Escape closes them too.
+  const headerMenusRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      if (headerMenusRef.current?.contains(e.target as Node)) return;
+      setModelMenuOpen(false);
+      setThinkMenuOpen(false);
+      setSessionMenuOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setModelMenuOpen(false);
+        setThinkMenuOpen(false);
+        setSessionMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, []);
   const [treeOpen, setTreeOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [completionVisible, setCompletionVisible] = useState(false);
@@ -1392,6 +1423,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     return map;
   }, [modelList]);
   const providers = useMemo(() => Object.keys(modelsByProvider).sort(), [modelsByProvider]);
+  const modelButtonLabel = state?.modelProvider
+    ? `${state.modelProvider} · ${state.modelName ?? state.modelId ?? "模型"}`
+    : state?.modelName ?? state?.modelId ?? "模型";
+
   const currentProvider = useMemo(() => {
     // Prefer the provider recorded at state_ready (exact); fall back to
     // matching by name/id (ambiguous when providers share model names).
@@ -1407,7 +1442,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   return (
     <div className="chat-pane">
       <div className="chat-header">
-        <div className="chat-header-left">
+        <div className="chat-header-left" ref={headerMenusRef}>
           <span className="chat-model-switch-wrap">
             <button
               className="chat-header-btn chat-model-btn"
@@ -1424,9 +1459,9 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
                   void window.api.tab.rpcSend(tabId, { type: "get_available_models" });
                 }
               }}
-              title={`${state?.modelName ?? "pi"}${state?.sessionName ? ` · ${state.sessionName}` : ""} — 点击切换模型`}
+              title={`${modelButtonLabel}${state?.sessionName ? ` · ${state.sessionName}` : ""} — 点击切换模型`}
             >
-              {state?.modelName ?? "模型"} ▾
+              {modelButtonLabel} ▾
             </button>
             {modelMenuOpen && (
               <div className="chat-model-menu">
@@ -1598,32 +1633,17 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           </span>
           )}
         </div>
-        <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
-          分支
-        </button>
-        <button className="chat-header-btn" onClick={switchToTerminal} disabled={switchBusy} title="切换为完整终端视图（TUI）">
-          终端视图
-        </button>
+        <div className="chat-header-right">
+          <button className="chat-header-btn" onClick={() => setTreeOpen(true)} title="会话分支（fork）">
+            分支
+          </button>
+          <button className="chat-header-btn" onClick={switchToTerminal} disabled={switchBusy} title="切换为完整终端视图（TUI）">
+            终端视图
+          </button>
+        </div>
       </div>
 
       <ChatNotices />
-
-      {/* Long-running agent indicator: without it a multi-minute think/tool
-       *  run looks hung. The banner carries the phase + a live elapsed
-       *  clock so "still working" is explicit. */}
-      {phaseActive && (
-        <div className={`chat-working-banner${phase === "tool" ? " tool" : ""}`}>
-          <span className="chat-turn-spinner" />
-          <span className="chat-working-text">
-            {phaseLabel[phase]}
-            {phase === "tool" && state?.turn.detail ? `：${state.turn.detail}` : ""}
-          </span>
-          <span className="chat-working-elapsed">已运行 {fmtElapsed(elapsed)}</span>
-          <button className="chat-btn chat-working-stop" onClick={() => useChatStore.getState().abort(tabId)} disabled={phase === "cancelling"}>
-            {phase === "cancelling" ? "正在停止…" : "停止"}
-          </button>
-        </div>
-      )}
 
       <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} />
 
@@ -1640,6 +1660,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           <div className={`chat-turn-status ${phase === "completed" ? "completed" : ""}`}>
             {phaseActive && <span className="chat-turn-spinner" />}
             <span>{phaseLabel[phase]}</span>
+            {phaseActive && <span className="chat-turn-elapsed">已运行 {fmtElapsed(elapsed)}</span>}
           </div>
         )}
         {mentionOpen && (

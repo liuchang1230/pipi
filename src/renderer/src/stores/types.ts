@@ -10,6 +10,9 @@ export interface FileNode {
 
 export interface TabInfo {
   id: string;
+  /** Explicit connection-shell classification supplied by main. Optimistic
+   * client records omit it only until the authoritative tab update arrives. */
+  kind?: "agent" | "connection";
   cwd: string;
   sessionPath?: string;
   title: string;

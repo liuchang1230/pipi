@@ -13,6 +13,7 @@ export type ToastType = "ok" | "err";
 export interface UpdateNoticeInfo {
   current: string | null;
   latest: string | null;
+  extensions: string[];
 }
 
 export interface AppUpdateNoticeInfo {
@@ -26,6 +27,17 @@ export interface ExtensionNoticeInfo {
   files: string[];
 }
 
+/** Outcome of running the pi (agent) update, surfaced as a success/failure
+ *  notice in both the chat notice bar and the global banner — so after
+ *  "立即更新" the user sees 更新中… then 更新成功（到哪个版本）or 更新失败. */
+export interface PiUpdateResult {
+  ok: boolean;
+  /** Version it updated to (ok only). */
+  version?: string;
+  /** Failure detail (ok=false). */
+  error?: string;
+}
+
 interface UiState {
   toast: { text: string; type: ToastType } | null;
   showToast: (text: string, type: ToastType) => void;
@@ -36,6 +48,15 @@ interface UiState {
   /** pi (and its extension packages) has a newer version available. */
   updateInfo: UpdateNoticeInfo | null;
   setUpdateInfo: (info: UpdateNoticeInfo | null) => void;
+  /** Result of the last pi update attempt (shown instead of the offer once set). */
+  updateResult: PiUpdateResult | null;
+  setUpdateResult: (r: PiUpdateResult | null) => void;
+  /** A pi update is in flight (shared by chat notice bar + global banner so
+   *  both consistently show "更新中…" and a second click is prevented). */
+  piUpdating: boolean;
+  setPiUpdating: (updating: boolean) => void;
+  /** Runs the complete update workflow once for every renderer presentation. */
+  runPiUpdate: () => Promise<void>;
   /** App-bundled pi extensions were re-shipped at startup with new content. */
   extNotice: ExtensionNoticeInfo | null;
   setExtNotice: (info: ExtensionNoticeInfo | null) => void;
@@ -62,6 +83,50 @@ export const useUiStore = create<UiState>()((set) => ({
   setAppUpdateInfo: (appUpdateInfo) => set({ appUpdateInfo }),
   updateInfo: null,
   setUpdateInfo: (updateInfo) => set({ updateInfo }),
+  updateResult: null,
+  setUpdateResult: (updateResult) => set({ updateResult }),
+  piUpdating: false,
+  setPiUpdating: (piUpdating) => set({ piUpdating }),
+  runPiUpdate: async () => {
+    // The main process remains the cross-window authority; this guard avoids
+    // duplicate work from the two renderer presentations in this window.
+    if (useUiStore.getState().piUpdating) return;
+    set({ piUpdating: true });
+    try {
+      const result = await window.api.update.run();
+      if (!result.ok) {
+        set({
+          updateInfo: null,
+          updateResult: { ok: false, error: result.error ?? result.output.slice(0, 120) },
+        });
+        useUiStore.getState().showToast("更新失败", "err");
+        return;
+      }
+
+      // Do not claim the version offered before update: npm may resolve a
+      // different release. Force a fresh check after main invalidates its cache.
+      try {
+        const verified = await window.api.update.check(true);
+        set({
+          updateInfo: null,
+          updateResult: { ok: true, version: verified.current ?? undefined },
+        });
+      } catch {
+        // The update itself succeeded; verification is best-effort and must
+        // not rewrite that outcome as a failure because IPC/network died.
+        set({ updateInfo: null, updateResult: { ok: true } });
+      }
+      useUiStore.getState().showToast("更新完成，请重启标签页生效", "ok");
+    } catch (error) {
+      set({
+        updateInfo: null,
+        updateResult: { ok: false, error: error instanceof Error ? error.message : String(error) },
+      });
+      useUiStore.getState().showToast("更新失败", "err");
+    } finally {
+      set({ piUpdating: false });
+    }
+  },
   extNotice: null,
   setExtNotice: (extNotice) => set({ extNotice }),
   appDialog: null,

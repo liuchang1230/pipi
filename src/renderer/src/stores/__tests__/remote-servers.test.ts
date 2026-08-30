@@ -17,6 +17,7 @@ const tabs = (items: TabInfo[]) => items;
 function sshTab(overrides: Partial<TabInfo>): TabInfo {
   return {
     id: "t1",
+    kind: "connection",
     cwd: ".",
     title: "root@h1 · 连接",
     isRemote: true,
@@ -98,8 +99,8 @@ describe("groupRemoteServers", () => {
       projects: [],
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
       tabs: [
-        sshTab({ id: "session", title: "my session", mode: "rpc" }),
-        sshTab({ id: "shell", title: "root@h1 · 连接" }),
+        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc" }),
+        sshTab({ id: "shell", kind: "connection", sshState: "ready" }),
       ],
     });
     expect(groups[0].status).toBe("connected");
@@ -180,7 +181,7 @@ describe("groupRemoteServers", () => {
       ]),
       remoteHistory: [],
       tabs: [
-        { id: "wtab", cwd: ".", title: "Ubuntu", isRemote: true, isWsl: true, wslDistro: "Ubuntu", pi: true, mode: "rpc" },
+        { id: "wtab", kind: "agent", cwd: ".", title: "Ubuntu", isRemote: true, isWsl: true, wslDistro: "Ubuntu", pi: true, mode: "rpc" },
       ],
     });
     expect(groups).toHaveLength(1);
@@ -217,7 +218,7 @@ describe("groupRemoteServers", () => {
       ...empty,
       projects: [],
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
-      tabs: [sshTab({ id: "s1", title: "my session", mode: "rpc" })],
+      tabs: [sshTab({ id: "s1", kind: "agent", title: "my session", mode: "rpc" })],
     });
     expect(groups[0].status).toBe("connected");
     expect(groups[0].tabId).toBe("s1");
@@ -261,8 +262,8 @@ describe("groupRemoteServers", () => {
       projects: [],
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
       tabs: [
-        sshTab({ id: "shell", title: "root@h1 · 连接" }), // pending
-        sshTab({ id: "session", title: "my session", mode: "rpc" }), // pi is running → connected
+        sshTab({ id: "shell", kind: "connection" }), // pending
+        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc" }), // pi is running → connected
       ],
     });
     expect(groups[0].status).toBe("connected");
@@ -303,7 +304,7 @@ describe("groupRemoteServers", () => {
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
       tabs: [
         sshTab({ id: "dead", sshState: "failed" }),
-        sshTab({ id: "session", title: "my session", mode: "rpc" }),
+        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc" }),
       ],
     });
     expect(groups[0].status).toBe("connected");

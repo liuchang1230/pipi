@@ -82,6 +82,32 @@ describe("expandDir (lazy tree)", () => {
     expect(api.file.listDirChildren).toHaveBeenCalledWith("/proj", undefined, "src", undefined);
   });
 
+  it("expands an SSH directory in place without changing its browse root", async () => {
+    const api = makeApi();
+    api.file.listDirChildren.mockResolvedValue([
+      { name: "main.ts", path: "/srv/project/src/main.ts", type: "file" },
+    ] as FileNode[]);
+    useTabsStore.setState({
+      tabs: [{ id: "remote-1", title: "remote", isRemote: true } as any],
+      activeTab: "remote-1",
+      isRemote: true,
+      cwd: "/srv/project",
+      remoteDir: "/srv/project",
+    });
+    useTreeStore.setState({
+      tree: [{ name: "src", path: "/srv/project/src", type: "directory", children: undefined }],
+      expanded: new Set(["/srv/project/src"]),
+      treeOrigin: { tabId: "remote-1", dirPath: "/srv/project", isRemote: true },
+    });
+
+    await useTreeStore.getState().expandDir("/srv/project/src");
+
+    expect(api.file.listDirChildren).toHaveBeenCalledWith(undefined, "remote-1", "/srv/project/src", undefined);
+    expect(useTreeStore.getState().tree[0]?.children?.map((node) => node.path)).toEqual(["/srv/project/src/main.ts"]);
+    expect(useTreeStore.getState().treeOrigin?.dirPath).toBe("/srv/project");
+    expect(useTabsStore.getState().remoteDir).toBe("/srv/project");
+  });
+
   it("skips the fetch when children are already loaded", async () => {
     const api = makeApi();
     useTreeStore.setState({

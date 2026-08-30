@@ -7,6 +7,8 @@ import { app, shell } from "electron";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { getGlobalPiBin } from "./pty";
 
 const REGISTRY_URL = "https://registry.npmjs.org/@earendil-works%2fpi-coding-agent/latest";
@@ -15,6 +17,8 @@ const APP_RELEASES_URL = "https://api.github.com/repos/liuchang1230/pipi/release
 export interface UpdateInfo {
   current: string | null;
   latest: string | null;
+  /** Configured npm/git pi packages with newer versions available. */
+  extensions: string[];
   hasUpdate: boolean;
   error?: string;
 }
@@ -151,6 +155,97 @@ async function getLatestVersion(): Promise<string | null> {
   }
 }
 
+/** Resolve pi's package entry file for the standalone checker child.
+ *
+ * Order:
+ *  1. global npm install (real files on disk — works in the packaged app too,
+ *     and is the install that `pi update` actually maintains);
+ *  2. the app's own node_modules (dev); paths inside app.asar are skipped
+ *     because a standalone node process cannot read asar archives.
+ */
+function resolvePiPackageEntry(): string | null {
+  const piBin = getGlobalPiBin();
+  if (piBin) {
+    const globalEntry = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
+    if (existsSync(globalEntry)) return globalEntry;
+  }
+  try {
+    const appEntry = join(app.getAppPath(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
+    if (existsSync(appEntry) && !appEntry.includes("app.asar")) return appEntry;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/** Ask pi's package manager which configured extensions have updates.
+ *
+ * This must run in a standalone Node process. Electron's embedded Node can be
+ * older/different from the Node version supported by pi's transitive undici
+ * dependency (which may use newer webidl APIs) — importing the package in the
+ * Electron main process would crash the whole app at startup.
+ *
+ * The script text deliberately avoids static `import ... from` statements:
+ * electron-vite injects its CJS shims right after the last static import it
+ * can regex-find in the bundle, and a lookalike import inside this string
+ * would make the shim (including `__dirname`) land inside the string, breaking
+ * the whole main process. Dynamic `import()` is used instead.
+ */
+async function getExtensionUpdates(): Promise<string[]> {
+  const nodeBin = resolveNodeBin();
+  const piEntry = resolvePiPackageEntry();
+  if (!nodeBin || !piEntry) return [];
+  const cwd = process.cwd();
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const script = `
+    const { DefaultPackageManager, SettingsManager } = await import(${JSON.stringify(pathToFileURL(piEntry).href)});
+    const manager = new DefaultPackageManager({
+      cwd: ${JSON.stringify(cwd)},
+      agentDir: ${JSON.stringify(agentDir)},
+      settingsManager: SettingsManager.create(${JSON.stringify(cwd)}, ${JSON.stringify(agentDir)})
+    });
+    const updates = await manager.checkForAvailableUpdates();
+    process.stdout.write(JSON.stringify(updates.map((update) => update.displayName)));
+  `;
+  return new Promise((resolve) => {
+    const child = spawn(nodeBin, ["--input-type=module", "-e", script], {
+      cwd,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* best effort */ }
+      resolve([]);
+    }, 20000);
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (data: string) => { stdout += data; });
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (data: string) => { stderr += data; });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      console.warn("[update] extension check failed:", error.message);
+      resolve([]);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        console.warn("[update] extension check failed:", stderr.trim().slice(-500));
+        resolve([]);
+        return;
+      }
+      try {
+        const updates = JSON.parse(stdout.trim());
+        resolve(Array.isArray(updates) ? updates.filter((x): x is string => typeof x === "string") : []);
+      } catch {
+        resolve([]);
+      }
+    });
+  });
+}
+
 /** Check the public GitHub release for an application update. The small
  * Interface is intentionally just check/open: the installer remains the
  * proven NSIS overwrite path, rather than adding a fragile in-place updater.
@@ -206,11 +301,16 @@ export async function openAppUpdateDownload(url: string): Promise<boolean> {
 /** Check for a pi update (cached; async, never throws). */
 export async function checkPiUpdate(force = false): Promise<UpdateInfo> {
   if (!force && cached && Date.now() - lastCheckedAt < CHECK_TTL_MS) return cached;
-  const [current, latest] = await Promise.all([getLocalPiVersion(), getLatestVersion()]);
+  const [current, latest, extensions] = await Promise.all([
+    getLocalPiVersion(),
+    getLatestVersion(),
+    getExtensionUpdates(),
+  ]);
   const info: UpdateInfo = {
     current,
     latest,
-    hasUpdate: !!(current && latest && compareVersions(latest, current) > 0),
+    extensions,
+    hasUpdate: !!(current && latest && compareVersions(latest, current) > 0) || extensions.length > 0,
   };
   if (!latest) info.error = "无法连接 npm registry";
   cached = info;
@@ -226,7 +326,7 @@ export async function runPiUpdate(): Promise<UpdateRunResult> {
   if (updateInFlight) return { ok: false, output: "", error: "更新已在进行中" };
   updateInFlight = true;
   try {
-    const { code, stdout, stderr } = await runPi(["update"], 300000);
+    const { code, stdout, stderr } = await runPi(["update", "--all"], 300000);
     const output = (stdout + "\n" + stderr).trim();
     const ok = code === 0;
     // Invalidate the cached check so the next check reflects the new version.

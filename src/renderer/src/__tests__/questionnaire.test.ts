@@ -11,6 +11,7 @@ import {
   buildFlushSteps,
   extractSentinelLabel,
   parseQuestionsFromArgs,
+  questionnaireKeyAction,
   walkerTitleStarts,
   type QQuestion,
 } from "../dialogs/QuestionnaireDialog";
@@ -221,6 +222,38 @@ describe("buildFlushResponse", () => {
 
   it("returns null when a select dialog carries no options (caller aborts)", () => {
     expect(buildFlushResponse({ qi: 0, kind: "select" }, { kind: "option", index: 0 }, [])).toBeNull();
+  });
+});
+
+describe("questionnaireKeyAction", () => {
+  const ctx = { minimized: false, tab: 0, submitTab: 3, allAnswered: true };
+
+  it("maps Escape to cancel and arrows to prev/next when visible", () => {
+    expect(questionnaireKeyAction("Escape", ctx)).toBe("cancel");
+    expect(questionnaireKeyAction("ArrowLeft", ctx)).toBe("prev");
+    expect(questionnaireKeyAction("ArrowRight", ctx)).toBe("next");
+  });
+
+  it("submits only on the submit tab with Enter and everything answered", () => {
+    expect(questionnaireKeyAction("Enter", { ...ctx, tab: 3 })).toBe("submit");
+    expect(questionnaireKeyAction("Enter", { ...ctx, tab: 3, allAnswered: false })).toBeNull();
+    expect(questionnaireKeyAction("Enter", { ...ctx, tab: 1 })).toBeNull();
+  });
+
+  it("ignores irrelevant keys", () => {
+    expect(questionnaireKeyAction("a", ctx)).toBeNull();
+    expect(questionnaireKeyAction("Enter", ctx)).toBeNull();
+  });
+
+  it("when minimized, only Escape reaches the hidden questionnaire", () => {
+    const m = { ...ctx, minimized: true };
+    // The two regressions the reviewer flagged: Enter on the submit tab and
+    // arrows must NOT act on a dialog the user cannot see.
+    expect(questionnaireKeyAction("Enter", { ...m, tab: 3 })).toBeNull();
+    expect(questionnaireKeyAction("ArrowLeft", m)).toBeNull();
+    expect(questionnaireKeyAction("ArrowRight", m)).toBeNull();
+    // Escape still cancels (documented in the collapsed pill hint).
+    expect(questionnaireKeyAction("Escape", m)).toBe("cancel");
   });
 });
 

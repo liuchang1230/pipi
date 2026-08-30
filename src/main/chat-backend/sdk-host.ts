@@ -204,6 +204,7 @@ export function openSdkSession(opts: CreateTabOptions & { id?: string; agentDir:
   const w = ensureWorker();
   const tab: TabInfo = {
     id,
+    kind: "agent",
     cwd: opts.cwd,
     sessionPath: opts.sessionPath,
     title: opts.title || opts.cwd.replace(/\\/g, "/").split("/").pop() || opts.cwd,

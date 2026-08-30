@@ -43,6 +43,9 @@ export type QAnswer =
 /** Sentinel row label — matches the extension's reserved "Type something." row. */
 const DEFAULT_SENTINEL_LABEL = "Type something.";
 
+/** localStorage key for the questionnaire window's dragged position. */
+const POS_STORAGE_KEY = "pipi:questionnaire:pos";
+
 /**
  * Extract the walker's sentinel row label from its select dialog options
  * (last option line "N+1. <label>"), so the custom row follows the host
@@ -52,6 +55,24 @@ export function extractSentinelLabel(options: string[] | undefined): string {
   const last = options && options.length > 0 ? options[options.length - 1]! : "";
   const m = /^\d+\.\s*(.*)$/.exec(last);
   return m?.[1]?.trim() || DEFAULT_SENTINEL_LABEL;
+}
+
+/** Key action the questionnaire should take for a keypress. Pure so the
+ * minimized-hidden dialog can't receive Enter/arrow keys — they would submit
+ * or navigate a dialog the user cannot see (the transcript is interactive
+ * again once the overlay is gone). Event-context guards (IME composition,
+ * focus inside an INPUT/TEXTAREA) stay in the component's keydown handler. */
+export type QuestionnaireKeyAction = "cancel" | "prev" | "next" | "submit" | null;
+export function questionnaireKeyAction(
+  key: string,
+  ctx: { minimized: boolean; tab: number; submitTab: number; allAnswered: boolean },
+): QuestionnaireKeyAction {
+  if (ctx.minimized) return key === "Escape" ? "cancel" : null;
+  if (key === "Escape") return "cancel";
+  if (key === "ArrowLeft") return "prev";
+  if (key === "ArrowRight") return "next";
+  if (key === "Enter" && ctx.tab === ctx.submitTab && ctx.allAnswered) return "submit";
+  return null;
 }
 
 /** Parse the `questions` array out of an ask_user_question tool call's args. */
@@ -177,6 +198,105 @@ export function QuestionnaireDialog({ questions, submitting, active, sentinelLab
 
   const submitTab = questions.length;
   const [tab, setTab] = useState(0); // 0..n-1 = questions, n = submit tab
+
+  // Draggable window position. null = centered (default). Remembered across
+  // sessions via localStorage so one drag benefits every later questionnaire.
+  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(() => {
+    try {
+      const raw = localStorage.getItem(POS_STORAGE_KEY);
+      if (!raw) return null;
+      const p = JSON.parse(raw) as { x?: unknown; y?: unknown };
+      if (typeof p.x === "number" && typeof p.y === "number") return { x: p.x, y: p.y };
+    } catch {
+      // Corrupt storage — fall back to centered.
+    }
+    return null;
+  });
+  const [minimized, setMinimized] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ startX: number; startY: number; origLeft: number; origTop: number } | null>(null);
+  const lastPosRef = useRef<{ x: number; y: number } | null>(null);
+
+  // --- Dragging ----------------------------------------------------------
+  // Drag starts on the title bar (mousedown). The document listeners are
+  // managed by the effect below (keyed on `dragging`), so React tears them
+  // down even if the component unmounts mid-drag. The handlers themselves are
+  // stable (refs + setState only), so add/remove always target the same
+  // function reference.
+  const startDrag = (e: React.MouseEvent) => {
+    // Buttons inside the title bar (minimize/close) must not start a drag.
+    if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+    const rect = dialogRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    // Anchor at the ACTUALLY rendered position (rect.left/top), not the stored
+    // dragPos: the render clamps an out-of-viewport position back into view
+    // (e.g. after the window shrank), so anchoring at the raw stored value
+    // would make the dialog jump the moment the user grabs it.
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      origLeft: rect.left,
+      origTop: rect.top,
+    };
+    setDragging(true);
+  };
+
+  const onDragMove = (e: MouseEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    const dy = e.clientY - d.startY;
+    // Small movement threshold: a plain click on the title bar is not a drag.
+    if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+    const rect = dialogRef.current?.getBoundingClientRect();
+    const maxX = Math.max(8, window.innerWidth - (rect?.width ?? 400) - 8);
+    const maxY = Math.max(8, window.innerHeight - (rect?.height ?? 300) - 8);
+    const pos = {
+      x: Math.max(8, Math.min(d.origLeft + dx, maxX)),
+      y: Math.max(8, Math.min(d.origTop + dy, maxY)),
+    };
+    lastPosRef.current = pos;
+    setDragPos(pos);
+  };
+
+  const onDragEnd = () => {
+    setDragging(false);
+    dragRef.current = null;
+    const pos = lastPosRef.current;
+    if (pos) {
+      try {
+        localStorage.setItem(POS_STORAGE_KEY, JSON.stringify(pos));
+      } catch {
+        // Storage unavailable — position just won't persist.
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!dragging) return;
+    // App loses focus mid-drag (Alt-Tab): end the drag so the dialog can't
+    // follow the mouse while no button is held.
+    const onBlur = () => setDragging(false);
+    document.addEventListener("mousemove", onDragMove);
+    document.addEventListener("mouseup", onDragEnd);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      document.removeEventListener("mousemove", onDragMove);
+      document.removeEventListener("mouseup", onDragEnd);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [dragging]);
+
+  // Double-click the title bar to reset to centered.
+  const centerAgain = () => {
+    setDragPos(null);
+    try {
+      localStorage.removeItem(POS_STORAGE_KEY);
+    } catch {
+      // Ignore.
+    }
+  };
   const [answered, setAnswered] = useState<Record<number, boolean>>({});
   const [focus, setFocus] = useState<Record<number, number>>({});
   const [selected, setSelected] = useState<Record<number, number[]>>({});
@@ -251,17 +371,22 @@ export function QuestionnaireDialog({ questions, submitting, active, sentinelLab
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
       if (e.isComposing) return;
-      if (e.key === "Escape") {
+      // Minimized: the overlay is gone and the transcript is interactive again,
+      // but the questionnaire itself is invisible — only Esc (cancel) may reach
+      // it. Enter/arrows would secretly submit or navigate a dialog the user
+      // cannot see (questionnaireKeyAction enforces this).
+      const action = questionnaireKeyAction(e.key, { minimized, tab, submitTab, allAnswered });
+      if (action === "cancel") {
         e.preventDefault();
         e.stopPropagation();
         onCancel();
-      } else if (e.key === "ArrowLeft") {
+      } else if (action === "prev") {
         e.preventDefault();
         prev();
-      } else if (e.key === "ArrowRight") {
+      } else if (action === "next") {
         e.preventDefault();
         next();
-      } else if (e.key === "Enter" && tab === submitTab && allAnswered) {
+      } else if (action === "submit") {
         e.preventDefault();
         e.stopPropagation();
         submit();
@@ -279,12 +404,60 @@ export function QuestionnaireDialog({ questions, submitting, active, sentinelLab
   const previewOpt =
     previewQ && previewIdx >= 0 && previewIdx < previewQ.options.length ? previewQ.options[previewIdx] : undefined;
 
+  const dialogStyle = dragPos
+    ? {
+        left: Math.min(dragPos.x, Math.max(8, window.innerWidth - 80)),
+        top: Math.min(dragPos.y, Math.max(8, window.innerHeight - 80)),
+      }
+    : undefined;
+
+  // Minimized: a single pill at the bottom of the chat view. No overlay, so
+  // the transcript is fully readable and scrollable; answers are kept and
+  // clicking the pill restores the full dialog. Esc still cancels (the
+  // keydown handler stays mounted). Mirrors the TUI's Ctrl+] collapse.
+  if (minimized) {
+    return (
+      <div
+        className="qq-collapsed-bar"
+        role="button"
+        tabIndex={0}
+        title="点击恢复问卷"
+        onClick={() => setMinimized(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setMinimized(false);
+          }
+        }}
+      >
+        <span>问卷已收起 — 点击恢复</span>
+        <span className="qq-collapsed-actions">Esc 取消</span>
+      </div>
+    );
+  }
+
   return (
     <div className="dialog-overlay ui-dialog-overlay">
-      <div className="dialog ui-dialog qq-dialog">
-        <div className="dialog-title">
-          {tab < submitTab ? `问题 ${tab + 1}/${submitTab}` : "确认提交"}
+      <div
+        ref={dialogRef}
+        className={`dialog ui-dialog qq-dialog${dragPos ? " positioned" : ""}${dragging ? " dragging" : ""}`}
+        style={dialogStyle}
+      >
+        <div
+          className="dialog-title qq-title-bar"
+          onMouseDown={startDrag}
+          onDoubleClick={centerAgain}
+          title="拖动移动 · 双击恢复居中"
+        >
+          <span>{tab < submitTab ? `问题 ${tab + 1}/${submitTab}` : "确认提交"}</span>
           {q?.multiSelect && <span className="qq-multi-badge">可多选</span>}
+          <span className="qq-title-spacer" />
+          <button className="qq-icon-btn" title="最小化（保留答案）" disabled={submitting} onClick={() => setMinimized(true)}>
+            ─
+          </button>
+          <button className="qq-icon-btn" title="取消（Esc）" disabled={submitting} onClick={onCancel}>
+            ✕
+          </button>
         </div>
 
         {/* Tab bar — click a tab to go back to any earlier question. */}

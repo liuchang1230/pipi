@@ -783,6 +783,7 @@ function emitTabs() {
   // renderer gets the same tab twice (pty + rpc) and renders BOTH panes.
   const ptyTabs = listTabs().filter((t) => t.pty).map((t) => ({
     id: t.id,
+    kind: t.kind,
     cwd: t.cwd,
     sessionPath: t.sessionPath,
     title: t.title,
@@ -803,6 +804,7 @@ function emitTabs() {
     const t = getTab(s.id);
     return {
       id: s.id,
+      kind: t?.kind ?? "agent",
       cwd: t?.cwd ?? "",
       sessionPath: t?.sessionPath,
       title: t?.title ?? "",
@@ -1167,7 +1169,7 @@ if (gotSingleInstanceLock) {
   ipcMain.handle("tab:resize", (_e, id: string, cols: number, rows: number) => resizeTab(id, cols, rows));
   ipcMain.handle("tab:list", () => [
     ...listTabs().filter((t) => t.pty).map((t) => ({
-      id: t.id, cwd: t.cwd, sessionPath: t.sessionPath, title: t.title,
+      id: t.id, kind: t.kind, cwd: t.cwd, sessionPath: t.sessionPath, title: t.title,
       isRemote: !!(t.remote || t.wsl),
       isWsl: !!t.wsl,
       wslDistro: t.wsl?.distro,
@@ -1179,6 +1181,7 @@ if (gotSingleInstanceLock) {
       const t = getTab(s.id);
       return {
         id: s.id,
+        kind: t?.kind ?? "agent",
         cwd: t?.cwd ?? "",
         sessionPath: t?.sessionPath,
         title: t?.title ?? "",
@@ -1197,6 +1200,7 @@ if (gotSingleInstanceLock) {
       const t = getTab(s.tabId);
       return {
         id: s.tabId,
+        kind: t?.kind ?? "agent",
         cwd: t?.cwd ?? "",
         sessionPath: t?.sessionPath,
         title: t?.title ?? "",
@@ -1220,15 +1224,19 @@ if (gotSingleInstanceLock) {
         const targetDir = dirPath ?? payload?.rootPath ?? t.wsl.path ?? "~";
         const resolved = resolveWslPath(t.wsl.distro, targetDir);
         const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
-        const cached = getCachedRemoteFileTree(cacheKey);
-        if (cached) return cached;
+        if (!payload?.noCache) {
+          const cached = getCachedRemoteFileTree(cacheKey);
+          if (cached) return cached;
+        }
         return setCachedRemoteFileTree(cacheKey, await wslListFiles(t.wsl.distro, resolved));
       }
       if (t?.remote) {
         const targetDir = dirPath ?? payload?.rootPath ?? t.remoteBrowsePath ?? t.remote.path ?? "~";
         const cacheKey = remoteFileTreeCacheKey(t.remote, targetDir);
-        const cached = getCachedRemoteFileTree(cacheKey);
-        if (cached) return cached;
+        if (!payload?.noCache) {
+          const cached = getCachedRemoteFileTree(cacheKey);
+          if (cached) return cached;
+        }
         return setCachedRemoteFileTree(cacheKey, await remoteListFiles(t.remote, targetDir));
       }
     }
@@ -1249,15 +1257,29 @@ if (gotSingleInstanceLock) {
     return fileTreeIndex.refresh(localTreeKey(root, "."), () => listDirChildren(root, "."));
   });
 
-  /** Lazy local tree: list ONE directory's children (shallow) on expand.
-   *  Local-only — remote/WSL trees navigate via remote.setBrowsePath and
-   *  their own 5s TTL adapters. rootPath is authoritative (local preview
-   *  under a remote ACTIVE tab must still list the local root), mirroring
-   *  file:list. The cache key is root-aware (paths in a listing are
-   *  root-relative) and relative to the project root. */
+  /** List one directory's children for the shared lazy file tree. Local paths
+   *  are root-relative; remote/WSL paths are absolute Linux paths. Each
+   *  adapter returns directories with `children: undefined`, meaning they can
+   *  be expanded in place instead of replacing the current tree root. */
   ipcMain.handle("file:list-dir", async (_e, payload?: { tabId?: string; rootPath?: string; relDir: string; noCache?: boolean }) => {
     const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
-    if (!payload?.rootPath && (t?.remote || t?.wsl)) return [];
+    if (!payload?.rootPath && t?.wsl && payload?.relDir) {
+      const resolved = resolveWslPath(t.wsl.distro, payload.relDir);
+      const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
+      if (!payload?.noCache) {
+        const cached = getCachedRemoteFileTree(cacheKey);
+        if (cached) return cached;
+      }
+      return setCachedRemoteFileTree(cacheKey, await wslListFiles(t.wsl.distro, resolved));
+    }
+    if (!payload?.rootPath && t?.remote && payload?.relDir) {
+      const cacheKey = remoteFileTreeCacheKey(t.remote, payload.relDir);
+      if (!payload?.noCache) {
+        const cached = getCachedRemoteFileTree(cacheKey);
+        if (cached) return cached;
+      }
+      return setCachedRemoteFileTree(cacheKey, await remoteListFiles(t.remote, payload?.relDir));
+    }
     const root = payload?.rootPath ?? t?.cwd;
     if (!root || !payload?.relDir) return [];
     const key = localTreeKey(root, payload.relDir);
@@ -2571,14 +2593,8 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
         name: item.name,
         path: posixPath.join(linuxPath, item.name),
         type: (item.isDirectory() ? "directory" : "file") as "directory" | "file",
-        children: item.isDirectory() ? [] : undefined,
+        children: undefined,
       }));
-      if (linuxPath !== "/") {
-        const parent = posixPath.dirname(linuxPath) || "/";
-        if (parent !== linuxPath) {
-          entries.unshift({ name: "..", path: parent, type: "directory" as const, children: [] });
-        }
-      }
       entries.sort((a, b) => {
         if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
         return a.name.localeCompare(b.name);
@@ -2601,14 +2617,8 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
           name: item.name,
           path: posixPath.join(dir, item.name),
           type: (item.type === "d" ? "directory" : "file") as "directory" | "file",
-          children: item.type === "d" ? [] : undefined,
+          children: undefined,
         }));
-        if (dir !== "/") {
-          const parent = posixPath.dirname(dir) || "/";
-          if (parent !== dir) {
-            entries.unshift({ name: "..", path: parent, type: "directory" as const, children: [] });
-          }
-        }
         return entries;
       });
     } catch (e) {

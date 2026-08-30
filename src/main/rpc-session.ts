@@ -499,6 +499,7 @@ export function createRpcTab(opts: CreateTabOptions): string {
 
   const tab: TabInfo = {
     id,
+    kind: "agent",
     cwd: opts.cwd,
     sessionPath: opts.sessionPath,
     title,

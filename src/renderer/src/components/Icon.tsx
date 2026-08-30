@@ -19,6 +19,7 @@ export type IconName =
   | "penguin"
   | "pencil"
   | "trash"
+  | "terminal"
   | "sun"
   | "moon"
   | "robot"
@@ -93,6 +94,14 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
       <path d="M10 11v6" />
       <path d="M14 11v6" />
+    </>
+  ),
+  // Lucide "square-terminal"
+  terminal: (
+    <>
+      <path d="m7 15 5-3-5-3" />
+      <path d="M12 15h5" />
+      <rect width="20" height="18" x="2" y="3" rx="2" />
     </>
   ),
   // Lucide "sun"

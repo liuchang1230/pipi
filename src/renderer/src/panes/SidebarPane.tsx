@@ -40,12 +40,13 @@ interface SidebarPaneProps {
   onNewLocalProject: () => void;
   onAddRemoteServer: () => void;
   onConnectServer: (server: RemoteServerGroup) => Promise<boolean> | void;
+  onOpenServerTerminal: (server: RemoteServerGroup) => void;
   onAddRemoteProjectForServer: (server: RemoteServerGroup) => void;
   onWslConnect: (distro: string) => void;
   onAddWslProject: (distro: string) => void;
 }
 
-export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemoteServer, onConnectServer, onAddRemoteProjectForServer, onWslConnect, onAddWslProject }: SidebarPaneProps) {
+export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemoteServer, onConnectServer, onOpenServerTerminal, onAddRemoteProjectForServer, onWslConnect, onAddWslProject }: SidebarPaneProps) {
   // --- Tab context (drives active states) ---
   const isRemote = useTabsStore((s) => s.isRemote);
   const cwd = useTabsStore((s) => s.cwd);
@@ -64,7 +65,6 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const setExpanded = useTreeStore((s) => s.setExpanded);
   const fileTreeStatus = useTreeStore((s) => s.fileTreeStatus);
   const fileTreeError = useTreeStore((s) => s.fileTreeError);
-  const navigateRemoteDir = useTreeStore((s) => s.navigateRemoteDir);
 
   // --- Sessions / projects slice ---
   const projects = useSessionsStore((s) => s.projects);
@@ -243,9 +243,12 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
     async (expandPath?: string) => {
       await useTreeStore.getState().refresh();
       if (expandPath) {
+        const absolute = expandPath.startsWith("/");
         const parts = expandPath.split("/").filter(Boolean);
         const ancestors: string[] = [];
-        for (let i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join("/"));
+        for (let i = 1; i < parts.length; i++) {
+          ancestors.push(`${absolute ? "/" : ""}${parts.slice(0, i).join("/")}`);
+        }
         if (ancestors.length) {
           setExpanded((prev) => new Set([...prev, ...ancestors]));
           // Lazy: fetch the newly-expanded ancestors too, or they'd sit on
@@ -425,22 +428,18 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
   // --- Tree rendering ---
   const toggleDir = useCallback((path: string) => {
-    const tabsState = useTabsStore.getState();
-    if (tabsState.isRemote) {
-      void navigateRemoteDir(path);
-    } else {
-      const s = useTreeStore.getState();
-      const willExpand = !s.expanded.has(path);
-      setExpanded((prev) => {
-        const n = new Set(prev);
-        if (n.has(path)) n.delete(path);
-        else n.add(path);
-        return n;
-      });
-      // Lazy: expanding a directory fetches its children on demand.
-      if (willExpand) void useTreeStore.getState().expandDir(path);
-    }
-  }, [navigateRemoteDir, setExpanded]);
+    const s = useTreeStore.getState();
+    const willExpand = !s.expanded.has(path);
+    setExpanded((prev) => {
+      const n = new Set(prev);
+      if (n.has(path)) n.delete(path);
+      else n.add(path);
+      return n;
+    });
+    // One lazy-tree interaction for local, SSH, and WSL projects alike.
+    // The tree store chooses the appropriate filesystem adapter from origin.
+    if (willExpand) void useTreeStore.getState().expandDir(path);
+  }, [setExpanded]);
 
   const renderTree = useCallback((nodes: FileNode[], depth: number): ReactNode => {
     return nodes.map((node) => (
@@ -606,6 +605,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         onNewProjectSession={newProjectSession}
         onAddRemoteServer={onAddRemoteServer}
         onConnectServer={onConnectServer}
+        onOpenServerTerminal={onOpenServerTerminal}
         onAddRemoteProjectForServer={onAddRemoteProjectForServer}
         onOpenSession={openSession}
         onOpenRemoteSession={openRemoteSession}
@@ -750,6 +750,7 @@ interface SidebarProps {
   onNewProjectSession: (project: ProjectGroup) => void;
   onAddRemoteServer: () => void;
   onConnectServer: (server: RemoteServerGroup) => Promise<boolean> | void;
+  onOpenServerTerminal: (server: RemoteServerGroup) => void;
   onAddRemoteProjectForServer: (server: RemoteServerGroup) => void;
   onOpenSession: (session: SessionItem, projectCwd?: string) => void;
   onOpenRemoteSession: (tabId: string, projectCwd: string, session: SessionItem) => void;
@@ -791,6 +792,7 @@ const Sidebar = memo(function Sidebar({
   onNewProjectSession,
   onAddRemoteServer,
   onConnectServer,
+  onOpenServerTerminal,
   onAddRemoteProjectForServer,
   onOpenSession,
   onOpenRemoteSession,
@@ -875,6 +877,7 @@ const Sidebar = memo(function Sidebar({
             onToggleSessionSelect={onToggleSessionSelect}
             onAddServer={onAddRemoteServer}
             onConnectServer={onConnectServer}
+            onOpenServerTerminal={onOpenServerTerminal}
             onAddProjectForServer={onAddRemoteProjectForServer}
           />
           <WslConnectionSection
@@ -1217,6 +1220,7 @@ interface RemoteServerSectionProps {
   onToggleSessionSelect: (path: string) => void;
   onAddServer: () => void;
   onConnectServer: (server: RemoteServerGroup) => Promise<boolean> | void;
+  onOpenServerTerminal: (server: RemoteServerGroup) => void;
   onAddProjectForServer: (server: RemoteServerGroup) => void;
 }
 
@@ -1224,13 +1228,14 @@ interface RemoteServerSectionProps {
  *  project folders hanging beneath it — mirrors the WSL section. The header +
  *  opens the connect dialog; each node's + browses THAT server's directories
  *  (the old picker always targeted the first remote tab, which made a second
- *  server impossible to reach). */
+ *  server impossible to reach). Clicking a connected node toggles its
+ *  projects; the terminal icon opens the raw server shell on demand. */
 const RemoteServerSection = memo(function RemoteServerSection({
   title, titleIcon, emptyText, servers, expandedProjects, projectLoading,
   projectSessionStatus, selectedSessions, activeSessionPath, isProjectActive,
   onToggleProject, onDeleteProject, onNewProjectSession, onOpenRemoteSession,
   onDeleteSession, onSelectAllSessions, onToggleSessionSelect,
-  onAddServer, onConnectServer, onAddProjectForServer,
+  onAddServer, onConnectServer, onOpenServerTerminal, onAddProjectForServer,
 }: RemoteServerSectionProps) {
   const [openServers, setOpenServers] = useState<Set<string>>(new Set());
   const toggleServer = (key: string) => {
@@ -1260,14 +1265,15 @@ const RemoteServerSection = memo(function RemoteServerSection({
               className={`project-row${status === "connected" ? " server-connected" : ""}`}
               onClick={() => {
                 if (status !== "connected") {
-                  // Connect (or reconnect after a failure), then reveal the
-                  // projects once the shell is confirmed alive.
+                  // Connect (or reconnect after a failure) in the background,
+                  // then reveal the projects once the shell is confirmed alive.
+                  // No tab is opened — the SSH handle stays out of the way.
                   const p = onConnectServer(server) as Promise<boolean> | undefined;
                   if (p?.then) void p.then((ok) => { if (ok) toggleServer(server.key); });
                   return;
                 }
-                // Connected: activate the server's shell tab AND toggle the projects.
-                void onConnectServer(server);
+                // Connected: just toggle the projects. The live connection is
+                // a background handle; use the terminal icon to open its shell.
                 toggleServer(server.key);
               }}
               title={status === "connected" ? `${server.label}（点击收起/展开）` : `连接 ${server.label}`}
@@ -1277,7 +1283,13 @@ const RemoteServerSection = memo(function RemoteServerSection({
               <span className="project-name">{server.label}</span>
               {hint && <span className={`server-connect-hint${status === "failed" ? " failed" : status === "connecting" ? " connecting" : ""}`}>{hint}</span>}
               <button
-                className="row-action"
+                className="row-action server-terminal-btn"
+                disabled={status !== "connected" && status !== "connecting"}
+                onClick={(e) => { e.stopPropagation(); onOpenServerTerminal(server); }}
+                title={status === "failed" || status === "disconnected" ? "连接后可用" : `打开 ${server.label} 的远程终端（需密码时在此输入）`}
+              ><Icon name="terminal" /></button>
+              <button
+                className="row-action server-add-btn"
                 onClick={(e) => { e.stopPropagation(); void onAddProjectForServer(server); }}
                 title={`在 ${server.label} 中选择目录创建项目`}
               >+</button>

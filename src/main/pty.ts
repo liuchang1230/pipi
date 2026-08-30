@@ -917,6 +917,8 @@ export interface WslOpts {
 
 export interface TabInfo {
   id: string;
+  /** Explicit presentation/lifecycle classification; callers must not infer it from a title. */
+  kind: "agent" | "connection";
   cwd: string;
   sessionPath?: string;
   title: string;
@@ -1315,6 +1317,7 @@ export function createTab(opts: CreateTabOptions): string {
 
   const tab: TabInfo = {
     id,
+    kind: "agent",
     cwd: opts.cwd,
     sessionPath: opts.sessionPath,
     title,
@@ -1374,6 +1377,7 @@ export function getTab(id: string): TabInfo | undefined {
 export function listTabs(): TabInfo[] {
   return [...tabs.values()].map((t) => ({
     id: t.id,
+    kind: t.kind,
     cwd: t.cwd,
     sessionPath: t.sessionPath,
     title: t.title,
@@ -1629,6 +1633,7 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
 
   const tab: TabInfo = {
     id,
+    kind: "agent",
     cwd: opts.cwd,
     sessionPath: opts.sessionPath,
     title,
@@ -1737,6 +1742,7 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
 
   const tab: TabInfo = {
     id,
+    kind: r.startPi === false ? "connection" : "agent",
     cwd: opts.cwd,
     sessionPath: opts.sessionPath,
     title,

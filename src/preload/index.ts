@@ -19,6 +19,7 @@ export type FileOpResult = { ok: true } | { ok: false; error: string };
 
 export interface TabSummary {
   id: string;
+  kind: "agent" | "connection";
   cwd: string;
   sessionPath?: string;
   title: string;
@@ -203,7 +204,7 @@ const api = {
     download: (url: string): Promise<boolean> => ipcRenderer.invoke("app-update:download", url),
   },
   update: {
-    check: (force?: boolean): Promise<{ current: string | null; latest: string | null; hasUpdate: boolean; error?: string }> =>
+    check: (force?: boolean): Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }> =>
       ipcRenderer.invoke("update:check", force),
     run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
     getExtensionSynced: (): Promise<{ files: string[] }> => ipcRenderer.invoke("update:extensions-synced"),
@@ -288,7 +289,7 @@ const api = {
   file: {
     list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean): Promise<unknown> =>
       ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath, noCache }),
-    /** Lazy local tree: list one directory's children on expand. */
+    /** Lazy tree: list one directory's children on expand (local, SSH, WSL). */
     listDirChildren: (rootPath: string | undefined, tabId: string | undefined, relDir: string, noCache?: boolean): Promise<unknown> =>
       ipcRenderer.invoke("file:list-dir", { rootPath, tabId, relDir, noCache }),
     resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }): Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }> =>

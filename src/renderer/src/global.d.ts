@@ -33,6 +33,7 @@ export type FileOpResult = { ok: true } | { ok: false; error: string };
 
 export interface TabSummary {
   id: string;
+  kind: "agent" | "connection";
   cwd: string;
   sessionPath?: string;
   title: string;
@@ -186,7 +187,7 @@ declare global {
         download: (url: string) => Promise<boolean>;
       };
       update: {
-        check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; hasUpdate: boolean; error?: string }>;
+        check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
         run: () => Promise<{ ok: boolean; output: string; error?: string }>;
         /** App-bundled extensions re-shipped at startup (content changed), pull-once. */
         getExtensionSynced: () => Promise<{ files: string[] }>;
@@ -227,7 +228,7 @@ declare global {
       };
       file: {
         list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean) => Promise<FileNode[]>;
-        /** Lazy local tree: list one directory's children on expand. */
+        /** Lazy tree: list one directory's children on expand (local, SSH, WSL). */
         listDirChildren: (rootPath: string | undefined, tabId: string | undefined, relDir: string, noCache?: boolean) => Promise<FileNode[]>;
         resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }) => Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }>;
         read: (tabId: string | undefined, relPath: string, rootPath?: string, mention?: boolean) => Promise<FileReadResult>;

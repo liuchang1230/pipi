@@ -6,7 +6,7 @@
 // palette from main's COLORFGBG injection, so a running pi only needs a
 // `CSI ?997` nudge when the mode actually flips. (The old effect depended on
 // [theme, tabs] and re-pushed to every running pi on every tab-list change.)
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -26,13 +26,10 @@ interface TerminalViewProps {
   tabId: string;
   theme: "dark" | "light";
   active: boolean;
-  /** While true (connect notice overlay shown) the xterm must not grab
-   *  focus — keystrokes would vanish into a hidden shell underneath. */
-  blockFocus: boolean;
   onResize: (cols: number, rows: number) => void;
 }
 
-function TerminalView({ tabId, theme, active, blockFocus, onResize }: TerminalViewProps) {
+function TerminalView({ tabId, theme, active, onResize }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -237,22 +234,16 @@ function TerminalView({ tabId, theme, active, blockFocus, onResize }: TerminalVi
   // Refocus when THIS tab becomes the active one (switching tabs must hand
   // the keyboard straight back to the terminal, not leave it unfocused).
   // The window-focus listener lives here too so its closure always sees the
-  // CURRENT active value (a stale first-render value would skip refocus).
-  // While the connect-notice overlay is up (blockFocus) keystrokes must
-  // NEVER reach the shell hidden underneath — focus the overlay's button
-  // instead. This also covers switching away and back (the previous tab's
-  // textarea would otherwise keep focus and swallow keystrokes invisibly).
+  // CURRENT active value (a stale first-render value would skip refocus);
+  // switching away and back would otherwise leave the previous tab's
+  // textarea swallowing keystrokes invisibly.
   useEffect(() => {
     if (!active) return;
-    if (blockFocus) {
-      containerRef.current?.closest(".terminal-pane")?.querySelector<HTMLButtonElement>(".connect-notice button")?.focus();
-      return;
-    }
     termRef.current?.focus();
     const onWinFocus = () => termRef.current?.focus();
     window.addEventListener("focus", onWinFocus);
     return () => window.removeEventListener("focus", onWinFocus);
-  }, [active, blockFocus]);
+  }, [active]);
 
   // Update theme without destroying the terminal.
   useEffect(() => {
@@ -268,69 +259,35 @@ interface TerminalHostProps {
   visibleTabs: TabInfo[];
   activeTab: string | null;
   theme: "dark" | "light";
-  /** Connection tabs the user explicitly forced to a terminal view. */
-  forceShell: Set<string>;
-  onForceShell: (id: string) => void;
 }
 
-/** A connection shell tab (startPi:false, "· 连接" title). */
-function isConnectionTab(t: TabInfo): boolean {
-  return !!t.isRemote && !t.isWsl && t.title.endsWith(" · 连接");
-}
-
-function connectionLabel(t: TabInfo): string {
-  return t.remoteUser && t.remoteHost ? `${t.remoteUser}@${t.remoteHost}` : t.title;
-}
-
-/** "Connected" landing page: the user connected a server but hasn't picked a
- *  project yet — show a hint instead of dropping them into a bare shell. The
- *  terminal stays mounted underneath; the button lifts this overlay. */
-function ConnectNotice({ tab, onOpenTerminal }: { tab: TabInfo; onOpenTerminal: () => void }) {
-  return (
-    <div className="connect-notice">
-      <div className="connect-notice-title">✓ 已连接到 {connectionLabel(tab)}</div>
-      <div className="connect-notice-sub">从左侧选择项目开始远程编程，或点击服务器右侧 + 添加项目目录。</div>
-      <div className="connect-notice-actions">
-        <button className="btn" autoFocus onClick={onOpenTerminal}>打开服务器终端</button>
-      </div>
-    </div>
-  );
-}
-
-const TerminalHost = memo(function TerminalHost({ visibleTabs, activeTab, theme, forceShell, onForceShell }: TerminalHostProps) {
+const TerminalHost = memo(function TerminalHost({ visibleTabs, activeTab, theme }: TerminalHostProps) {
+  // A tab is "painted" when it is the active one. All tabs stay mounted
+  // (hidden ones too) — a connection tab's terminal is the SSH pty, so it
+  // must never unmount or the remote disconnects. Only the active tab is
+  // visible; when nothing is active (e.g. the first connect left only a
+  // background connection tab) show a hint overlay instead of a blank pane.
+  const activeShown = visibleTabs.some((t) => t.id === activeTab);
   return (
     <div className="terminal-wrap">
-      {visibleTabs.length === 0 ? (
-        <div className="placeholder">从左侧选择一个会话开始</div>
-      ) : (
-        visibleTabs.map((tab) => {
-          const active = tab.id === activeTab;
-          // A confirmed connection lands on a notice page instead of a bare
-          // shell. The terminal STAYS mounted underneath (history intact —
-          // "打开服务器终端" just lifts the overlay). While still connecting
-          // (or waiting at a password prompt) the terminal is the surface
-          // you interact with, so no overlay yet. Failed connection tabs are
-          // removed by main immediately (tab:exit → registry delete), so the
-          // failure is reported by toast/sidebar, not a lingering page.
-          const showNotice = isConnectionTab(tab) && tab.sshState === "ready" && !forceShell.has(tab.id);
-          return (
-            <div key={tab.id} className={`terminal-pane${active ? " active" : " hidden"}`}>
-              {tab.mode === "rpc" || tab.mode === "sdk" ? (
-                <ChatView tabId={tab.id} active={active} />
-              ) : (
-                <TerminalView
-                  tabId={tab.id}
-                  theme={theme}
-                  active={active}
-                  blockFocus={showNotice}
-                  onResize={(cols, rows) => window.api.tab.resize(tab.id, cols, rows)}
-                />
-              )}
-              {showNotice && <ConnectNotice tab={tab} onOpenTerminal={() => onForceShell(tab.id)} />}
-            </div>
-          );
-        })
-      )}
+      {visibleTabs.map((tab) => {
+        const active = tab.id === activeTab;
+        return (
+          <div key={tab.id} className={`terminal-pane${active ? " active" : " hidden"}`}>
+            {tab.mode === "rpc" || tab.mode === "sdk" ? (
+              <ChatView tabId={tab.id} active={active} />
+            ) : (
+              <TerminalView
+                tabId={tab.id}
+                theme={theme}
+                active={active}
+                onResize={(cols, rows) => window.api.tab.resize(tab.id, cols, rows)}
+              />
+            )}
+          </div>
+        );
+      })}
+      {!activeShown && <div className="terminal-empty">从左侧连接服务器/选择项目，开始远程编程</div>}
     </div>
   );
 });
@@ -345,6 +302,8 @@ interface TabBarProps {
 }
 
 const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onCloseTab, onShowRemote, onShowModels }: TabBarProps) {
+  // Connection tabs are live SSH terminals. They remain visible so a pending
+  // password/keyboard-interactive prompt always has an accessible input surface.
   const active = visibleTabs.find((t) => t.id === activeTab);
   // A pty-backed pi tab can switch to the chat view (local → in-process SDK,
   // remote/WSL → RPC). Chat-backed tabs (rpc/sdk) are already in the chat view.
@@ -412,30 +371,6 @@ export function TerminalPane({
   const activeTab = useTabsStore((s) => s.activeTab);
   const closeTab = useTabsStore((s) => s.closeTab);
   const selectTab = useTabsStore((s) => s.selectTab);
-  // Connection tabs the user explicitly asked to see as a terminal.
-  const [forceShell, setForceShell] = useState<Set<string>>(() => new Set());
-  const forceShellTab = useCallback((id: string) => {
-    setForceShell((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
-  }, []);
-  // Prune closed tabs so the set never grows unboundedly across connections.
-  const handleCloseTab = useCallback((id: string) => {
-    setForceShell((prev) => (prev.has(id) ? new Set([...prev].filter((x) => x !== id)) : prev));
-    void closeTab(id);
-  }, [closeTab]);
-  // Main can drop tabs without the close handler (failed connections exit
-  // and are removed from the registry) — prune those ids too.
-  useEffect(() => {
-    setForceShell((prev) => {
-      if (prev.size === 0) return prev;
-      const alive = new Set(tabs.map((t) => t.id));
-      const next = new Set([...prev].filter((id) => alive.has(id)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [tabs]);
-
-  // All tabs render, including connection-only shell tabs (startPi:false,
-  // "· 连接"): a connected server must be visible and switchable. The sidebar
-  // 远程服务器 section is the other handle onto these shells.
 
   // Live color-scheme push on mode flip only (deps [theme], tabs read
   // non-reactively). See file header for why the old [theme, tabs] dep was
@@ -455,17 +390,11 @@ export function TerminalPane({
         visibleTabs={tabs}
         activeTab={activeTab}
         onSelectTab={(id) => void selectTab(id)}
-        onCloseTab={handleCloseTab}
+        onCloseTab={(id) => void closeTab(id)}
         onShowRemote={onShowRemote}
         onShowModels={onShowModels}
       />
-      <TerminalHost
-        visibleTabs={tabs}
-        activeTab={activeTab}
-        theme={theme}
-        forceShell={forceShell}
-        onForceShell={forceShellTab}
-      />
+      <TerminalHost visibleTabs={tabs} activeTab={activeTab} theme={theme} />
     </main>
   );
 }
