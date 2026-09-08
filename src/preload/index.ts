@@ -28,6 +28,8 @@ export interface TabSummary {
   remoteHost?: string;
   remoteUser?: string;
   remotePort?: number;
+  /** Remote profile's agentDir override (model-sync scoping / history keys). */
+  remoteAgentDir?: string;
   /** Whether this tab runs the pi TUI (local tabs always; remote unless startPi:false). */
   pi: boolean;
   isWsl?: boolean;
@@ -182,9 +184,9 @@ const api = {
     return () => ipcRenderer.removeListener(channel, handler);
   },
   /** RPC chat: pi process exited. */
-  onRpcExit: (id: string, callback: (code: number) => void): (() => void) => {
+  onRpcExit: (id: string, callback: (info: { code: number; stderr?: string }) => void): (() => void) => {
     const channel = `tab:rpc-exit:${id}`;
-    const handler = (_e: Electron.IpcRendererEvent, code: number) => callback(code);
+    const handler = (_e: Electron.IpcRendererEvent, info: { code: number; stderr?: string }) => callback(info);
     ipcRenderer.on(channel, handler);
     return () => ipcRenderer.removeListener(channel, handler);
   },
@@ -206,6 +208,9 @@ const api = {
   update: {
     check: (force?: boolean): Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }> =>
       ipcRenderer.invoke("update:check", force),
+    checkTarget: (tabId: string): Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }> =>
+      ipcRenderer.invoke("update:check-target", tabId),
+    runTarget: (tabId: string): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run-target", tabId),
     run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
     getExtensionSynced: (): Promise<{ files: string[] }> => ipcRenderer.invoke("update:extensions-synced"),
   },
@@ -307,6 +312,9 @@ const api = {
       ipcRenderer.invoke("file:delete", { tabId, relPath, rootPath }),
     rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string): Promise<FileOpResult> =>
       ipcRenderer.invoke("file:rename", { tabId, relPath, newName, rootPath }),
+    /** Reveal a LOCAL file/folder in the OS file explorer (tree right-click). */
+    reveal: (input: { tabId?: string; rootPath?: string; relPath: string }): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:reveal", input),
   },
   onAutoFollow: (callback: (ev: { path: string; kind: "read" | "write"; tabId?: string }) => void): (() => void) => {
     const handler = (_e: Electron.IpcRendererEvent, ev: { path: string; kind: "read" | "write"; tabId?: string }) => callback(ev);
@@ -320,9 +328,9 @@ const api = {
   },
 
   settings: {
-    get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean } }> =>
+    get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; onboarding?: { seenAt?: number; completedAt?: number } }> =>
       ipcRenderer.invoke("settings:get"),
-    set: (patch: { autoFollow?: { enabled?: boolean; followReads?: boolean } }): Promise<{ autoFollow: { enabled: boolean; followReads: boolean } }> =>
+    set: (patch: { autoFollow?: { enabled?: boolean; followReads?: boolean }; onboarding?: { seenAt?: number; completedAt?: number } }): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; onboarding?: { seenAt?: number; completedAt?: number } }> =>
       ipcRenderer.invoke("settings:set", patch),
   },
 
@@ -376,8 +384,8 @@ const api = {
       ipcRenderer.invoke("session:delete", { path, tabId }),
     rename: (path: string, name: string): Promise<{ ok: boolean; error?: string }> =>
       ipcRenderer.invoke("session:rename", path, name),
-    onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[] }) => void): (() => void) => {
-      const handler = (_e: Electron.IpcRendererEvent, payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[] }) => callback(payload);
+    onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => void): (() => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => callback(payload);
       ipcRenderer.on("session:remote-updated", handler);
       return () => ipcRenderer.removeListener("session:remote-updated", handler);
     },

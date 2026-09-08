@@ -15,6 +15,15 @@ declare module "@earendil-works/pi-coding-agent" {
       setWorkingIndicator(options?: WorkingIndicatorOptions): void;
       notify(message: string, type?: "info" | "warning" | "error"): Promise<void>;
     };
+    /** Model registry facade: ctx.modelRegistry.refresh() re-reads
+     *  models.json/auth.json into the RUNNING session (used by
+     *  pipi-model-sync; mirrors pi's core ModelRegistry API). */
+    modelRegistry: {
+      refresh(options?: { allowNetwork?: boolean; providers?: readonly string[]; signal?: AbortSignal }): Promise<{
+        aborted: boolean;
+        errors: ReadonlyMap<string, Error>;
+      }>;
+    };
     /** Navigate to a different point in the session tree (TUI /tree action). */
     navigateTree(
       targetId: string,

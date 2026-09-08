@@ -1563,7 +1563,9 @@ function sessionArg(sessionPath: string): string {
   // skip the shell and leave the terminal dead. `;` always falls through to
   // an interactive bash, so quitting pi drops the user into a real terminal.
   return (
-    ` export PIPI_S="$(printf %s '${b64}' | base64 -d 2>/dev/null || printf %s '${b64}' | base64 -D 2>/dev/null)";` +
+    // Same nested SSH quoting constraint as rpc-session.ts: base64 is safe
+    // unquoted, while inner single quotes would terminate `bash -ic '…'`.
+    ` export PIPI_S="$(printf %s ${b64} | base64 -d 2>/dev/null || printf %s ${b64} | base64 -D 2>/dev/null)";` +
     ` pi \${PIPI_S:+--session "$PIPI_S"}; exec bash -i`
   );
 }

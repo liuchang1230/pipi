@@ -35,6 +35,7 @@ export interface RpcTransport {
   readonly stdout: NodeJS.ReadableStream;
   kill(): void;
   onExit(cb: (code: number) => void): void;
+  onStderr(cb: (chunk: string) => void): void;
 }
 
 /** Plain child process with pipes (local node, wsl.exe, ssh.exe). */
@@ -73,6 +74,10 @@ class ChildProcessTransport implements RpcTransport {
   onExit(cb: (code: number) => void): void {
     this.proc.on("exit", (code) => cb(code ?? -1));
   }
+
+  onStderr(cb: (chunk: string) => void): void {
+    this.proc.stderr?.on("data", (chunk: Buffer) => cb(chunk.toString("utf8")));
+  }
 }
 
 /** SSH channel via ssh2 (password auth — ssh.exe cannot prompt in pipes). */
@@ -84,6 +89,14 @@ class Ssh2Transport implements RpcTransport {
   private conn: SshClient;
   private ready = false;
   private exitCb: ((code: number) => void) | null = null;
+  private stderrCb: ((chunk: string) => void) | null = null;
+  private exitReported = false;
+
+  private reportExit(code: number | undefined): void {
+    if (this.exitReported) return;
+    this.exitReported = true;
+    this.exitCb?.(code ?? -1);
+  }
 
   constructor(remote: RemoteOpts, cmd: string, label: string) {
     this.stdin = this.input;
@@ -94,7 +107,7 @@ class Ssh2Transport implements RpcTransport {
       this.conn.exec(cmd, (err, stream) => {
         if (err) {
           console.error(`[rpc] ${label} exec error:`, err.message);
-          this.exitCb?.(-1);
+          this.reportExit(-1);
           return;
         }
         this.input.pipe(stream);
@@ -102,8 +115,12 @@ class Ssh2Transport implements RpcTransport {
         stream.stderr.setEncoding("utf8");
         stream.stderr.on("data", (d: string) => {
           if (d.trim()) console.log(`[rpc:${label}:err] ${d.trimEnd().slice(0, 500)}`);
+          this.stderrCb?.(d);
         });
-        stream.on("close", (code: number | undefined) => this.exitCb?.(code ?? 0));
+        // ssh2 reports the actual remote process status on `exit`; `close`
+        // is only a fallback for channels that disappear before an exit event.
+        stream.once("exit", (code: number | undefined) => this.reportExit(code));
+        stream.once("close", () => this.reportExit(-1));
       });
     });
     // Many servers (PAM configs) authenticate via keyboard-interactive
@@ -118,7 +135,7 @@ class Ssh2Transport implements RpcTransport {
     });
     this.conn.on("error", (err) => {
       console.error(`[rpc] ${label} ssh error:`, err.message);
-      this.exitCb?.(-1);
+      this.reportExit(-1);
     });
     this.conn.connect({
       host: remote.host,
@@ -143,6 +160,10 @@ class Ssh2Transport implements RpcTransport {
 
   onExit(cb: (code: number) => void): void {
     this.exitCb = cb;
+  }
+
+  onStderr(cb: (chunk: string) => void): void {
+    this.stderrCb = cb;
   }
 }
 
@@ -219,8 +240,11 @@ function cdArg(p: string): string {
 function sessionArg(sessionPath: string): string {
   const b64 = Buffer.from(sessionPath, "utf8").toString("base64");
   return (
-    ` export PIPI_S="$(printf %s '${b64}' | base64 -d 2>/dev/null || printf %s '${b64}' | base64 -D 2>/dev/null)";` +
-    ` pi --mode rpc \${PIPI_S:+--session "$PIPI_S"}; true`
+    // This string is nested in `bash -ic '…'` for SSH. Base64 has no shell
+    // metacharacters, so leave it unquoted: inner single quotes would close
+    // the outer command and make every resumed SSH session exit immediately.
+    ` export PIPI_S="$(printf %s ${b64} | base64 -d 2>/dev/null || printf %s ${b64} | base64 -D 2>/dev/null)";` +
+    ` pi --mode rpc \${PIPI_S:+--session "$PIPI_S"}`
   );
 }
 
@@ -268,6 +292,8 @@ export class RpcSession {
   /** Zero-output watchdog state (see constructor). */
   private sawOutput = false;
   private noOutputTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Last stderr from the remote pi (kept bounded for the exit banner). */
+  private lastStderr = "";
   /** Non-JSONL bytes received (e.g. a .bashrc echo or "command not found")
    *  — kept for the stalled-connection diagnosis. */
   private junkLines: string[] = [];
@@ -284,9 +310,11 @@ export class RpcSession {
         ? sessionArg(wslSessionToLinux(opts.wsl.distro, opts.sessionPath))
         : "pi --mode rpc";
       const wslBin = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "wsl.exe");
+      const wslCmd = `cd ${cdArg(opts.wsl.path || "~")} && ${inner}`;
+      debugLog("rpc", `tab ${id} CMD wsl=${opts.wsl.distro} ${JSON.stringify(wslCmd)}`);
       this.transport = new ChildProcessTransport(
         existsSync(wslBin) ? wslBin : "wsl.exe",
-        ["-d", opts.wsl.distro, "--", "bash", "-ic", `cd ${cdArg(opts.wsl.path || "~")} && ${inner}`],
+        ["-d", opts.wsl.distro, "--", "bash", "-ic", wslCmd],
         process.cwd(),
         label
       );
@@ -297,6 +325,7 @@ export class RpcSession {
       const agentDirEnv = r.agentDir ? `export PI_CODING_AGENT_DIR=${r.agentDir}; ` : "";
       const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : "pi --mode rpc";
       const remoteCmd = `cd ${cdArg(r.path || "~")} && bash -ic '${agentDirEnv}${inner}'`;
+      debugLog("rpc", `tab ${id} CMD ssh=${r.user}@${r.host} ${JSON.stringify(remoteCmd)}`);
       if (r.password) {
         this.transport = new Ssh2Transport(r, remoteCmd, label);
       } else {
@@ -340,12 +369,16 @@ export class RpcSession {
     });
     this.transport.onExit((code) => {
       console.log(`[rpc] tab ${id} exited: ${code}`);
-      debugLog("rpc", `tab ${id} EXIT ${code}`);
+      debugLog("rpc", `tab ${id} EXIT ${code} stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-600))}`);
       if (this.noOutputTimer) {
         clearTimeout(this.noOutputTimer);
         this.noOutputTimer = null;
       }
       this.emitExit(code);
+    });
+    this.transport.onStderr((chunk) => {
+      if (!chunk.trim()) return;
+      this.lastStderr = (this.lastStderr + chunk).slice(-4000);
     });
     // Zero-output watchdog: a password remote whose auth/exec stalls (wrong
     // password hangs in ssh2, bash -ic blocks on a slow .bashrc, pi missing)
@@ -355,8 +388,9 @@ export class RpcSession {
       this.noOutputTimer = null;
       if (this.exited || this.sawOutput) return;
       console.error(`[rpc] tab ${id} produced no output in 40s — auth/exec stalled`);
-      debugLog("rpc", `tab ${id} NO-OUTPUT-40s`);
-      forwardEvent(id, { type: "rpc_no_output", seconds: 40 });
+      const stderrTail = this.lastStderr.trimEnd().slice(-400);
+      debugLog("rpc", `tab ${id} NO-OUTPUT-40s stderr=${JSON.stringify(stderrTail)}`);
+      forwardEvent(id, { type: "rpc_no_output", seconds: 40, stderr: stderrTail });
     }, 40000);
     // Stalled-connection diagnosis: bytes ARE flowing but pi never answers
     // (login shell stuck in .bashrc under pipes, or pi booted into an
@@ -450,7 +484,7 @@ export class RpcSession {
     if (this.exited) return;
     this.exited = true;
     for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(`tab:rpc-exit:${this.id}`, code);
+      win.webContents.send(`tab:rpc-exit:${this.id}`, { code, stderr: this.lastStderr.trimEnd().slice(-2000) });
     }
   }
 }

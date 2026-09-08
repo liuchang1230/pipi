@@ -25,6 +25,10 @@ export interface TabInfo {
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
+  /** Present for WSL tabs: main's listTabs ships the pty TabInfo.wsl object
+   *  ({distro, path}) across IPC; used to distinguish WSL (locally revealable
+   *  via \\wsl$ UNC) from SSH remote origins. */
+  wsl?: { distro: string; path?: string };
   /** rpc = headless ChatPane (remote/WSL); sdk = in-process ChatPane (local);
    *  pty/undefined = terminal view. */
   mode?: "rpc" | "sdk" | "pty";

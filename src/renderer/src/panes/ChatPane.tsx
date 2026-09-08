@@ -30,6 +30,7 @@ import { SkillChips } from "../components/SkillChips";
 import { FileMentionMenu } from "../components/FileMentionMenu";
 import { Icon } from "../components/Icon";
 import { fileMentionPaths, fileMentionTokenAt, filterFileMentions, replaceFileMention, type FileMention } from "../file-mentions";
+import { modelSyncAppliesTo } from "../model-sync";
 
 /** "65" → "1m 5s" (running-time display). */
 function fmtElapsed(s: number): string {
@@ -306,9 +307,11 @@ function ChatNotices() {
           <span className="chat-notice-text">
             {piUpdating
               ? "正在更新 pi agent 和扩展包…"
-              : updateInfo.latest
-                ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
-                : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
+              : updateInfo.targetLabel
+                ? `${updateInfo.targetLabel} pi agent 版本（${updateInfo.current ?? "?"}）与应用配套版本（${updateInfo.latest ?? "?"}）不一致；更新将对齐版本并同步扩展包`
+                : updateInfo.latest
+                  ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
+                  : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
           </span>
           <button
             className="btn btn-primary chat-notice-btn"
@@ -347,7 +350,7 @@ const HIDDEN_TIMELINE = {
   lastError: undefined as string | undefined,
 };
 
-const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut }: { tabId: string; bootTimedOut: boolean }) {
+const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeoutDetail }: { tabId: string; bootTimedOut: boolean; bootTimeoutDetail?: string | null }) {
   const timeline = useChatStore(useShallow((s) => {
     const st = s.states[tabId];
     // Zustand selectors must return a stable snapshot while the async session
@@ -414,7 +417,12 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut }: { tabId
       if (e.deltaY < 0 && e.currentTarget.scrollTop < 80) revealOlder();
     }}>
       {!timeline.booted && !bootTimedOut && <div className="chat-placeholder">{timeline.bootStage === "connecting" ? "正在连接远程 Pi…" : "正在启动 Pi…"}</div>}
-      {!timeline.booted && bootTimedOut && <div className="chat-error-banner">pi 启动超时（远程服务器可能未安装 pi，或连接失败）。可切换到终端视图排查。</div>}
+      {!timeline.booted && bootTimedOut && (
+        <div className="chat-error-banner">
+          pi 启动超时（远程服务器可能未安装 pi，或连接失败）。可切换到终端视图排查。
+          {bootTimeoutDetail && <div className="chat-error-detail">远程输出：{bootTimeoutDetail}</div>}
+        </div>
+      )}
       {messages.length === 0 && timeline.booted && <div className="chat-placeholder">输入问题开始对话（鼠标可直接点击、选中、编辑输入内容）</div>}
       {hiddenCount > 0 && <div className="chat-load-older" onClick={revealOlder}>↑ 更早的消息已折叠（还有 {hiddenCount} 条）— 点击或滚动到顶部加载</div>}
       {visibleMessages.map((message) => <MessageView key={message.id} message={message} />)}
@@ -536,6 +544,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   }, []);
   const [treeOpen, setTreeOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
+  const [bootTimeoutDetail, setBootTimeoutDetail] = useState<string | null>(null);
   const [completionVisible, setCompletionVisible] = useState(false);
   const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [stats, setStats] = useState<{ tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; context?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | null>(null);
@@ -696,7 +705,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         // (auth hang / .bashrc block / pi missing) — same conclusion as the
         // 30s boot timer, but definitive and earlier.
         const st = useChatStore.getState().states[tabId];
-        if (!st?.booted && !st?.exited) setBootTimedOut(true);
+        if (!st?.booted && !st?.exited) {
+          setBootTimedOut(true);
+          setBootTimeoutDetail(((event as { stderr?: string }).stderr ?? "").trim() || null);
+        }
         return;
       }
       if (event.type === "response" && event.command === "get_available_models") {
@@ -789,7 +801,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       }
       useChatStore.getState().applyEvent(tabId, event);
     });
-    const offExit = window.api.onRpcExit(tabId, (code) => useChatStore.getState().markExited(tabId, code));
+    const offExit = window.api.onRpcExit(tabId, (info) => useChatStore.getState().markExited(tabId, info));
     const offUi = window.api.onRpcUiRequest(tabId, (raw) => {
       const req = raw as unknown as UiRequest;
       const consumed = handleFireAndForget(req, (text) => {
@@ -860,6 +872,87 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       void window.api.tab.rpcSend(tabId, { type: "get_messages" });
     }
   }, [active, tabId]);
+
+  // Model config hot-sync: the ModelConfigDialog bumps modelConfigSavedAt
+  // (with a target payload) after saving ~/.pi/agent/models.json (locally or
+  // via SFTP). Running pi processes never re-read those files on their own
+  // (even pi's /reload doesn't refresh the model registry), so this invokes
+  // the shipped pipi-model-sync extension command — ctx.modelRegistry.refresh()
+  // inside the live session. The prompt is gated on get_commands (an unknown
+  // slash command would leak into the transcript as a user message); the
+  // prompt's own response frame is the completion signal (extension commands
+  // never start an agent run, so there is no agent_settled to await).
+  // After completion the two header caches are dropped and re-fetched.
+  const modelConfigSavedAt = useUiStore((s) => s.modelConfigSavedAt);
+  const modelConfigTarget = useUiStore((s) => s.modelConfigTarget);
+  const seenModelSaveRef = useRef(modelConfigSavedAt);
+  useEffect(() => {
+    if (modelConfigSavedAt === seenModelSaveRef.current) return;
+    seenModelSaveRef.current = modelConfigSavedAt;
+    const target = modelConfigTarget;
+    const tab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
+    // Scope the sync to tabs the save actually applies to (pure predicate in
+    // model-sync.ts: local saves reach SDK + local-rpc chat tabs; remote/WSL
+    // saves reach tabs on exactly that profile).
+    if (!modelSyncAppliesTo(target, tab)) return;
+    // Listener + fallback timer live in the effect scope so cleanup reaps
+    // both even when the save supersedes an in-flight handshake.
+    let cancelled = false;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    let offResp: (() => void) | null = null;
+    const settle = () => {
+      if (cancelled) return;
+      cancelled = true;
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = null;
+      offResp?.();
+      offResp = null;
+      setModelList([]);
+      setThinkingLevels([]);
+      void window.api.tab.rpcSend(tabId, { type: "get_available_models" });
+    };
+    void (async () => {
+      try {
+        // Does this session know the shipped extension command?
+        const cmds = await window.api.tab.rpcRequest(tabId, { type: "get_commands" }, 10000);
+        if (cancelled) return;
+        const known = cmds.success && Array.isArray((cmds.data as { commands?: Array<{ name?: unknown }> } | undefined)?.commands)
+          && ((cmds.data as { commands: Array<{ name?: unknown }> }).commands.some((c) => c?.name === "pipi-model-sync"));
+        if (!known) return; // old pi / extension not synced yet — next session restart picks the config up from disk
+        // Invoke it. The prompt response arrives the moment the extension
+        // handler finishes; keep the menu cache dirty until then.
+        const reqId = `sync-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        offResp = window.api.onRpcEvent(tabId, (event) => {
+          if (event.type !== "response" || event.id !== reqId) return;
+          // Success OR an explicit error response both mean the command
+          // dispatch has finished — refresh the menu either way.
+          settle();
+        });
+        const sent = await window.api.tab.rpcSend(tabId, { type: "prompt", message: "/pipi-model-sync", expandPromptTemplates: true, id: reqId });
+        if (cancelled) return;
+        if (!sent) {
+          // Session gone — drop the listener quietly.
+          cancelled = true;
+          offResp?.();
+          offResp = null;
+          return;
+        }
+        // No response within the window: treat as settled anyway so a long
+        // turn can't leave the menu stale — a fresh get_available_models is
+        // harmless against the same snapshot.
+        settleTimer = setTimeout(settle, 15000);
+      } catch {
+        /* rpcRequest can only resolve; this path is belt-and-braces */
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = null;
+      offResp?.();
+      offResp = null;
+    };
+  }, [modelConfigSavedAt, modelConfigTarget, tabId]);
 
   useEffect(() => {
     // credentials, …), stop the spinner after 30s and point at the fallback.
@@ -1645,7 +1738,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
 
       <ChatNotices />
 
-      <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} />
+      <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} bootTimeoutDetail={bootTimeoutDetail} />
 
       {exited && (
         <div className="chat-exited-bar">

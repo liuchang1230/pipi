@@ -18,6 +18,7 @@ import type SftpClient from "ssh2-sftp-client";
 import { remoteAgentDir } from "./pty";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
+import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
 
 const EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
 
@@ -29,6 +30,7 @@ export interface ShippedExtension {
 export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-static-indicator.ts", content: staticIndicatorSource },
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
+  { fileName: "pipi-model-sync.ts", content: modelSyncSource },
 ];
 
 /**

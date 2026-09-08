@@ -25,6 +25,7 @@ import { TerminalPane } from "./panes/TerminalPane";
 import { ViewerPane } from "./panes/ViewerPane";
 import { ModelConfigDialog } from "./dialogs/ModelConfigDialog";
 import { PiInstallDialog } from "./dialogs/PiInstallDialog";
+import { OnboardingDialog } from "./dialogs/OnboardingDialog";
 import { RemoteDialog } from "./dialogs/RemoteDialog";
 import { RemoteDirPicker } from "./dialogs/RemoteDirPicker";
 import { useTabsStore } from "./stores/tabsStore";
@@ -114,9 +115,11 @@ function UpdateBanner() {
           <span>
             {piUpdating
               ? "正在更新 pi agent 和扩展包…"
-              : updateInfo.latest
-                ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
-                : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
+              : updateInfo.targetLabel
+                ? `${updateInfo.targetLabel} pi agent 版本（${updateInfo.current ?? "?"}）与应用配套版本（${updateInfo.latest ?? "?"}）不一致；更新将对齐版本并同步扩展包`
+                : updateInfo.latest
+                  ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
+                  : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
           </span>
           <button
             className="btn btn-primary update-banner-btn"
@@ -150,8 +153,12 @@ export default function App() {
   // --- Dialog open flags (dialogs own their state internally) -------------
   const [showModelConfig, setShowModelConfig] = useState(false);
   const [showRemote, setShowRemote] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const [showRemotePicker, setShowRemotePicker] = useState(false);
   const pickerTabRef = useRef<string | null>(null);
+  /** Remote pi probe errors shown once per tab per session (no toast spam on
+   *  repeated tab switches while the probe result is cached). */
+  const probeErrorShownRef = useRef<Set<string>>(new Set());
 
   // --- Activation bookkeeping (refs mirror the store for the stable handler) ---
   const activeTabRef = useRef<string | null>(null);
@@ -162,7 +169,16 @@ export default function App() {
   useEffect(() => {
     // Initial catalog load: the sidebar project list and the remote-history
     // dropdown must be populated at start.
-    void useSessionsStore.getState().refreshProjects();
+    void (async () => {
+      const [settings] = await Promise.all([
+        window.api.settings.get().catch(() => null),
+        useSessionsStore.getState().refreshProjects(),
+      ]);
+      if (!settings?.onboarding?.seenAt && useSessionsStore.getState().projects.length === 0) {
+        setShowOnboarding(true);
+        void window.api.settings.set({ onboarding: { seenAt: Date.now() } }).catch(() => {});
+      }
+    })();
     window.api.remote.listHistory().then((list) => useSessionsStore.getState().setRemoteHistory(list)).catch(() => {});
     // Update notices (chat page + global banner share uiStore):
     // 1) pi itself / its extension packages have a newer version;
@@ -173,9 +189,13 @@ export default function App() {
       }
     }).catch(() => {});
     window.api.update.check().then((r) => {
+      const tabsState = useTabsStore.getState();
+      const active = tabsState.tabs.find((t) => t.id === tabsState.activeTab);
+      // A slow startup-local check must never replace a notice for a remote
+      // execution target selected while the check was in flight. When tabs
+      // already exist but activeTab is not hydrated yet, defer to onActiveTab.
+      if (active?.isRemote || (tabsState.tabs.length > 0 && !active)) return;
       if (r.hasUpdate) {
-        // A fresh detection replaces any stale previous result (e.g. an old
-        // undismissed success/failure notice) with the new offer.
         useUiStore.getState().setUpdateResult(null);
         useUiStore.getState().setUpdateInfo({ current: r.current, latest: r.latest, extensions: r.extensions ?? [] });
       }
@@ -186,6 +206,32 @@ export default function App() {
     const offTabs = window.api.onTabsUpdate((list) => useTabsStore.setState({ tabs: list }));
     const offActive = window.api.onActiveTab(async ({ id, cwd: c, isRemote: r, sessions: payloadSessions }) => {
       const prevActive = activeTabRef.current;
+      if (!id) {
+        useUiStore.getState().setUpdateInfo(null);
+      } else if (r) {
+        useUiStore.getState().setUpdateInfo(null);
+        useUiStore.getState().setUpdateResult(null);
+        window.api.update.checkTarget(id).then((info) => {
+          if (activeTabRef.current !== id) return;
+          if (info.hasUpdate) {
+            useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions ?? [], targetLabel: info.target.label, targetTabId: id });
+            return;
+          }
+          // The remote pi probe failed (missing pi / runtime too old / …):
+          // surface the reason once per tab instead of failing silently.
+          if (info.error && !probeErrorShownRef.current.has(id)) {
+            probeErrorShownRef.current.add(id);
+            useUiStore.getState().showToast(`${info.target.label}：${info.error}`, "err");
+          }
+        }).catch(() => {});
+      } else if (id && !r) {
+        useUiStore.getState().setUpdateInfo(null);
+        useUiStore.getState().setUpdateResult(null);
+        window.api.update.check().then((info) => {
+          if (activeTabRef.current !== id || !info.hasUpdate) return;
+          useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions });
+        }).catch(() => {});
+      }
       activeTabRef.current = id;
       if (!id) {
         // Apply the cleared state atomically: one render pass instead of six
@@ -259,11 +305,21 @@ export default function App() {
   }, []);
 
   // --- Local project: native dir picker → project + tab --------------------
-  const handleSelectDir = useCallback(async () => {
+  const handleSelectDir = useCallback(async (): Promise<boolean> => {
     const dir = await window.api.selectDir();
-    if (!dir) return;
+    if (!dir) return false;
     await useSessionsStore.getState().addLocalProject(dir);
     await window.api.tab.create({ cwd: dir });
+    return true;
+  }, []);
+
+  const skipOnboarding = useCallback(() => {
+    setShowOnboarding(false);
+  }, []);
+
+  const completeOnboarding = useCallback(() => {
+    setShowOnboarding(false);
+    void window.api.settings.set({ onboarding: { completedAt: Date.now() } }).catch(() => {});
   }, []);
 
   // Native menu commands share the same deep actions as the in-page controls,
@@ -486,6 +542,14 @@ export default function App() {
 
       <ViewerPane />
 
+      <OnboardingDialog
+        open={showOnboarding}
+        onConfigureModel={() => setShowModelConfig(true)}
+        onAddLocalProject={handleSelectDir}
+        onConnectRemote={() => setShowRemote(true)}
+        onSkip={skipOnboarding}
+        onComplete={completeOnboarding}
+      />
       {showModelConfig && <ModelConfigDialog onClose={() => setShowModelConfig(false)} />}
       {/* /settings from chat opens the model config dialog via uiStore. */}
       {useUiStore((s) => s.appDialog) === "model-config" && <ModelConfigDialog onClose={() => useUiStore.getState().closeAppDialog()} />}

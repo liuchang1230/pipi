@@ -42,8 +42,12 @@ export interface TabSummary {
   remoteHost?: string;
   remoteUser?: string;
   remotePort?: number;
+  /** Remote profile's agentDir override (model-sync scoping / history keys). */
+  remoteAgentDir?: string;
   /** Whether this tab runs the pi TUI (local tabs always; remote unless startPi:false). */
   pi: boolean;
+  /** WSL tabs: {distro, path} from main's TabInfo.wsl. */
+  wsl?: { distro: string; path?: string };
   /** rpc = headless ChatPane (local tabs); pty = terminal view. */
   mode?: "rpc" | "sdk" | "pty";
   /** Connection shell tabs only: "ready" after the remote shell confirmed,
@@ -138,6 +142,7 @@ export interface AutoFollowSettings {
 
 export interface AppSettings {
   autoFollow: AutoFollowSettings;
+  onboarding?: { seenAt?: number; completedAt?: number };
 }
 
 declare global {
@@ -177,7 +182,7 @@ declare global {
       /** RPC chat: parsed pi events (message_update, tool_execution_*, …). */
       onRpcEvent: (id: string, callback: (event: Record<string, unknown>) => void) => () => void;
       /** RPC chat: pi process exited. */
-      onRpcExit: (id: string, callback: (code: number) => void) => () => void;
+      onRpcExit: (id: string, callback: (info: { code: number; stderr?: string }) => void) => () => void;
       /** RPC chat: extension UI dialog request (select/confirm/input/editor). */
       onRpcUiRequest: (id: string, callback: (req: Record<string, unknown>) => void) => () => void;
       /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
@@ -188,6 +193,8 @@ declare global {
       };
       update: {
         check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
+        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
+        runTarget: (tabId: string) => Promise<{ ok: boolean; output: string; error?: string }>;
         run: () => Promise<{ ok: boolean; output: string; error?: string }>;
         /** App-bundled extensions re-shipped at startup (content changed), pull-once. */
         getExtensionSynced: () => Promise<{ files: string[] }>;
@@ -237,6 +244,8 @@ declare global {
         mkdir: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
         delete: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
         rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string) => Promise<FileOpResult>;
+        /** Reveal a LOCAL file/folder in the OS file explorer (tree right-click). */
+        reveal: (input: { tabId?: string; rootPath?: string; relPath: string }) => Promise<FileOpResult>;
       };
       onAutoFollow: (callback: (ev: AutoFollowEvent) => void) => () => void;
       onAutoFollowStatus: (callback: (status: AutoFollowStatus) => void) => () => void;
@@ -257,7 +266,7 @@ declare global {
         listRemote: (tabId: string, remoteCwd?: string) => Promise<RemoteSessionListResult>;
         delete: (path: string, tabId?: string) => Promise<{ ok: boolean; error?: string }>;
         rename: (path: string, name: string) => Promise<{ ok: boolean; error?: string }>;
-        onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[] }) => void) => () => void;
+        onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => void) => () => void;
         onLocalUpdated: (callback: (payload: { cwd: string; sessions: SessionListItem[] }) => void) => () => void;
         setRemoteHydrationPaused: (tabId: string, remoteCwd: string, paused: boolean) => Promise<boolean>;
         prioritizeRemote: (tabId: string, remoteCwd: string, priority?: number) => Promise<boolean>;

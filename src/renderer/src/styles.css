@@ -857,6 +857,13 @@ html, body, #root {
   transition: background 0.12s ease, color 0.12s ease;
 }
 .tab-remote-icon { display: inline-flex; }
+/* Compact glance-only tab state: all truth already comes from TabInfo. */
+.tab-connection-state { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); flex: 0 0 auto; }
+.tab-connection-state.ready { background: var(--success); }
+.tab-connection-state.failed { background: var(--danger); }
+.tab-connection-state.connecting { background: var(--accent); animation: tab-connection-pulse 1.2s ease-in-out infinite; }
+@keyframes tab-connection-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .tab-connection-state.connecting { animation: none; } }
 .tab:hover { background: var(--hover); }
 .tab.active {
   color: var(--text);
@@ -1486,6 +1493,27 @@ textarea:focus-visible,
 .btn-primary:hover { background: rgba(137, 180, 250, 0.25); }
 .btn-primary:disabled { opacity: 0.35; }
 
+/* --- First-run guide --- */
+.onboarding-overlay { z-index: 90; }
+.onboarding-dialog { width: 500px; }
+.onboarding-topline { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.onboarding-brand { color: var(--accent); font-size: 15px; font-weight: 700; letter-spacing: .04em; }
+.onboarding-skip, .onboarding-text-action { border: 0; background: none; color: var(--text-dim); cursor: pointer; font-size: 12px; }
+.onboarding-skip:hover, .onboarding-text-action:hover { color: var(--accent); }
+.onboarding-steps { display: flex; gap: 8px; margin: 0 0 20px; }
+.onboarding-step { display: inline-flex; align-items: center; gap: 6px; border: 0; background: none; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 0; }
+.onboarding-step span { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 1px solid var(--border); border-radius: 50%; }
+.onboarding-step.active { color: var(--accent); }
+.onboarding-step.active span, .onboarding-step.done span { border-color: var(--accent); color: var(--accent); }
+.onboarding-step + .onboarding-step::before { content: "→"; color: var(--border); margin-right: 2px; }
+.onboarding-body h3 { font-size: 18px; margin-bottom: 10px; }
+.onboarding-body p { color: var(--text-dim); line-height: 1.7; margin-bottom: 20px; }
+.onboarding-choice-row { display: flex; gap: 8px; margin-bottom: 14px; }
+.onboarding-text-action { display: block; padding: 0; margin-top: 14px; }
+.onboarding-tip { padding: 10px 12px; margin-bottom: 20px; color: var(--text-dim); background: var(--bg-input); border-radius: 6px; line-height: 1.6; }
+.onboarding-actions { justify-content: flex-end; }
+.onboarding-actions .btn:first-child { margin-right: auto; }
+
 /* --- Remote directory picker --- */
 .picker-path {
   display: flex;
@@ -1620,6 +1648,13 @@ textarea:focus-visible,
   border-radius: 6px;
   color: var(--danger);
   font-size: 12px;
+}
+.chat-error-detail {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
 }
 .chat-retry-banner {
   margin: 8px 0;

@@ -14,6 +14,10 @@ export interface UpdateNoticeInfo {
   current: string | null;
   latest: string | null;
   extensions: string[];
+  /** Omitted for the local agent; present when the checked pi runs on SSH/WSL. */
+  targetLabel?: string;
+  /** Authoritative tab id used to execute a remote update in that exact target. */
+  targetTabId?: string;
 }
 
 export interface AppUpdateNoticeInfo {
@@ -60,6 +64,13 @@ interface UiState {
   /** App-bundled pi extensions were re-shipped at startup with new content. */
   extNotice: ExtensionNoticeInfo | null;
   setExtNotice: (info: ExtensionNoticeInfo | null) => void;
+  /** Monotonic bump every time the model config dialog saves/deletes/transplants
+   *  a model config — ChatViews consume it to hot-sync their RUNNING pi session. */
+  modelConfigSavedAt: number;
+  /** The save target of the LAST modelConfigSavedAt bump (local / WSL distro /
+   *  remote profile), so each ChatView can decide whether the save applies to it. */
+  modelConfigTarget: { kind: "local" } | { kind: "wsl"; distro: string } | { kind: "remote"; host: string; user: string; port: number; agentDir?: string };
+  markModelConfigSaved: (target: UiState["modelConfigTarget"]) => void;
   /** Global app dialog requested from anywhere (e.g. /settings from chat). */
   appDialog: "model-config" | null;
   openAppDialog: (d: "model-config") => void;
@@ -93,7 +104,10 @@ export const useUiStore = create<UiState>()((set) => ({
     if (useUiStore.getState().piUpdating) return;
     set({ piUpdating: true });
     try {
-      const result = await window.api.update.run();
+      const target = useUiStore.getState().updateInfo;
+      const result = target?.targetTabId
+        ? await window.api.update.runTarget(target.targetTabId)
+        : await window.api.update.run();
       if (!result.ok) {
         set({
           updateInfo: null,
@@ -106,7 +120,9 @@ export const useUiStore = create<UiState>()((set) => ({
       // Do not claim the version offered before update: npm may resolve a
       // different release. Force a fresh check after main invalidates its cache.
       try {
-        const verified = await window.api.update.check(true);
+        const verified = target?.targetTabId
+          ? await window.api.update.checkTarget(target.targetTabId)
+          : await window.api.update.check(true);
         set({
           updateInfo: null,
           updateResult: { ok: true, version: verified.current ?? undefined },
@@ -129,6 +145,9 @@ export const useUiStore = create<UiState>()((set) => ({
   },
   extNotice: null,
   setExtNotice: (extNotice) => set({ extNotice }),
+  modelConfigSavedAt: 0,
+  modelConfigTarget: { kind: "local" },
+  markModelConfigSaved: (target) => set((s) => ({ modelConfigSavedAt: s.modelConfigSavedAt + 1, modelConfigTarget: target })),
   appDialog: null,
   openAppDialog: (appDialog) => set({ appDialog }),
   closeAppDialog: () => set({ appDialog: null }),

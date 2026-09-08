@@ -15,6 +15,7 @@ export interface AutoFollowSettings {
 
 export interface AppSettings {
   autoFollow: AutoFollowSettings;
+  onboarding?: { seenAt?: number; completedAt?: number };
   /** Backend selection for local pi tabs: "rpc" forces the old child-process
    *  backend; unset/undefined uses the in-process SDK worker. */
   pipi?: { backend?: "rpc" };
@@ -40,10 +41,12 @@ export function getSettings(): AppSettings {
     const r = raw as Partial<AppSettings> | null;
     const af = r?.autoFollow;
     return {
+      ...r,
       autoFollow: {
         enabled: typeof af?.enabled === "boolean" ? af.enabled : DEFAULTS.autoFollow.enabled,
         followReads: typeof af?.followReads === "boolean" ? af.followReads : DEFAULTS.autoFollow.followReads,
       },
+      onboarding: r?.onboarding,
     };
   } catch {
     return cloneDefaults();
@@ -61,6 +64,7 @@ export function updateSettings(patch: Partial<AppSettings>): AppSettings {
       enabled: typeof patch.autoFollow?.enabled === "boolean" ? patch.autoFollow.enabled : prev.autoFollow.enabled,
       followReads: typeof patch.autoFollow?.followReads === "boolean" ? patch.autoFollow.followReads : prev.autoFollow.followReads,
     },
+    onboarding: patch.onboarding ? { ...prev.onboarding, ...patch.onboarding } : prev.onboarding,
   };
   const file = settingsPath();
   mkdirSync(dirname(file), { recursive: true });

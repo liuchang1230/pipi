@@ -320,6 +320,14 @@ const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onClo
           >
             {t.isWsl && <span className="tab-remote-icon"><Icon name="penguin" /></span>}
             {t.isRemote && !t.isWsl && <span className="tab-remote-icon"><Icon name="globe" /></span>}
+            {t.isRemote && !t.isWsl && t.kind === "connection" && (
+              <span
+                className={`tab-connection-state${t.sshState === "ready" ? " ready" : t.sshState === "failed" ? " failed" : " connecting"}`}
+                title={t.sshState === "ready" ? "SSH 已连接" : t.sshState === "failed" ? "SSH 连接失败" : "SSH 连接中"}
+                role="img"
+                aria-label={t.sshState === "ready" ? "SSH 已连接" : t.sshState === "failed" ? "SSH 连接失败" : "SSH 连接中"}
+              />
+            )}
             <span className="tab-title">{t.title}</span>
             <button
               className="tab-close"

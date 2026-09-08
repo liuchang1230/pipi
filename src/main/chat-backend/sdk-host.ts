@@ -182,7 +182,7 @@ function markExited(tabId: string, code: number): void {
   // Mirror RpcSession.emitExit so the renderer marks the tab exited (input
   // disabled, "pi 已退出" banner) and tab:alive goes false.
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send(`tab:rpc-exit:${tabId}`, code);
+    win.webContents.send(`tab:rpc-exit:${tabId}`, { code });
   }
   for (const cb of tab.onExitCbs) cb(code);
   tab.onExitCbs = [];

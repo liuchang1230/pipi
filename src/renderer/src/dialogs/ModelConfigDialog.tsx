@@ -37,6 +37,13 @@ type ModelTarget =
 
 const showToast = (text: string, type: "ok" | "err") => useUiStore.getState().showToast(text, type);
 
+type ModelConfigTarget = { kind: "local" } | { kind: "wsl"; distro: string } | { kind: "remote"; host: string; user: string; port: number; agentDir?: string };
+
+/** Signal the ChatViews that the saved config changed, so they can hot-sync
+ *  their RUNNING pi session (pipi-model-sync extension bridge). The target
+ *  lets each chat tab decide whether the save applies to it. */
+const notifyModelConfigChanged = (target: ModelConfigTarget) => useUiStore.getState().markModelConfigSaved(target);
+
 function configuredModelIds(item: ModelConfigItem): string[] {
   return Array.from(new Set([item.model, ...(item.availableModels ?? [])].map((id) => id.trim()).filter(Boolean)));
 }
@@ -479,9 +486,11 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                             provider: item.provider || "",
                           });
                           await loadRemoteModels(modelTarget);
+                          notifyModelConfigChanged({ kind: "remote", host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, agentDir: modelTarget.agentDir });
                         } else {
                           await window.api.model.delete(item.id);
                           await loadModels();
+                          notifyModelConfigChanged({ kind: "local" });
                         }
                       } finally {
                         setBusyAction(null);
@@ -519,7 +528,14 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                     });
                   }
                   const label = modelTarget.kind === "wsl" ? modelTarget.distro : `${(modelTarget as any).user}@${(modelTarget as any).host}`;
-                  showToast(result.ok ? `已移植 ${result.copied.join(", ")} 到 ${label}` : `移植失败: ${result.error}`, result.ok ? "ok" : "err");
+                  showToast(result.ok ? `已移植 ${result.copied.join("、")} 到 ${label}` : `移植失败: ${result.error}`, result.ok ? "ok" : "err");
+                  if (result.ok) {
+                    if (modelTarget.kind === "wsl") {
+                      notifyModelConfigChanged({ kind: "wsl", distro: modelTarget.distro });
+                    } else {
+                      notifyModelConfigChanged({ kind: "remote", host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, agentDir: modelTarget.agentDir });
+                    }
+                  }
                 } catch (err) {
                   showToast(`移植失败: ${err instanceof Error ? err.message : String(err)}`, "err");
                 } finally {
@@ -607,6 +623,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                     await window.api.model.deleteRemote({ remote, provider: oldProvider });
                   }
                   await loadRemoteModels(modelTarget);
+                  notifyModelConfigChanged({ kind: "remote", host: modelTarget.host, user: modelTarget.user, port: modelTarget.port, agentDir: modelTarget.agentDir });
                 } else {
                   if (editingModel) {
                     await window.api.model.update(editingModel.id, payload);
@@ -614,6 +631,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                     await window.api.model.add(payload);
                   }
                   await loadModels();
+                  notifyModelConfigChanged({ kind: "local" });
                 }
                 resetModelForm();
                 if (targetKindWsl) {

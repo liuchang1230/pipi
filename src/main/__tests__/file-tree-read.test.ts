@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { readFileContent, imagePayloadOf, rasterImageMimeOf, IMAGE_PREVIEW_MAX_BYTES, listFiles, listDirChildren, readPreviewFromAbs, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES } from "../file-tree";
+import { readFileContent, imagePayloadOf, rasterImageMimeOf, IMAGE_PREVIEW_MAX_BYTES, listFiles, listDirChildren, readPreviewFromAbs, resolveWithin, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES } from "../file-tree";
 
 let root: string;
 
@@ -197,5 +197,32 @@ describe("image preview payload", () => {
     const svg = await readFileContent(root, "icon.svg");
     expect(svg.isBinary).toBe(false);
     expect(svg.image).toBeUndefined();
+  });
+});
+
+describe("resolveWithin (file:reveal containment)", () => {
+  it("resolves nested root-relative paths inside the root", () => {
+    const abs = resolveWithin(root, "src/main/index.ts");
+    expect(abs).toBe(join(root, "src/main/index.ts"));
+    expect(resolveWithin(root, "note.txt")).toBe(join(root, "note.txt"));
+  });
+
+  it("rejects any escape out of the root", () => {
+    expect(() => resolveWithin(root, "../other")).toThrow(/escapes/);
+    expect(() => resolveWithin(root, "a/../../other")).toThrow(/escapes/);
+    expect(() => resolveWithin(root, "..")).toThrow(/escapes/);
+  });
+
+  it("rejects absolute / drive / UNC second arguments", () => {
+    expect(() => resolveWithin(root, "/etc/passwd")).toThrow(/escapes/);
+    if (process.platform === "win32") {
+      expect(() => resolveWithin(root, "C:\\Windows\\system32")).toThrow(/escapes/);
+      expect(() => resolveWithin(root, "\\\\server\\share\\x")).toThrow(/escapes/);
+    }
+  });
+
+  it("rejects backslash-encoded .. escapes on Windows (\\.\\ is a separator there)", () => {
+    if (process.platform !== "win32") return; // on POSIX backslashes are legal filename chars, not separators
+    expect(() => resolveWithin(root, "..\\..\\Windows\\system32")).toThrow(/escapes/);
   });
 });

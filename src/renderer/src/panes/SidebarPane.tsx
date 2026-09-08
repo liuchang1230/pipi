@@ -65,6 +65,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const setExpanded = useTreeStore((s) => s.setExpanded);
   const fileTreeStatus = useTreeStore((s) => s.fileTreeStatus);
   const fileTreeError = useTreeStore((s) => s.fileTreeError);
+  const treeOrigin = useTreeStore((s) => s.treeOrigin);
 
   // --- Sessions / projects slice ---
   const projects = useSessionsStore((s) => s.projects);
@@ -120,7 +121,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
   // --- Remote hydration: main's background hydration → per-project caches ---
   useEffect(() => {
-    const off = window.api.session.onRemoteUpdated(({ tabId, remoteCwd, sessions }) => {
+    const off = window.api.session.onRemoteUpdated(({ tabId, remoteCwd, sessions, hydratedCount, totalCount }) => {
       setRemoteSessions((prev) => ({ ...prev, [remoteSessionCacheKey(tabId, remoteCwd, tabs.find((t) => t.id === tabId)?.remoteAgentDir ?? "")]: sessions as SessionItem[] }));
       setProjectSessions((prev) => {
         const next = { ...prev };
@@ -139,7 +140,18 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         }
         return next;
       });
-      setRemoteHydration((prev) => (prev.tabId === tabId && prev.remoteCwd === remoteCwd ? { phase: "idle" } : prev));
+      setRemoteHydration((prev) => {
+        // The main process keeps hydrating in batches of 4 after the first
+        // pass (head 5 → +4 each) — the FIRST event must not clear the
+        // "正在补全远程会话信息" state while rows still say 同步中. Clear
+        // only when every session in this event is hydrated, and this event
+        // is still ours (tab/cwd match).
+        const allHydrated = typeof hydratedCount === "number" && typeof totalCount === "number"
+          ? hydratedCount >= totalCount
+          : (sessions as SessionItem[]).every((s) => !(s.name === null && s.firstMessage === "" && s.messageCount === 0));
+        if (!allHydrated) return prev;
+        return prev.tabId === tabId && prev.remoteCwd === remoteCwd ? { phase: "idle" } : prev;
+      });
     });
     return off;
   }, [projects, setProjectSessions, setRemoteHydration, setRemoteSessions, tabs]);
@@ -212,6 +224,26 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
     setTreeCtx({ x: e.clientX, y: e.clientY, node });
   }, []);
   const closeTreeMenu = useCallback(() => setTreeCtx(null), []);
+
+  /** "打开文件所在位置" — reveal a tree node in the OS file explorer. Works
+   *  when the browsed files ARE reachable from Windows: a local preview
+   *  (rootPath), a non-remote tab, or a WSL tab (\\wsl$ UNC mapping). SSH
+   *  origins are excluded — the files live on a remote disk. */
+  const handleRevealInExplorer = useCallback(async (node: FileNode) => {
+    const origin = useTreeStore.getState().treeOrigin;
+    if (!origin) return;
+    if (origin.isRemote) {
+      // WSL only: main maps the linux path to \\wsl$\distro\... and reveals.
+      const tab = origin.tabId ? useTabsStore.getState().tabs.find((t) => t.id === origin.tabId) : undefined;
+      if (!tab?.wsl) return;
+    }
+    try {
+      const res = await window.api.file.reveal({ tabId: origin.tabId, rootPath: origin.rootPath, relPath: node.path });
+      if (!res.ok) useUiStore.getState().showToast(res.error || "无法在资源管理器中定位", "err");
+    } catch (e) {
+      useUiStore.getState().showToast(e instanceof Error ? e.message : "无法在资源管理器中定位", "err");
+    }
+  }, []);
 
   /** Parent dir for new files: the right-clicked node, or the tree root.
    *  For a FILE node, creations land in its parent directory. The null-node
@@ -672,6 +704,11 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
             ...(treeCtx.node
               ? [
                   { label: "重命名", icon: "pencil" as const, onSelect: () => setFilePrompt({ kind: "rename", title: "重命名", node: treeCtx.node }) },
+                  // Local browse or WSL (\\wsl$ UNC) only: SSH files have no
+                  // Windows location to reveal.
+                  ...(!treeOrigin?.isRemote || (treeOrigin.tabId && tabs.find((t) => t.id === treeOrigin.tabId)?.wsl)
+                    ? [{ label: "打开文件所在位置", icon: "external-link" as const, onSelect: () => void handleRevealInExplorer(treeCtx.node!) }]
+                    : []),
                   { label: "删除", icon: "trash" as const, danger: true, onSelect: () => setFileConfirm({ node: treeCtx.node! }) },
                 ]
               : []),

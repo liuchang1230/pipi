@@ -8,6 +8,15 @@
  */
 import { create } from "zustand";
 
+/** Pick the useful line from a failed pi process's stderr for the exit banner.
+ * `bash -i` without a TTY prints job-control noise first; pi's own error (the
+ * useful line) comes last. Returns null when there is nothing to show. */
+export function pickExitErrorLine(stderr: string | undefined): string | null {
+  const lines = (stderr ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  return [...lines].reverse().find((l) => !/cannot set terminal process group|no job control in this shell/i.test(l)) ?? lines[0]!;
+}
+
 export type ChatBlock =
   | { kind: "text"; contentIndex: number; text: string; done: boolean }
   | { kind: "thinking"; contentIndex: number; text: string; done: boolean }
@@ -100,7 +109,7 @@ interface ChatStore {
    * payload sent to Pi (for example @file contents). */
   sendPrompt: (tabId: string, message: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, displayText?: string) => Promise<void>;
   abort: (tabId: string) => void;
-  markExited: (tabId: string, code: number) => void;
+  markExited: (tabId: string, info: { code: number; stderr?: string }) => void;
 }
 
 const emptyState = (): ChatTabState => ({
@@ -298,8 +307,9 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     });
   },
 
-  markExited: (tabId, code) => {
+  markExited: (tabId, { code, stderr }) => {
     get().ensure(tabId);
+    const detail = pickExitErrorLine(stderr);
     set((s) => ({
       states: {
         ...s.states,
@@ -307,9 +317,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           ...s.states[tabId]!,
           isStreaming: false,
           exited: true,
-          lastError: `pi 进程已退出 (code ${code})`,
+          lastError: code === 0
+            ? `pi 进程已退出 (code 0)`
+            : detail
+              ? `pi 进程已退出 (code ${code})：${detail}`
+              : `pi 进程已退出 (code ${code})`,
           exitCode: code,
-          turn: { phase: "exited", lastActivityAt: Date.now(), detail: `进程退出（code ${code}）` },
+          turn: { phase: "exited", lastActivityAt: Date.now(), detail: `进程退出（code ${code}）${detail ? ` · ${detail}` : ""}` },
         },
       },
     }));

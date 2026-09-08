@@ -135,7 +135,7 @@ const VISIBLE_DOTFILES = new Set([
 ]);
 
 /** Resolve a renderer-supplied (possibly relative) path against root, with containment. */
-function resolveWithin(rootDir: string, relPath: string): string {
+export function resolveWithin(rootDir: string, relPath: string): string {
   const abs = resolve(rootDir, relPath);
   const rootResolved = resolve(rootDir);
   if (abs !== rootResolved && !abs.startsWith(rootResolved + sep)) {

@@ -335,3 +335,31 @@ describe("chatStore session-mode fallback", () => {
     expect(st.followUpQueue).toEqual([]);
   });
 });
+
+describe("pickExitErrorLine", () => {
+  it("returns the last useful line, skipping bash -i job-control noise", async () => {
+    const { pickExitErrorLine } = await import("../chatStore");
+    const stderr =
+      "bash: cannot set terminal process group (904): Inappropriate ioctl for device\n" +
+      "bash: no job control in this shell\n" +
+      "TypeError: webidl.util.markAsUncloneable is not a function";
+    expect(pickExitErrorLine(stderr)).toBe("TypeError: webidl.util.markAsUncloneable is not a function");
+  });
+
+  it("returns the only line when there is no noise", () => {
+    return import("../chatStore").then(({ pickExitErrorLine }) => {
+      expect(pickExitErrorLine("pi: command not found")).toBe("pi: command not found");
+    });
+  });
+
+  it("returns null for empty/whitespace stderr", async () => {
+    const { pickExitErrorLine } = await import("../chatStore");
+    expect(pickExitErrorLine(undefined)).toBeNull();
+    expect(pickExitErrorLine("  \n \n")).toBeNull();
+  });
+
+  it("falls back to the first line when every line is noise", async () => {
+    const { pickExitErrorLine } = await import("../chatStore");
+    expect(pickExitErrorLine("bash: no job control in this shell")).toBe("bash: no job control in this shell");
+  });
+});
