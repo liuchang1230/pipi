@@ -17,8 +17,19 @@ describe("buildRemoteAlignCommand", () => {
   it("pins the exact bundled version and detects bun installs", () => {
     const cmd = buildRemoteAlignCommand("0.84.4");
     expect(cmd).toContain("@earendil-works/pi-coding-agent@0.84.4");
-    expect(cmd).toContain("*/.bun/*) PM=\"bun install -g\"");
-    expect(cmd).toContain("*) PM=\"npm install -g\"");
+    // bun install -g on the bun path; plain npm install -g otherwise.
+    expect(cmd).toContain("*/.bun/*) npm install -g @earendil-works/pi-coding-agent@0.84.4;;");
+    expect(cmd).toContain("*) npm install -g @earendil-works/pi-coding-agent@0.84.4;;");
+  });
+
+  it("registry fallback retries via the official registry on the npm path only", () => {
+    const fallback = buildRemoteAlignCommand("0.85.1", true);
+    expect(fallback).toContain("--registry=https://registry.npmjs.org");
+    // The bun branch has no registry override (bun has no --registry flag;
+    // its default registry is the official one anyway).
+    expect(fallback).toContain("*/.bun/*) npm install -g @earendil-works/pi-coding-agent@0.85.1;;");
+    // Default (no fallback) has no registry override.
+    expect(buildRemoteAlignCommand("0.85.1")).not.toContain("registry.npmjs.org");
   });
 
   it("contains no single quotes (safe inside bash -ic '…')", () => {

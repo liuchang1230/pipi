@@ -508,24 +508,30 @@ function runSsh2Version(remote: RemoteOpts): Promise<string> {
 export async function runRemotePiUpdate(target: RemoteUpdateTarget): Promise<UpdateRunResult> {
   const bundled = getBundledPiVersion();
   if (!bundled) return { ok: false, output: "", error: "无法确定应用配套的 pi 版本" };
-  const command = buildRemoteAlignCommand(bundled);
+  // First attempt respects the server's configured registry (mirrors).
+  // ETARGET (mirror lag behind the fresh bundle) retries ONCE with an
+  // official-registry fallback baked into the shell command — no second UI
+  // round-trip. Any other failure, or a second ETARGET, reports honestly.
   let output = "";
-  try {
-    output = target.kind === "wsl"
-      ? await runWslCommand(target.wsl!, command)
-      : target.remote?.password
-        ? await runSsh2Command(target.remote, command)
-        : await runSshCommand(target.remote!, command);
-  } catch (e) {
-    const raw = e instanceof Error ? e.message : String(e);
-    const cleaned = stripShellNoise(raw);
-    // ETARGET = the server's npm registry (often a mirror) does not carry
-    // this version yet. With the pinned bundle the version is old enough for
-    // any synced mirror; if it still fires, the mirror itself is stale.
-    const hint = /ETARGET|notarget|No matching version/i.test(raw)
-      ? "（服务器 npm 源无此版本——若配了镜像源通常是同步滞后：可等镜像同步，或临时用 --registry=https://registry.npmjs.org 直连官方源重试）"
-      : "";
-    return { ok: false, output: "", error: `远程安装失败：${cleaned}${hint}` };
+  for (const withFallback of [false, true]) {
+    const command = buildRemoteAlignCommand(bundled, withFallback);
+    try {
+      output = target.kind === "wsl"
+        ? await runWslCommand(target.wsl!, command)
+        : target.remote?.password
+          ? await runSsh2Command(target.remote, command)
+          : await runSshCommand(target.remote!, command);
+      break;
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e);
+      const cleaned = stripShellNoise(raw);
+      const mirrorLag = /ETARGET|notarget|No matching version/i.test(raw);
+      if (mirrorLag && !withFallback) continue;
+      const hint = mirrorLag
+        ? "（服务器 npm 源确认无此版本，官方源重试仍失败——检查服务器到 registry.npmjs.org 的网络可达性）"
+        : "";
+      return { ok: false, output: "", error: `远程安装失败：${cleaned}${hint}` };
+    }
   }
   // Post-install verification: the newest bundle needs undici's
   // markAsUncloneable, which old Node (<20.10) and every stable Bun lack —
@@ -549,9 +555,17 @@ export async function runRemotePiUpdate(target: RemoteUpdateTarget): Promise<Upd
 }
 
 /** Build the remote align command. No single quotes (it nests inside
- * `bash -ic '…'`) and no shell metacharacters from inputs. */
-export function buildRemoteAlignCommand(version: string): string {
-  return `P=$(command -v pi || true); case "$P" in */.bun/*) PM="bun install -g";; *) PM="npm install -g";; esac; $PM @earendil-works/pi-coding-agent@${version} && (pi update --extensions 2>/dev/null || true)`;
+ * `bash -ic '…'`) and no shell metacharacters from inputs.
+ * When withRegistryFallback is set, npm falls back to the official registry
+ * in the SAME command: a lagging mirror (npmmirror etc.) that does not yet
+ * carry the pinned version fails with ETARGET; the `||` retry then pulls
+ * straight from registry.npmjs.org without a second UI round-trip. bun has
+ * no --registry flag → `bun pm` config unchanged; its default registry is
+ * the official one anyway. */
+export function buildRemoteAlignCommand(version: string, withRegistryFallback = false): string {
+  const npmInstall = `npm install -g @earendil-works/pi-coding-agent@${version}`;
+  const npmSpec = withRegistryFallback ? `${npmInstall} || ${npmInstall} --registry=https://registry.npmjs.org` : npmInstall;
+  return `P=$(command -v pi || true); case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac && (pi update --extensions 2>/dev/null || true)`;
 }
 
 export function targetPiCommand(remote: RemoteOpts | undefined, cwd: string | undefined, command: string): string {
