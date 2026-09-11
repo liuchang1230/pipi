@@ -408,6 +408,36 @@ export function stripShellNoise(stderr: string): string {
   return text.length > 1600 ? text.slice(0, 800) + "\n…\n" + text.slice(-800) : text;
 }
 
+/** Map a failed remote-align run to a short, actionable next step.
+ *
+ * Two failure families matter and they look deceptively alike:
+ *  - ETARGET: npm DID answer — but stale. npm's HTTP layer falls back to the
+ *    local cacache packument when the network fails (stale-if-error), so an
+ *    unreachable registry masquerades as "version doesn't exist" when it
+ *    really means "version didn't exist when this cache was written".
+ *  - FETCH_ERROR / network timeout: npm genuinely could not reach the
+ *    registry (no proxy, direct egress blocked — the usual China-server
+ *    situation against registry.npmjs.org/Cloudflare).
+ * Both resolve the same way: npmmirror is reachable from inside China and
+ * syncs within hours, so the hint is a paste-ready mirror install command.
+ */
+export function friendlyRemoteInstallError(raw: string, version: string): string {
+  if (/ETARGET|notarget|No matching version/i.test(raw)) {
+    // If npmmirror itself answered the ETARGET, the mirror genuinely lags
+    // (fresh bundle not yet synced) — the mirror command just failed, so
+    // recommending it again would be wrong. Otherwise the stale-cache story
+    // applies: the version exists; point at the mirror.
+    if (/registry\.npmmirror\.com/i.test(raw)) {
+      return `建议：npmmirror 镜像尚未同步 ${version}，请稍后重试；若急需，可先检查服务器到 registry.npmjs.org 的网络后再从官方源安装`;
+    }
+    return `建议：官方源网络不通时 npm 会回退到本地旧缓存，ETARGET 往往是过期缓存的假象（版本其实是存在的）。在服务器上执行：npm install -g @earendil-works/pi-coding-agent@${version} --registry=https://registry.npmmirror.com`;
+  }
+  if (/FETCH_ERROR|network timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|socket hang up|getaddrinfo/i.test(raw)) {
+    return `建议：服务器到 npm 源的网络连接失败。执行：npm install -g @earendil-works/pi-coding-agent@${version} --registry=https://registry.npmmirror.com`;
+  }
+  return "";
+}
+
 /** Turn a failed remote `pi --version` stderr into a short actionable reason. */
 export function friendlyRemoteProbeError(stderr: string): string {
   const lines = stderr.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
@@ -508,30 +538,27 @@ function runSsh2Version(remote: RemoteOpts): Promise<string> {
 export async function runRemotePiUpdate(target: RemoteUpdateTarget): Promise<UpdateRunResult> {
   const bundled = getBundledPiVersion();
   if (!bundled) return { ok: false, output: "", error: "无法确定应用配套的 pi 版本" };
-  // First attempt respects the server's configured registry (mirrors).
-  // ETARGET (mirror lag behind the fresh bundle) retries ONCE with an
-  // official-registry fallback baked into the shell command — no second UI
-  // round-trip. Any other failure, or a second ETARGET, reports honestly.
+  // ONE round trip: the shell command chains the server's default registry
+  // and the China-reachable npmmirror with `||`. Default source wins when
+  // healthy; a stale-cache ETARGET or an unreachable official registry falls
+  // through to the mirror with no second UI round-trip. (2026-09 incident:
+  // server default = official registry, unreachable → npm silently served
+  // pre-release cached metadata as ETARGET; npmmirror had the version all
+  // along — the official registry is the WORST fallback from inside China,
+  // so the mirror is the baked-in retry target instead.)
+  const command = buildRemoteAlignCommand(bundled, true);
   let output = "";
-  for (const withFallback of [false, true]) {
-    const command = buildRemoteAlignCommand(bundled, withFallback);
-    try {
-      output = target.kind === "wsl"
-        ? await runWslCommand(target.wsl!, command)
-        : target.remote?.password
-          ? await runSsh2Command(target.remote, command)
-          : await runSshCommand(target.remote!, command);
-      break;
-    } catch (e) {
-      const raw = e instanceof Error ? e.message : String(e);
-      const cleaned = stripShellNoise(raw);
-      const mirrorLag = /ETARGET|notarget|No matching version/i.test(raw);
-      if (mirrorLag && !withFallback) continue;
-      const hint = mirrorLag
-        ? "（服务器 npm 源确认无此版本，官方源重试仍失败——检查服务器到 registry.npmjs.org 的网络可达性）"
-        : "";
-      return { ok: false, output: "", error: `远程安装失败：${cleaned}${hint}` };
-    }
+  try {
+    output = target.kind === "wsl"
+      ? await runWslCommand(target.wsl!, command)
+      : target.remote?.password
+        ? await runSsh2Command(target.remote, command)
+        : await runSshCommand(target.remote!, command);
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e);
+    const cleaned = stripShellNoise(raw);
+    const hint = friendlyRemoteInstallError(raw, bundled);
+    return { ok: false, output: "", error: `远程安装失败：${cleaned}${hint ? `\n${hint}` : ""}` };
   }
   // Post-install verification: the newest bundle needs undici's
   // markAsUncloneable, which old Node (<20.10) and every stable Bun lack —
@@ -556,15 +583,21 @@ export async function runRemotePiUpdate(target: RemoteUpdateTarget): Promise<Upd
 
 /** Build the remote align command. No single quotes (it nests inside
  * `bash -ic '…'`) and no shell metacharacters from inputs.
- * When withRegistryFallback is set, npm falls back to the official registry
- * in the SAME command: a lagging mirror (npmmirror etc.) that does not yet
- * carry the pinned version fails with ETARGET; the `||` retry then pulls
- * straight from registry.npmjs.org without a second UI round-trip. bun has
- * no --registry flag → `bun pm` config unchanged; its default registry is
- * the official one anyway. */
+ * When withRegistryFallback is set, npm falls back to npmmirror in the SAME
+ * command: the official registry is frequently unreachable from China
+ * servers (direct egress), and when npm can't reach a registry it may serve
+ * STALE LOCAL CACHE metadata instead — which surfaces as a bogus ETARGET
+ * "No matching version" for versions that were published days ago.
+ * npmmirror is China-reachable and syncs from the official registry within
+ * hours, so it is the reliable retry target. bun has no --registry flag →
+ * `bun pm` config unchanged; its default registry is the official one.
+ */
 export function buildRemoteAlignCommand(version: string, withRegistryFallback = false): string {
-  const npmInstall = `npm install -g @earendil-works/pi-coding-agent@${version}`;
-  const npmSpec = withRegistryFallback ? `${npmInstall} || ${npmInstall} --registry=https://registry.npmjs.org` : npmInstall;
+  // fetch-timeout/retries are clamped so a black-holed default registry
+  // cannot eat the whole 600s budget before the npmmirror fallback runs.
+  const npmFlags = "--fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000";
+  const npmInstall = `npm install -g ${npmFlags} @earendil-works/pi-coding-agent@${version}`;
+  const npmSpec = withRegistryFallback ? `${npmInstall} || ${npmInstall} --registry=https://registry.npmmirror.com` : npmInstall;
   return `P=$(command -v pi || true); case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac && (pi update --extensions 2>/dev/null || true)`;
 }
 
@@ -583,21 +616,27 @@ export function targetPiCommand(remote: RemoteOpts | undefined, cwd: string | un
   return `P="$(printf %s ${encodedCwd} | base64 -d)"; case "$P" in "~") P="$HOME";; "~/"*) P="$HOME/\${P#\\~/}";; esac; cd "$P" && ${agentEnv}${command}`;
 }
 
-function runSshCommand(remote: RemoteOpts, command: string, timeoutMs = 300000): Promise<string> {
+// 600s default: the align command may run npm twice (default registry, then
+// the npmmirror fallback) — a hung default source must still leave time for
+// the mirror attempt to finish.
+function runSshCommand(remote: RemoteOpts, command: string, timeoutMs = 600000): Promise<string> {
   const args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"];
   if (remote.port && remote.port !== 22) args.push("-p", String(remote.port));
   args.push(`${remote.user}@${remote.host}`, `bash -ic '${targetPiCommand(remote, remote.path, command)}'`);
   return collectVersion(spawn(findSshBin(), args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }), timeoutMs);
 }
 
-function runWslCommand(wsl: WslOpts, command: string, timeoutMs = 300000): Promise<string> {
+function runWslCommand(wsl: WslOpts, command: string, timeoutMs = 600000): Promise<string> {
   return collectVersion(spawn(findWslBin(), ["-d", wsl.distro, "--", "bash", "-ic", targetPiCommand(undefined, wsl.path, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }), timeoutMs);
 }
 
 function runSsh2Command(remote: RemoteOpts, command: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const conn = new SshClient();
-    const timer = setTimeout(() => { conn.end(); reject(new Error("远程 pi 更新超时")); }, 300000);
+    // 600s: the align command may run npm twice (default registry, then the
+    // npmmirror fallback) — a hung default source must still leave time for
+    // the mirror attempt to finish.
+    const timer = setTimeout(() => { conn.end(); reject(new Error("远程 pi 更新超时")); }, 600000);
     conn.on("error", (e) => { clearTimeout(timer); conn.end(); reject(e); });
     conn.once("ready", () => conn.exec(`bash -ic '${targetPiCommand(remote, remote.path, command)}'`, (err, stream) => {
       if (err) { clearTimeout(timer); conn.end(); reject(err); return; }

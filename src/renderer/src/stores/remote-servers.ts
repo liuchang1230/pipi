@@ -55,6 +55,18 @@ export interface GroupRemoteServersParams {
   projectErrors: Record<string, string | undefined>;
   projectDiagnostics: Record<string, RemoteFileDiagnostics | undefined>;
   remoteHydration: RemoteHydrationState;
+  /** Live connection state from the probe registry, keyed by remoteKey.
+   *  Tab-independent: a server the user just probed reads "connected" here
+   *  even though no connection tab exists for it. */
+  remoteStatus?: Record<string, {
+    status: ServerStatus;
+    needPassword?: boolean;
+    /** Live profile from the last successful probe. Carries the password the
+     *  user just typed (in-memory only — persisted only when "remember" is
+     *  checked), so it must override stale saved passwords from history/
+     *  projects for every follow-up read. */
+    profile?: { host?: string; user?: string; port?: number; agentDir?: string; password?: string };
+  }>;
 }
 
 export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServerGroup[] {
@@ -89,7 +101,12 @@ export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServ
   //    activation target prefers the connection shell tab, ranked
   //    ready > connecting > failed (a dead tab must never win the slot).
   const connTabByKey = new Map<string, TabInfo>();
-  const hasSessionTabByKey = new Map<string, boolean>();
+  /** A server counts as "connected by a tab" only when that tab PROVED
+   *  connectivity: a pi session that booted (remoteReady) or a connection
+   *  shell whose __PIPI_READY__ marker arrived. A merely-existing tab (e.g. a
+   *  session stuck at auth) must stay "connecting" — otherwise the sidebar
+   *  lied green while every read failed. */
+  const hasReadyTabByKey = new Map<string, boolean>();
   const connRank = (t: TabInfo): number => (t.sshState === "ready" ? 2 : t.sshState === "failed" ? 0 : 1);
   for (const t of tabs) {
     if (!t.isRemote || t.isWsl || !t.remoteKey || !t.remoteHost || !t.remoteUser) continue;
@@ -101,15 +118,22 @@ export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServ
       // among shell tabs, the healthier one wins.
       const prev = connTabByKey.get(t.remoteKey);
       if (!prev || !isConnectionTab(prev) || connRank(t) > connRank(prev)) connTabByKey.set(t.remoteKey, t);
+      if (t.sshState === "ready") hasReadyTabByKey.set(t.remoteKey, true);
     } else {
-      hasSessionTabByKey.set(t.remoteKey, true);
+      if (t.remoteReady === true) hasReadyTabByKey.set(t.remoteKey, true);
       if (!connTabByKey.has(t.remoteKey)) connTabByKey.set(t.remoteKey, t);
     }
   }
 
   function serverStatus(key: string, tab: TabInfo | undefined): ServerStatus {
-    if (hasSessionTabByKey.get(key)) return "connected";
-    if (tab?.sshState === "ready") return "connected";
+    const registry = params.remoteStatus?.[key];
+    if (registry) {
+      // A live ready tab still proves connectivity even when the last probe
+      // failed (the probe may have used a stale credential).
+      if (registry.status !== "connected" && hasReadyTabByKey.get(key)) return "connected";
+      return registry.status;
+    }
+    if (hasReadyTabByKey.get(key)) return "connected";
     if (tab?.sshState === "failed") return "failed";
     if (tab) return "connecting";
     return "disconnected";
@@ -120,6 +144,11 @@ export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServ
   for (const [key, seed] of seeds) {
     const tab = connTabByKey.get(key);
     const status = serverStatus(key, tab);
+    // The last successful probe's password is the freshest credential we have
+    // (the user just typed it). It must win over history/project copies that
+    // may be stale — otherwise a successful one-off login is followed by a
+    // need-password prompt on every subsequent session/file read.
+    const livePassword = params.remoteStatus?.[key]?.profile?.password;
     const projectsForServer = projects
       .filter(
         (p) =>
@@ -137,10 +166,11 @@ export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServ
           cwd: p.path!,
           type: "remote",
           tabId: tab?.id,
+          remoteKey: key,
           host: p.host,
           user: p.user,
           port: p.port,
-          password: p.password,
+          password: livePassword ?? p.password ?? seed.password,
           agentDir: p.agentDir,
           sessions,
           disabled: status !== "connected",
@@ -155,10 +185,11 @@ export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServ
       user: seed.user,
       port: seed.port,
       agentDir: seed.agentDir,
-      password: seed.password,
+      password: livePassword ?? seed.password,
       path: seed.path,
       label: serverLabel(seed.host, seed.user, seed.port, seed.agentDir),
       status,
+      needPassword: params.remoteStatus?.[key]?.needPassword,
       tabId: tab?.id,
       projects: projectsForServer,
     });

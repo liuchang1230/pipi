@@ -10,6 +10,8 @@ import { useTreeStore, sortFileNodes } from "./treeStore";
 import { useUiStore } from "./uiStore";
 import { apply, type Updater } from "./utils";
 import { buildRemoteKey, remoteSessionCacheKey } from "./remote-servers";
+import { projectProfile, projectTarget, type TargetRef } from "./remote-target";
+import { useRemoteStore } from "./remoteStore";
 import type {
   AutoFollowSettings,
   FileNode,
@@ -80,9 +82,9 @@ interface SessionsState {
 
   // Session lifecycle actions
   openSession: (session: SessionItem, projectCwd?: string) => Promise<void>;
-  openRemoteSession: (tabId: string, projectCwd: string, session: SessionItem) => Promise<void>;
-  deleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => Promise<void>;
-  batchDelete: (tabId?: string, projectCwd?: string) => Promise<void>;
+  openRemoteSession: (project: ProjectGroup, session: SessionItem) => Promise<void>;
+  deleteSession: (session: SessionItem, project?: ProjectGroup) => Promise<void>;
+  batchDelete: (project?: ProjectGroup) => Promise<void>;
   toggleSessionSelect: (path: string) => void;
   selectAllSessions: (items: SessionItem[]) => void;
 
@@ -206,33 +208,33 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       openingSessions.delete(session.path);
     }
   },
-  openRemoteSession: async (tabId, projectCwd, session) => {
+  openRemoteSession: async (project, session) => {
     if (openingSessions.has(session.path)) return;
-    const currentTab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
-    const existing = useTabsStore.getState().tabs.find((t) =>
-      t.sessionPath === session.path
-      && (!currentTab?.isRemote || t.remoteKey === currentTab.remoteKey)
-    );
+    const projectRemoteKey = project.remoteKey ?? buildRemoteKey(project.host, project.user, project.port, project.agentDir);
+    // Reuse an already-open tab for this session (same server, so two servers
+    // with identical paths never share a tab).
+    const existing = useTabsStore.getState().tabs.find((t) => t.sessionPath === session.path && t.remoteKey === projectRemoteKey);
     if (existing) {
       const ok = await window.api.tab.activate(existing.id);
       if (ok) useTabsStore.getState().setActiveTab(existing.id);
       return;
     }
-    const remote = await window.api.remote.getInfo(tabId);
-    if (!remote) return;
-    const remoteAgentDir = (remote as { agentDir?: string }).agentDir;
+    // The project row carries the whole connection profile, so opening a
+    // session needs no connection tab and no remote:get-info round trip.
+    const isWsl = (project.port ?? 22) === 0;
     openingSessions.add(session.path);
     try {
-      if ((remote as { isWsl?: boolean }).isWsl) {
+      if (isWsl) {
+        const distro = project.host ?? "";
         const id = await window.api.tab.create({
           cwd: useTabsStore.getState().cwd || ".",
           sessionPath: session.path,
           title: sessionLabel(session),
-          wsl: { distro: (remote as { host: string }).host, path: projectCwd },
+          wsl: { distro, path: project.cwd },
         });
         useTabsStore.getState().showTabImmediately(
-          { id, cwd: projectCwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, isWsl: true, wslDistro: (remote as { host: string }).host, pi: true, mode: "rpc" },
-          { cwd: projectCwd, isRemote: true, remoteDir: projectCwd, remoteLabel: `WSL ${(remote as { host: string }).host}` },
+          { id, cwd: project.cwd, sessionPath: session.path, title: sessionLabel(session), isRemote: true, isWsl: true, wslDistro: distro, pi: true, mode: "rpc" },
+          { cwd: project.cwd, isRemote: true, remoteDir: project.cwd, remoteLabel: `WSL ${distro}` },
         );
       } else {
         const id = await window.api.tab.create({
@@ -240,37 +242,37 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
           sessionPath: session.path,
           title: sessionLabel(session),
           remote: {
-            host: remote.host,
-            user: remote.user,
-            port: remote.port,
-            path: projectCwd,
-            password: remote.password,
-            agentDir: remoteAgentDir,
+            host: project.host ?? "",
+            user: project.user ?? "",
+            port: project.port,
+            path: project.cwd,
+            password: project.password,
+            agentDir: project.agentDir,
           },
         });
         useTabsStore.getState().showTabImmediately(
           {
             id,
-            cwd: projectCwd,
+            cwd: project.cwd,
             sessionPath: session.path,
             title: sessionLabel(session),
             isRemote: true,
-            remoteHost: remote.host,
-            remoteUser: remote.user,
-            remotePort: remote.port ?? 22,
-            remoteAgentDir,
-            remoteKey: buildRemoteKey(remote.host, remote.user, remote.port, remoteAgentDir),
+            remoteHost: project.host,
+            remoteUser: project.user,
+            remotePort: project.port ?? 22,
+            remoteAgentDir: project.agentDir,
+            remoteKey: projectRemoteKey,
             pi: true,
             mode: "rpc",
           },
-          { cwd: projectCwd, isRemote: true, remoteDir: projectCwd, remoteLabel: `${remote.user}@${remote.host}` },
+          { cwd: project.cwd, isRemote: true, remoteDir: project.cwd, remoteLabel: `${project.user}@${project.host}` },
         );
       }
     } finally {
       openingSessions.delete(session.path);
     }
   },
-  deleteSession: async (session, tabId, projectCwd) => {
+  deleteSession: async (session, project) => {
     if (!confirm(`删除该会话？\n${sessionLabel(session)}`)) return;
     const opened = useTabsStore.getState().tabs.filter((t) => t.sessionPath === session.path);
     for (const tab of opened) {
@@ -280,7 +282,8 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         /* 标签页可能已关闭，忽略 */
       }
     }
-    const result = await window.api.session.delete(session.path, tabId);
+    const target = project ? projectTarget(project) : undefined;
+    const result = await window.api.session.delete(session.path, target);
     if (!result.ok) {
       alert(`删除失败: ${result.error}`);
       return;
@@ -289,13 +292,13 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     await refreshProjectCachesForDeleted([session.path], get, set);
     await get().loadSessions(useTabsStore.getState().cwd);
     await get().refreshProjects();
-    if (tabId && projectCwd) {
-      const remoteList = await window.api.session.listRemote(tabId, projectCwd);
-      const profile = useTabsStore.getState().tabs.find((t) => t.id === tabId)?.remoteAgentDir ?? "";
-      set((s) => ({ remoteSessions: { ...s.remoteSessions, [remoteSessionCacheKey(tabId, projectCwd, profile)]: remoteList.sessions as SessionItem[] } }));
+    if (project && target) {
+      const remoteList = await window.api.session.listRemote(target, project.cwd);
+      const cacheId = project.remoteKey ?? `wsl:${project.host}`;
+      set((s) => ({ remoteSessions: { ...s.remoteSessions, [remoteSessionCacheKey(cacheId, project.cwd, project.agentDir)]: remoteList.sessions as SessionItem[] } }));
     }
   },
-  batchDelete: async (tabId, projectCwd) => {
+  batchDelete: async (project) => {
     const selected = get().selectedSessions;
     if (selected.size === 0) return;
     if (!confirm(`确定删除已选中的 ${selected.size} 个会话？\n此操作不可撤销。`)) return;
@@ -332,11 +335,11 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         await get().loadSessions(useTabsStore.getState().cwd);
         await get().refreshProjects();
       }
-      const tabsState = useTabsStore.getState();
-      if (tabsState.isRemote && tabId && projectCwd) {
-        const remoteList = await window.api.session.listRemote(tabId, projectCwd);
-        const profile = useTabsStore.getState().tabs.find((t) => t.id === tabId)?.remoteAgentDir ?? "";
-        set((s) => ({ remoteSessions: { ...s.remoteSessions, [remoteSessionCacheKey(tabId, projectCwd, profile)]: remoteList.sessions as SessionItem[] } }));
+      if (project) {
+        const target = projectTarget(project);
+        const remoteList = await window.api.session.listRemote(target, project.cwd);
+        const cacheId = project.remoteKey ?? (project.port === 0 ? `wsl:${project.host}` : buildRemoteKey(project.host, project.user, project.port, project.agentDir));
+        set((s) => ({ remoteSessions: { ...s.remoteSessions, [remoteSessionCacheKey(cacheId, project.cwd, project.agentDir)]: remoteList.sessions as SessionItem[] } }));
       }
     } catch (err) {
       alert(`批量删除出错：${err instanceof Error ? err.message : String(err)}`);
@@ -423,57 +426,75 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         connectingRemotes.delete(guard);
       }
     } else if (!tabId && project.host && project.user && (project.port ?? 22) !== 0) {
-      // SSH project on an unconnected server: auto-connect a shell tab so the
-      // click opens the project instead of silently no-oping.
-      const guard = `ssh:${buildRemoteKey(project.host, project.user, project.port, project.agentDir)}`;
-      if (connectingRemotes.has(guard)) return;
-      connectingRemotes.add(guard);
-      try {
-        tabId = await window.api.tab.create({
-          cwd: tabsState.cwd || ".",
-          remote: {
-            host: project.host,
-            user: project.user,
-            port: project.port,
-            path: project.cwd,
-            password: project.password,
-            agentDir: project.agentDir,
-            startPi: false,
-          },
+      // SSH projects are browsed through the connection PROFILE, never a
+      // shell tab: main resolves file/session calls from
+      // host/user/port/password/agentDir (see resolveTarget). Without a saved
+      // password the probe is what surfaces the login dialog — the sidebar's
+      // server node owns that (and remembers the credential).
+      // Probe on every expansion (not only when no password is saved): a
+      // stale/wrong saved password must surface the login dialog instead of
+      // letting SFTP fail silently into an eternal "正在加载会话信息".
+      // probeIfNeeded skips the round trip when this profile connected seconds
+      // ago, so repeat clicks stay instant.
+      if (willExpand) {
+        const outcome = await useRemoteStore.getState().probeIfNeeded({
+          host: project.host,
+          user: project.user,
+          port: project.port,
+          password: project.password,
+          agentDir: project.agentDir,
         });
-        project.tabId = tabId;
-      } catch (error) {
-        failConnect(error instanceof Error ? error.message : String(error));
-        useUiStore.getState().showToast(`连接 ${project.user}@${project.host} 失败: ${error instanceof Error ? error.message : String(error)}`, "err");
-        return;
-      } finally {
-        connectingRemotes.delete(guard);
+        if (!outcome.ok) {
+          failConnect(outcome.needPassword
+            ? `需要登录 ${project.user}@${project.host}：请点击左侧服务器节点输入密码`
+            : outcome.error || `无法连接 ${project.user}@${project.host}`);
+          return;
+        }
       }
     }
-    if (!tabId) return;
 
-    // Set the browse path BEFORE activating: the activation handler reads
-    // getBrowsePath when tabs:active fires, so a stale path would load the
-    // wrong tree and clobber the treeOrigin we set below (pre-existing race,
-    // fixed here by ordering).
-    await window.api.remote.setBrowsePath(tabId, project.cwd);
-    await window.api.tab.activate(tabId);
-    // One atomic activation (was six separate setters in App's hook).
+    // How the follow-up calls address this project: a live tab when one
+    // exists (WSL distro tabs), else the connection profile.
+    const profile = projectProfile(project);
+    const isWslProfile = "distro" in profile;
+    const target: TargetRef = tabId ?? projectTarget(project);
+    const cacheId = tabId
+      ?? project.remoteKey
+      ?? (isWslProfile ? `wsl:${profile.distro}` : buildRemoteKey(project.host, project.user, project.port, project.agentDir));
+
+    if (tabId) {
+      // Set the browse path BEFORE activating: the activation handler reads
+      // getBrowsePath when tabs:active fires, so a stale path would load the
+      // wrong tree and clobber the treeOrigin we set below (pre-existing race,
+      // fixed here by ordering).
+      await window.api.remote.setBrowsePath(tabId, project.cwd);
+      await window.api.tab.activate(tabId);
+    }
     useTabsStore.setState({
-      activeTab: tabId,
+      // A profile-backed project has no tab to activate: the middle pane keeps
+      // whatever the user had open instead of jumping to a bare shell.
+      ...(tabId ? { activeTab: tabId } : {}),
       isRemote: true,
       remoteDir: project.cwd,
       cwd: project.cwd,
-      remoteLabel: project.host && (project.port ?? 22) === 0 ? `WSL ${project.host}` : `${project.user}@${project.host}`,
+      remoteLabel: isWslProfile ? `WSL ${profile.distro}` : `${project.user}@${project.host}`,
     });
     // Record the origin BEFORE any cached tree is shown: file reads/mutations
     // must resolve against this project even while the activation handler's
     // async loadTree is still in flight.
-    useTreeStore.setState({ treeOrigin: { tabId, dirPath: project.cwd, isRemote: true } });
+    useTreeStore.setState({
+      treeOrigin: {
+        tabId,
+        remote: isWslProfile ? undefined : profile,
+        wsl: isWslProfile ? profile : undefined,
+        dirPath: project.cwd,
+        isRemote: true,
+      },
+    });
 
-    const remoteCacheKey = remoteSessionCacheKey(tabId, project.cwd, project.agentDir);
-    await window.api.session.setRemoteHydrationPaused(tabId, project.cwd, !willExpand);
-    if (willExpand) await window.api.session.prioritizeRemote(tabId, project.cwd, 2);
+    const remoteCacheKey = remoteSessionCacheKey(cacheId, project.cwd, project.agentDir);
+    await window.api.session.setRemoteHydrationPaused(target, project.cwd, !willExpand);
+    if (willExpand) await window.api.session.prioritizeRemote(target, project.cwd, 2);
     const st = get();
     const cachedTree = st.projectTrees[project.key] ?? useTreeStore.getState().remoteTreeCache[remoteCacheKey];
     if (cachedTree) useTreeStore.getState().setTree(sortFileNodes(cachedTree));
@@ -487,7 +508,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       }
       if (hasCachedTree && hasCachedSessions) {
         set((s) => ({ projectSessionStatus: { ...s.projectSessionStatus, [project.key]: "ready" } }));
-        void window.api.session.listRemote(tabId, project.cwd).then((listResult) => {
+        void window.api.session.listRemote(target, project.cwd).then((listResult) => {
           set((s) => ({
             projectSessions: { ...s.projectSessions, [project.key]: listResult.sessions as SessionItem[] },
             projectErrors: { ...s.projectErrors, [project.key]: listResult.error },
@@ -501,10 +522,10 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       }
       set((s) => ({ projectLoading: { ...s.projectLoading, [project.key]: true } }));
       set((s) => ({ projectSessionStatus: { ...s.projectSessionStatus, [project.key]: hasCachedSessions ? "ready" : "loading" } }));
-      set({ remoteHydration: { phase: hasCachedSessions ? "hydrating" : "loading", tabId, remoteCwd: project.cwd } });
+      set({ remoteHydration: { phase: hasCachedSessions ? "hydrating" : "loading", tabId, remoteKey: tabId ? undefined : cacheId, remoteCwd: project.cwd } });
 
       if (!hasCachedSessions) {
-        void window.api.session.listRemote(tabId, project.cwd).then((listResult) => {
+        void window.api.session.listRemote(target, project.cwd).then((listResult) => {
           set((s) => ({
             projectSessions: { ...s.projectSessions, [project.key]: listResult.sessions as SessionItem[] },
             projectErrors: { ...s.projectErrors, [project.key]: listResult.error },
@@ -526,7 +547,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       }
 
       if (!hasCachedTree) {
-        const nodes = await window.api.file.list(tabId, project.cwd);
+        const nodes = await window.api.file.list(target, project.cwd);
         const sortedNodes = sortFileNodes(nodes as FileNode[]);
         useTreeStore.getState().setTree(sortedNodes);
         set((s) => ({ projectTrees: { ...s.projectTrees, [project.key]: sortedNodes } }));
@@ -535,7 +556,7 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       return;
     }
 
-    const nodes = await window.api.file.list(tabId, project.cwd);
+    const nodes = await window.api.file.list(target, project.cwd);
     const sortedNodes = sortFileNodes(nodes as FileNode[]);
     useTreeStore.getState().setTree(sortedNodes);
     set((s) => ({
@@ -614,7 +635,12 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       return;
     }
     if (project.type === "remote") {
-      let remoteInfo = project.tabId ? await window.api.remote.getInfo(project.tabId) : null;
+      // The project row carries the whole profile, so no connection tab and no
+      // tab lookup are needed to open (or list) its sessions.
+      const target = projectTarget(project);
+      let remoteInfo = project.host && project.user && (project.port ?? 22) !== 0
+        ? await window.api.remote.getInfo(target)
+        : null;
       if (!remoteInfo && project.host && project.user) {
         remoteInfo = {
           host: project.host,
@@ -654,10 +680,10 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         },
         { cwd: project.cwd, isRemote: true, remoteDir: project.cwd, remoteLabel: `${remoteInfo.user}@${remoteInfo.host}` },
       );
-      const remoteTabId = project.tabId || id;
-      const remoteListResult = await window.api.session.listRemote(remoteTabId, project.cwd);
+      const remoteCacheId = project.remoteKey ?? buildRemoteKey(remoteInfo.host, remoteInfo.user, remoteInfo.port, remoteAgentDir);
+      const remoteListResult = await window.api.session.listRemote(target, project.cwd);
       set((s) => ({
-        remoteSessions: { ...s.remoteSessions, [remoteSessionCacheKey(remoteTabId, project.cwd, remoteAgentDir)]: remoteListResult.sessions as SessionItem[] },
+        remoteSessions: { ...s.remoteSessions, [remoteSessionCacheKey(remoteCacheId, project.cwd, remoteAgentDir)]: remoteListResult.sessions as SessionItem[] },
         projectErrors: { ...s.projectErrors, [project.key]: remoteListResult.error },
         projectDiagnostics: { ...s.projectDiagnostics, [project.key]: remoteListResult.diagnostics },
         projectSessionStatus: { ...s.projectSessionStatus, [project.key]: remoteListResult.error ? "error" : remoteListResult.sessions.length > 0 ? "ready" : "empty" },

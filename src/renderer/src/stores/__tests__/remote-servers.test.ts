@@ -213,15 +213,25 @@ describe("groupRemoteServers", () => {
     expect(groups[0].status).toBe("connected");
   });
 
-  it("falls back to a session tab when no connection shell tab exists", () => {
+  it("falls back to a pi session tab (booted) when no connection shell tab exists", () => {
     const groups = groupRemoteServers({
       ...empty,
       projects: [],
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
-      tabs: [sshTab({ id: "s1", kind: "agent", title: "my session", mode: "rpc" })],
+      tabs: [sshTab({ id: "s1", kind: "agent", title: "my session", mode: "rpc", remoteReady: true })],
     });
     expect(groups[0].status).toBe("connected");
     expect(groups[0].tabId).toBe("s1");
+  });
+
+  it("does NOT report connected for a session tab whose pi never booted (the auth-stuck case)", () => {
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: [],
+      remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
+      tabs: [sshTab({ id: "s1", kind: "agent", title: "my session", mode: "rpc" })], // exists, but no remoteReady
+    });
+    expect(groups[0].status).toBe("connecting");
   });
 
   it("reports connecting while the connection tab has not confirmed yet", () => {
@@ -256,14 +266,14 @@ describe("groupRemoteServers", () => {
     expect(groups[0].status).toBe("failed");
   });
 
-  it("an open pi session tab overrides a pending connection shell tab", () => {
+  it("a booted pi session tab overrides a pending connection shell tab", () => {
     const groups = groupRemoteServers({
       ...empty,
       projects: [],
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
       tabs: [
         sshTab({ id: "shell", kind: "connection" }), // pending
-        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc" }), // pi is running → connected
+        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc", remoteReady: true }), // pi is running → connected
       ],
     });
     expect(groups[0].status).toBe("connected");
@@ -297,14 +307,14 @@ describe("groupRemoteServers", () => {
     expect(groups[0].tabId).toBe("live");
   });
 
-  it("a session tab overrides a failed shell tab for connectivity", () => {
+  it("a booted session tab overrides a failed shell tab for connectivity", () => {
     const groups = groupRemoteServers({
       ...empty,
       projects: [],
       remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
       tabs: [
         sshTab({ id: "dead", sshState: "failed" }),
-        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc" }),
+        sshTab({ id: "session", kind: "agent", title: "my session", mode: "rpc", remoteReady: true }),
       ],
     });
     expect(groups[0].status).toBe("connected");
@@ -350,6 +360,22 @@ describe("groupRemoteServers", () => {
     expect(groups[0].password).toBe("new");
   });
 
+  it("the live probe profile's password overrides stale saved passwords (one-off login must not re-prompt)", () => {
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: projects([
+        { id: "p1", type: "remote", name: "app", host: "h1", user: "root", port: 22, path: "/srv/app", password: "stale" },
+      ]),
+      remoteHistory: history([{ id: "rh", host: "h1", user: "root", port: 22, password: "stale", updatedAt: 1 }]),
+      tabs: [],
+      remoteStatus: {
+        "root@h1:22": { status: "connected", profile: { host: "h1", user: "root", port: 22, password: "fresh-typed" } },
+      },
+    });
+    expect(groups[0].password).toBe("fresh-typed");
+    expect(groups[0].projects[0].password).toBe("fresh-typed");
+  });
+
   it("propagates the hydration phase for the hydrating project", () => {
     const groups = groupRemoteServers({
       ...empty,
@@ -374,5 +400,54 @@ describe("groupRemoteServers", () => {
       remoteHydration: { phase: "loading", tabId: "other", remoteCwd: "/srv/app" },
     });
     expect(groups[0].projects[0].hydrationPhase).toBe("idle");
+  });
+});
+
+// The probe registry is the tab-independent connection truth: a server the
+// user just probed must read "connected" without any connection tab existing,
+// and a live tab must still upgrade a stale "failed" probe.
+describe("groupRemoteServers with probe status", () => {
+  const registry = { "root@h1:22": { status: "connected" as const } };
+
+  it("reports a probed server as connected with no tab open", () => {
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: projects([
+        { id: "p1", type: "remote", name: "app", host: "h1", user: "root", port: 22, path: "/srv/app" },
+      ]),
+      remoteHistory: history([{ id: "r1", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
+      tabs: [],
+      remoteStatus: registry,
+      remoteHydration: { phase: "idle" },
+    });
+    expect(groups[0].status).toBe("connected");
+    // The project is therefore addressable (not disabled) without a tab.
+    expect(groups[0].projects[0].disabled).toBe(false);
+    expect(groups[0].projects[0].remoteKey).toBe("root@h1:22");
+  });
+
+  it("surfaces need-password from the registry for the login affordance", () => {
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: [],
+      remoteHistory: history([{ id: "r1", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
+      tabs: [],
+      remoteStatus: { "root@h1:22": { status: "disconnected" as const, needPassword: true } },
+      remoteHydration: { phase: "idle" },
+    });
+    expect(groups[0].status).toBe("disconnected");
+    expect(groups[0].needPassword).toBe(true);
+  });
+
+  it("lets a live ready tab override a stale failed probe", () => {
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: [],
+      remoteHistory: history([{ id: "r1", host: "h1", user: "root", port: 22, updatedAt: 1 }]),
+      tabs: [sshTab({ id: "t1", sshState: "ready" })],
+      remoteStatus: { "root@h1:22": { status: "failed" as const } },
+      remoteHydration: { phase: "idle" },
+    });
+    expect(groups[0].status).toBe("connected");
   });
 });

@@ -30,6 +30,7 @@ import {
   type WslOpts,
 } from "../pty";
 import type { ExtensionUiRequest } from "../rpc-session";
+import { subagentEnv } from "../subagent-model";
 
 interface PendingRequest {
   resolve: (r: { id?: string; command: string; success: boolean; data?: unknown; error?: string }) => void;
@@ -67,16 +68,22 @@ export function setUiRequestHandler(handler: (tabId: string, req: ExtensionUiReq
   onUiRequest = handler;
 }
 
-/** Pre-warm the worker (SDK import + shared infra) in the background so the
- *  first tab open is fast. Idempotent; safe to call at app startup. */
-export function prewarmSdkWorker(agentDir: string): void {
+/** Start the SDK worker WITHOUT warming a session: called on the first real
+ *  use (a local tab switching to the chat view), never at startup.
+ *
+ *  The worker is a worker_thread, so its memory counts against the MAIN
+ *  process — and it loads the bundled pi SDK (a ~139MB package) plus the model
+ *  runtime. Pre-warming it at startup therefore taxed every user, including
+ *  those who only ever work on remote sessions, to save ~1s on a local chat
+ *  open. Lazy start trades that second for hundreds of MB of headroom. */
+export function ensureSdkWorkerStarted(agentDir: string): void {
   try {
     const w = ensureWorker();
     // The worker queues this until the SDK module and message loop are ready.
     // This warms ModelRuntime/settings/theme, not just the worker process.
     w.postMessage({ kind: "warm", agentDir });
   } catch (e) {
-    console.error("[sdk] prewarm failed:", e instanceof Error ? e.message : String(e));
+    console.error("[sdk] worker start failed:", e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -221,6 +228,11 @@ export function openSdkSession(opts: CreateTabOptions & { id?: string; agentDir:
     agentDir: opts.agentDir,
     sessionPath: opts.sessionPath,
     continueRecent: opts.continueRecent,
+    // Worker threads get their own env copy, and the worker is long-lived
+    // across setting changes — so the subagent model travels WITH each open
+    // and the worker applies it to its own process.env (see sdk-worker.ts).
+    // Absent = follow the main model (the object is empty).
+    subagentEnv: subagentEnv(),
   });
   return id;
 }

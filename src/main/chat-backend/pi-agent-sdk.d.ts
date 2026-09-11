@@ -61,6 +61,9 @@ declare module "@earendil-works/pi-coding-agent" {
     switchSession(sessionPath: string, options?: Record<string, unknown>): Promise<{ cancelled: boolean }>;
     fork(entryId: string, options?: { position?: "at" | "after" }): Promise<{ cancelled: boolean; selectedText?: string }>;
     setRebindSession(cb: (session: AgentSession) => Promise<void>): void;
+    /** pi's startup model-restore failure notice (e.g. auth missing for the
+     *  session's saved provider) — undefined when the model restored cleanly. */
+    readonly modelFallbackMessage?: string;
   }
 
   export interface AgentSession {

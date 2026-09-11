@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionsStore, sessionLabel, remoteSessionCacheKey, buildRemoteKey } from "../sessionsStore";
 import { useTabsStore } from "../tabsStore";
 import { useTreeStore } from "../treeStore";
-import type { SessionItem, ProjectListItem, RemoteHistoryItem, RemoteServerGroup } from "../types";
+import { useRemoteStore } from "../remoteStore";
+import type { SessionItem, ProjectGroup, ProjectListItem, RemoteHistoryItem, RemoteServerGroup } from "../types";
 
 const SESSION: SessionItem = {
   path: "/sessions/x.jsonl",
@@ -42,6 +43,8 @@ function makeApi(opts: { sessionList?: (cwd?: string) => Promise<SessionItem[]> 
       setBrowsePath: vi.fn(async () => true),
       listHistory: vi.fn(async () => [] as RemoteHistoryItem[]),
       deleteHistory: vi.fn(async () => true),
+      probe: vi.fn(async (): Promise<{ status: "ready" | "need-password" | "failed"; error?: string; key: string }> => ({ status: "ready", key: "u@h:22" })),
+      saveHistory: vi.fn(async () => [] as RemoteHistoryItem[]),
     },
     file: {
       list: vi.fn(async () => [] as ProjectListItem[]),
@@ -67,6 +70,10 @@ beforeEach(() => {
     remoteHydration: { phase: "idle" },
     expandedProjects: new Set(),
   });
+  // Connection status is a module-level store shared by every test in this
+  // file: without a reset, a "connected" probe from an earlier test makes
+  // probeIfNeeded skip the probe here and hides the behavior under test.
+  useRemoteStore.setState({ byKey: {}, probing: {} });
   useTabsStore.setState({ tabs: [], activeTab: null, isRemote: false, cwd: "/proj", remoteDir: null, remoteLabel: "" });
   useTreeStore.setState({ tree: [], expanded: new Set(), fileTreeStatus: "idle", fileTreeError: null, remoteTreeCache: {}, treeOrigin: null });
 });
@@ -140,11 +147,17 @@ describe("openSession", () => {
   });
 });
 
+const WSL_PROJECT: ProjectGroup = {
+  key: "wsl-1", label: "Ubuntu", cwd: "/proj", type: "remote", host: "Ubuntu", user: "", port: 0, sessions: [],
+};
+const SSH_PROJECT: ProjectGroup = {
+  key: "ssh-1", label: "proj", cwd: "/proj", type: "remote", host: "h", user: "u", port: 22, password: "p", remoteKey: "u@h:22", sessions: [],
+};
+
 describe("openRemoteSession", () => {
-  it("creates and immediately shows a WSL tab when the source tab is a WSL connection", async () => {
+  it("creates and immediately shows a WSL tab from the project profile", async () => {
     const api = makeApi();
-    api.remote.getInfo.mockResolvedValue({ host: "Ubuntu", user: "", isWsl: true, path: "~" });
-    await useSessionsStore.getState().openRemoteSession("t-wsl", "/proj", SESSION);
+    await useSessionsStore.getState().openRemoteSession(WSL_PROJECT, SESSION);
     expect(api.tab.create).toHaveBeenCalledWith({
       cwd: "/proj",
       sessionPath: SESSION.path,
@@ -156,22 +169,26 @@ describe("openRemoteSession", () => {
     expect(useTabsStore.getState().remoteDir).toBe("/proj");
   });
 
-  it("creates an SSH tab for a regular remote tab", async () => {
+  it("creates an SSH session tab straight from the project profile (no tab round trip)", async () => {
     const api = makeApi();
-    api.remote.getInfo.mockResolvedValue({ host: "h", user: "u", port: 22, password: "p", path: "~" });
-    await useSessionsStore.getState().openRemoteSession("t-ssh", "/proj", SESSION);
+    await useSessionsStore.getState().openRemoteSession(SSH_PROJECT, SESSION);
+    // The row carries the profile, so resolving it via remote:get-info is gone.
+    expect(api.remote.getInfo).not.toHaveBeenCalled();
     expect(api.tab.create).toHaveBeenCalledWith(
-      expect.objectContaining({ remote: { host: "h", user: "u", port: 22, path: "/proj", password: "p" } }),
+      expect.objectContaining({
+        sessionPath: SESSION.path,
+        remote: expect.objectContaining({ host: "h", user: "u", port: 22, path: "/proj", password: "p" }),
+      }),
     );
   });
 
-  it("dedups against an already-open tab for the session without clobbering remoteDir", async () => {
+  it("dedups against an already-open tab for the same server without clobbering remoteDir", async () => {
     const api = makeApi();
     useTabsStore.setState({
-      tabs: [{ id: "t-open", cwd: "D:/app", isRemote: true, sessionPath: SESSION.path, title: "x", pi: true } as any],
+      tabs: [{ id: "t-open", cwd: "D:/app", isRemote: true, remoteKey: "u@h:22", sessionPath: SESSION.path, title: "x", pi: true } as any],
       remoteDir: "/remote/project",
     });
-    await useSessionsStore.getState().openRemoteSession("t-any", "/proj", SESSION);
+    await useSessionsStore.getState().openRemoteSession(SSH_PROJECT, SESSION);
     expect(api.tab.activate).toHaveBeenCalledWith("t-open");
     expect(api.tab.create).not.toHaveBeenCalled();
     expect(useTabsStore.getState().activeTab).toBe("t-open");
@@ -263,7 +280,9 @@ describe("toggleProject (explorer orchestration)", () => {
     expect(api.session.prioritizeRemote).toHaveBeenCalledWith("t-conn", "/r", 2);
     // Cached tree shown immediately (no file.list for the fast path).
     expect(api.file.list).not.toHaveBeenCalled();
-    expect(useTreeStore.getState().treeOrigin).toEqual({ tabId: "t-conn", dirPath: "/r", isRemote: true });
+    // A tab-backed project still records its connection profile on the origin,
+    // so later file reads/mutations stay addressable if the tab goes away.
+    expect(useTreeStore.getState().treeOrigin).toEqual(expect.objectContaining({ tabId: "t-conn", dirPath: "/r", isRemote: true }));
     const tabs = useTabsStore.getState();
     expect(tabs.isRemote).toBe(true);
     expect(tabs.remoteDir).toBe("/r");
@@ -301,65 +320,97 @@ describe("toggleProject (explorer orchestration)", () => {
     await useSessionsStore.getState().toggleProject(wslProject);
     expect(api.tab.create).toHaveBeenCalledWith({ cwd: "/proj", wsl: { distro: "Ubuntu", path: "/w/proj" } });
     expect(api.remote.setBrowsePath).toHaveBeenCalledWith("tab-1", "/w/proj");
-    expect(useTreeStore.getState().treeOrigin).toEqual({ tabId: "tab-1", dirPath: "/w/proj", isRemote: true });
+    expect(useTreeStore.getState().treeOrigin).toEqual(expect.objectContaining({ tabId: "tab-1", dirPath: "/w/proj", isRemote: true }));
   });
 
-  it("SSH project without an open tab auto-connects a shell tab", async () => {
+  it("SSH project without an open tab browses through the connection profile (no tab at all)", async () => {
     const api = makeApi();
     const sshProject = {
       key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
       host: "h", user: "u", port: 22, password: "p", sessions: [],
     };
     await useSessionsStore.getState().toggleProject(sshProject);
-    expect(api.tab.create).toHaveBeenCalledWith(expect.objectContaining({
-      cwd: "/proj",
-      remote: { host: "h", user: "u", port: 22, path: "/r", password: "p", startPi: false },
+    // The sidebar click must never produce a tab: no ssh shell, no middle-pane jump.
+    expect(api.tab.create).not.toHaveBeenCalled();
+    expect(api.tab.activate).not.toHaveBeenCalled();
+    expect(api.remote.setBrowsePath).not.toHaveBeenCalled();
+    // Sessions + tree address the PROFILE; the cache keys stay tab-independent.
+    expect(api.session.listRemote).toHaveBeenCalledWith(
+      { remote: expect.objectContaining({ host: "h", user: "u", port: 22, password: "p" }) },
+      "/r",
+    );
+    expect(api.file.list).toHaveBeenCalledWith({ remote: expect.objectContaining({ host: "h" }) }, "/r");
+    expect(useTreeStore.getState().treeOrigin).toEqual(expect.objectContaining({
+      dirPath: "/r",
+      isRemote: true,
+      remote: expect.objectContaining({ host: "h", user: "u" }),
     }));
-    expect(api.remote.setBrowsePath).toHaveBeenCalledWith("tab-1", "/r");
-    expect(useTreeStore.getState().treeOrigin).toEqual({ tabId: "tab-1", dirPath: "/r", isRemote: true });
   });
 
-  it("rapid double-clicks on a disconnected SSH project create exactly one tab", async () => {
+  it("SSH project without a saved password asks for login instead of spawning a tab", async () => {
     const api = makeApi();
-    let resolveCreate!: (value: string) => void;
-    api.tab.create.mockImplementation(() => new Promise<string>((r) => (resolveCreate = r)));
+    api.remote.probe.mockResolvedValue({ status: "need-password", key: "u@h:22" });
     const sshProject = {
       key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
-      host: "h", user: "u", port: 22, password: "p", sessions: [],
+      host: "h", user: "u", port: 22, sessions: [],
     };
-    const p1 = useSessionsStore.getState().toggleProject(sshProject);
-    const p2 = useSessionsStore.getState().toggleProject(sshProject); // second click while first is in flight
-    resolveCreate("tab-1");
-    await Promise.all([p1, p2]);
-    expect(api.tab.create).toHaveBeenCalledTimes(1);
+    useSessionsStore.setState({ expandedProjects: new Set() });
+    await useSessionsStore.getState().toggleProject(sshProject);
+    expect(api.tab.create).not.toHaveBeenCalled();
+    const s = useSessionsStore.getState();
+    // No eternal spinner: expansion reverted and the row says what to do.
+    expect(s.expandedProjects.has("sp")).toBe(false);
+    expect(s.projectSessionStatus.sp).toBe("error");
+    expect(s.projectErrors.sp).toContain("需要登录");
   });
 
-  it("failed SSH auto-connect rolls back expansion and marks the project as error", async () => {
+  it("re-probes a project that HAS a saved password (stale password must not hide behind a green dot)", async () => {
     const api = makeApi();
-    api.tab.create.mockRejectedValue(new Error("connection refused"));
+    api.remote.probe.mockResolvedValue({ status: "need-password", key: "u@h:22" });
     const sshProject = {
       key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
-      host: "h", user: "u", port: 22, password: "p", sessions: [],
+      host: "h", user: "u", port: 22, password: "stale", sessions: [],
+    };
+    useSessionsStore.setState({ expandedProjects: new Set() });
+    await useSessionsStore.getState().toggleProject(sshProject);
+    // The probe runs even though a password is stored: otherwise a wrong
+    // password would let the row load nothing and say "正在加载会话信息" forever.
+    expect(api.remote.probe).toHaveBeenCalledTimes(1);
+    expect(api.session.listRemote).not.toHaveBeenCalled();
+    const s = useSessionsStore.getState();
+    expect(s.expandedProjects.has("sp")).toBe(false);
+    expect(s.projectErrors.sp).toContain("需要登录");
+  });
+
+  it("a failed probe rolls back expansion and marks the project as error", async () => {
+    const api = makeApi();
+    api.remote.probe.mockResolvedValue({ status: "failed", error: "connection refused", key: "u@h:22" });
+    const sshProject = {
+      key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
+      host: "h", user: "u", port: 22, sessions: [],
     };
     useSessionsStore.setState({ expandedProjects: new Set() });
     await useSessionsStore.getState().toggleProject(sshProject);
     const s = useSessionsStore.getState();
-    // No eternal "远程会话加载中…": expansion reverted, error surfaced.
     expect(s.expandedProjects.has("sp")).toBe(false);
     expect(s.projectSessionStatus.sp).toBe("error");
-    expect(s.projectErrors.sp).toBe("connection refused");
+    expect(s.projectErrors.sp).toContain("connection refused");
   });
 
-  it("a failed auto-connect releases the in-flight guard so a retry reconnects", async () => {
+  it("a failed probe does not latch the project: retrying probes again", async () => {
     const api = makeApi();
-    api.tab.create.mockRejectedValueOnce(new Error("boom")).mockResolvedValueOnce("tab-2");
+    api.remote.probe
+      .mockResolvedValueOnce({ status: "failed", error: "boom", key: "u@h:22" })
+      .mockResolvedValueOnce({ status: "ready", key: "u@h:22" });
     const sshProject = {
       key: "sp", label: "SP", cwd: "/r", type: "remote" as const,
-      host: "h", user: "u", port: 22, password: "p", sessions: [],
+      host: "h", user: "u", port: 22, sessions: [],
     };
     await useSessionsStore.getState().toggleProject(sshProject);
+    useSessionsStore.setState({ expandedProjects: new Set() }); // user retries the row
     await useSessionsStore.getState().toggleProject(sshProject);
-    expect(api.tab.create).toHaveBeenCalledTimes(2);
+    expect(api.remote.probe).toHaveBeenCalledTimes(2);
+    expect(api.session.listRemote).toHaveBeenCalled();
   });
 
   it("newProjectSession: local project opens and immediately shows a plain tab", async () => {

@@ -1,9 +1,21 @@
 /**
  * Session tree dialog — aligned with pi's TUI /tree (TreeSelectorComponent):
- *  - connector gutter (└/├/─), fold markers, active-path dots, branch labels
+ *  - connector gutter (│/├/└), fold markers (⊞/⊟ inside the gutter, like the
+ *    TUI), active-path dots, branch labels, per-row timestamps (HH:MM today,
+ *    M/D otherwise)
  *  - per-type entry labels (user:/assistant:/[tool]/[model]/[compaction]/…)
+ *  - default view hides bookkeeping entries (label/model_change/…) and
+ *    tool-call-only assistant rows — same visibility rules as the TUI's
+ *    applyFilter; quick filter chips (标准/用户/无工具/全部) + multi-token search
+ *  - folding hides descendants (a child whose parent is folded collapses
+ *    into it, like the TUI's fold handling; gutter shapes are computed on
+ *    the full tree, so a folded tail row keeps its elbow — cosmetic only)
+ *  - windowed rendering: only the rows around the viewport mount, so a
+ *    thousand-entry session renders ~30 rows regardless of size
+ *  - keyboard: ↑/↓ move, Home/End jump, Enter navigates, Shift+Enter offers
+ *    the summary choice, Ctrl+F focuses search, Esc backs out / closes
  *  - active-branch-first ordering, single-child chains rendered flat
- *  - current leaf pre-selected, search filter, fold/unfold
+ *  - current leaf pre-selected, fold/unfold
  *  - navigate to a point (SDK tabs: native `navigate_tree` RPC — a silent
  *    session operation, nothing enters the prompt channel; RPC-backed
  *    remote/WSL tabs: pipi-tree-nav extension command bridge, since
@@ -16,13 +28,16 @@
  * dropped first request, or a worker hiccup fills in instead of leaving a
  * stale empty tree; explicit failures show an error + retry, and a truly
  * blank session gets its own empty-state copy instead of a misleading
- * "（无匹配）".
+ * "（无匹配）". Identical snapshots (same entries + leaf) are dropped
+ * instead of re-rendering — the poll costs nothing while nothing changes.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
 import { buildTreeFromEntries, type TreeEntry as FlatTreeEntry } from "../../../shared/tree-build";
+import { applyVisibility, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
+import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
 
 interface TreeEntry {
   id: string;
@@ -108,9 +123,11 @@ interface FlatNode {
   showConnector: boolean;
   isLast: boolean;
   isVirtualRootChild: boolean;
+  /** Vertical │ gutters at ancestor levels (position = display indent level). */
+  gutters: Array<{ position: number; show: boolean }>;
 }
 
-function flattenTree(roots: TreeNode[], leafId: string | null): { flat: FlatNode[]; containsActive: Map<string, boolean> } {
+function flattenTree(roots: TreeNode[], leafId: string | null): { flat: FlatNode[] } {
   const containsActive = new Map<string, boolean>();
   // Post-order: does a subtree contain the active leaf?
   {
@@ -131,25 +148,32 @@ function flattenTree(roots: TreeNode[], leafId: string | null): { flat: FlatNode
   const flat: FlatNode[] = [];
   const multipleRoots = roots.length > 1;
   const orderedRoots = [...roots].sort((a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)));
-  const stack: Array<[TreeNode, number, boolean, boolean, boolean, boolean]> = [];
+  const stack: Array<[TreeNode, number, boolean, boolean, boolean, Array<{ position: number; show: boolean }>, boolean]> = [];
   for (let i = orderedRoots.length - 1; i >= 0; i--) {
-    stack.push([orderedRoots[i]!, multipleRoots ? 1 : 0, multipleRoots, multipleRoots, i === orderedRoots.length - 1, multipleRoots]);
+    stack.push([orderedRoots[i]!, multipleRoots ? 1 : 0, multipleRoots, multipleRoots, i === orderedRoots.length - 1, [], multipleRoots]);
   }
   while (stack.length) {
-    const [node, indent, justBranched, showConnector, isLast, isVirtualRootChild] = stack.pop()!;
-    flat.push({ node, indent, showConnector, isLast, isVirtualRootChild });
+    const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop()!;
+    flat.push({ node, indent, showConnector, isLast, isVirtualRootChild, gutters });
     const children = node.children;
     const multipleChildren = children.length > 1;
     const orderedChildren = [...children].sort((a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)));
     let childIndent: number;
     if (multipleChildren) childIndent = indent + 1;
-    else if (justBranched && indent > 0) childIndent = indent + 1;
+    else if (justBranched && indent > 1) childIndent = indent + 1;
     else childIndent = indent;
+    // The connector this node drew leaves a vertical gutter for its
+    // descendants (continues while the node is not the last child) — this is
+    // what keeps deep branches visually attached to their parent elbow.
+    const connectorDisplayed = showConnector && !isVirtualRootChild;
+    const displayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
+    const connectorPosition = Math.max(0, displayIndent - 1);
+    const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
     for (let i = orderedChildren.length - 1; i >= 0; i--) {
-      stack.push([orderedChildren[i]!, childIndent, multipleChildren, multipleChildren, i === orderedChildren.length - 1, false]);
+      stack.push([orderedChildren[i]!, childIndent, multipleChildren, multipleChildren, i === orderedChildren.length - 1, childGutters, false]);
     }
   }
-  return { flat, containsActive };
+  return { flat };
 }
 
 // --- entry display (mirrors getEntryDisplayText) ----------------------------
@@ -214,6 +238,17 @@ function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; arg
 
 type SummaryChoice = "none" | "auto" | "custom";
 
+const FILTER_LABELS: Record<TreeFilterMode, string> = {
+  default: "标准",
+  "user-only": "用户",
+  "no-tools": "无工具",
+  "labeled-only": "标签",
+  all: "全部",
+};
+
+/** Row window around the viewport — long sessions mount ~2×40 rows, not all. */
+const WINDOW_MARGIN = 20;
+
 export function TreeDialog({
   tabId,
   onClose,
@@ -232,6 +267,7 @@ export function TreeDialog({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [folded, setFolded] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
+  const [filterMode, setFilterMode] = useState<TreeFilterMode>("default");
   const [error, setError] = useState<string | null>(null);
   const [navPhase, setNavPhase] = useState<"idle" | "choose-summary" | "custom-instructions" | "navigating">("idle");
   const [customInstr, setCustomInstr] = useState("");
@@ -245,6 +281,8 @@ export function TreeDialog({
   const [treeStatus, setTreeStatus] = useState<"loading" | "ready" | "error">("loading");
   const [slowTicks, setSlowTicks] = useState(0); // ~3s each; drives the "still loading" hint
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** Last applied snapshot (entries + leaf) — identical polls are dropped. */
+  const lastSnapshotRef = useRef<{ entries: FlatTreeEntry[]; leafId: string | null } | null>(null);
   // Mirrors for timers/closures that must not capture stale render values.
   const treeStatusRef = useRef(treeStatus);
   treeStatusRef.current = treeStatus;
@@ -270,18 +308,54 @@ export function TreeDialog({
       // get_entries (flat) instead of get_tree (nested): Electron's
       // contextBridge rejects trees nested deeper than 1000 levels, which a
       // long linear session is. The renderer rebuilds the tree from entries.
+      // Single-flight: never stack a second request while one is unanswered
+      // (see entriesInFlightRef) — the poll interval is far shorter than a
+      // slow remote round trip.
+      if (!tryAcquireEntriesSlot()) return;
       void window.api.tab.rpcSend(tabId, { type: "get_entries" })
         .then((ok) => {
           window.api.debug.log(`TreeDialog(${tabId}) get_entries sent ok=${ok}`);
-          if (!ok && !pendingNavRequestId.current) {
-            setTreeStatus("error");
-            setError("会话不可用（标签页未就绪或已退出）");
+          if (!ok) {
+            releaseEntriesSlot();
+            if (!pendingNavRequestId.current) {
+              setTreeStatus("error");
+              setError("会话不可用（标签页未就绪或已退出）");
+            }
           }
         })
         .catch(() => {
-          // IPC rejected (e.g. window torn down mid-invoke): stay on the
-          // current state; the interval keeps retrying and heals on success.
+          // IPC rejected (e.g. window torn down mid-invoke): release the slot
+          // so the interval retries and heals on success.
+          releaseEntriesSlot();
         });
+    };
+    /** Apply a fetched snapshot, dropping no-op polls so nothing re-renders
+     *  while the session is unchanged (the 3s poll stays free). */
+    const applySnapshot = (entries: FlatTreeEntry[], nextLeaf: string | null) => {
+      const prev = lastSnapshotRef.current;
+      const prevLeaf = prev?.leafId ?? null;
+      if (prev && prevLeaf === nextLeaf && prev.entries.length === entries.length) {
+        let same = true;
+        for (let i = 0; i < entries.length; i++) {
+          const a = prev.entries[i]!, b = entries[i]!;
+          if (a.id !== b.id || a.type !== b.type || a.parentId !== b.parentId || a.timestamp !== b.timestamp) {
+            same = false;
+            break;
+          }
+        }
+        if (same) {
+          setError(null);
+          setTreeStatus("ready");
+          setSlowTicks(0);
+          return;
+        }
+      }
+      lastSnapshotRef.current = { entries, leafId: nextLeaf };
+      setTree(buildTreeFromEntries(entries).tree);
+      setLeafId(nextLeaf);
+      setError(null);
+      setTreeStatus("ready");
+      setSlowTicks(0);
     };
     sendRefresh();
     const tryFileSnapshot = () => {
@@ -293,7 +367,9 @@ export function TreeDialog({
           // flight — the snapshot's stale leaf must not trip the navigation
           // completion detector (which fires on leafId change + navigatingId).
           if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.entries)) {
-            setTree(buildTreeFromEntries(res.entries as FlatTreeEntry[]).tree);
+            const entries = res.entries as FlatTreeEntry[];
+            lastSnapshotRef.current = { entries, leafId: res.leafId ?? null };
+            setTree(buildTreeFromEntries(entries).tree);
             setLeafId(res.leafId ?? null);
             setError(null);
             setTreeStatus("ready");
@@ -409,6 +485,10 @@ export function TreeDialog({
       }
       if (event.type !== "response" || event.command !== "get_entries") return;
       lastResponseAtRef.current = Date.now();
+      // Any get_entries response — refresh poll or navigation poll — frees the
+      // single-flight slot. Done BEFORE the navigation filter below: a late
+      // refresh response must not leave the slot claimed forever.
+      releaseEntriesSlot();
       // During navigation, ignore unrelated tree snapshots (initial refreshes
       // or another consumer's request). They must not be able to complete the
       // current navigation early.
@@ -418,11 +498,7 @@ export function TreeDialog({
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
         window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE entries=${data.entries.length} leaf=${data.leafId ?? "null"}`);
-        setTree(buildTreeFromEntries(data.entries as FlatTreeEntry[]).tree);
-        setLeafId(data.leafId ?? null);
-        setError(null);
-        setTreeStatus("ready");
-        setSlowTicks(0);
+        applySnapshot(data.entries as FlatTreeEntry[], data.leafId ?? null);
       } else {
         setTreeStatus("error");
         setError(friendlyTreeError(String(event.error ?? "获取会话树失败")));
@@ -487,14 +563,27 @@ export function TreeDialog({
     return set;
   }, [tree, leafId]);
 
+  // Visibility + search, mirroring the TUI's applyFilter: bookkeeping entries
+  // hidden in the default view, tool-call-only assistant rows hidden (unless
+  // error/aborted/current leaf), multi-token AND search. FlatNode satisfies
+  // the structural TreeFlatLike, so the result stays fully typed.
+  const visible = useMemo(
+    () => applyVisibility(flat, filterMode, query, leafId),
+    [flat, filterMode, query, leafId],
+  );
+
+  // Folding hides DESCENDANTS (mirrors the TUI's fold handling): a child whose
+  // parent (or any nearer ancestor) is folded is skipped, so its row collapses
+  // into the folded parent instead of dangling detached.
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return flat;
-    return flat.filter((f) => {
-      const d = entryDisplay(f.node, toolCalls);
-      return (d.label + " " + d.text).toLowerCase().includes(q);
-    });
-  }, [flat, query, toolCalls]);
+    if (folded.size === 0) return visible;
+    const skip = new Set<string>();
+    for (const f of visible) {
+      const { id, parentId } = f.node.entry;
+      if (parentId != null && (folded.has(parentId) || skip.has(parentId))) skip.add(id);
+    }
+    return visible.filter((f) => !skip.has(f.node.entry.id));
+  }, [visible, folded]);
 
   const selected = useMemo(() => {
     for (const f of flat) if (f.node.entry.id === selectedId) return f.node;
@@ -527,6 +616,48 @@ export function TreeDialog({
       return next;
     });
   };
+
+  // Windowed rows: only entries within WINDOW_MARGIN of the viewport mount.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const rowRefs = useRef(new Map<string, HTMLDivElement>());
+  const [win, setWin] = useState({ start: 0, end: 80 });
+  const winRef = useRef(win);
+  winRef.current = win;
+  const recomputeWindow = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const rowH = 24; // .tree-row fixed height (see styles.css)
+    const start = Math.max(0, Math.floor(el.scrollTop / rowH) - WINDOW_MARGIN);
+    const count = Math.ceil(el.clientHeight / rowH) + WINDOW_MARGIN * 2;
+    setWin((w) => (w.start === start && w.end === start + count ? w : { start, end: start + count }));
+  };
+  /** Nudge the window so `index` is inside it (Home/End, big selection jumps)
+   *  and set the scroller near the row so it mounts, then scrollIntoView lands
+   *  on it. Without this a jump past the window's edge never mounts the row
+   *  and can never scroll to it. */
+  const ensureWindowCovers = (index: number) => {
+    const w = winRef.current;
+    if (index >= w.start && index < w.end) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = Math.max(0, index * 24 - el.clientHeight / 2);
+    const start = Math.max(0, index - WINDOW_MARGIN);
+    setWin({ start, end: start + WINDOW_MARGIN * 2 + 40 });
+  };
+  useEffect(() => {
+    recomputeWindow();
+    const el = scrollRef.current;
+    if (!el) return;
+    el.addEventListener("scroll", recomputeWindow, { passive: true });
+    return () => el.removeEventListener("scroll", recomputeWindow);
+  }, []);
+  // Clamp the window when the list size changes (filter switch, tree update).
+  useEffect(() => {
+    setWin((w) => ({
+      start: Math.min(w.start, Math.max(0, filtered.length - 1)),
+      end: Math.max(w.end, Math.min(w.start + 80, filtered.length)),
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered.length]);
 
   const navigate = (choice: SummaryChoice) => {
     if (!selected) return;
@@ -636,9 +767,21 @@ export function TreeDialog({
           };
     void window.api.tab.rpcSend(tabId, cmd);
     // Poll get_tree until the leaf moves (or timeout) — navigateTree executes
-    // synchronously inside pi, so this resolves quickly.
+    // synchronously inside pi, so this resolves quickly. Same single-flight
+    // slot as the refresh poll: navigation can take up to 180s (a summarize
+    // model call), and 1s polling without the guard queued ~180 requests on
+    // pi's serial command loop.
     const timer = setInterval(() => {
-      void window.api.tab.rpcSend(tabId, { type: "get_entries", id: requestId });
+      if (tryAcquireEntriesSlot()) {
+        void window.api.tab
+          .rpcSend(tabId, { type: "get_entries", id: requestId })
+          .then((ok) => {
+            // Tab gone → no response will ever arrive; free the slot so the
+            // poll keeps trying instead of waiting out the stall window.
+            if (!ok) releaseEntriesSlot();
+          })
+          .catch(() => releaseEntriesSlot());
+      }
       // The timeout is a backstop for a worker that never answers. A human
       // answering an extension prompt during navigation (e.g. pi-rewind's
       // "Restore Options") can legitimately extend the wait, so give plain
@@ -658,6 +801,20 @@ export function TreeDialog({
 
   const pendingNavTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const pendingNavRequestId = useRef<string | null>(null);
+  /**
+   * Single-flight gate for `get_entries` (both the 3s refresh poll and the
+   * 1s navigation poll). The RPC link can be FAR slower than the poll
+   * interval — measured 15–18s per response on a high-latency remote — and
+   * `pi --mode rpc` answers commands serially behind a stdout backpressure
+   * gate. Polling without this gate stacks hundreds of requests (observed:
+   * 12949 sends / 12932 responses for one dialog) and starves every other
+   * command (prompt/get_state/get_messages), which is what made the app look
+   * hung. See tree-poll-guard.ts for the policy + tests.
+   */
+  const entriesSlotRef = useRef(createEntriesSlot(ENTRIES_STALL_MS));
+  /** Drop a stale in-flight claim before polling; false = a request is out. */
+  const tryAcquireEntriesSlot = (): boolean => entriesSlotRef.current.acquire();
+  const releaseEntriesSlot = (): void => entriesSlotRef.current.release();
   const prevLeafRef = useRef<string | null>(null);
 
   // Fresh view of the navigation completion. The onRpcEvent handler is
@@ -719,6 +876,86 @@ export function TreeDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flat]);
 
+  // Selection fallback: if the selected row is filtered/folded out, move to
+  // the nearest still-visible ancestor (mirrors the TUI's findNearestVisible).
+  useEffect(() => {
+    if (!selectedId || filtered.some((f) => f.node.entry.id === selectedId)) return;
+    const parentById = new Map<string, string | null>();
+    for (const f of flat) parentById.set(f.node.entry.id, f.node.entry.parentId);
+    let cur: string | null = parentById.get(selectedId) ?? null;
+    while (cur && !filtered.some((f) => f.node.entry.id === cur)) cur = parentById.get(cur) ?? null;
+    setSelectedId(cur ?? filtered[filtered.length - 1]?.node.entry.id ?? null);
+  }, [filtered, flat, selectedId]);
+
+  // Keyboard: ↑/↓ move, Home/End jump, Enter navigates, Shift+Enter offers the
+  // summary choice, Ctrl+F focuses search, Esc backs out / closes. The input
+  // keeps all printing keys; nav keys are handled here so arrows work from
+  // the search box too (like the TUI). isComposing guards keep an active
+  // Chinese IME candidate window from moving the selection or closing.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (navPhase !== "idle" || e.isComposing) return;
+      const isSearchFocused = document.activeElement === searchRef.current;
+      if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+        return;
+      }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (filtered.length === 0) return;
+        const idx = filtered.findIndex((f) => f.node.entry.id === selectedId);
+        const delta = e.key === "ArrowDown" ? 1 : -1;
+        const next = idx < 0 ? (delta > 0 ? 0 : filtered.length - 1) : Math.min(filtered.length - 1, Math.max(0, idx + delta));
+        setSelectedId(filtered[next]!.node.entry.id);
+      } else if (e.key === "Home" || e.key === "End") {
+        if (isSearchFocused && !e.ctrlKey && !e.metaKey) return; // text caret
+        if (filtered.length === 0) return;
+        e.preventDefault();
+        setSelectedId((e.key === "Home" ? filtered[0] : filtered[filtered.length - 1])!.node.entry.id);
+      } else if (e.key === "Enter") {
+        // Enter in the search box commits the search (re-focuses the list),
+        // it does not navigate — navigate from the list with Enter/双击.
+        if (isSearchFocused) {
+          e.preventDefault();
+          searchRef.current?.blur();
+          return;
+        }
+        if (!selectedId) return;
+        const target = filtered.find((f) => f.node.entry.id === selectedId);
+        if (!target) return;
+        e.preventDefault();
+        if (e.shiftKey) {
+          if (target.node.entry.id !== leafId) setNavPhase("choose-summary");
+        } else {
+          if (target.node.entry.id !== leafId) setNavPhase("choose-summary");
+          else useUiStore.getState().showToast("已是当前分支的最新位置", "ok");
+        }
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [filtered, selectedId, navPhase, leafId, onClose]);
+
+  // Windowed rendering: keep the selected row scrolled into view. The row
+  // refs only hold MOUNTED rows, so jumps beyond the window (Home/End, the
+  // initial pre-selection on a long session) must first move the window —
+  // ensureWindowCovers sets scrollTop so the row mounts, then the DOM
+  // scrollIntoView below fine-tunes it into view.
+  useEffect(() => {
+    if (!selectedId || filtered.length === 0) return;
+    const idx = filtered.findIndex((f) => f.node.entry.id === selectedId);
+    if (idx >= 0) ensureWindowCovers(idx);
+    const el = rowRefs.current.get(selectedId);
+    el?.scrollIntoView({ block: "nearest" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
   useEffect(() => {
     if (query) searchRef.current?.focus();
   }, [query]);
@@ -736,9 +973,28 @@ export function TreeDialog({
             className="dialog-input tree-search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索消息…"
+            placeholder="搜索消息…（多关键词用空格分隔）"
+            title="↑↓ 选择 · Enter 导航 · Shift+Enter 导航并摘要 · Ctrl+F 搜索 · Esc 关闭"
           />
-          <div className="tree-scroll">
+          <div className="tree-filters" role="group" aria-label="显示筛选">
+            {(Object.keys(FILTER_LABELS) as TreeFilterMode[]).map((m) => (
+              <button
+                key={m}
+                className={`tree-chip${filterMode === m ? " active" : ""}`}
+                aria-pressed={filterMode === m}
+                onClick={() => setFilterMode(m)}
+                title={m === "default" ? "隐藏 model/label 等簿记条目与纯工具调用行" : m === "user-only" ? "只看用户消息（快速定位分支点）" : m === "no-tools" ? "默认视图再去掉工具结果" : m === "labeled-only" ? "只看有标签的节点" : "显示全部条目"}
+              >
+                {FILTER_LABELS[m]}
+              </button>
+            ))}
+            {folded.size > 0 && (
+              <button className="tree-chip tree-chip-action" onClick={() => setFolded(new Set())} title="展开所有折叠的分支">
+                展开全部({folded.size})
+              </button>
+            )}
+          </div>
+          <div className="tree-scroll" ref={scrollRef}>
             {exited && filtered.length === 0 && (
               <div className="tree-empty">
                 pi 进程已退出，无法读取会话树。常见原因：远程密码认证失败（应用内保存的密码可能已过期/变更）或连接断开。请在「远程服务器」设置里更新密码，或切到终端视图确认登录状态。
@@ -786,74 +1042,82 @@ export function TreeDialog({
               </div>
             )}
             {filtered.length === 0 && treeStatus === "ready" && tree.length > 0 && <div className="tree-empty">（无匹配）</div>}
-            {filtered.map((f) => {
-              const e = f.node.entry;
-              const d = entryDisplay(f.node, toolCalls);
-              const isOnActive = activePath.has(e.id);
-              const isSelected = e.id === selectedId;
-              const isCurrent = e.id === leafId;
-              const hasChildren = f.node.children.length > 0;
-              const isFolded = folded.has(e.id);
-              // Build the connector gutter (mirrors TreeSelector's prefix logic)
-              let prefix = "";
-              const displayIndent = f.indent;
-              // connectors at each ancestor level
-              const connectorLevel = Math.max(0, displayIndent - 1);
-              const showOwnConnector = f.showConnector && !f.isVirtualRootChild;
-              // simple: draw vertical/elbow connectors based on isLast
-              if (showOwnConnector) {
-                const depth = displayIndent;
-                // we approximate: root-level rows get no gutter; deeper rows get
-                // "│  " for non-last ancestors and "└─ " for the last row
-                if (depth === 0) {
-                  prefix = "";
-                } else {
-                  const isLast = f.isLast;
-                  prefix = (isLast ? "└" : "├") + "─ ";
-                  // for depth > 1 add vertical continuation of ancestors
-                  void connectorLevel;
-                }
-              } else {
-                prefix = "  ".repeat(Math.max(0, displayIndent - 1));
-              }
-              const foldMarker = hasChildren ? (isFolded ? "⊞ " : "⊟ ") : "";
-              const pathMarker = isOnActive ? "• " : "";
-              const labelPart = f.node.label ? `[${f.node.label}] ` : "";
-              // rollback checkpoint badge on file-edit tool nodes
-              const cp = e.type === "message" && e.message?.role === "toolResult"
-                ? editPoints.get((e.message as { toolCallId?: string }).toolCallId ?? "")
-                : undefined;
+            {(() => {
+              // Windowed render: only rows near the viewport mount, so a
+              // thousand-entry session costs the same as a 80-row one.
+              const multipleRoots = tree.length > 1;
+              const slice = filtered.slice(win.start, win.end);
               return (
-                <div
-                  key={e.id}
-                  className={`tree-row${isSelected ? " selected" : ""}${isCurrent ? " current" : ""}`}
-                  onClick={() => {
-                    if (hasChildren) {
-                      // single click selects; double-click toggles fold
+                <>
+                  {win.start > 0 && <div style={{ height: win.start * 24 }} aria-hidden="true" />}
+                  {slice.map((f: FlatNode) => {
+                    const e = f.node.entry;
+                    const d = entryDisplay(f.node, toolCalls);
+                    const isOnActive = activePath.has(e.id);
+                    const isSelected = e.id === selectedId;
+                    const isCurrent = e.id === leafId;
+                    const hasChildren = f.node.children.length > 0;
+                    const isFolded = folded.has(e.id);
+                    // TUI gutter: │ continuation at ancestor levels, ├/└ at
+                    // the connector level; the ⊞/⊟ fold glyph lives in its
+                    // own fixed column (same information, bigger target).
+                    const displayIndent = multipleRoots ? Math.max(0, f.indent - 1) : f.indent;
+                    const showOwnConnector = f.showConnector && !f.isVirtualRootChild;
+                    const connectorPosition = showOwnConnector ? displayIndent - 1 : -1;
+                    let prefix = "";
+                    for (let level = 0; level < displayIndent; level++) {
+                      const g = f.gutters.find((x) => x.position === level);
+                      if (g) prefix += g.show ? "│  " : "   ";
+                      else if (level === connectorPosition) prefix += (f.isLast ? "└" : "├") + "─ ";
+                      else prefix += "   ";
                     }
-                    setSelectedId(e.id);
-                    setNavPhase("idle");
-                  }}
-                  onDoubleClick={() => hasChildren && toggleFold(e.id)}
-                  title={d.text || e.id}
-                >
-                  <span className="tree-gutter">{prefix}</span>
-                  <span className="tree-fold" onClick={(ev) => { ev.stopPropagation(); hasChildren && toggleFold(e.id); }}>
-                    {foldMarker}
-                  </span>
-                  <span className="tree-pathmark">{pathMarker}</span>
-                  <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
-                  <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
-                  {labelPart && <span className="tree-branch-tag">{labelPart}</span>}
-                  {cp && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${cp.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
-                  {isCurrent && <span className="tree-leaf-tag">当前</span>}
-                </div>
+                    const ts = formatEntryTime(e.timestamp);
+                    // rollback checkpoint badge on file-edit tool nodes
+                    const cp = e.type === "message" && e.message?.role === "toolResult"
+                      ? editPoints.get((e.message as { toolCallId?: string }).toolCallId ?? "")
+                      : undefined;
+                    return (
+                      <div
+                        key={e.id}
+                        ref={(el) => {
+                          if (el) rowRefs.current.set(e.id, el);
+                          else rowRefs.current.delete(e.id);
+                        }}
+                        className={`tree-row${isSelected ? " selected" : ""}${isCurrent ? " current" : ""}`}
+                        onClick={() => {
+                          setSelectedId(e.id);
+                          setNavPhase("idle");
+                        }}
+                        onDoubleClick={() => hasChildren && toggleFold(e.id)}
+                        title={d.text || e.id}
+                      >
+                        <span className="tree-gutter">{prefix}</span>
+                        <span
+                          className="tree-fold"
+                          onClick={(ev) => { ev.stopPropagation(); hasChildren && toggleFold(e.id); }}
+                        >
+                          {hasChildren ? (isFolded ? "⊞" : "⊟") : ""}
+                        </span>
+                        <span className="tree-pathmark">{isOnActive ? "•" : ""}</span>
+                        {f.node.label && <span className="tree-branch-tag">[{f.node.label}]</span>}
+                        <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
+                        <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
+                        {cp && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${cp.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
+                        {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
+                        {isCurrent && <span className="tree-leaf-tag">当前</span>}
+                      </div>
+                    );
+                  })}
+                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * 24 }} aria-hidden="true" />}
+                </>
               );
-            })}
+            })()}
           </div>
           <div className="tree-status">
             ({filtered.findIndex((f) => f.node.entry.id === selectedId) + 1 || 0}/{filtered.length})
-            {query && " · 过滤中"} {folded.size > 0 && " · 有折叠"} · 单击选中 · 双击折叠/展开
+            {query && " · 搜索中"}
+            {filterMode !== "default" && ` · ${FILTER_LABELS[filterMode]}`}
+            {folded.size > 0 && " · 有折叠"} · ↑↓ 选择 · Enter 导航 · Esc 关闭
           </div>
           {fileSnapshot && (
             <div className="tree-snapshot-note">树来自会话文件快照 · 正在同步实时状态（远程 pi 未就绪时先显示存档数据）</div>
@@ -927,7 +1191,7 @@ export function TreeDialog({
         </div>
         <div className="ui-dialog-actions">
           {onOpenTerminal && (
-            <span className="tree-native-hint">完整分支能力（标签/折叠/搜索/快捷键）在终端视图的原生 /tree 中</span>
+            <span className="tree-native-hint">标签编辑等完整分支能力在终端视图的原生 /tree 中</span>
           )}
           <button
             className="btn"

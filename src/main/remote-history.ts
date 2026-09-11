@@ -62,8 +62,11 @@ export function saveRemoteHistory(entry: { host: string; user: string; port?: nu
     (i) => i.host === entry.host && i.user === entry.user && i.port === port && (i.agentDir ?? "") === (entry.agentDir ?? "")
   );
   if (existing) {
-    existing.password = entry.password;
-    existing.path = entry.path;
+    // Non-destructive: only write a password when one was explicitly provided
+    // (the "记住密码" opt-in). A connection without a password must never wipe
+    // an already-remembered credential.
+    if (entry.password) existing.password = entry.password;
+    if (entry.path !== undefined) existing.path = entry.path;
     existing.agentDir = entry.agentDir;
     existing.updatedAt = now;
     writeHistory(list);

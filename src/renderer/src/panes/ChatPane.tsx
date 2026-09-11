@@ -25,17 +25,64 @@ import {
 } from "../dialogs/QuestionnaireDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
 import { DiffView, editsToDiff, isDiffish } from "../components/DiffView";
+import {
+  fmtDuration,
+  summarizeTool,
+  type ToolSummary,
+} from "../components/tool-summary";
 import { SlashMenu } from "../components/SlashMenu";
 import { SkillChips } from "../components/SkillChips";
 import { FileMentionMenu } from "../components/FileMentionMenu";
 import { Icon } from "../components/Icon";
 import { fileMentionPaths, fileMentionTokenAt, filterFileMentions, replaceFileMention, type FileMention } from "../file-mentions";
 import { modelSyncAppliesTo } from "../model-sync";
+import { projectLabelForTab } from "../project-label";
+import { createHistoryGate } from "./history-gate";
+import { INTERNAL_RPC_ID_PREFIX } from "../../../shared/transcript";
 
 /** "65" → "1m 5s" (running-time display). */
 function fmtElapsed(s: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
+
+/** Await `p`, or resolve `null` if it takes longer than `ms` (and map a
+ *  rejection to `null`). The timer is cleared whenever the race settles, so a
+ *  fast path leaks nothing — a bare `Promise.race` with `setTimeout` would keep
+ *  one pending timer per call for the whole `ms` window. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([p.catch(() => null), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/** Quiet-turn threshold before the read-only liveness probe runs (5s tick).
+ *  A healthy turn emits events continuously (streaming/tool progress), so 60s
+ *  of total silence means either a wedged pi or a dead pipe — but the probe,
+ *  not the silence, decides. */
+const NO_RESPONSE_PROBE_MS = 60000;
+/** A live pi answers get_session_stats in ~100ms even over SSH; 12s of nothing
+ *  means the command (or the whole pipe) is gone. */
+const PROBE_TIMEOUT_MS = 12000;
+/** Budget for ONE transcript (`get_messages`) round trip. This is NOT a
+ *  liveness timeout — the probe above owns liveness. Measured on a slow remote
+ *  (36-server, multi-MB session, ssh2 + pi's serial command loop): 17–45s. The
+ *  old 15s budget therefore ALWAYS expired, and `rpcRequest` removes its
+ *  listener on timeout — so the arriving transcript was discarded while
+ *  `historyLoaded` stayed false, and every later `get_state` re-fired the whole
+ *  multi-MB download (three overlapped at once in the log): the link saturated
+ *  (“连接非常卡”) and the main process stalled parsing JSON (“未响应”), with the
+ *  `[mem]` peaks to match (rss 631MB at 08:26:21, inside a get_messages window).
+ *  120s ≈ 2.7× the worst measured round trip. */
+const HISTORY_REQUEST_TIMEOUT_MS = 120_000;
+/** Budget for the FILE attempt (`session:transcript-from-file`). The read is
+ *  bounded on the main side, but a wedged SFTP lease would otherwise leave the
+ *  single-flight gate claimed forever — so the caller bounds it too and falls
+ *  back to RPC. */
+const TRANSCRIPT_FILE_TIMEOUT_MS = 60_000;
 import {
   commandTokenAt,
   fetchCommands,
@@ -85,11 +132,23 @@ function CollapsibleText({
 }
 
 function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
+  // Collapsed by default; failures auto-expand the result area so errors are
+  // visible without a click. args/result stay click-to-toggle.
   const [showArgs, setShowArgs] = useState(false);
-  const [showResult, setShowResult] = useState(false);
+  const failed = block.isError === true;
+  const [showResult, setShowResult] = useState(failed);
+  // Live-streamed failures arrive after mount → auto-expand when isError turns
+  // true so the error is visible without a click (never auto-collapse).
+  useEffect(() => {
+    if (block.isError) setShowResult(true);
+  }, [block.isError]);
   const running = block.status === "streaming";
   const resultText = block.resultText ?? "";
   const isDiff = isDiffish(resultText);
+  const summary = useMemo(
+    () => summarizeTool(block.name, block.argsText, resultText, block.isError),
+    [block.name, block.argsText, resultText, block.isError],
+  );
   // edit tool: render a real diff from args (oldText→newText) even before
   // the result arrives — args-only JSON is unreadable.
   const editDiff = useMemo(() => {
@@ -150,11 +209,29 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
       return null;
     }
   }, [resultText]);
+  // Edit diff defaults to collapsed: the head row shows a +N −N diffstat and
+  // the full diff renders only when the row is expanded. Not force-opened on
+  // failure — a failed edit did NOT apply, so showing its would-be diff
+  // misleads; the auto-expanded error result explains what went wrong instead.
+  const hasDiffDetail = !!editDiff && !isDiff;
   return (
     <div className={`chat-tool${block.isError ? " error" : ""}`}>
-      <div className="chat-tool-head" onClick={() => setShowArgs((v) => !v)}>
+      <div
+        className="chat-tool-head"
+        onClick={() => setShowArgs((v) => !v)}
+        role="button"
+        tabIndex={0}
+        aria-expanded={showArgs}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setShowArgs((v) => !v);
+          }
+        }}
+      >
         <span className={`chat-tool-dot${running ? " running" : ""}`} />
         <span className="chat-tool-name">{block.name ?? "tool"}</span>
+        <ToolSummaryView summary={summary} running={running} />
         <span className="chat-tool-toggle">{showArgs ? "▾" : "▸"}</span>
       </div>
       {showArgs && bashPreview && (
@@ -185,14 +262,27 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
           <pre className="chat-tool-write-preview">{writePreview.content || "（空内容）"}</pre>
         </div>
       )}
-      {editDiff && !isDiff && (
+      {hasDiffDetail && showArgs && (
         <div className="chat-tool-editdiff">
           <div className="chat-tool-result-head">编辑预览</div>
-          <DiffView diffText={editDiff} />
+          <DiffView diffText={editDiff!} />
         </div>
       )}
       {(block.resultDone || running) && (
-        <div className="chat-tool-result-wrap" onClick={() => setShowResult((v) => !v)}>
+        <div
+          className="chat-tool-result-wrap"
+          onClick={() => setShowResult((v) => !v)}
+          role="button"
+          tabIndex={0}
+          aria-expanded={showResult}
+          aria-label={running ? "工具执行中，点按展开或收起输出" : block.isError ? "执行失败，点按展开或收起错误信息" : "点按展开或收起执行结果"}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setShowResult((v) => !v);
+            }
+          }}
+        >
           <div className="chat-tool-result-head">
             {running ? "执行中…" : block.isError ? "执行失败" : "执行结果"}
             <span>{showResult ? "▾" : "▸"}</span>
@@ -212,6 +302,39 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
     </div>
   );
 }
+
+/** Right side of the collapsed head row: object + result status. */
+const ToolSummaryView = memo(function ToolSummaryView({
+  summary,
+  running,
+}: {
+  summary: ToolSummary | null;
+  running: boolean;
+}) {
+  if (!summary || running) return <span className="chat-tool-summary" />;
+  return (
+    <span className="chat-tool-summary">
+      {summary.object && (
+        <span className="chat-tool-object" title={summary.object}>
+          {summary.objectDir && <span className="chat-tool-object-dir">{summary.objectDir}</span>}
+          {summary.object}
+        </span>
+      )}
+      {summary.size && <span className="chat-tool-chip">{summary.size}</span>}
+      {summary.stat && (
+        <span className="chat-tool-chip">
+          <span className="diffstat-add">+{summary.stat.adds}</span> <span className="diffstat-del">−{summary.stat.dels}</span>
+        </span>
+      )}
+      {summary.durationMs !== undefined && <span className="chat-tool-chip">{fmtDuration(summary.durationMs)}</span>}
+      {summary.lines !== undefined && <span className="chat-tool-chip">{summary.lines} 行</span>}
+      {summary.exitCode !== undefined && summary.exitCode !== 0 && (
+        <span className="chat-tool-chip chip-fail">exit {summary.exitCode}</span>
+      )}
+      <span className={`chat-tool-status${summary.alert ? " fail" : ""}`}>{summary.alert ? "✗" : "✓"}</span>
+    </span>
+  );
+});
 
 const CHAT_MARKDOWN_MAX_CHARS = 120_000;
 
@@ -470,6 +593,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       isStreaming: st.isStreaming,
       exited: st.exited,
       exitCode: st.exitCode,
+      exitDetail: st.exitDetail,
       booted: st.booted,
       modelName: st.modelName,
       modelId: st.modelId,
@@ -477,6 +601,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       thinkingLevel: st.thinkingLevel,
       sessionName: st.sessionName,
       lastError: st.lastError,
+      restoreInput: st.restoreInput,
       retryInfo: st.retryInfo,
       compacting: st.compacting,
       steeringQueue: st.steeringQueue,
@@ -545,6 +670,12 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   const [treeOpen, setTreeOpen] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [bootTimeoutDetail, setBootTimeoutDetail] = useState<string | null>(null);
+  // Connection-death banner (see the probe effect below): set only when a
+  // read-only probe proves pi is NOT answering, never on mere quiet.
+  const [unresponsive, setUnresponsive] = useState<{ silentMs: number; detail?: string | null } | null>(null);
+  const unresponsiveRef = useRef(false);
+  const probeInFlightRef = useRef(false);
+  const lastEventAtRef = useRef(Date.now());
   const [completionVisible, setCompletionVisible] = useState(false);
   const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [stats, setStats] = useState<{ tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; context?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | null>(null);
@@ -572,6 +703,22 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   // delayed mount-time response from erasing a newer prompt or live stream.
   const historyRequestSeq = useRef(0);
   const historyLoadedRef = useRef(false);
+  // Single-flight for the transcript download (see history-gate.ts): the
+  // mount effect, the `state_ready` branch and branch navigation used to
+  // overlap three multi-MB `get_messages` on one link. `requestHistoryRef`
+  // lets the settle path re-run without depending on its own identity.
+  const historyGateRef = useRef(createHistoryGate());
+  const requestHistoryRef = useRef<(opts?: { preferRpc?: boolean }) => void>(() => {});
+  // Fresh view of `active` for the event-subscription effect: that effect must
+  // run ONCE per mount (re-subscribing and re-downloading history on every tab
+  // ACTIVATION made big remote sessions stall the UI on each switch), but its
+  // mount-time steeringMode check still needs the current value.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  // Dedupes the one-shot modelFallbackMessage toast per ChatPane mount so a
+  // boot handshake + mount-time get_state (or a later manual refresh) don't
+  // repeat it.
+  const seenModelFallbackRef = useRef(false);
 
   // Auto-focus the input when this chat becomes the visible tab (new tab via
   // "+" or switching back). Without it, typing right after clicking "+"
@@ -611,18 +758,66 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     };
   }, [activeTab, tabId]);
 
-  const requestHistory = useCallback(() => {
+  /** `opts.preferRpc`: use the RPC path even for a remote/WSL tab. Set by the
+   *  EXPLICIT refresh paths (fork / branch navigation / new / clone), which
+   *  immediately follow a state change: pi's LIVE state is authoritative there,
+   *  while the file can still be behind it (an unflushed navigation is a
+   *  documented divergence — see tree-from-file.ts). These paths are rare and
+   *  user-initiated, so paying the RPC transfer is the correct trade; the
+   *  ambient mount/retry path uses the file instead. */
+  const requestHistory = useCallback((opts?: { preferRpc?: boolean }) => {
+    // Coalesce, never stack: a trigger arriving while a payload is in flight
+    // is recorded by the gate and re-runs ONCE after it settles, instead of
+    // opening a PARALLEL multi-MB download on the same link.
+    if (!historyGateRef.current.begin()) return;
     const seq = ++historyRequestSeq.current;
     historyLoadedRef.current = false;
     useChatStore.getState().markHistoryLoading(tabId);
-    void window.api.tab.rpcRequest(tabId, { type: "get_messages" }, 15000).then((response) => {
-      if (seq !== historyRequestSeq.current || !response.success) return;
-      const data = response.data as { messages?: unknown[] } | undefined;
-      if (!data) return;
+
+    const apply = (messages: unknown[] | undefined) => {
+      if (seq !== historyRequestSeq.current || !messages) return;
       historyLoadedRef.current = true;
-      useChatStore.getState().initMessages(tabId, data.messages ?? []);
-    });
+      useChatStore.getState().initMessages(tabId, messages);
+    };
+
+    void (async () => {
+      if (!opts?.preferRpc) {
+        // File first: it carries the multi-MB history over SFTP/UNC instead of
+        // the `pi --mode rpc` command loop, which is serial and behind a
+        // stdout-backpressure gate — a big `get_messages` made `prompt`/
+        // `get_state` queue, so the agent looked stuck (measured 17–45s round
+        // trips). Main scopes this to remote/WSL, verifies the file's message
+        // count against pi's own `get_state` count, and answers `ok: false` for
+        // anything it cannot serve — that is NOT an error, it is the cue to
+        // fall through to RPC, so a pi format change degrades to "slow but
+        // correct" rather than blank or stale chat.
+        const file = await withTimeout(window.api.session.transcriptFromFile(tabId), TRANSCRIPT_FILE_TIMEOUT_MS);
+        if (seq !== historyRequestSeq.current) return;
+        if (file?.ok) {
+          apply(file.messages);
+          return;
+        }
+      }
+      const response = await window.api.tab.rpcRequest(tabId, { type: "get_messages" }, HISTORY_REQUEST_TIMEOUT_MS);
+      if (!response.success) return;
+      apply((response.data as { messages?: unknown[] } | undefined)?.messages);
+    })()
+      .catch(() => {
+        /* both paths resolve rather than reject; belt-and-braces */
+      })
+      .finally(() => {
+        // Free the slot on EVERY outcome — including a timeout — before any
+        // early return, or one lost payload would wedge history forever.
+        const rerun = historyGateRef.current.settle();
+        if (seq !== historyRequestSeq.current) return; // a newer request owns the state
+        // A trigger that arrived mid-flight still needs a snapshot (it may be
+        // a branch navigation, whose payload the settled request predates).
+        // Triggers are event-driven — mount / state_ready / navigation, never
+        // a timer — so this adds at most one download per burst.
+        if (rerun) requestHistoryRef.current(opts);
+      });
   }, [tabId]);
+  requestHistoryRef.current = requestHistory;
 
   // --- ask_user_question full-questionnaire plumbing -----------------------
   // The rpiv extension's RPC walker emits one select/input dialog per
@@ -700,6 +895,25 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   useEffect(() => {
     useChatStore.getState().ensure(tabId);
     const offEvent = window.api.onRpcEvent(tabId, (event) => {
+      // Liveness clock: ANY frame from pi (event, response, delta) proves the
+      // pipe is alive, so it also clears the connection-death banner.
+      lastEventAtRef.current = Date.now();
+      if (unresponsiveRef.current) flagUnresponsive(null);
+      // Responses to MAIN's internal probes (the transcript provider's
+      // get_state) are not this component's requests. Letting one reach the
+      // `state_ready` branch below would re-enter requestHistory → probe → …
+      // (a self-feeding loop), so they are dropped here.
+      if (typeof event.id === "string" && event.id.startsWith(INTERNAL_RPC_ID_PREFIX)) return;
+      if (event.type === "rpc_unresponsive") {
+        // Main's post-boot silence watchdog: a command was written and not a
+        // single byte came back — the pipe is gone (silently dropped SSH flow,
+        // wedged remote process). Definitive, unlike a merely quiet turn.
+        flagUnresponsive({
+          silentMs: typeof event.silentMs === "number" ? event.silentMs : 0,
+          detail: ((event.stderr as string | undefined) ?? "").trim() || null,
+        });
+        return;
+      }
       if (event.type === "rpc_no_output") {
         // Main's zero-output watchdog: the remote produced no bytes at all
         // (auth hang / .bashrc block / pi missing) — same conclusion as the
@@ -725,6 +939,17 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         // Model changes invalidate the thinking-level cache: the available
         // levels belong to the selected model, not the provider.
         setThinkingLevels([]);
+        if (event.success === false) {
+          // Backend refused the switch ("No API key for p/m" from pi's auth
+          // check, "Model not found" from a stale menu cache, …). The menu is
+          // already closed at this point — without surfacing this the header
+          // keeps the old model and the switch silently no-ops (the classic
+          // "切了但没换" report). Do NOT optimistically patch or re-query:
+          // get_state would just confirm the unchanged old model.
+          const errText = typeof event.error === "string" && event.error ? event.error : "未知错误";
+          useUiStore.getState().showToast(`切换模型失败：${errText}`, "err");
+          return;
+        }
         // The response data IS the full Model object (not wrapped in .model).
         const model = event.data as { name?: string; id?: string; provider?: string } | null;
         if (model?.id) {
@@ -748,8 +973,17 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           steeringMode?: string;
           followUpMode?: string;
           autoCompactionEnabled?: boolean;
+          modelFallbackMessage?: string | null;
         } | undefined;
         if (data && (data.model || data.thinkingLevel || data.steeringMode || data.followUpMode || data.autoCompactionEnabled !== undefined)) {
+          // SDK backend only: pi failed to restore the session's model
+          // (e.g. its provider lost auth) and fell back to the default —
+          // the TUI prints a banner for this, the chat view used to show
+          // nothing, so users saw "different models" across views.
+          if (data.modelFallbackMessage && !seenModelFallbackRef.current) {
+            seenModelFallbackRef.current = true;
+            useUiStore.getState().showToast(`模型恢复失败：${data.modelFallbackMessage}`, "err");
+          }
           useChatStore.getState().applyEvent(tabId, {
             type: "state_ready",
             model: data.model ?? null,
@@ -784,7 +1018,11 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         if (data && !data.cancelled) {
           // The new branch starts empty; replay the forked message so the
           // agent re-answers from that point (same as TUI /tree fork).
-          void window.api.tab.rpcSend(tabId, { type: "get_messages" });
+          // requestHistory (NOT a bare get_messages): the transcript is only
+          // ever applied via `initMessages`, so a bare send opened a multi-MB
+          // RPC transfer whose payload was dropped — and left the chat stuck on
+          // the OLD branch. This is the rule already documented for `onNavigated`.
+          requestHistory({ preferRpc: true });
           void window.api.tab.rpcSend(tabId, { type: "get_state" });
           if (typeof data.text === "string" && data.text.trim()) {
             useChatStore.getState().sendPrompt(tabId, data.text);
@@ -797,6 +1035,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         // Refresh stats after a turn completes.
         void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
         useChatStore.getState().applyEvent(tabId, event);
+        nudgeSessionTitle();
         return;
       }
       useChatStore.getState().applyEvent(tabId, event);
@@ -834,14 +1073,20 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     // response can arrive before this subscription exists (worker is ~50ms vs
     // RPC's ~1.9s), so booted=true from state_ready must not suppress it.
     const st2 = useChatStore.getState().states[tabId];
-    // Unconditional: hidden tabs also need history ready for when they're
-    // shown, and `active` can be stale false at mount time (tabs:update is
-    // async) — the guard caused history to never load with the SDK backend.
+    // Unconditional within THIS mount: hidden tabs also need history ready for
+    // when they're shown, and a remount (terminal view → chat view) must
+    // re-read a session that advanced while the chat was unmounted. Not on
+    // every `active` flip though — `active` is deliberately NOT a dependency
+    // of this effect: a huge remote session's get_messages payload (multi-MB)
+    // was re-downloaded and re-parsed on every tab switch, which is what made
+    // switching tabs to a long session hang. Mount-time/live events keep the
+    // transcript current; explicit paths (new_session/fork/clone/navigate,
+    // app_phase ready) re-request history on their own.
     requestHistory();
     void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
     // Session behavior fields (steeringMode/…) ride on get_state; the boot
     // handshake may have raced the subscription, so re-ask when missing.
-    if (active && st2.steeringMode === undefined) {
+    if (activeRef.current && st2.steeringMode === undefined) {
       void window.api.tab.rpcSend(tabId, { type: "get_state" });
     }
     return () => {
@@ -849,7 +1094,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       offExit();
       offUi();
     };
-  }, [tabId, active, requestHistory]);
+  }, [tabId, requestHistory]);
 
   // Session commands for the slash popup / skill chips / extension badge.
   // Per-tab cache in commands.ts; get_commands is static per session.
@@ -863,15 +1108,17 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     };
   }, [tabId]);
 
-  useEffect(() => {
-    // Hidden RPC tabs receive state events but defer the potentially large
-    // history payload until the user actually opens the tab.
-    if (!active) return;
-    const st = useChatStore.getState().states[tabId];
-    if (!st?.messages.length) {
-      void window.api.tab.rpcSend(tabId, { type: "get_messages" });
-    }
-  }, [active, tabId]);
+  // NOTE: there used to be an effect here that sent a bare
+  // `rpcSend(get_messages)` when the active tab had no messages. It was removed
+  // because nothing consumed its response: `chatStore.applyEvent` has no
+  // `get_messages` branch (history is applied only by `initMessages`, reached
+  // via `requestHistory`'s own request id), and main has no side effect on that
+  // response (session linkage comes from `get_state` — see pty.ts:1568).
+  // So it opened an UNGATED, UN-COALESCED multi-MB transfer on the serial RPC
+  // command loop whose payload was discarded, re-firing on every remount while
+  // history happened to be empty (the bare `SEND get_messages` every ~30s in
+  // pipi-debug.log). History is owned by `requestHistory`: gated, file-first,
+  // and retried on `state_ready`.
 
   // Model config hot-sync: the ModelConfigDialog bumps modelConfigSavedAt
   // (with a target payload) after saving ~/.pi/agent/models.json (locally or
@@ -1019,10 +1266,19 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     }
   };
   const phase = state?.turn.phase ?? "booting";
+  // "Where does this session run" — read from the tab record (remote/WSL tabs
+  // keep the project in remoteDir: their cwd is the local app directory).
+  const project = useTabsStore(
+    useShallow((s) => {
+      const label = projectLabelForTab(s.tabs.find((t) => t.id === tabId));
+      return label ? { short: label.short, full: label.full } : null;
+    }),
+  );
   const phaseLabel: Record<string, string> = {
     booting: "正在启动 Pi…",
     ready: "已就绪",
     submitting: "已发送，等待 Pi 开始处理…",
+    accepted: "Pi 已受理，等待模型响应…",
     thinking: "正在思考…",
     streaming: "正在回复…",
     tool: state?.turn.detail ?? "正在执行工具…",
@@ -1049,6 +1305,84 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phaseActive, phase]);
 
+  /** Set/clear the connection-death banner (ref keeps the event handler cheap). */
+  const flagUnresponsive = (value: { silentMs: number; detail?: string | null } | null) => {
+    unresponsiveRef.current = !!value;
+    setUnresponsive(value);
+  };
+
+  /**
+   * Remote/WSL tab titles follow the session LIST, and that list is lazily
+   * refreshed (12s cache + 4s poll) and its labels come from background
+   * hydration — so a brand-new session's name can take ~20s to reach the tab
+   * while the sidebar already shows it. One targeted listRemote call right
+   * after a turn settles prioritizes that project's hydration (main marks the
+   * cache priority 2), which runs emitRemoteSessionsUpdated → the tab title
+   * sync, within a second or two. Local tabs are not nudged: their titles come
+   * from the session-file watcher, which is immediate.
+   */
+  const titleNudgeRef = useRef<{ initial: string; attempts: number } | null>(null);
+  const nudgeSessionTitle = () => {
+    const tab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
+    if (!tab || (!tab.isRemote && !tab.isWsl)) return;
+    const seen = (titleNudgeRef.current ??= { initial: tab.title, attempts: 0 });
+    // Stop as soon as a real title replaced the placeholder (project/folder
+    // name) the tab was born with, and never poll in a loop.
+    if (tab.title !== seen.initial || seen.attempts >= 3) return;
+    seen.attempts += 1;
+    void window.api.session.listRemote(tabId, tab.remoteDir || tab.cwd).catch(() => {});
+  };
+
+  // Connection watchdog. Two failures look identical in the UI while a turn is
+  // running and both end in "已发送，等待 Pi 开始处理…" forever:
+  //   1. the transport died (SSH flow silently dropped, remote process wedged)
+  //      yet no exit ever reaches us;
+  //   2. pi is alive but stuck inside prompt preflight (waiting on the provider
+  //      or an extension hook) and will never emit a single event.
+  // A silent turn alone proves nothing — a long tool run is legitimately quiet —
+  // so the verdict comes from a read-only probe: only an UNANSWERED probe
+  // declares the connection dead. get_session_stats is the cheap command that
+  // cannot disturb the turn (unlike get_state, which refreshes UI state).
+  useEffect(() => {
+    if (!phaseActive) return;
+    let cancelled = false;
+    const tick = setInterval(() => {
+      if (probeInFlightRef.current || unresponsiveRef.current || exited) return;
+      const silentMs = Date.now() - lastEventAtRef.current;
+      if (silentMs < NO_RESPONSE_PROBE_MS) return;
+      probeInFlightRef.current = true;
+      void window.api.tab
+        .rpcRequest(tabId, { type: "get_session_stats" }, PROBE_TIMEOUT_MS)
+        .then((res) => {
+          probeInFlightRef.current = false;
+          if (cancelled) return;
+          // Answered → pi is alive, just quiet. Any event also bumps the clock.
+          if (res.success) return;
+          flagUnresponsive({ silentMs: Date.now() - lastEventAtRef.current, detail: null });
+        })
+        .catch(() => {
+          probeInFlightRef.current = false;
+        });
+    }, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(tick);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phaseActive, tabId, exited]);
+
+  // pi refused the prompt before it entered the transcript: hand the text back
+  // to the composer. Losing a long prompt behind a spinner is the failure mode
+  // users report as "发了没反应".
+  const restoreInput = state?.restoreInput;
+  useEffect(() => {
+    if (!restoreInput) return;
+    const text = useChatStore.getState().consumeRestoreInput(tabId);
+    if (!text) return;
+    setInput((prev) => (prev.trim() ? prev : text));
+    requestAnimationFrame(() => taRef.current?.focus());
+  }, [restoreInput, tabId]);
+
   const grow = () => {
     const ta = taRef.current;
     if (!ta) return;
@@ -1068,7 +1402,11 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           useUiStore.getState().showToast(res.error ?? "新会话失败", "err");
           return true;
         }
-        void window.api.tab.rpcSend(tabId, { type: "get_messages" });
+        // requestHistory, not a bare get_messages: a bare send's payload is
+        // dropped, so the new (empty) session's transcript would never replace
+        // the old one. preferRpc: this follows a state change, so pi's LIVE
+        // state is authoritative (the file may not have the new session yet).
+        requestHistory({ preferRpc: true });
         void window.api.tab.rpcSend(tabId, { type: "get_state" });
         void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
         setInput("");
@@ -1123,8 +1461,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           return true;
         }
         // Clone switches the active branch to the new session: reload history
-        // and session state from the new session file.
-        void window.api.tab.rpcSend(tabId, { type: "get_messages" });
+        // and session state from the new session file. requestHistory, not a
+        // bare get_messages — the latter's payload is dropped. preferRpc: the
+        // file cannot be trusted to hold the new session yet.
+        requestHistory({ preferRpc: true });
         void window.api.tab.rpcSend(tabId, { type: "get_state" });
         void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
         setInput("");
@@ -1536,6 +1876,20 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     <div className="chat-pane">
       <div className="chat-header">
         <div className="chat-header-left" ref={headerMenusRef}>
+          {project && (
+            <button
+              className="chat-header-btn chat-project-btn"
+              title={`项目：${project.full}\n点击复制路径`}
+              onClick={() => {
+                void navigator.clipboard.writeText(project.full).then(
+                  () => useUiStore.getState().showToast("已复制项目路径", "ok"),
+                  () => useUiStore.getState().showToast(`项目路径：${project.full}`, "ok"),
+                );
+              }}
+            >
+              <Icon name="folder" /> {project.short}
+            </button>
+          )}
           <span className="chat-model-switch-wrap">
             <button
               className="chat-header-btn chat-model-btn"
@@ -1595,7 +1949,15 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
                             : ""
                         }`}
                         onClick={() => {
-                          void window.api.tab.rpcSend(tabId, { type: "set_model", provider: m.provider ?? selectedProvider ?? m.id.split("/")[0], modelId: m.id });
+                          // rpcSend resolves false when the session process is
+                          // gone (exited flag / dead channel) — the command was
+                          // DROPPED, so no response (and no error toast from
+                          // the handler above) will ever arrive. Say so now.
+                          void window.api.tab
+                            .rpcSend(tabId, { type: "set_model", provider: m.provider ?? selectedProvider ?? m.id.split("/")[0], modelId: m.id })
+                            .then((sent) => {
+                              if (!sent) useUiStore.getState().showToast("切换模型失败：会话未连接", "err");
+                            });
                           setModelMenuOpen(false);
                         }}
                         title={m.id}
@@ -1742,8 +2104,23 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
 
       {exited && (
         <div className="chat-exited-bar">
-          <span>{state?.exitCode === 0 ? "Pi 已正常退出，会话已保存在服务器上" : `Pi 进程异常退出（code ${state?.exitCode ?? "?"}）`}</span>
+          <span title={state?.exitDetail || undefined}>
+            {state?.exitCode === 0 ? "Pi 已正常退出，会话已保存在服务器上" : `Pi 进程异常退出（code ${state?.exitCode ?? "?"}）`}
+            {state?.exitCode !== 0 && state?.exitDetail ? ` · ${state.exitDetail.slice(0, 160)}` : ""}
+          </span>
           <button className="chat-btn" onClick={resumeSession} disabled={switchBusy}>继续此会话</button>
+          <button className="chat-btn" onClick={switchToTerminal} disabled={switchBusy}>终端视图</button>
+        </div>
+      )}
+
+      {unresponsive && !exited && (
+        <div className="chat-exited-bar chat-unresponsive-bar">
+          <span title={unresponsive.detail ?? undefined}>
+            Pi 已 {fmtElapsed(Math.max(1, Math.round(unresponsive.silentMs / 1000)))} 无响应 —
+            连接可能已断开（远程主机掉线 / 网络中断）
+            {unresponsive.detail ? `：${unresponsive.detail.slice(0, 120)}` : ""}
+          </span>
+          <button className="chat-btn" onClick={resumeSession} disabled={switchBusy}>重新连接</button>
           <button className="chat-btn" onClick={switchToTerminal} disabled={switchBusy}>终端视图</button>
         </div>
       )}
@@ -1780,7 +2157,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           ref={taRef}
           className="chat-textarea"
           value={input}
-          placeholder={exited ? "pi 已退出，请切换到终端视图" : phase === "submitting" ? "消息已发送，等待 Pi 响应…" : phase === "cancelling" ? "正在停止当前任务…" : isStreaming ? "agent 运行中 — Enter 排队发送" : "输入消息…（Shift+Enter 换行）"}
+          placeholder={exited ? "pi 已退出，请切换到终端视图" : phase === "submitting" || phase === "accepted" ? "消息已发送，等待 Pi 响应…" : phase === "cancelling" ? "正在停止当前任务…" : isStreaming ? "agent 运行中 — Enter 排队发送" : "输入消息…（Shift+Enter 换行）"}
           onChange={(e) => {
             const v = e.target.value;
             setInput(v);
@@ -1866,8 +2243,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
             // refreshes the transcript — a bare rpcSend(get_messages)
             // response is dropped by the event handlers, leaving the chat
             // stuck at the end of the old branch. get_state keeps the
-            // session-behavior fields in sync.
-            requestHistory();
+            // session-behavior fields in sync. preferRpc: navigation just moved
+            // the leaf, and an unflushed navigation is a documented divergence
+            // from the file — pi's live state is authoritative here.
+            requestHistory({ preferRpc: true });
             void window.api.tab.rpcSend(tabId, { type: "get_state" });
             setInput(editorText ?? "");
             if (editorText) {

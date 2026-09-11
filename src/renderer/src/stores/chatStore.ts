@@ -45,6 +45,11 @@ export type TurnPhase =
   | "booting"
   | "ready"
   | "submitting"
+  /** pi's prompt response frame arrived (preflight passed) but no agent event
+   *  yet: the turn is pi's now, we are waiting on the model. Distinct from
+   *  "submitting" so a stall can be attributed honestly (never accepted vs
+   *  accepted-but-silent). */
+  | "accepted"
   | "thinking"
   | "streaming"
   | "tool"
@@ -78,12 +83,22 @@ export interface ChatTabState {
   exited: boolean;
   /** Normal (0) or abnormal exit code from the backend process. */
   exitCode?: number;
+  /** Useful stderr line from a failed process (SSH drop, pi crash) — shown in
+   *  the exit banner so "远程断了" is distinguishable from "pi 挂了". */
+  exitDetail?: string;
   /** Boot progress from the backend (connecting → ready). */
   bootStage?: "connecting" | "starting" | "ready";
   /** History has been fetched at least once (guards ready-signal re-ask). */
   historyLoaded?: boolean;
   lastError?: string;
   pendingUserText?: string;
+  /** Command id of the prompt awaiting pi's response frame (the optimistic
+   *  turn's identity — see sendPrompt). */
+  pendingPromptId?: string;
+  /** Display text of a prompt pi REJECTED before it entered the transcript.
+   *  ChatView puts it back into the composer instead of dropping the user's
+   *  typing on the floor. */
+  restoreInput?: string;
   /** Model stream error → pi exponential-backoff retry progress. */
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage: string } | null;
   /** Context compaction running (auto/manual). */
@@ -102,12 +117,19 @@ interface ChatStore {
   states: Record<string, ChatTabState>;
   ensure: (tabId: string) => void;
   clear: (tabId: string) => void;
+  /** Drop state for tabs that no longer exist (main's tabs:update is
+   *  authoritative). A closed tab used to keep its full transcript — plus the
+   *  rAF-batched delta queue — in memory for the rest of the app's run, so
+   *  memory grew with every session the user ever opened. */
+  retainTabs: (liveTabIds: Set<string>) => void;
   applyEvent: (tabId: string, event: Record<string, unknown>) => void;
   initMessages: (tabId: string, messages: unknown[]) => void;
   markHistoryLoading: (tabId: string) => void;
   /** displayText is kept in the chat bubble; message is the private expanded
    * payload sent to Pi (for example @file contents). */
   sendPrompt: (tabId: string, message: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, displayText?: string) => Promise<void>;
+  /** Read-and-clear the composer restore request (see ChatTabState.restoreInput). */
+  consumeRestoreInput: (tabId: string) => string | undefined;
   abort: (tabId: string) => void;
   markExited: (tabId: string, info: { code: number; stderr?: string }) => void;
 }
@@ -123,6 +145,46 @@ const emptyState = (): ChatTabState => ({
 });
 
 let localSeq = 0;
+
+/** Turn phases that represent work already in flight (never "reset" to ready
+ *  by an unrelated state_ready snapshot). */
+const pendingTurnPhases = new Set<TurnPhase>(["submitting", "accepted", "thinking", "streaming", "tool", "cancelling", "compacting"]);
+
+/**
+ * pi refused the prompt (or the write never left the app), so the message
+ * never entered the transcript: drop the optimistic bubble and hand the text
+ * back to the composer. Both facts matter — a 500-word prompt that "vanished"
+ * with a spinner is worse than an error, and a bubble that pi never saw lies
+ * about the session's actual history.
+ */
+function rejectPrompt(tabId: string, errorText: string): void {
+  useChatStore.setState((s) => {
+    const cur = s.states[tabId];
+    if (!cur) return {};
+    const last = cur.messages[cur.messages.length - 1];
+    const pending = cur.pendingUserText && cur.pendingUserText.trim() ? cur.pendingUserText : undefined;
+    return {
+      states: {
+        ...s.states,
+        [tabId]: {
+          ...cur,
+          messages: last && last.id.startsWith("local-") ? cur.messages.slice(0, -1) : cur.messages,
+          pendingUserText: undefined,
+          pendingPromptId: undefined,
+          restoreInput: pending,
+          lastError: errorText,
+          // A refused STEER (running turn) must not relabel that turn: the
+          // agent is still working, only the queued message was rejected. The
+          // error banner + restored composer carry the news instead.
+          turn:
+            cur.isStreaming && pendingTurnPhases.has(cur.turn.phase)
+              ? cur.turn
+              : { phase: "failed", lastActivityAt: Date.now(), detail: errorText },
+        },
+      },
+    };
+  });
+}
 
 // Streaming can produce hundreds of tiny deltas per second. Expose one
 // normal `applyEvent` Interface to callers, but coalesce visual-only deltas
@@ -307,6 +369,19 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     });
   },
 
+  retainTabs: (liveTabIds) => {
+    // Cheap no-op in the common case (nothing closed) so the subscription
+    // does not re-render every chat on each tab-list update.
+    const dropped = Object.keys(get().states).filter((id) => !liveTabIds.has(id));
+    if (dropped.length === 0) return;
+    for (const id of dropped) pendingStreamEvents.delete(id);
+    set((s) => {
+      const states = { ...s.states };
+      for (const id of dropped) delete states[id];
+      return { states };
+    });
+  },
+
   markExited: (tabId, { code, stderr }) => {
     get().ensure(tabId);
     const detail = pickExitErrorLine(stderr);
@@ -317,6 +392,9 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           ...s.states[tabId]!,
           isStreaming: false,
           exited: true,
+          // Kept separately from lastError so the exit banner can say WHY
+          // (a dropped SSH flow reads very differently from a crashed pi).
+          exitDetail: detail ?? undefined,
           lastError: code === 0
             ? `pi 进程已退出 (code 0)`
             : detail
@@ -432,7 +510,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         autoCompactionEnabled: (event.autoCompactionEnabled as boolean | undefined) ?? st.autoCompactionEnabled,
         booted: true,
         bootStage: "ready",
-        turn: st.isStreaming ? st.turn : { phase: "ready", lastActivityAt: Date.now() },
+        // A pending prompt (written, not yet answered by pi) is in-flight
+        // work even though isStreaming is still false: a stray get_state —
+        // the settings refresh, the liveness probe — must not paint it as
+        // "已就绪" and hide that the message is still unanswered.
+        turn: st.isStreaming || pendingTurnPhases.has(st.turn.phase) ? st.turn : { phase: "ready", lastActivityAt: Date.now() },
       });
       return;
     }
@@ -510,6 +592,35 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         turn: event.errorMessage && !event.aborted
           ? { phase: "failed", lastActivityAt: Date.now(), detail: event.errorMessage as string }
           : st.turn,
+      });
+      return;
+    }
+    if (type === "response") {
+      // pi's verdict on a prompt command. Its response frame is emitted the
+      // moment preflight passes (pi rpc-mode.js `case "prompt"` →
+      // preflightResult), i.e. BEFORE agent_start / any message event — so it
+      // is the only signal that separates "pi is thinking" from "pi never took
+      // this message". Ignoring it is what left the UI on "已发送，等待 Pi 开始
+      // 处理…" forever when pi refused (no API key / already processing /
+      // compaction in flight) or when the response never came at all.
+      if (event.command !== "prompt") return;
+      const respId = typeof event.id === "string" ? event.id : undefined;
+      // Only the composer's own turn is tracked here: main injects other
+      // prompts (model-sync) that must not touch the visible turn.
+      if (!st.pendingPromptId || respId !== st.pendingPromptId) return;
+      if (event.success === false) {
+        const reason = typeof event.error === "string" && event.error ? event.error : "Pi 拒绝了这条消息";
+        rejectPrompt(tabId, reason);
+        return;
+      }
+      patch({
+        pendingPromptId: undefined,
+        restoreInput: undefined,
+        // A steer ack only means "queued into the running turn" — that turn's
+        // phase (streaming/tool) is still the truth, so leave it alone.
+        turn: st.isStreaming
+          ? st.turn
+          : { phase: "accepted", startedAt: st.turn.startedAt ?? Date.now(), lastActivityAt: Date.now() },
       });
       return;
     }
@@ -735,8 +846,18 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       });
       return;
     }
-    // Ignore: response / turn_start / turn_end / compaction_* /
-    // auto_retry_* / agent_end / bash_execution_update / summarization_retry_*
+    // Ignore: response frames for other commands (handled in ChatView or by
+    // rpcRequest) / turn_start / turn_end / auto_retry_* / agent_end /
+    // bash_execution_update / summarization_retry_*
+  },
+
+  consumeRestoreInput: (tabId) => {
+    const pending = get().states[tabId]?.restoreInput;
+    if (pending === undefined) return undefined;
+    set((s) => ({
+      states: { ...s.states, [tabId]: { ...s.states[tabId]!, restoreInput: undefined } },
+    }));
+    return pending;
   },
 
   sendPrompt: async (tabId, message, images, displayText = message) => {
@@ -744,6 +865,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     const st = get().states[tabId]!;
     if (st.exited) return;
     const id = `local-${++localSeq}`;
+    // pi answers every prompt command with a response frame carrying this id:
+    // success = preflight passed (the turn starts), failure = pi refused the
+    // prompt (no API key, already processing, compaction running…). Without
+    // matching on this id a rejected prompt left the UI at "已发送" forever.
+    const promptId = `prompt-${id}`;
     // The visible user bubble deliberately differs from the private prompt
     // payload when @mentions expanded a file. Pi will echo the payload in its
     // message_start event, so pendingUserText keeps reconciliation on the
@@ -754,7 +880,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         [tabId]: {
           ...s.states[tabId]!,
           pendingUserText: displayText,
-          turn: { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
+          pendingPromptId: promptId,
+          restoreInput: undefined,
+          // A steer joins a turn that is already running: "已发送，等待 Pi 开始
+          // 处理…" would be a lie (pi is mid-stream), and the queue banner
+          // (queue_update) is the honest feedback for it.
+          turn: st.isStreaming
+            ? st.turn
+            : { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
           messages: [
             ...s.states[tabId]!.messages,
             { id, role: "user", status: "done", blocks: [{ kind: "text", contentIndex: 0, text: displayText, done: true }] },
@@ -765,19 +898,9 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     const cmd: Record<string, unknown> = st.isStreaming
       ? { type: "prompt", message, images, streamingBehavior: "steer" }
       : { type: "prompt", message, images };
-    const sent = await window.api.tab.rpcSend(tabId, cmd);
+    const sent = await window.api.tab.rpcSend(tabId, { ...cmd, id: promptId });
     if (!sent) {
-      set((s) => ({
-        states: {
-          ...s.states,
-          [tabId]: {
-            ...s.states[tabId]!,
-            pendingUserText: undefined,
-            lastError: "消息未能发送到 Pi，请重试或切换到终端视图检查连接。",
-            turn: { phase: "failed", lastActivityAt: Date.now(), detail: "发送失败" },
-          },
-        },
-      }));
+      rejectPrompt(tabId, "消息未能发送到 Pi，请重试或切换到终端视图检查连接。");
     }
   },
 

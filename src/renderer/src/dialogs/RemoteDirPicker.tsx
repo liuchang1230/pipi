@@ -1,12 +1,14 @@
-// Remote/WSL directory picker — extracted from App.tsx (O1). Browsed via the
-// given tab's SFTP connection; picking a directory adds it as a project
-// (SSH remote or WSL) through the sessionsStore project actions.
+// Remote/WSL directory picker — extracted from App.tsx (O1). Browsed through
+// the given connection TARGET (a tab id or an explicit server profile), so a
+// directory can be picked without opening a connection tab. Picking adds the
+// directory as a project through the sessionsStore project actions.
 import { useCallback, useEffect, useState } from "react";
 import { useSessionsStore } from "../stores/sessionsStore";
 import type { FileNode } from "../stores/types";
+import type { TargetRef } from "../stores/remote-target";
 import { Icon } from "../components/Icon";
 
-export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: () => void }) {
+export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClose: () => void }) {
   const [pickerPath, setPickerPath] = useState("~");
   const [pickerEntries, setPickerEntries] = useState<FileNode[]>([]);
   const [pickerLoading, setPickerLoading] = useState(false);
@@ -16,24 +18,24 @@ export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: ()
       setPickerPath(dir);
       setPickerLoading(true);
       try {
-        const entries = (await window.api.file.list(tabId, dir)) as FileNode[];
+        const entries = (await window.api.file.list(target, dir)) as FileNode[];
         setPickerEntries(entries);
       } catch {
         setPickerEntries([{ name: "（远程目录加载失败）", path: "", type: "file" }]);
       }
       setPickerLoading(false);
     },
-    [tabId],
+    [target],
   );
 
-  // Start from the tab's own browse path.
+  // Start from the target's own browse path.
   useEffect(() => {
-    window.api.remote.getBrowsePath(tabId).then((p) => listDir(p || "~")).catch(() => listDir("~"));
+    window.api.remote.getBrowsePath(target).then((p) => listDir(p || "~")).catch(() => listDir("~"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tabId]);
+  }, [target]);
 
   const pickerSelect = useCallback(async () => {
-    const remote = await window.api.remote.getInfo(tabId);
+    const remote = await window.api.remote.getInfo(target);
     if (remote) {
       const ss = useSessionsStore.getState();
       if ((remote as { isWsl?: boolean }).isWsl) {
@@ -51,7 +53,7 @@ export function RemoteDirPicker({ tabId, onClose }: { tabId: string; onClose: ()
       }
     }
     onClose();
-  }, [pickerPath, tabId, onClose]);
+  }, [pickerPath, target, onClose]);
 
   return (
     <div className="dialog-overlay" onClick={onClose}>

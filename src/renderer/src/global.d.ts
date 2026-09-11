@@ -53,6 +53,8 @@ export interface TabSummary {
   /** Connection shell tabs only: "ready" after the remote shell confirmed,
    *  "failed" when ssh exited before that. */
   sshState?: "ready" | "failed";
+  /** RPC remote tabs only: true once pi booted and answered get_state. */
+  remoteReady?: boolean;
 }
 
 export interface SessionListItem {
@@ -123,6 +125,13 @@ export interface RemoteTarget {
   agentDir?: string;
 }
 
+/** Connection target for a remote/WSL operation: a live tab id (historically
+ *  the only form) or an explicit connection profile. The profile form lets
+ *  file + session operations work with no connection tab open at all. */
+export type TargetRef =
+  | string
+  | { tabId?: string; remote?: RemoteTarget; wsl?: { distro: string; path?: string } };
+
 export interface AutoFollowEvent {
   path: string;
   kind: "read" | "write";
@@ -142,7 +151,15 @@ export interface AutoFollowSettings {
 
 export interface AppSettings {
   autoFollow: AutoFollowSettings;
+  /** Delegated-subagent model (analyst / reviewer / scout). null/absent =
+   *  the subagent follows the main session's model. */
+  subagents?: SubagentModelSettings | null;
   onboarding?: { seenAt?: number; completedAt?: number };
+}
+
+export interface SubagentModelSettings {
+  provider?: string;
+  model: string;
 }
 
 declare global {
@@ -234,18 +251,18 @@ declare global {
         setMode: (mode: "dark" | "light") => Promise<boolean>;
       };
       file: {
-        list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean) => Promise<FileNode[]>;
+        list: (target?: TargetRef, dirPath?: string, rootPath?: string, noCache?: boolean) => Promise<FileNode[]>;
         /** Lazy tree: list one directory's children on expand (local, SSH, WSL). */
-        listDirChildren: (rootPath: string | undefined, tabId: string | undefined, relDir: string, noCache?: boolean) => Promise<FileNode[]>;
+        listDirChildren: (rootPath: string | undefined, target: TargetRef | undefined, relDir: string, noCache?: boolean) => Promise<FileNode[]>;
         resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }) => Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }>;
-        read: (tabId: string | undefined, relPath: string, rootPath?: string, mention?: boolean) => Promise<FileReadResult>;
+        read: (target: TargetRef | undefined, relPath: string, rootPath?: string, mention?: boolean) => Promise<FileReadResult>;
         searchMentions: (tabId: string, query: string) => Promise<FileMentionResult>;
-        write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string) => Promise<FileOpResult>;
-        mkdir: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
-        delete: (tabId: string | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
-        rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string) => Promise<FileOpResult>;
+        write: (target: TargetRef | undefined, relPath: string, content: string, rootPath?: string) => Promise<FileOpResult>;
+        mkdir: (target: TargetRef | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
+        delete: (target: TargetRef | undefined, relPath: string, rootPath?: string) => Promise<FileOpResult>;
+        rename: (target: TargetRef | undefined, relPath: string, newName: string, rootPath?: string) => Promise<FileOpResult>;
         /** Reveal a LOCAL file/folder in the OS file explorer (tree right-click). */
-        reveal: (input: { tabId?: string; rootPath?: string; relPath: string }) => Promise<FileOpResult>;
+        reveal: (input: { tabId?: string; remote?: RemoteTarget; wsl?: { distro: string; path?: string }; rootPath?: string; relPath: string }) => Promise<FileOpResult>;
       };
       onAutoFollow: (callback: (ev: AutoFollowEvent) => void) => () => void;
       onAutoFollowStatus: (callback: (status: AutoFollowStatus) => void) => () => void;
@@ -262,14 +279,17 @@ declare global {
       };
       session: {
         list: (cwd?: string) => Promise<SessionListItem[]>;
+        /** Attempt a transcript from the session file. `ok: false` means "fall
+         *  back to get_messages", not "failed". */
+        transcriptFromFile: (tabId: string) => Promise<{ ok: true; messages: unknown[] } | { ok: false; reason: string }>;
         listProjects: () => Promise<string[]>;
-        listRemote: (tabId: string, remoteCwd?: string) => Promise<RemoteSessionListResult>;
-        delete: (path: string, tabId?: string) => Promise<{ ok: boolean; error?: string }>;
+        listRemote: (target: TargetRef, remoteCwd?: string) => Promise<RemoteSessionListResult>;
+        delete: (path: string, target?: TargetRef) => Promise<{ ok: boolean; error?: string }>;
         rename: (path: string, name: string) => Promise<{ ok: boolean; error?: string }>;
-        onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => void) => () => void;
+        onRemoteUpdated: (callback: (payload: { tabId?: string; remoteKey?: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => void) => () => void;
         onLocalUpdated: (callback: (payload: { cwd: string; sessions: SessionListItem[] }) => void) => () => void;
-        setRemoteHydrationPaused: (tabId: string, remoteCwd: string, paused: boolean) => Promise<boolean>;
-        prioritizeRemote: (tabId: string, remoteCwd: string, priority?: number) => Promise<boolean>;
+        setRemoteHydrationPaused: (target: TargetRef, remoteCwd: string, paused: boolean) => Promise<boolean>;
+        prioritizeRemote: (target: TargetRef, remoteCwd: string, priority?: number) => Promise<boolean>;
       };
       model: {
         list: () => Promise<ModelConfigItem[]>;
@@ -286,9 +306,15 @@ declare global {
         transplantToRemote: (remote: RemoteTarget) => Promise<{ ok: boolean; error?: string; copied: string[] }>;
       };
       remote: {
-        setBrowsePath: (tabId: string, path: string) => Promise<boolean>;
-        getBrowsePath: (tabId: string) => Promise<string | null>;
-        getInfo: (tabId: string) => Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; agentDir?: string; isWsl?: boolean } | null>;
+        /** Prove a server is reachable without opening a tab. "need-password"
+         *  drives the login dialog. */
+        probe: (remote: RemoteTarget) => Promise<{ status: "ready" | "need-password" | "failed"; error?: string; key: string }>;
+        saveHistory: (remote: RemoteTarget) => Promise<RemoteHistoryItem[]>;
+        /** Main-discovered connection state (SFTP breaker / probe). */
+        onStatus: (callback: (ev: { remoteKey: string; status: "connected" | "failed" | "disconnected"; needPassword?: boolean; error?: string; profile?: { host: string; user: string; port?: number; agentDir?: string } }) => void) => () => void;
+        setBrowsePath: (target: TargetRef, path: string) => Promise<boolean>;
+        getBrowsePath: (target: TargetRef) => Promise<string | null>;
+        getInfo: (target: TargetRef) => Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; agentDir?: string; isWsl?: boolean } | null>;
         listHistory: () => Promise<RemoteHistoryItem[]>;
         deleteHistory: (target: { host: string; user: string; port: number; agentDir?: string }) => Promise<boolean>;
       };

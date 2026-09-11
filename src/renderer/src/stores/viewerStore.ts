@@ -7,6 +7,7 @@ import { useTabsStore } from "./tabsStore";
 import { useTreeStore } from "./treeStore";
 import { useUiStore } from "./uiStore";
 import { useLayoutStore } from "./layoutStore";
+import { targetOfOrigin, type RemoteProfileTarget, type TargetRef, type WslProfileTarget } from "./remote-target";
 import type { CurrentFile } from "../FileViewer";
 import type { AutoFollowSettings } from "./types";
 
@@ -46,7 +47,7 @@ interface ViewerState {
   /** Open a file (relative to the tree origin) into the viewer. `followed`
    *  marks auto-follow opens (retried on ENOENT, never clobbering a manual
    *  open). Resolves reads against the TREE's origin, not the active tab. */
-  openFile: (relPath: string, followed: boolean, originOverride?: { tabId?: string; rootPath?: string }) => Promise<void>;
+  openFile: (relPath: string, followed: boolean, originOverride?: { tabId?: string; remote?: RemoteProfileTarget; wsl?: WslProfileTarget; rootPath?: string }) => Promise<void>;
 }
 
 export const useViewerStore = create<ViewerState>()((set, get) => ({
@@ -67,20 +68,29 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
   openFile: async (relPath, followed, originOverride) => {
     const tabs = useTabsStore.getState();
     const origin = useTreeStore.getState().treeOrigin;
-    const tabId = originOverride?.tabId ?? origin?.tabId ?? tabs.activeTab ?? undefined;
+    // Precedence: an explicit caller target (chat link / follow event) wins;
+    // then the tree origin — which may be a connection PROFILE with no tab;
+    // then the active tab.
+    const explicit = !!originOverride && !!(originOverride.tabId || originOverride.remote || originOverride.wsl);
+    const target: TargetRef | undefined = explicit
+      ? { tabId: originOverride!.tabId, remote: originOverride!.remote, wsl: originOverride!.wsl }
+      : targetOfOrigin(origin) ?? tabs.activeTab ?? undefined;
+    const tabId = typeof target === "string" ? target : origin?.tabId;
+    const remote = originOverride?.remote ?? origin?.remote;
+    const wslProfile = originOverride?.wsl ?? origin?.wsl;
     const rootPath = originOverride?.rootPath ?? origin?.rootPath;
     const seq = ++openReq.seq;
     if (!followed) openReq.manualSeq = seq;
     set({ fileLoading: true });
     try {
-      let res = await window.api.file.read(tabId, relPath, rootPath);
+      let res = await window.api.file.read(target, relPath, rootPath);
       // Write-tool race: auto-follow fires when pi's toolCall is recorded in
       // the session JSONL, possibly BEFORE a just-created file exists on disk
       // (ENOENT). Retry briefly so the viewer lands on the real content.
       if (followed && res.error && isRetryableReadError(res.error) && seq === openReq.seq) {
         for (let attempt = 0; attempt < 4 && seq === openReq.seq; attempt++) {
           await new Promise((r) => setTimeout(r, 250));
-          res = await window.api.file.read(tabId, relPath, rootPath);
+          res = await window.api.file.read(target, relPath, rootPath);
           if (!res.error) break;
         }
       }
@@ -99,6 +109,8 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
             followed: false,
             error: res.error,
             tabId,
+            remote,
+            wsl: wslProfile,
             rootPath,
             source: tabs.isRemote ? "remote" : "local",
             sourceLabel: tabs.isRemote ? `${tabs.remoteLabel}${tabs.remoteDir ? `:${tabs.remoteDir}` : ""}` : tabs.cwd,
@@ -119,6 +131,8 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
           truncated: res.truncated,
           followed,
           tabId,
+          remote,
+          wsl: wslProfile,
           rootPath,
           source: tabs.isRemote ? "remote" : "local",
           sourceLabel: tabs.isRemote ? `${tabs.remoteLabel}${tabs.remoteDir ? `:${tabs.remoteDir}` : ""}` : tabs.cwd,

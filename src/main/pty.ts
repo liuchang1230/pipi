@@ -15,6 +15,8 @@ import { existsSync, readFileSync, readdirSync, statSync, watch, openSync, close
 import { spawnSync, spawn, type ChildProcess } from "node:child_process";
 import { delimiter, dirname, join, posix } from "node:path";
 import { sessionDirFor } from "./session-list";
+import { debugLog } from "./debug-log";
+import { subagentEnv, subagentShellPrefix } from "./subagent-model";
 import { parseWslDistroList, type WslDistro } from "./wsl";
 import { themeEnv } from "./theme-sync";
 import { TERMINAL_THEMES, type ThemeMode } from "../shared/terminal-theme";
@@ -147,6 +149,7 @@ function updateTabTitleFromSession(id: string): void {
   if (!t || !t.sessionPath) return;
   const label = sessionTitleFromFile(t.sessionPath);
   if (!label || label === t.title) return;
+  debugLog("title", `tab ${id} session-file label ${JSON.stringify(label)}`);
   t.title = label;
   emitTabsChanged();
 }
@@ -199,35 +202,89 @@ function maybeLinkBlankTab(id: string): void {
   emitTabsChanged();
 }
 
+/**
+ * Which watcher a tab needs to keep its title in sync with pi's session file.
+ * Pure decision (the fs existence check is injected) so the cases stay pinned
+ * by tests — the "promised but not yet written" case is invisible in the code
+ * paths that create it and silently degraded tab titles for months:
+ *  - none:           remote/WSL tabs sync titles through the session list.
+ *  - file:           linked to an existing session file — watch it (renames,
+ *                    first message) and refresh the title on change.
+ *  - dir-until-file: pi reported a session path it has NOT written yet (a new
+ *                    session file is created on the first assistant response),
+ *                    so watch the directory until the file shows up.
+ *  - dir-until-link: blank tab — the next session file created in the dir
+ *                    belongs to it (oldest blank tab wins).
+ */
+export type SessionWatchPlan = "none" | "file" | "dir-until-file" | "dir-until-link";
+
+export function sessionWatchPlan(
+  tab: { remote?: unknown; wsl?: unknown; sessionPath?: string },
+  fileExists: boolean
+): SessionWatchPlan {
+  if (tab.remote || tab.wsl) return "none";
+  if (!tab.sessionPath) return "dir-until-link";
+  return fileExists ? "file" : "dir-until-file";
+}
+
+/**
+ * Watch `dir` for the tab, falling back to its parent while the directory
+ * itself does not exist yet (pi creates the sessions dir lazily). Exactly one
+ * watcher per tab is registered; `onChange` is expected to call
+ * setSessionWatcher once its own precondition holds.
+ */
+function watchDirForTab(tab: TabInfo, dir: string, onChange: () => void): void {
+  const attach = (target: string, cb: () => void): boolean => {
+    try {
+      const watcher = watch(target, { persistent: false }, () => {
+        if (tabs.has(tab.id)) cb();
+      });
+      titleWatchers.set(tab.id, watcher);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (attach(dir, onChange)) return;
+  attach(dirname(dir), () => {
+    const cur = tabs.get(tab.id);
+    if (cur && existsSync(dir)) setSessionWatcher(cur);
+  });
+}
+
 /** Start (or restart) the title watcher for a tab. Remote tabs: no-op. */
 function setSessionWatcher(tab: TabInfo): void {
   stopSessionWatcher(tab.id);
-  if (tab.remote || tab.wsl) return;
-  if (!tab.sessionPath) {
-    const dir = sessionDirFor(tab.cwd);
-    try {
-      const watcher = watch(dir, { persistent: false }, () => maybeLinkBlankTab(tab.id));
-      titleWatchers.set(tab.id, watcher);
-      maybeLinkBlankTab(tab.id); // files pi created before the watch armed
-    } catch {
-      // Session dir not created yet (pi creates it lazily) — watch the parent
-      // and re-arm once the dir shows up.
-      try {
-        const parent = dirname(dir);
-        const watcher = watch(parent, { persistent: false }, () => {
-          // Tab may have been closed while we waited for the dir to appear.
-          if (!tabs.has(tab.id)) return;
-          if (existsSync(dir)) setSessionWatcher(tab);
-        });
-        titleWatchers.set(tab.id, watcher);
-      } catch {
-        /* nothing more we can do */
-      }
-    }
+  const plan = sessionWatchPlan(tab, !!tab.sessionPath && existsSync(tab.sessionPath));
+  if (plan === "none") return;
+
+  if (plan === "dir-until-file") {
+    // pi reports the session path from get_state BEFORE the file exists: a new
+    // session's .jsonl is written on its first assistant response (verified
+    // against pi 0.85.1 — get_state returns the promised path with nothing on
+    // disk). fs.watch on a missing path throws, and chat views link tabs from
+    // exactly that promise, so without this branch a local chat tab kept the
+    // project name as its title for the whole session while the sidebar
+    // learned the real name from the session list.
+    const promised = tab.sessionPath!;
+    const settle = (): void => {
+      const cur = tabs.get(tab.id);
+      if (cur?.sessionPath === promised && existsSync(promised)) setSessionWatcher(cur);
+    };
+    watchDirForTab(tab, dirname(promised), settle);
+    settle(); // pi may have written the file between get_state and this call
     return;
   }
+
+  if (plan === "dir-until-link") {
+    const dir = sessionDirFor(tab.cwd);
+    watchDirForTab(tab, dir, () => maybeLinkBlankTab(tab.id));
+    maybeLinkBlankTab(tab.id); // files pi created before the watch armed
+    return;
+  }
+
   try {
-    const watcher = watch(tab.sessionPath, { persistent: false }, () => {
+    const watcher = watch(tab.sessionPath!, { persistent: false }, () => {
       if (titleTimers.has(tab.id)) clearTimeout(titleTimers.get(tab.id)!);
       titleTimers.set(
         tab.id,
@@ -265,6 +322,10 @@ function stopSessionWatcher(id: string): void {
 export function setTabTitle(id: string, title: string): boolean {
   const t = tabs.get(id);
   if (!t || !title || t.title === title) return false;
+  // One line per actual change: the "session name never reached the chat view"
+  // class of report is only diagnosable if the log shows which path (session
+  // file watcher vs session-list sync) produced a title, and when.
+  debugLog("title", `tab ${id} ${JSON.stringify(t.title)} -> ${JSON.stringify(title)}`);
   t.title = title;
   emitTabsChanged();
   return true;
@@ -273,7 +334,15 @@ export function setTabTitle(id: string, title: string): boolean {
 /** Link a blank tab to the session file pi created for it. */
 export function linkTabSession(id: string, sessionPath: string, title?: string | null): boolean {
   const t = tabs.get(id);
-  if (!t || t.sessionPath) return false;
+  if (!t) return false;
+  if (t.sessionPath === sessionPath) {
+    // pi re-reports the same path (e.g. a chat tab's get_state after its
+    // promised file was missing at link time). Re-arming is idempotent and is
+    // how such a tab picks up its title watcher once the file exists.
+    setSessionWatcher(t);
+    return false;
+  }
+  if (t.sessionPath) return false; // never repoint an already-linked tab
   t.sessionPath = sessionPath;
   if (title) t.title = title;
   setSessionWatcher(t);
@@ -941,6 +1010,10 @@ export interface TabInfo {
    *  remote bash actually started); "failed" when the ssh process exits
    *  before the marker. Absent until then = still connecting. */
   sshState?: "ready" | "failed";
+  /** For RPC (pi --mode rpc) remote tabs: true only after pi actually booted
+   *  and answered get_state. A tab EXISTING must never read as "connected" —
+   *  a session stuck at auth has a tab but no working pi. */
+  remoteReady?: boolean;
   /** Incomplete trailing line of pty output (no newline yet) used to spot the
    *  ready-marker line across chunk boundaries and strip it from the stream. */
   sshLineBuf?: string;
@@ -1303,6 +1376,7 @@ export function createTab(opts: CreateTabOptions): string {
       cwd: opts.cwd,
       env: {
         ...process.env,
+        ...subagentEnv(),
         TERM: "xterm-256color",
         COLORTERM: "truecolor",
         ...themeEnv(mode),
@@ -1389,8 +1463,32 @@ export function listTabs(): TabInfo[] {
     remoteKey: t.remoteKey,
     wsl: t.wsl,
     sshState: t.sshState,
+    remoteReady: t.remoteReady,
     createdAt: t.createdAt,
   }));
+}
+
+/** An RPC session's pi actually booted (get_state answered): the tab — and
+ *  therefore its server in the sidebar — is genuinely connected now. */
+export function markTabRemoteReady(id: string): void {
+  const t = tabs.get(id);
+  if (!t) return;
+  if (t.remoteReady) return;
+  t.remoteReady = true;
+  emitTabsChanged();
+}
+
+/** The RPC transport died: the tab is no longer connected, so its server must
+ *  stop reading "connected" in the sidebar. A one-shot boot event must never
+ *  outlive the connection it proved (that was the "still green after the
+ *  server dropped us" bug). */
+export function markTabRemoteDown(id: string): void {
+  const t = tabs.get(id);
+  if (!t) return;
+  if (!t.remoteReady && t.sshState !== "ready") return;
+  t.remoteReady = false;
+  if (t.sshState === "ready") t.sshState = undefined;
+  emitTabsChanged();
 }
 
 export function getActiveTab(): TabInfo | null {
@@ -1464,6 +1562,13 @@ export function writeTab(id: string, data: string): boolean {
 export function registerExternalTab(tab: TabInfo): void {
   tabs.set(tab.id, tab);
   activeId = tab.id;
+  // External (chat) tabs arrive with a session path only when they RESUME one
+  // — arm the title watcher so `/name` renames follow into the tab title. A
+  // blank chat tab is deliberately left unwatched: pi reports its own promised
+  // path within ~1s (get_state → linkTabSession), and the blank-tab
+  // "newest unlinked file in the dir" heuristic could hand it another chat
+  // tab's session in the same project.
+  if (tab.sessionPath) setSessionWatcher(tab);
 }
 
 /** Remove a non-pty tab from the shared registry (no process kill). */
@@ -1566,7 +1671,9 @@ function sessionArg(sessionPath: string): string {
     // Same nested SSH quoting constraint as rpc-session.ts: base64 is safe
     // unquoted, while inner single quotes would terminate `bash -ic '…'`.
     ` export PIPI_S="$(printf %s ${b64} | base64 -d 2>/dev/null || printf %s ${b64} | base64 -D 2>/dev/null)";` +
-    ` pi \${PIPI_S:+--session "$PIPI_S"}; exec bash -i`
+    // The subagent-model env must sit directly in front of `pi` (the agent
+    // extensions inherit the pi process env; ssh/WSL do not forward ours).
+    ` ${subagentShellPrefix()}pi \${PIPI_S:+--session "$PIPI_S"}; exec bash -i`
   );
 }
 
@@ -1603,7 +1710,7 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
   // notice when pi is not installed in the distro.
   const inner = linuxSessionPath
     ? sessionArg(linuxSessionPath)
-    : `if command -v pi >/dev/null 2>&1; then pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
+    : `if command -v pi >/dev/null 2>&1; then ${subagentShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
 
   const wslBin = findWslBin();
   const wslArgs = [
@@ -1712,7 +1819,7 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
     : opts.sessionPath
       // sessionArg already ends with the `pi ...` invocation.
       ? sessionArg(opts.sessionPath)
-      : `if command -v pi >/dev/null 2>&1; then pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
+      : `if command -v pi >/dev/null 2>&1; then ${subagentShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
   const remoteCmd = `cd ${shellPath} && bash -ic '${modeEnv}${agentDirEnv} ${inner}'`;
   sshArgs.push(remoteCmd);
 

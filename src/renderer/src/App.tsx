@@ -28,7 +28,11 @@ import { PiInstallDialog } from "./dialogs/PiInstallDialog";
 import { OnboardingDialog } from "./dialogs/OnboardingDialog";
 import { RemoteDialog } from "./dialogs/RemoteDialog";
 import { RemoteDirPicker } from "./dialogs/RemoteDirPicker";
+import { RemotePasswordDialog } from "./dialogs/RemotePasswordDialog";
+import { serverProfile, type RemoteProfileTarget, type TargetRef } from "./stores/remote-target";
+import { useRemoteStore } from "./stores/remoteStore";
 import { useTabsStore } from "./stores/tabsStore";
+import { useChatStore } from "./stores/chatStore";
 import { useSessionsStore } from "./stores/sessionsStore";
 import { useTreeStore } from "./stores/treeStore";
 import { useViewerStore } from "./stores/viewerStore";
@@ -56,6 +60,33 @@ function ViewerExpandButton() {
     >
       ❮
     </button>
+  );
+}
+
+/** Login dialog host: owns the password dialog for BOTH paths — main's
+ *  discovered auth failures (SFTP breaker / probe / background poll) and an
+ *  explicit click request. Self-contained, so App keeps zero store
+ *  subscriptions (its rendering stays limited to its own dialog flags). */
+function RemoteLoginDialogHost() {
+  const request = useRemoteStore((s) => s.loginRequest);
+  const busy = useRemoteStore((s) => s.loginBusy);
+  if (!request) return null;
+  return (
+    <RemotePasswordDialog
+      request={request}
+      busy={busy}
+      onSubmit={(password, remember) => {
+        void (async () => {
+          const ok = await useRemoteStore.getState().submitLogin(password, remember);
+          if (!ok) return;
+          useUiStore.getState().showToast(`已连接到 ${request.remote.user}@${request.remote.host}`, "ok");
+          // The credential now exists for this server: refresh the catalog so
+          // its project rows can load sessions through the profile.
+          void useSessionsStore.getState().refreshProjects();
+        })();
+      }}
+      onCancel={() => useRemoteStore.getState().dismissLogin()}
+    />
   );
 }
 
@@ -155,7 +186,7 @@ export default function App() {
   const [showRemote, setShowRemote] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showRemotePicker, setShowRemotePicker] = useState(false);
-  const pickerTabRef = useRef<string | null>(null);
+  const pickerTargetRef = useRef<TargetRef | null>(null);
   /** Remote pi probe errors shown once per tab per session (no toast spam on
    *  repeated tab switches while the probe result is cached). */
   const probeErrorShownRef = useRef<Set<string>>(new Set());
@@ -203,7 +234,15 @@ export default function App() {
     window.api.update.getExtensionSynced().then((r) => {
       if (r.files.length > 0) useUiStore.getState().setExtNotice({ files: r.files });
     }).catch(() => {});
-    const offTabs = window.api.onTabsUpdate((list) => useTabsStore.setState({ tabs: list }));
+    const offTabs = window.api.onTabsUpdate((list) => {
+      useTabsStore.setState({ tabs: list });
+      // Tab list is authoritative: drop chat state (full transcripts) for tabs
+      // that no longer exist, or memory grows with every session ever opened.
+      useChatStore.getState().retainTabs(new Set(list.map((t) => t.id)));
+    });
+    // Main-discovered connection state (SFTP breaker / probe). The dialog host
+    // component above consumes it, so App itself stays subscription-free.
+    const offRemoteStatus = window.api.remote.onStatus((ev) => useRemoteStore.getState().applyStatusEvent(ev));
     const offActive = window.api.onActiveTab(async ({ id, cwd: c, isRemote: r, sessions: payloadSessions }) => {
       const prevActive = activeTabRef.current;
       if (!id) {
@@ -300,6 +339,7 @@ export default function App() {
     return () => {
       offTabs();
       offActive();
+      offRemoteStatus();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -400,16 +440,37 @@ export default function App() {
     }
   }, []);
 
-  /** Server node click reuses or creates a visible connection tab, then
-   * signals success so the sidebar expands the node's projects. The mounted
-   * SSH terminal remains the authentication surface while it is connecting. */
-  const handleConnectServer = useCallback(async (server: RemoteServerGroup): Promise<boolean> => {
-    const tabId = await ensureRemoteConnection(server);
-    return !!tabId;
-  }, [ensureRemoteConnection]);
+  /** Probe a server and make it the connection — NO tab is created, so the
+   *  middle pane never changes when the user clicks a server. When auth needs
+   *  a password the login dialog takes over (the credential is remembered
+   *  through remote-history, which is what the next probe reads). */
+  const connectRemoteProfile = useCallback(async (remote: RemoteProfileTarget, options?: { remember?: boolean; quiet?: boolean }): Promise<boolean> => {
+    const outcome = await useRemoteStore.getState().probe(remote, { remember: options?.remember });
+    if (outcome.ok) {
+      if (!options?.quiet) useUiStore.getState().showToast(`已连接到 ${remote.user}@${remote.host}`, "ok");
+      return true;
+    }
+    if (outcome.needPassword) {
+      // The dialog is owned by RemoteLoginDialogHost; the click path and main's
+      // own status events funnel into the same request.
+      useRemoteStore.getState().requestLogin(remote, outcome.error);
+      return false;
+    }
+    useUiStore.getState().showToast(
+      `连接失败: ${remote.user}@${remote.host}${outcome.error ? `（${outcome.error}）` : "（请检查地址/端口/免密配置）"}`,
+      "err",
+    );
+    return false;
+  }, []);
 
-  /** Explicitly focus a server's raw shell terminal. Connection tabs are
-   * already visible in the tab bar; this is a direct navigation shortcut. */
+  /** Server node click: probe only. The SSH handle stays out of the tab bar. */
+  const handleConnectServer = useCallback(async (server: RemoteServerGroup): Promise<boolean> => {
+    return connectRemoteProfile(serverProfile(server));
+  }, [connectRemoteProfile]);
+
+  /** Explicitly focus a server's raw shell terminal. This is the ONE path
+   * that still creates a connection tab — the user asked for a terminal, and
+   * a terminal tab is exactly where a password prompt can be answered. */
   const handleOpenServerTerminal = useCallback(async (server: RemoteServerGroup): Promise<void> => {
     const tabId = await ensureRemoteConnection(server);
     if (!tabId) return;
@@ -417,13 +478,15 @@ export default function App() {
     if (ok) useTabsStore.getState().setActiveTab(tabId);
   }, [ensureRemoteConnection]);
 
-  /** Server node +: browse THAT server's directories (never the first tab). */
+  /** Server node +: browse THAT server's directories (never the first tab).
+   *  Needs a working connection, but a probe — not a tab — decides that. */
   const handleAddRemoteProjectForServer = useCallback(async (server: RemoteServerGroup) => {
-    const tabId = await ensureRemoteConnection(server);
-    if (!tabId) return;
-    pickerTabRef.current = tabId;
+    const remote = serverProfile(server);
+    const ok = await connectRemoteProfile(remote, { quiet: true });
+    if (!ok) return;
+    pickerTargetRef.current = { remote };
     setShowRemotePicker(true);
-  }, [ensureRemoteConnection]);
+  }, [connectRemoteProfile]);
 
   /** Connect a WSL distro: activate its tab if open, otherwise create one. */
   /** In-flight WSL connects: a double-click must not open two tabs for one
@@ -456,7 +519,7 @@ export default function App() {
       const tabs = useTabsStore.getState().tabs;
       const existing = tabs.find((t) => t.isWsl && t.wslDistro === distro);
       const id = existing?.id ?? await window.api.tab.create({ cwd: useTabsStore.getState().cwd || ".", wsl: { distro } });
-      pickerTabRef.current = id;
+      pickerTargetRef.current = id;
       setShowRemotePicker(true);
     } catch (e) {
       useUiStore.getState().showToast(`WSL ${distro} 连接失败: ${e instanceof Error ? e.message : String(e)}`, "err");
@@ -556,14 +619,15 @@ export default function App() {
       {/* pi agent auto-install progress — main-driven, self-contained. */}
       <PiInstallDialog />
       {showRemote && <RemoteDialog onClose={() => setShowRemote(false)} />}
-      {showRemotePicker && pickerTabRef.current && (
+      {showRemotePicker && pickerTargetRef.current && (
         <RemoteDirPicker
-          tabId={pickerTabRef.current}
-          onClose={() => { setShowRemotePicker(false); pickerTabRef.current = null; }}
+          target={pickerTargetRef.current}
+          onClose={() => { setShowRemotePicker(false); pickerTargetRef.current = null; }}
         />
       )}
 
       {/* Toast notification */}
+      <RemoteLoginDialogHost />
       <ToastHost />
       <UpdateBanner />
     </div>

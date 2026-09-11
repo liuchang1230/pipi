@@ -23,8 +23,10 @@ import { delimiter, dirname, join } from "node:path";
 import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
 import { debugLog } from "./debug-log";
+import { isSshAuthError } from "./sftp-failure";
+import { subagentEnv, subagentShellPrefix } from "./subagent-model";
 import {
-  closeTab, createTab, getGlobalPiBin, getTab, linkTabSession, registerExternalTab, setTabTitle, unregisterExternalTab,
+  closeTab, createTab, getGlobalPiBin, getTab, linkTabSession, markTabRemoteDown, markTabRemoteReady, registerExternalTab, setTabTitle, unregisterExternalTab,
   type CreateTabOptions, type RemoteOpts, type TabInfo, type WslOpts,
 } from "./pty";
 
@@ -47,7 +49,11 @@ class ChildProcessTransport implements RpcTransport {
   constructor(file: string, args: string[], cwd: string | undefined, label: string) {
     this.proc = spawn(file, args, {
       cwd,
-      env: process.env,
+      // subagentEnv(): the local `node cli.js --mode rpc` child must carry
+      // PI_PROVIDER/PI_MODEL so delegated agents inherit the configured
+      // subagent model. (wsl.exe/ssh.exe ignore them; their remote commands
+      // get the env via subagentShellPrefix instead.)
+      env: { ...process.env, ...subagentEnv() },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -98,7 +104,7 @@ class Ssh2Transport implements RpcTransport {
     this.exitCb?.(code ?? -1);
   }
 
-  constructor(remote: RemoteOpts, cmd: string, label: string) {
+  constructor(remote: RemoteOpts, cmd: string, label: string, onAuthFailure?: (message: string) => void) {
     this.stdin = this.input;
     this.stdout = this.output;
     this.conn = new SshClient();
@@ -135,8 +141,23 @@ class Ssh2Transport implements RpcTransport {
     });
     this.conn.on("error", (err) => {
       console.error(`[rpc] ${label} ssh error:`, err.message);
+      if (isSshAuthError(err)) onAuthFailure?.(err.message);
+      this.stderrCb?.(`SSH 连接错误：${err.message}\n`);
       this.reportExit(-1);
     });
+    // Transport death must reach the renderer as an exit. ssh2 emits `close`
+    // (and often `end`) when the flow dies — a dropped WiFi link, a server-side
+    // timeout, keepalive exhaustion — without emitting `error`, so without
+    // these two handlers the tab kept reporting itself alive and every later
+    // prompt vanished into the void.
+    const reportDropped = (why: string) => {
+      if (this.exitReported) return;
+      console.error(`[rpc] ${label} ssh ${why}`);
+      this.stderrCb?.(`SSH 连接已断开（${why}）\n`);
+      this.reportExit(-1);
+    };
+    this.conn.on("end", () => reportDropped("对端关闭"));
+    this.conn.on("close", () => reportDropped("网络中断或 keepalive 超时"));
     this.conn.connect({
       host: remote.host,
       port: remote.port ?? 22,
@@ -146,6 +167,14 @@ class Ssh2Transport implements RpcTransport {
       // Matches the app's ssh.exe StrictHostKeyChecking=accept-new stance.
       hostVerifier: () => true,
       readyTimeout: 20000,
+      // Liveness for a long-lived chat session. Without keepalive a NAT /
+      // firewall that silently drops the idle TCP flow leaves ssh2 believing
+      // the channel is healthy: stdin stays writable, writes land in the local
+      // buffer, and NOTHING ever comes back — the renderer sat on
+      // "已发送，等待 Pi 开始处理…" for as long as the user waited. 15s × 3
+      // unacknowledged probes ≈ 45s to a definitive "connection is gone".
+      keepaliveInterval: 15000,
+      keepaliveCountMax: 3,
     });
   }
 
@@ -244,7 +273,10 @@ function sessionArg(sessionPath: string): string {
     // metacharacters, so leave it unquoted: inner single quotes would close
     // the outer command and make every resumed SSH session exit immediately.
     ` export PIPI_S="$(printf %s ${b64} | base64 -d 2>/dev/null || printf %s ${b64} | base64 -D 2>/dev/null)";` +
-    ` pi --mode rpc \${PIPI_S:+--session "$PIPI_S"}`
+    // Subagent-model env directly in front of `pi`: the delegated-agent
+    // extensions inherit the pi process env, and neither ssh exec nor WSL
+    // forwards our Windows env.
+    ` ${subagentShellPrefix()}pi --mode rpc \${PIPI_S:+--session "$PIPI_S"}`
   );
 }
 
@@ -255,6 +287,46 @@ function wslSessionToLinux(distro: string, sessionPath: string): string {
     return "/" + sessionPath.slice(prefix.length).replace(/\\/g, "/");
   }
   return sessionPath;
+}
+
+// --- Post-boot liveness -----------------------------------------------------
+
+/**
+ * A command written to a dead pipe reports success and is never answered: no
+ * response frame, no exit event. 90s is far beyond any legitimate pi response
+ * (a remote `get_state` answers in ~100ms and even a cold model turn emits
+ * stream events continuously), so silence this long means the connection is
+ * gone rather than busy.
+ */
+export const SEND_SILENCE_MS = 90000;
+
+/**
+ * "Wrote a command, nothing came back" clock. Pure state machine: the timer
+ * only polls it, so the policy is unit-testable without a transport.
+ * `take` disarms, so one silence window produces exactly ONE report — a dead
+ * tab must not spam the renderer (or the log) every 90s.
+ */
+export class SilenceWatchdog {
+  private since: number | null = null;
+
+  /** Arm on the first write that has no answering byte yet. */
+  arm(now: number): void {
+    if (this.since === null) this.since = now;
+  }
+
+  /** Any byte from pi proves the pipe is alive. */
+  noteBytes(): void {
+    this.since = null;
+  }
+
+  /** Silent duration in ms when the window elapsed (and disarm), else null. */
+  take(now: number, limit = SEND_SILENCE_MS): number | null {
+    if (this.since === null) return null;
+    const elapsed = now - this.since;
+    if (elapsed < limit) return null;
+    this.since = null;
+    return elapsed;
+  }
 }
 
 // --- Session ----------------------------------------------------------------
@@ -300,6 +372,19 @@ export class RpcSession {
   private responsesSeen = 0;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private firstOutputLogged = false;
+  /** "Wrote a command, nothing came back" clock (see SilenceWatchdog). */
+  private readonly silence = new SilenceWatchdog();
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set once the transport reported a hard authentication failure, so a
+   *  later get_state timeout does not overwrite the more specific
+   *  "需要登录" state with a generic "failed". */
+  authFailed = false;
+
+  private reportAuthFailure(remote: RemoteOpts | undefined, message: string): void {
+    if (!remote || this.authFailed) return;
+    this.authFailed = true;
+    emitRemoteState(remote, "disconnected", true, message || "认证失败：需要密码或密钥未授权");
+  }
 
   constructor(id: string, opts: CreateTabOptions) {
     this.id = id;
@@ -308,7 +393,7 @@ export class RpcSession {
     if (opts.wsl) {
       const inner = opts.sessionPath
         ? sessionArg(wslSessionToLinux(opts.wsl.distro, opts.sessionPath))
-        : "pi --mode rpc";
+        : `${subagentShellPrefix()}pi --mode rpc`;
       const wslBin = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "wsl.exe");
       const wslCmd = `cd ${cdArg(opts.wsl.path || "~")} && ${inner}`;
       debugLog("rpc", `tab ${id} CMD wsl=${opts.wsl.distro} ${JSON.stringify(wslCmd)}`);
@@ -323,11 +408,11 @@ export class RpcSession {
       // Pi derives sessions from agentDir/sessions/<encoded-cwd>; do not pass
       // a flat session directory or the app's session index cannot find them.
       const agentDirEnv = r.agentDir ? `export PI_CODING_AGENT_DIR=${r.agentDir}; ` : "";
-      const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : "pi --mode rpc";
+      const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : `${subagentShellPrefix()}pi --mode rpc`;
       const remoteCmd = `cd ${cdArg(r.path || "~")} && bash -ic '${agentDirEnv}${inner}'`;
       debugLog("rpc", `tab ${id} CMD ssh=${r.user}@${r.host} ${JSON.stringify(remoteCmd)}`);
       if (r.password) {
-        this.transport = new Ssh2Transport(r, remoteCmd, label);
+        this.transport = new Ssh2Transport(r, remoteCmd, label, (msg) => this.reportAuthFailure(r, msg));
       } else {
         // Key auth: system ssh.exe handles ~/.ssh keys + agent, no TTY
         // needed. BatchMode=yes: if the server actually REQUIRES a password
@@ -365,9 +450,28 @@ export class RpcSession {
         this.firstOutputLogged = true;
         debugLog("rpc", `tab ${id} FIRST BYTES: ${JSON.stringify(chunk.slice(0, 80))}`);
       }
+      this.noteBytes();
       this.onChunk(chunk);
     });
     this.transport.onExit((code) => {
+      // The connection proved by get_state is gone: the tab's server must stop
+      // reading "connected" in the sidebar immediately.
+      if (opts.remote) {
+        // Only announce a failure for a genuine drop. A user-initiated close
+        // unregisters the tab first, so the sidebar re-derives "disconnected"
+        // from the now-empty tab set — do not paint that server red.
+        const stillRegistered = !!getTab(id);
+        markTabRemoteDown(id);
+        if (stillRegistered) {
+          emitRemoteState(opts.remote, "failed", false, "连接已断开（远程会话结束或网络中断）");
+        }
+      }
+      // A key-auth ssh.exe (BatchMode) that failed auth exits non-zero with no
+      // stdout and "Permission denied" on stderr — surface it as "需要登录"
+      // too, or the tab would just die while the sidebar stayed "连接中".
+      if (opts.remote && !this.sawOutput && /permission denied|publickey|no supported authentication/i.test(this.lastStderr)) {
+        this.reportAuthFailure(opts.remote, "认证失败：需要密码或密钥未授权");
+      }
       console.log(`[rpc] tab ${id} exited: ${code}`);
       debugLog("rpc", `tab ${id} EXIT ${code} stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-600))}`);
       if (this.noOutputTimer) {
@@ -414,7 +518,42 @@ export class RpcSession {
     }
     debugLog("rpc", `tab ${this.id} SEND ${String(cmd.type)}${cmd.id ? ` id=${String(cmd.id)}` : ""}`);
     this.transport.stdin.write(JSON.stringify(cmd) + "\n");
+    this.armSilenceWatchdog();
     return true;
+  }
+
+  /** Any byte from pi proves the pipe is alive: cancel the silence probe. */
+  private noteBytes(): void {
+    this.silence.noteBytes();
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+  }
+
+  /**
+   * Post-boot liveness: a command written while the pipe is dead (silently
+   * dropped TCP, wedged remote process) reports `writable === true` and then
+   * NOTHING comes back — no response frame, no exit event. The boot-time
+   * watchdogs above stop applying the moment pi speaks, so this one covers the
+   * whole session; `SilenceWatchdog` owns the policy.
+   */
+  private armSilenceWatchdog(): void {
+    this.silence.arm(Date.now());
+    if (this.silenceTimer) return;
+    this.silenceTimer = setTimeout(() => {
+      this.silenceTimer = null;
+      if (this.exited) return;
+      const silentMs = this.silence.take(Date.now());
+      if (silentMs === null) return;
+      console.error(`[rpc] tab ${this.id} no bytes for ${Math.round(silentMs / 1000)}s after a command — connection presumed dead`);
+      debugLog("rpc", `tab ${this.id} UNRESPONSIVE ${Math.round(silentMs / 1000)}s stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-400))}`);
+      forwardEvent(this.id, {
+        type: "rpc_unresponsive",
+        silentMs,
+        stderr: this.lastStderr.trimEnd().slice(-400),
+      });
+    }, SEND_SILENCE_MS);
   }
 
   kill(): void {
@@ -483,6 +622,7 @@ export class RpcSession {
   private emitExit(code: number): void {
     if (this.exited) return;
     this.exited = true;
+    this.noteBytes(); // a dead session must not also fire the silence report
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:rpc-exit:${this.id}`, { code, stderr: this.lastStderr.trimEnd().slice(-2000) });
     }
@@ -496,6 +636,23 @@ const sessions = new Map<string, RpcSession>();
 function forwardEvent(tabId: string, msg: Record<string, unknown>): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send(`tab:rpc-event:${tabId}`, msg);
+  }
+}
+
+/** Push a remote connection state the sidebar + login dialog follow. Fired
+ *  when the RPC transport CANNOT authenticate, and when pi never answers
+ *  (get_state failed) — the "connected" claim must come from pi actually
+ *  booting, never from a tab merely existing. */
+function emitRemoteState(remote: RemoteOpts, status: "connected" | "failed" | "disconnected", needPassword?: boolean, error?: string): void {
+  const remoteKey = `${remote.user}@${remote.host}:${remote.port ?? 22}${remote.agentDir ? `[${remote.agentDir}]` : ""}`;
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send("remote:status", {
+      remoteKey,
+      status,
+      needPassword: needPassword ?? false,
+      error,
+      profile: { host: remote.host, user: remote.user, port: remote.port ?? 22, agentDir: remote.agentDir },
+    });
   }
 }
 
@@ -564,6 +721,11 @@ export function createRpcTab(opts: CreateTabOptions): string {
     const data = res.data;
     if (!res.success || !data) {
       console.warn(`[rpc] tab ${id} get_state failed:`, res.error ?? "no data");
+      // The transport already reported auth failure when that was the cause;
+      // otherwise the server is reachable but pi did not answer — red dot.
+      if (remote && !session.authFailed) {
+        emitRemoteState(remote, "failed", false, "pi 未响应（未安装、启动失败或命令超时）");
+      }
       return;
     }
     if (data.sessionFile && !tab.sessionPath) {
@@ -575,6 +737,12 @@ export function createRpcTab(opts: CreateTabOptions): string {
     }
     if (data.sessionName) setTabTitle(id, data.sessionName);
     forwardEvent(id, { type: "app_phase", phase: "ready" });
+    // Genuine connectivity proof: pi booted and answered. Flipping this tab
+    // (and its server node) from "connecting" to "connected".
+    if (remote) {
+      markTabRemoteReady(id);
+      emitRemoteState(remote, "connected");
+    }
     forwardEvent(id, {
       type: "state_ready",
       model: data.model ?? null,

@@ -18,6 +18,8 @@ import {
   buildRemoteKey,
 } from "../stores/sessionsStore";
 import { groupRemoteServers } from "../stores/remote-servers";
+import { targetOfOrigin } from "../stores/remote-target";
+import { useRemoteStore } from "../stores/remoteStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
 import { useUiStore } from "../stores/uiStore";
@@ -79,6 +81,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const remoteHistory = useSessionsStore((s) => s.remoteHistory);
   const setRemoteSessions = useSessionsStore((s) => s.setRemoteSessions);
   const remoteHydration = useSessionsStore((s) => s.remoteHydration);
+  const remoteConnectionStatus = useRemoteStore((s) => s.byKey);
   const setRemoteHydration = useSessionsStore((s) => s.setRemoteHydration);
   const expandedProjects = useSessionsStore((s) => s.expandedProjects);
   const selectedSessions = useSessionsStore((s) => s.selectedSessions);
@@ -121,36 +124,57 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
   // --- Remote hydration: main's background hydration → per-project caches ---
   useEffect(() => {
-    const off = window.api.session.onRemoteUpdated(({ tabId, remoteCwd, sessions, hydratedCount, totalCount }) => {
-      setRemoteSessions((prev) => ({ ...prev, [remoteSessionCacheKey(tabId, remoteCwd, tabs.find((t) => t.id === tabId)?.remoteAgentDir ?? "")]: sessions as SessionItem[] }));
+    const off = window.api.session.onRemoteUpdated(({ tabId, remoteKey, remoteCwd, sessions, hydratedCount, totalCount }) => {
+      // Which server this event belongs to: the connection profile when main
+      // knows it (tab-independent), else the emitting tab (WSL).
+      const cacheId = remoteKey ?? tabId;
+      setRemoteSessions((prev) => {
+        if (!cacheId) return prev;
+        const agentDir = projects.find((p) => p.type === "remote" && p.path === remoteCwd && buildRemoteKey(p.host, p.user, p.port, p.agentDir) === remoteKey)?.agentDir
+          ?? tabs.find((t) => t.id === tabId)?.remoteAgentDir
+          ?? "";
+        return { ...prev, [remoteSessionCacheKey(cacheId, remoteCwd, agentDir)]: sessions as SessionItem[] };
+      });
       setProjectSessions((prev) => {
+        let changed = false;
         const next = { ...prev };
         for (const project of projects) {
           if (project.path !== remoteCwd || !project.id) continue;
           if (project.type === "wsl") {
             // WSL projects have no remoteKey; match the emitting tab via distro.
-            const matchesTab = tabs.find((t) => t.id === tabId && t.isWsl && t.wslDistro === project.distro);
-            if (matchesTab) next[project.id] = sessions as SessionItem[];
+            const matchesTab = !!tabId && tabs.some((t) => t.id === tabId && t.isWsl && t.wslDistro === project.distro);
+            if (matchesTab) {
+              next[project.id] = sessions as SessionItem[];
+              changed = true;
+            }
           } else if (project.type === "remote") {
             if (!project.host || !project.user) continue;
-            const projectRemoteKey = buildRemoteKey(project.host, project.user, project.port, (project as { agentDir?: string }).agentDir);
-            const matchesTab = tabs.find((t) => t.id === tabId && t.isRemote && t.remoteKey === projectRemoteKey);
-            if (matchesTab) next[project.id] = sessions as SessionItem[];
+            const projectRemoteKey = buildRemoteKey(project.host, project.user, project.port, project.agentDir);
+            const matches = remoteKey
+              ? projectRemoteKey === remoteKey
+              : !!tabId && tabs.some((t) => t.id === tabId && t.isRemote && t.remoteKey === projectRemoteKey);
+            if (matches) {
+              next[project.id] = sessions as SessionItem[];
+              changed = true;
+            }
           }
         }
-        return next;
+        return changed ? next : prev;
       });
       setRemoteHydration((prev) => {
         // The main process keeps hydrating in batches of 4 after the first
         // pass (head 5 → +4 each) — the FIRST event must not clear the
         // "正在补全远程会话信息" state while rows still say 同步中. Clear
         // only when every session in this event is hydrated, and this event
-        // is still ours (tab/cwd match).
+        // is still ours (profile/tab + cwd match).
         const allHydrated = typeof hydratedCount === "number" && typeof totalCount === "number"
           ? hydratedCount >= totalCount
           : (sessions as SessionItem[]).every((s) => !(s.name === null && s.firstMessage === "" && s.messageCount === 0));
         if (!allHydrated) return prev;
-        return prev.tabId === tabId && prev.remoteCwd === remoteCwd ? { phase: "idle" } : prev;
+        const sameTarget = remoteKey
+          ? prev.remoteKey === remoteKey && prev.remoteCwd === remoteCwd
+          : prev.tabId === tabId && prev.remoteCwd === remoteCwd;
+        return sameTarget ? { phase: "idle" } : prev;
       });
     });
     return off;
@@ -238,7 +262,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       if (!tab?.wsl) return;
     }
     try {
-      const res = await window.api.file.reveal({ tabId: origin.tabId, rootPath: origin.rootPath, relPath: node.path });
+      const res = await window.api.file.reveal({ tabId: origin.tabId, remote: origin.remote, wsl: origin.wsl, rootPath: origin.rootPath, relPath: node.path });
       if (!res.ok) useUiStore.getState().showToast(res.error || "无法在资源管理器中定位", "err");
     } catch (e) {
       useUiStore.getState().showToast(e instanceof Error ? e.message : "无法在资源管理器中定位", "err");
@@ -297,8 +321,8 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
    *  the origin (active) tab. */
   const treeOp = useCallback(() => {
     const origin = useTreeStore.getState().treeOrigin;
-    if (origin?.rootPath) return { tabId: undefined, rootPath: origin.rootPath };
-    return { tabId: origin?.tabId ?? activeTab ?? undefined, rootPath: undefined };
+    if (origin?.rootPath) return { target: undefined, rootPath: origin.rootPath };
+    return { target: targetOfOrigin(origin) ?? activeTab ?? undefined, rootPath: undefined };
   }, [activeTab]);
 
   const handleNewFile = useCallback(
@@ -311,9 +335,9 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       }
       fsBusyRef.current = true;
       try {
-        const { tabId, rootPath } = treeOp();
+        const { target, rootPath } = treeOp();
         const rel = joinRel(treeParentDir(prompt.node), name);
-        const res = await window.api.file.write(tabId, rel, "", rootPath);
+        const res = await window.api.file.write(target, rel, "", rootPath);
         if (!res.ok) {
           useUiStore.getState().showToast(res.error || "新建文件失败", "err");
           return;
@@ -340,9 +364,9 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       }
       fsBusyRef.current = true;
       try {
-        const { tabId, rootPath } = treeOp();
+        const { target, rootPath } = treeOp();
         const rel = joinRel(treeParentDir(prompt.node), name);
-        const res = await window.api.file.mkdir(tabId, rel, rootPath);
+        const res = await window.api.file.mkdir(target, rel, rootPath);
         if (!res.ok) {
           useUiStore.getState().showToast(res.error || "新建文件夹失败", "err");
           return;
@@ -367,8 +391,8 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       if (newName === node.name) return; // nothing to do
       fsBusyRef.current = true;
       try {
-        const { tabId, rootPath } = treeOp();
-        const res = await window.api.file.rename(tabId, node.path, newName, rootPath);
+        const { target, rootPath } = treeOp();
+        const res = await window.api.file.rename(target, node.path, newName, rootPath);
         if (!res.ok) {
           useUiStore.getState().showToast(res.error || "重命名失败", "err");
           return;
@@ -400,8 +424,8 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       }
       fsBusyRef.current = true;
       try {
-        const { tabId, rootPath } = treeOp();
-        const res = await window.api.file.delete(tabId, node.path, rootPath);
+        const { target, rootPath } = treeOp();
+        const res = await window.api.file.delete(target, node.path, rootPath);
         if (!res.ok) {
           useUiStore.getState().showToast(res.error || "删除失败", "err");
           return;
@@ -517,8 +541,9 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         projectErrors,
         projectDiagnostics,
         remoteHydration,
+        remoteStatus: remoteConnectionStatus,
       }),
-    [projects, remoteHistory, tabs, projectSessions, remoteSessions, projectErrors, projectDiagnostics, remoteHydration],
+    [projects, remoteHistory, tabs, projectSessions, remoteSessions, projectErrors, projectDiagnostics, remoteHydration, remoteConnectionStatus],
   );
 
   // WSL: distro is a CONNECTION node (like an SSH host); its projects are the
@@ -598,8 +623,13 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   // Stable wrapper so the memoized Sidebar never re-renders from changing
   // closure identities (only from actual data changes).
   const handleBatchDeleteClick = useCallback(() => {
-    const st = useTabsStore.getState();
-    void useSessionsStore.getState().batchDelete(st.activeTab ?? undefined, st.remoteDir ?? undefined);
+    const sessions = useSessionsStore.getState();
+    const selected = sessions.selectedSessions;
+    // Batch delete refreshes the owning REMOTE project's cache afterwards; the
+    // owner is the remote group containing a selected session (local groups
+    // need no remote refresh).
+    const owner = sessionOwnerRef.current.find((g) => g.type === "remote" && g.sessions.some((s) => selected.has(s.path)));
+    void sessions.batchDelete(owner);
   }, []);
 
   return (
@@ -790,8 +820,8 @@ interface SidebarProps {
   onOpenServerTerminal: (server: RemoteServerGroup) => void;
   onAddRemoteProjectForServer: (server: RemoteServerGroup) => void;
   onOpenSession: (session: SessionItem, projectCwd?: string) => void;
-  onOpenRemoteSession: (tabId: string, projectCwd: string, session: SessionItem) => void;
-  onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
+  onOpenRemoteSession: (project: ProjectGroup, session: SessionItem) => void;
+  onDeleteSession: (session: SessionItem, project?: ProjectGroup) => void;
   onHandleSessionCtx: (e: React.MouseEvent, session: SessionItem) => void;
   onSelectAllSessions: (sessions: SessionItem[]) => void;
   onToggleSessionSelect: (path: string) => void;
@@ -990,8 +1020,8 @@ interface ProjectGroupSectionProps {
   onDeleteProject: (project: ProjectGroup) => void;
   onNewProjectSession: (project: ProjectGroup) => void;
   onOpenSession?: (session: SessionItem, projectCwd?: string) => void;
-  onOpenRemoteSession?: (tabId: string, projectCwd: string, session: SessionItem) => void;
-  onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
+  onOpenRemoteSession?: (project: ProjectGroup, session: SessionItem) => void;
+  onDeleteSession: (session: SessionItem, project?: ProjectGroup) => void;
   onHandleSessionCtx?: (e: React.MouseEvent, session: SessionItem) => void;
   onSelectAllSessions: (sessions: SessionItem[]) => void;
   onToggleSessionSelect: (path: string) => void;
@@ -1013,8 +1043,8 @@ interface ProjectItemProps {
   onDeleteProject: (project: ProjectGroup) => void;
   onNewProjectSession: (project: ProjectGroup) => void;
   onOpenSession?: (session: SessionItem, projectCwd?: string) => void;
-  onOpenRemoteSession?: (tabId: string, projectCwd: string, session: SessionItem) => void;
-  onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
+  onOpenRemoteSession?: (project: ProjectGroup, session: SessionItem) => void;
+  onDeleteSession: (session: SessionItem, project?: ProjectGroup) => void;
   onHandleSessionCtx?: (e: React.MouseEvent, session: SessionItem) => void;
   onSelectAllSessions: (sessions: SessionItem[]) => void;
   onToggleSessionSelect: (path: string) => void;
@@ -1031,7 +1061,7 @@ const ProjectItem = memo(function ProjectItem({
   const disabled = !!project.disabled;
   const onOpen = (session: SessionItem) => {
     if (isRemoteSection) {
-      if (project.tabId && onOpenRemoteSession) onOpenRemoteSession(project.tabId, project.cwd, session);
+      if (onOpenRemoteSession) onOpenRemoteSession(project, session);
       return;
     }
     onOpenSession?.(session, project.cwd);
@@ -1069,7 +1099,7 @@ const ProjectItem = memo(function ProjectItem({
                   checked={selectedSessions.has(session.path)}
                   onToggleChecked={onToggleSessionSelect}
                   onOpen={() => onOpen(session)}
-                  onDelete={() => onDeleteSession(session, isRemoteSection ? project.tabId : undefined, isRemoteSection ? project.cwd : undefined)}
+                  onDelete={() => onDeleteSession(session, isRemoteSection ? project : undefined)}
                   onContextMenu={onHandleSessionCtx ? (e) => onHandleSessionCtx(e, session) : undefined}
                 />
               ))}
@@ -1150,8 +1180,8 @@ interface WslConnectionSectionProps {
   onToggleProject: (project: ProjectGroup) => void;
   onDeleteProject: (project: ProjectGroup) => void;
   onNewProjectSession: (project: ProjectGroup) => void;
-  onOpenRemoteSession?: (tabId: string, projectCwd: string, session: SessionItem) => void;
-  onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
+  onOpenRemoteSession?: (project: ProjectGroup, session: SessionItem) => void;
+  onDeleteSession: (session: SessionItem, project?: ProjectGroup) => void;
   onSelectAllSessions: (sessions: SessionItem[]) => void;
   onToggleSessionSelect: (path: string) => void;
   onWslConnect: (distro: string) => void;
@@ -1251,8 +1281,8 @@ interface RemoteServerSectionProps {
   onToggleProject: (project: ProjectGroup) => void;
   onDeleteProject: (project: ProjectGroup) => void;
   onNewProjectSession: (project: ProjectGroup) => void;
-  onOpenRemoteSession?: (tabId: string, projectCwd: string, session: SessionItem) => void;
-  onDeleteSession: (session: SessionItem, tabId?: string, projectCwd?: string) => void;
+  onOpenRemoteSession?: (project: ProjectGroup, session: SessionItem) => void;
+  onDeleteSession: (session: SessionItem, project?: ProjectGroup) => void;
   onSelectAllSessions: (sessions: SessionItem[]) => void;
   onToggleSessionSelect: (path: string) => void;
   onAddServer: () => void;
@@ -1292,10 +1322,15 @@ const RemoteServerSection = memo(function RemoteServerSection({
       {servers.length === 0 ? <div className="placeholder">{emptyText}</div> : servers.map((server) => {
         const isOpen = openServers.has(server.key);
         const status = server.status;
-        const hint =
-          status === "connecting" ? "连接中…" :
-          status === "failed" ? "连接失败" :
-          status === "disconnected" ? "未连接" : null;
+        // The dot next to the address is the whole connection readout: green =
+        // SSH ready, pulsing = connecting, red = failed, hollow = idle. A
+        // server whose auth needs a password reads "需要登录" until the dialog
+        // supplies one.
+        const dotLabel =
+          status === "connected" ? `${server.label} 已连接` :
+          status === "connecting" ? `${server.label} 连接中…` :
+          status === "failed" ? `${server.label} 连接失败` :
+          server.needPassword ? `${server.label} 需要登录` : `${server.label} 未连接`;
         return (
           <div key={server.key} className="remote-server-connection">
             <div
@@ -1318,7 +1353,12 @@ const RemoteServerSection = memo(function RemoteServerSection({
               <span className="tree-chevron">{isOpen ? "▾" : "▸"}</span>
               <span className="project-icon"><Icon name="globe" /></span>
               <span className="project-name">{server.label}</span>
-              {hint && <span className={`server-connect-hint${status === "failed" ? " failed" : status === "connecting" ? " connecting" : ""}`}>{hint}</span>}
+              <span
+                className={`server-state-dot ${status}${status === "disconnected" && server.needPassword ? " need-password" : ""}`}
+                title={dotLabel}
+                role="img"
+                aria-label={dotLabel}
+              />
               <button
                 className="row-action server-terminal-btn"
                 disabled={status !== "connected" && status !== "connecting"}

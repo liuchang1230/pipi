@@ -24,12 +24,17 @@ import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionTextAsync, type SessionEntry } from "./session-list";
 import { parseTreeFileAsync } from "./tree-from-file";
+import { transcriptFromContent } from "./transcript-from-file";
 import { sameSessionPaths } from "../shared/session-paths";
 import { pickWslEventTab } from "./wsl-event-tab";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
 import { debugLog } from "./debug-log";
+import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
+import { INTERNAL_RPC_ID_PREFIX } from "../shared/transcript";
+import { isSftpMissingPathError } from "./sftp-errors";
+import { describeConnectFailure, isSftpPathError, isSshAuthError } from "./sftp-failure";
 import {
   closeAllRpcSessions, closeRpcTab, createRpcTab, getRpcSession, listRpcSessions,
   setUiRequestHandler, switchRpcToTerminal, switchTerminalToRpc,
@@ -38,7 +43,7 @@ import {
 import {
   sdkSend, sdkUiResponse, sdkRequest, sdkOnExit, openSdkSession, closeSdkTab, getSdkTab, listSdkTabs, closeAllSdkSessions,
   switchSdkToTerminal, switchTerminalToSdk,
-  prewarmSdkWorker,
+  ensureSdkWorkerStarted,
   setUiRequestHandler as setSdkUiRequestHandler,
 } from "./chat-backend/sdk-host";
 import { checkAppUpdate, checkPiUpdate, checkRemotePiUpdate, openAppUpdateDownload, runPiUpdate, runRemotePiUpdate, type RemoteUpdateTarget } from "./update-check";
@@ -158,8 +163,7 @@ type SftpLease = {
   connectPromise: Promise<SftpLease> | null;
 };
 
-const REMOTE_SESSION_CACHE_TTL_MS = 12_000;
-const REMOTE_FILE_TREE_CACHE_TTL_MS = 5_000;
+const REMOTE_SESSION_CACHE_TTL_MS = 12_000;const REMOTE_FILE_TREE_CACHE_TTL_MS = 5_000;
 // Idle TTL for the shared SFTP lease. 20s was too aggressive: every lease
 // expiry destroys the connection (client-side clean close → sshd logs
 // "Received disconnect :11"), and the next poll re-creates it — a fresh
@@ -167,6 +171,10 @@ const REMOTE_FILE_TREE_CACHE_TTL_MS = 5_000;
 // "login, dies ~20s later, repeated every ~20s". 2 minutes keeps the
 // connection warm across polls/hydration while still reclaiming idle conns.
 const SFTP_IDLE_TTL_MS = 120_000;
+/** Budget for the transcript provider's INTERNAL get_state probe. Small response
+ *  (hundreds of bytes), so it stays far below HISTORY_REQUEST_TIMEOUT_MS: if pi
+ *  cannot answer even this, the RPC fallback would not fare better. */
+const TRANSCRIPT_STATE_TIMEOUT_MS = 12_000;
 const REMOTE_SESSION_EAGER_PARSE_LIMIT = 0;
 const REMOTE_SESSION_HEAD_HYDRATE_LIMIT = 5;
 // Batch of 8 (up from 4): OpenSSH sftp-server serializes requests on one
@@ -183,6 +191,13 @@ const REMOTE_SESSION_TAIL_READ_BYTES = 64 * 1024;
 const remoteSessionCache = new Map<string, RemoteSessionCacheEntry>();
 const remoteFileTreeCache = new Map<string, RemoteFileTreeCacheEntry>();
 const sftpLeases = new Map<string, SftpLease>();
+/** Latest connection profile seen per remoteKey. Background session
+ *  hydration is keyed by remoteKey, so it needs the profile even when no tab
+ *  exists for that server ("virtual target" flows — see resolveTarget). */
+const remoteProfiles = new Map<string, RemoteOpts>();
+function rememberRemoteProfile(remote: RemoteOpts | undefined): void {
+  if (remote?.host && remote.user) remoteProfiles.set(stableRemoteKey(remote), remote);
+}
 
 // Remote theme sync cache: skip re-uploading theme files on every connect.
 const remoteThemeSyncAt = new Map<string, number>();
@@ -218,9 +233,21 @@ function sessionTargetForTab(t: TabInfo): SessionTarget {
   return t.wsl ? wslTarget(t.wsl.distro) : localTarget();
 }
 
-function emitRemoteSessionsUpdated(tabId: string, remoteCwd: string, sessions: SessionEntry[], hydratedCount?: number, totalCount?: number): void {
-  mainWindow?.webContents.send("session:remote-updated", { tabId, remoteCwd, sessions, hydratedCount, totalCount });
-  syncRemoteTabTitles(tabId, remoteCwd, sessions);
+function emitRemoteSessionsUpdated(payload: {
+  /** Present for tab-bound flows (WSL, active remote tab). */
+  tabId?: string;
+  /** Connection profile key — the tab-independent identity of a remote
+   *  server. The renderer caches remote session lists by this when present. */
+  remoteKey?: string;
+  remoteCwd: string;
+  sessions: SessionEntry[];
+  hydratedCount?: number;
+  totalCount?: number;
+}): void {
+  mainWindow?.webContents.send("session:remote-updated", payload);
+  // Tab-bound flows also refresh the open tab's label; a pure profile flow
+  // (no tab) has no label to sync.
+  if (payload.tabId) syncRemoteTabTitles(payload.tabId, payload.remoteCwd, payload.sessions);
 }
 
 /**
@@ -430,8 +457,81 @@ function scheduleSftpLeaseCleanup(lease: SftpLease): void {
   }, SFTP_IDLE_TTL_MS);
 }
 
+/** Recent remote CONNECT failures keyed by the readable profile key (no path:
+ *  one broken server is one problem, however many projects it hosts). Without
+ *  this, every caller — session-hydration batches, the 4s title poll, the 6s
+ *  tree poll — retried a dead server independently, each attempt paying a full
+ *  TCP + auth round trip: a connect storm that made the whole machine crawl
+ *  while the UI showed "正在加载…". */
+const sftpFailures = new Map<string, { at: number; error: string; auth: boolean }>();
+const SFTP_FAILURE_COOLDOWN_MS = 20_000;
+/** Auth failures stay "known-bad" much longer: retrying cannot help until a
+ *  credential changes, and the user must be asked for a password instead. */
+const SFTP_AUTH_FAILURE_COOLDOWN_MS = 60_000;
+
+/** Push a remote connection state to the renderer (sidebar dot + login
+ *  dialog). Emitted by the SFTP breaker and by remote:probe, so the dot is
+ *  correct no matter which entry path discovered the failure. The password is
+ *  deliberately NOT sent back — the renderer is about to ask for one. */
+function emitRemoteStatus(
+  remote: RemoteOpts,
+  status: "connected" | "failed" | "disconnected",
+  extra?: { needPassword?: boolean; error?: string },
+): void {
+  mainWindow?.webContents.send("remote:status", {
+    remoteKey: buildRemoteKey(remote),
+    status,
+    needPassword: extra?.needPassword ?? false,
+    error: extra?.error,
+    profile: { host: remote.host, user: remote.user, port: remote.port ?? 22, agentDir: remote.agentDir },
+  });
+}
+
+/** Default private keys for key-auth servers (best effort, in preference
+ *  order). ssh2 accepts several and tries them in turn. */
+async function defaultPrivateKeys(): Promise<Buffer[]> {
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  if (!home) return [];
+  const keys: Buffer[] = [];
+  for (const name of ["id_ed25519", "id_ecdsa", "id_rsa"]) {
+    try {
+      keys.push(await readFile(join(home, ".ssh", name)));
+    } catch {
+      /* key not present */
+    }
+  }
+  return keys;
+}
+
+/** SSH auth material for a profile. The probe and the SFTP lease MUST use the
+ *  same material: when the probe could authenticate but SFTP could not, the
+ *  sidebar went green while every session/file read failed auth — the
+ *  "connected but 正在加载会话信息 forever" bug. Password first (what the user
+ *  typed), otherwise ssh-agent + the usual ~/.ssh keys. */
+async function remoteAuthOptions(remote: RemoteOpts): Promise<Record<string, unknown>> {
+  if (remote.password) return { password: remote.password };
+  const auth: Record<string, unknown> = {
+    agent: process.env.SSH_AUTH_SOCK || "\\\\.\\pipe\\openssh-ssh-agent",
+  };
+  const keys = await defaultPrivateKeys();
+  if (keys.length) auth.privateKey = keys;
+  return auth;
+}
+
 async function getSftpLease(remote: RemoteOpts): Promise<SftpLease> {
+  // Every SFTP round-trip is a chance to learn/refresh this server's profile
+  // (incl. a password the user just typed): keep it for background hydration.
+  rememberRemoteProfile(remote);
   const key = stableRemoteKey(remote);
+  const breakerKey = buildRemoteKey(remote);
+  // Circuit breaker: a fresh failure short-circuits WITHOUT touching the
+  // network, so a broken server cannot be hammered by every caller at once.
+  const failure = sftpFailures.get(breakerKey);
+  if (failure) {
+    const cooldown = failure.auth ? SFTP_AUTH_FAILURE_COOLDOWN_MS : SFTP_FAILURE_COOLDOWN_MS;
+    if (Date.now() - failure.at < cooldown) throw new Error(failure.error);
+    sftpFailures.delete(breakerKey);
+  }
   const existing = sftpLeases.get(key);
   if (existing) {
     if (existing.connectPromise) return existing.connectPromise;
@@ -458,16 +558,26 @@ async function getSftpLease(remote: RemoteOpts): Promise<SftpLease> {
         host: remote.host,
         port: remote.port ?? 22,
         username: remote.user,
-        password: remote.password,
+        // Same auth material as remote:probe — otherwise a key-auth server
+        // probes green and then fails every SFTP call.
+        ...(await remoteAuthOptions(remote)),
         readyTimeout: 15000,
       });
       lease.homeDir = await lease.client.realPath(".");
       lease.lastUsedAt = Date.now();
+      sftpFailures.delete(breakerKey);
       lease.connectPromise = null;
       return lease;
     } catch (error) {
       sftpLeases.delete(key);
       try { await lease.client.end(); } catch { /* ignore */ }
+      // Never-open-breaker for a path error: that is not a connect problem.
+      if (isSftpPathError(error)) throw error;
+      const auth = isSshAuthError(error);
+      const reason = describeConnectFailure(error);
+      sftpFailures.set(breakerKey, { at: Date.now(), error: reason, auth });
+      console.error(`[remote] connect failed (${breakerKey}):`, reason, auth ? "[auth]" : "");
+      emitRemoteStatus(remote, auth ? "disconnected" : "failed", { needPassword: auth, error: reason });
       throw error;
     }
   })();
@@ -738,6 +848,20 @@ function sdkBackendEnabled(): boolean {
   }
 }
 
+/**
+ * The directory a tab actually runs in. A remote/WSL tab's `cwd` is the LOCAL
+ * path (the app-side directory a new tab would inherit), so labelling a session
+ * with its project needs the remote side — without this the renderer showed
+ * "agent" for a session living in /data/liuchang/CRSCU…`. Undefined when the
+ * tab has no remote identity (local) or the directory is unknown/home.
+ */
+function tabProjectDir(t: TabInfo | null | undefined): string | undefined {
+  if (!t) return undefined;
+  if (t.remote) return t.remote.path || t.remoteBrowsePath || undefined;
+  if (t.wsl) return t.wsl.path || undefined;
+  return undefined;
+}
+
 function emitTabs() {
   // listTabs() includes RPC-backed tabs in the shared registry — exclude
   // them here; listRpcSessions() emits them with mode "rpc". Otherwise the
@@ -757,8 +881,10 @@ function emitTabs() {
     pi: t.remote ? t.remote.startPi !== false : true,
     isWsl: !!t.wsl,
     wslDistro: t.wsl?.distro,
+    remoteDir: tabProjectDir(t),
     remoteAgentDir: t.remote?.agentDir,
     sshState: t.sshState,
+    remoteReady: t.remoteReady,
     mode: "pty" as const,
   }));
   const rpcTabs = listRpcSessions().map((s) => {
@@ -776,7 +902,9 @@ function emitTabs() {
       remotePort: t?.remote?.port ?? 22,
       isWsl: !!t?.wsl,
       wslDistro: t?.wsl?.distro,
+      remoteDir: tabProjectDir(t),
       remoteAgentDir: t?.remote?.agentDir,
+      remoteReady: t?.remoteReady,
       pi: true,
       mode: "rpc" as const,
     };
@@ -855,6 +983,24 @@ if (process.platform === "win32") {
 // Single-instance lock: a second launch must focus the existing window, not
 // spawn a second main process (two instances would both poll sessions and
 // fight over the SFTP lease pool).
+/** Memory trend logging. The main process hosts the pre-warmed pi SDK worker
+ *  (a worker_thread counts toward this process), the remote session/tree
+ *  caches and every open tab's stream buffers; when users report "the machine
+ *  lags / this app eats RAM" the numbers must be on disk, not guessed. Two
+ *  minutes apart is enough for a trend without flooding the log. */
+function logMemory(tag: string): void {
+  try {
+    const m = process.memoryUsage();
+    const mb = (n: number) => Math.round(n / 1048576);
+    debugLog(
+      "mem",
+      `${tag} rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}MB external=${mb(m.external)}MB arrayBuffers=${mb(m.arrayBuffers)}MB`,
+    );
+  } catch {
+    /* logging must never break the app */
+  }
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
@@ -869,6 +1015,9 @@ if (!gotSingleInstanceLock) {
 
 if (gotSingleInstanceLock) {
   app.whenReady().then(async () => {
+  logMemory("startup");
+  const memTimer = setInterval(() => logMemory("tick"), 120_000);
+  memTimer.unref?.();
   // Ship app-bundled pi extensions (static working indicator etc.) BEFORE any
   // tab can spawn pi, so every pi process auto-discovers them. The returned
   // list of actually-written files feeds the chat-page update notice.
@@ -881,7 +1030,12 @@ if (gotSingleInstanceLock) {
   // tab open doesn't pay the ~1.1s SDK import; model runtime infra initializes
   // lazily on first open but the module graph is already hot.
   if (sdkBackendEnabled()) {
-    setTimeout(() => prewarmSdkWorker(agentDir()), 0);
+    // The pi SDK worker is NOT pre-warmed at startup any more: it is a
+    // worker_thread (memory charged to the main process) loading the bundled
+    // pi SDK + model runtime, and only a LOCAL tab switching to the chat view
+    // needs it. It starts on first use instead — see the SDK branch of
+    // tab:create — so remote-only work never pays for it.
+    logMemory("startup");
   }
 
   // Extension UI sub-protocol → forwarded to the renderer, which renders
@@ -927,7 +1081,7 @@ if (gotSingleInstanceLock) {
         return;
       }
       wslLastEmittedSessions.set(dedupKey, sessions);
-      emitRemoteSessionsUpdated(tab.id, cwd, sessions);
+      emitRemoteSessionsUpdated({ tabId: tab.id, remoteCwd: cwd, sessions });
       return;
     }
     mainWindow?.webContents.send("session:local-updated", { cwd, sessions });
@@ -1054,7 +1208,10 @@ if (gotSingleInstanceLock) {
     } else if (opts.remote || opts.wsl) {
       id = createRpcTab(opts);
     } else if (sdkBackendEnabled()) {
+      // First use starts the worker (and warms the SDK/model runtime in it).
+      ensureSdkWorkerStarted(agentDir());
       id = openSdkSession({ ...opts, agentDir: agentDir() });
+      logMemory("sdk-worker-start");
     } else {
       id = createRpcTab(opts);
     }
@@ -1116,7 +1273,11 @@ if (gotSingleInstanceLock) {
     if (opts.wsl) {
       void syncWslExtensions(opts.wsl.distro);
     }
-    if (opts.remote) saveRemoteHistory(opts.remote);
+    // Persist the server NODE (host/user/port/path) so it survives restarts,
+    // but never a password: password persistence is opt-in via the UI's
+    // "记住密码" checkbox. saveRemoteHistory is non-destructive, so this keeps
+    // any already-remembered credential while adding none.
+    if (opts.remote) saveRemoteHistory({ ...opts.remote, password: undefined });
     emitTabs();
     emitActive();
     return id;
@@ -1171,6 +1332,7 @@ if (gotSingleInstanceLock) {
       isRemote: !!(t.remote || t.wsl),
       isWsl: !!t.wsl,
       wslDistro: t.wsl?.distro,
+      remoteDir: tabProjectDir(t),
       pi: t.remote ? t.remote.startPi !== false : true,
       sshState: t.sshState,
       mode: "pty" as const,
@@ -1190,6 +1352,7 @@ if (gotSingleInstanceLock) {
         remotePort: t?.remote?.port ?? 22,
         isWsl: !!t?.wsl,
         wslDistro: t?.wsl?.distro,
+        remoteDir: tabProjectDir(t),
         // Parity with emitTabs' rpc mapping: a renderer reload while remote
         // sessions are live must still see the profile's agentDir (the
         // model-config hot-sync scoping and remote history keys read it).
@@ -1215,8 +1378,8 @@ if (gotSingleInstanceLock) {
   ]);
 
   // --- File tree + viewer (left/right panels) ---
-  ipcMain.handle("file:list", async (_e, payload?: { tabId?: string; dirPath?: string; rootPath?: string; noCache?: boolean }) => {
-    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+  ipcMain.handle("file:list", async (_e, payload?: TargetRef & { dirPath?: string; rootPath?: string; noCache?: boolean }) => {
+    const t = resolveTarget(payload);
     const dirPath = payload?.dirPath;
     // rootPath = explicit LOCAL preview root (sidebar project click). It is
     // authoritative: never route it through a remote/WSL tab even if one is
@@ -1263,8 +1426,8 @@ if (gotSingleInstanceLock) {
    *  are root-relative; remote/WSL paths are absolute Linux paths. Each
    *  adapter returns directories with `children: undefined`, meaning they can
    *  be expanded in place instead of replacing the current tree root. */
-  ipcMain.handle("file:list-dir", async (_e, payload?: { tabId?: string; rootPath?: string; relDir: string; noCache?: boolean }) => {
-    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+  ipcMain.handle("file:list-dir", async (_e, payload?: TargetRef & { rootPath?: string; relDir: string; noCache?: boolean }) => {
+    const t = resolveTarget(payload);
     if (!payload?.rootPath && t?.wsl && payload?.relDir) {
       const resolved = resolveWslPath(t.wsl.distro, payload.relDir);
       const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
@@ -1532,8 +1695,8 @@ if (gotSingleInstanceLock) {
     }
   });
 
-  ipcMain.handle("file:read", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string; mention?: boolean }) => {
-    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+  ipcMain.handle("file:read", async (_e, payload: TargetRef & { rootPath?: string; relPath: string; mention?: boolean }) => {
+    const t = resolveTarget(payload);
     const relPath = payload.relPath;
     // Local preview root is authoritative (see file:list).
     if (!payload.rootPath) {
@@ -1661,13 +1824,13 @@ if (gotSingleInstanceLock) {
 
   /** Shared dispatch for the four mutation handlers. */
   async function mutateFile(
-    tabId: string | undefined,
+    ref: TargetRef | undefined,
     relPath: string,
     fn: (t: TabInfo) => Promise<void> | void
   ): Promise<FileMutationResult> {
     const bad = validateRel(relPath);
     if (bad) return { ok: false, error: bad };
-    const t = tabId ? getTab(tabId) : getActiveTab();
+    const t = resolveTarget(ref);
     if (!t) return { ok: false, error: "找不到终端会话" };
     try {
       await fn(t);
@@ -1702,7 +1865,7 @@ if (gotSingleInstanceLock) {
 
   /** Local mutations in preview mode resolve against rootPath, not the tab cwd. */
 
-  ipcMain.handle("file:write", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string; content: string }) => {
+  ipcMain.handle("file:write", async (_e, payload: TargetRef & { rootPath?: string; relPath: string; content: string }) => {
     const relPath = payload.relPath;
     const content = payload.content ?? "";
     // Local preview root is authoritative; needs no tab at all.
@@ -1711,7 +1874,7 @@ if (gotSingleInstanceLock) {
       if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
-    return mutateFile(payload.tabId, relPath, async (t) => {
+    return mutateFile(payload, relPath, async (t) => {
       if (t.wsl) {
         await wslWrite(t, relPath, content);
       } else if (t.remote) {
@@ -1725,14 +1888,14 @@ if (gotSingleInstanceLock) {
     });
   });
 
-  ipcMain.handle("file:mkdir", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
+  ipcMain.handle("file:mkdir", async (_e, payload: TargetRef & { rootPath?: string; relPath: string }) => {
     const relPath = payload.relPath;
     if (payload.rootPath) {
       const r = await createDirectory(payload.rootPath, relPath);
       if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
-    return mutateFile(payload.tabId, relPath, async (t) => {
+    return mutateFile(payload, relPath, async (t) => {
       if (t.wsl) {
         await mkdir(wslFullPath(t, relPath), { recursive: true });
       } else if (t.remote) {
@@ -1746,14 +1909,14 @@ if (gotSingleInstanceLock) {
     });
   });
 
-  ipcMain.handle("file:delete", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string }) => {
+  ipcMain.handle("file:delete", async (_e, payload: TargetRef & { rootPath?: string; relPath: string }) => {
     const relPath = payload.relPath;
     if (payload.rootPath) {
       const r = await deletePath(payload.rootPath, relPath);
       if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
-    return mutateFile(payload.tabId, relPath, async (t) => {
+    return mutateFile(payload, relPath, async (t) => {
       if (t.wsl) {
         await wslDelete(t, relPath);
       } else if (t.remote) {
@@ -1767,7 +1930,7 @@ if (gotSingleInstanceLock) {
     });
   });
 
-  ipcMain.handle("file:rename", async (_e, payload: { tabId?: string; rootPath?: string; relPath: string; newName: string }) => {
+  ipcMain.handle("file:rename", async (_e, payload: TargetRef & { rootPath?: string; relPath: string; newName: string }) => {
     const relPath = payload.relPath;
     const newName = (payload.newName ?? "").trim();
     if (payload.rootPath) {
@@ -1775,7 +1938,7 @@ if (gotSingleInstanceLock) {
       if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
       return r;
     }
-    return mutateFile(payload.tabId, relPath, async (t) => {
+    return mutateFile(payload, relPath, async (t) => {
       if (t.wsl) {
         await wslRename(t, relPath, newName);
       } else if (t.remote) {
@@ -1796,7 +1959,7 @@ if (gotSingleInstanceLock) {
    *  SSH nodes live on a remote disk — the renderer never offers the action
    *  for those origins, and the handler refuses them anyway (rootPath =
    *  explicit local preview root, tab route = non-remote or WSL tab only). */
-  ipcMain.handle("file:reveal", (_e, payload?: { tabId?: string; rootPath?: string; relPath?: string }) => {
+  ipcMain.handle("file:reveal", (_e, payload?: TargetRef & { rootPath?: string; relPath?: string }) => {
     const relPath = payload?.relPath ?? "";
     // Tree node paths are posix root-relative and never contain NUL. Same
     // containment the sibling local ops enforce (resolveWithin) — this also
@@ -1813,7 +1976,7 @@ if (gotSingleInstanceLock) {
         return { ok: false, error: "路径越界，无法定位" };
       }
     } else {
-      const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+      const t = resolveTarget(payload);
       if (!t) return { ok: false, error: "找不到该文件所属的会话" };
       if (t.remote) return { ok: false, error: "远程文件不支持在系统资源管理器中定位" };
       try {
@@ -1833,7 +1996,98 @@ if (gotSingleInstanceLock) {
     return { ok: true };
   });
 
-  ipcMain.handle("remote:set-browse-path", (_e, tabId: string, path: string) => {
+  /** Prove a server is reachable WITHOUT opening a tab: an ssh2 auth round
+   *  strip plus an SFTP channel check (no shell, no pty, nothing for the user
+   *  to look at). "ready" therefore means the DATA channel works, not merely
+   *  that a shell could log in. `need-password` is the signal that drives the
+   *  renderer's password dialog. */
+  async function probeRemote(remote: RemoteOpts): Promise<{ status: "ready" | "need-password" | "failed"; error?: string }> {
+    const auth = await remoteAuthOptions(remote);
+    return new Promise((resolve) => {
+      const conn = new SshClient();
+      let settled = false;
+      const finish = (result: { status: "ready" | "need-password" | "failed"; error?: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          conn.end();
+        } catch {
+          /* already closed */
+        }
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish({ status: "failed", error: "连接超时（10s）" }), 12000);
+      conn.on("ready", () => {
+        // Auth passed — now prove the SFTP subsystem actually answers, so
+        // "green" implies the sidebar can list sessions and files.
+        conn.sftp((sftpErr, sftp) => {
+          if (sftpErr) {
+            finish({ status: "failed", error: `已登录但 SFTP 不可用：${sftpErr.message}` });
+            return;
+          }
+          sftp.realpath(".", (pathErr: Error | undefined) => {
+            finish(pathErr ? { status: "failed", error: `已登录但 SFTP 不可用：${pathErr.message}` } : { status: "ready" });
+          });
+        });
+      });
+      conn.on("error", (err: Error & { level?: string }) => {
+        // With no saved password, ssh2 may report an unavailable Windows
+        // agent instead of `client-authentication`. That still means the
+        // profile has no usable credential and must open the password dialog.
+        const authFailure = err.level === "client-authentication" || isSshAuthError(err);
+        if (authFailure) {
+          finish({
+            status: "need-password",
+            error: remote.password ? "认证失败（密码可能已变更）" : "需要输入 SSH 密码",
+          });
+          return;
+        }
+        finish({ status: "failed", error: err.message });
+      });
+      try {
+        conn.connect({ host: remote.host, port: remote.port ?? 22, username: remote.user, readyTimeout: 10000, ...auth });
+      } catch (err) {
+        finish({ status: "failed", error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+  }
+
+  ipcMain.handle("remote:probe", async (_e, remote: RemoteOpts) => {
+    const result = await probeRemote(remote);
+    debugLog("probe", `${remote.user}@${remote.host}:${remote.port ?? 22} -> ${result.status}${result.error ? ` (${result.error})` : ""}`);
+    if (result.status === "ready") {
+      rememberRemoteProfile(remote);
+      // A fresh credential (or a recovered server) must clear the breaker,
+      // otherwise the user's just-typed password would be refused for up to
+      // the auth cooldown by the cache that already gave up.
+      sftpFailures.delete(buildRemoteKey(remote));
+      emitRemoteStatus(remote, "connected");
+    } else if (result.status === "need-password") {
+      emitRemoteStatus(remote, "disconnected", { needPassword: true, error: result.error });
+    } else {
+      emitRemoteStatus(remote, "failed", { error: result.error });
+    }
+    return { ...result, key: stableRemoteKey(remote) };
+  });
+
+  /** Persist a connection profile (password included) into remote-history.json
+   *  so the next connect can skip the password dialog. Same store the
+   *  tab-based connect path already writes on every connect. */
+  ipcMain.handle("remote:save-history", (_e, remote: RemoteOpts) => {
+    saveRemoteHistory(remote);
+    // New credentials invalidate a previous auth failure immediately.
+    if (remote.password) sftpFailures.delete(buildRemoteKey(remote));
+    return listRemoteHistory();
+  });
+
+  ipcMain.handle("remote:set-browse-path", (_e, ref: string | TargetRef, path: string) => {
+    const target = toTargetRef(ref);
+    // Virtual target (explicit profile): no tab owns the browse path — the
+    // renderer passes the directory on every read, so there is nothing to
+    // persist here.
+    if (!target?.tabId) return true;
+    const tabId = target.tabId;
     const t = getTab(tabId);
     if (t?.wsl) {
       t.wsl.path = resolveWslPath(t.wsl.distro, path);
@@ -1844,12 +2098,18 @@ if (gotSingleInstanceLock) {
     if (ok && getActiveTab()?.id === tabId) emitActive();
     return ok;
   });
-  ipcMain.handle("remote:get-browse-path", (_e, tabId: string) => {
-    const t = getTab(tabId);
-    return t?.wsl ? (t.wsl.path || "~") : getRemoteBrowsePath(tabId);
+  ipcMain.handle("remote:get-browse-path", (_e, ref: string | TargetRef) => {
+    const target = toTargetRef(ref);
+    if (!target?.tabId) {
+      const virtual = resolveTarget(target, false);
+      if (!virtual) return null;
+      return virtual.wsl ? (virtual.wsl.path || "~") : (virtual.remote?.path || "~");
+    }
+    const t = getTab(target.tabId);
+    return t?.wsl ? (t.wsl.path || "~") : getRemoteBrowsePath(target.tabId);
   });
-  ipcMain.handle("remote:get-info", (_e, tabId: string) => {
-    const t = getTab(tabId);
+  ipcMain.handle("remote:get-info", (_e, ref: string | TargetRef) => {
+    const t = resolveTarget(toTargetRef(ref), false);
     if (t?.wsl) {
       return {
         host: t.wsl.distro,
@@ -1967,6 +2227,33 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   }
 }
 
+/** The session-file location for a tab — the ONE place a tab's fields are
+ *  mapped onto the reader's channel rule (see session-file-reader.ts). */
+function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
+  return { wslDistro: tab.wsl ? tab.wsl.distro : undefined, remote: tab.remote };
+}
+
+  /** Session-file channel adapters. Declared inside the ready closure (not at
+   *  module level) because the SFTP adapter needs `withSftp`, whose
+   *  refCount/destroy-on-error discipline the previous hand-rolled lease call
+   *  was missing. */
+  const readSessionFile = createSessionFileReader({
+    readLocal: (p) => readFile(p, "utf8"),
+    readWsl: (distro, p) => readFile(wslToWinPath(distro, p), "utf8"),
+    readSftp: (remote, p) =>
+      withSftp(remote, async (client) => {
+        const buf = (await client.get(p)) as string | Buffer;
+        return Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
+      }),
+    readSsh: async (remote, p) => {
+      const content = await sshCatRemoteFile(remote, p);
+      // The helper signals failure with an empty string; the reader's contract
+      // is "resolve text or throw", so callers fall back to the RPC path.
+      if (!content) throw new Error("key-auth remote read failed");
+      return content;
+    },
+  });
+
   ipcMain.handle("tree:from-file", async (_e, tabId: string) => {
     const tab = getTab(tabId);
     let sessionPath: string | null | undefined = tab?.sessionPath;
@@ -1985,25 +2272,12 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     }
     debugLog("tree", `tab ${tabId} from-file start (${pathSource}) path=${sessionPath}`);
     try {
-      let content: string;
-      if (tab.wsl) {
-        content = await readFile(wslToWinPath(tab.wsl.distro, sessionPath), "utf8");
-      } else if (tab.remote) {
-        if (tab.remote.password) {
-          const lease = await getSftpLease(tab.remote);
-          const buf = (await lease.client.get(sessionPath)) as string | Buffer;
-          lease.lastUsedAt = Date.now();
-          scheduleSftpLeaseCleanup(lease);
-          content = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
-        } else {
-          // Key-auth remote: no SFTP lease — read the session file over
-          // ssh.exe instead (works even when the remote pi is dead).
-          content = await sshCatRemoteFile(tab.remote, sessionPath);
-          if (!content) return { ok: false, error: "key-auth remote read failed" };
-        }
-      } else {
-        content = await readFile(sessionPath, "utf8");
-      }
+      // Channel selection (WSL UNC / SFTP-or-ssh / local) lives in
+      // session-file-reader.ts, not here: the tree dialog, the chat transcript
+      // and future readers must not each re-derive it. Throws on failure →
+      // caught below, so a key-auth read failure still reports exactly
+      // "key-auth remote read failed".
+      const content = await readSessionFile(sessionFileTargetOf(tab), sessionPath);
       const { entries, leafId } = await parseTreeFileAsync(content);
       debugLog("tree", `tab ${tabId} from-file OK entries=${entries.length}`);
       // Flat entries (not a nested tree): a long linear session nests deeper
@@ -2017,6 +2291,58 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
+  /** Transcript straight from the session file — keeps a multi-MB history
+   *  transfer OFF the `pi --mode rpc` command loop (which is serial and behind a
+   *  stdout-backpressure gate, so a big `get_messages` makes `prompt`/
+   *  `get_state` queue and the agent looks stuck; measured 17–45s round trips).
+   *
+   *  Scope (R5): only targets whose RPC channel is expensive — remote/WSL.
+   *  Local and SDK tabs keep `get_messages` (in-process / local pipe).
+   *
+   *  CONSISTENCY: pi's `get_state` reports `messageCount = session.messages.length`
+   *  — the exact length of the list `get_messages` would return — so the file's
+   *  resolution is CHECKED against it before being trusted. A mismatch means the
+   *  file is behind pi's in-memory state (an unflushed branch navigation, a
+   *  session switch) and the caller must use the RPC path rather than show stale
+   *  history. That probe costs one small round trip instead of a multi-MB one;
+   *  its response id is prefixed so the renderer ignores it (see
+   *  `INTERNAL_RPC_ID_PREFIX`) — otherwise it would drive `state_ready` and loop.
+   *
+   *  The result is deliberately a discriminated "attempt" rather than a
+   *  transcript: the renderer falls back to `get_messages` whenever this cannot
+   *  produce one, so a pi format change degrades to "slow but correct" instead
+   *  of blank chat (R4). */
+  ipcMain.handle("session:transcript-from-file", async (_e, tabId: string) => {
+    const tab = getTab(tabId);
+    if (!tab) return { ok: false, reason: "tab gone" };
+    if (!tab.remote && !tab.wsl) return { ok: false, reason: "local tab" };
+    const session = getRpcSession(tabId);
+    if (!session) return { ok: false, reason: "no rpc session" };
+    const state = await session.request<{ messageCount?: number; sessionFile?: string }>(
+      { type: "get_state", id: `${INTERNAL_RPC_ID_PREFIX}get_state` },
+      TRANSCRIPT_STATE_TIMEOUT_MS,
+    );
+    if (!state.success) return { ok: false, reason: "get_state failed" };
+    const expected = state.data?.messageCount;
+    if (typeof expected !== "number") return { ok: false, reason: "no message count" };
+    const sessionPath = state.data?.sessionFile || tab.sessionPath || (await findRecentSessionFile(tab));
+    if (!sessionPath) return { ok: false, reason: "no session file" };
+    try {
+      const content = await readSessionFile(sessionFileTargetOf(tab), sessionPath);
+      const messages = await transcriptFromContent(content);
+      if (!messages) return { ok: false, reason: "empty transcript" };
+      if (messages.length !== expected) {
+        return { ok: false, reason: `file behind pi state (${messages.length} != ${expected})` };
+      }
+      debugLog("transcript", `tab ${tabId} from-file OK messages=${messages.length}`);
+      return { ok: true, messages };
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      debugLog("transcript", `tab ${tabId} from-file FAILED ${reason}`);
+      return { ok: false, reason };
+    }
+  });
+
   ipcMain.handle("tab:rpc-switch-terminal", (_e, tabId: string) => {
     // Chat → terminal: local SDK-backed chat tabs respawn the pty TUI;
     // RPC-backed (remote/WSL) chat tabs switch to their pty pi too.
@@ -2089,7 +2415,17 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   });
 
   // --- WSL distro list ---
-  ipcMain.handle("wsl:list-distros", () => listWslDistros());
+  ipcMain.handle("wsl:list-distros", async () => {
+    const distros = await listWslDistros();
+    // Warm the home-dir cache in the background. The sync getWslHome() on WSL
+    // click paths uses spawnSync("wsl.exe") with a 5s timeout, which BLOCKS
+    // the whole main process (all IPC, terminal streaming) when cold — the
+    // "app freezes when I open a WSL tab/tree" report. Listing distros always
+    // precedes those clicks (sidebar + remote dialog), so by the time one
+    // lands the async probe has usually filled the shared cache.
+    for (const d of distros.slice(0, 4)) void getWslHomeAsync(d.name);
+    return distros;
+  });
 
   // --- Project list ---
   ipcMain.handle("project:list", () => listProjects());
@@ -2470,22 +2806,22 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     return sessionIndex.refresh(localTarget(), dir);
   });
   ipcMain.handle("session:list-projects", () => listLocalProjects(agentDir()));
-  ipcMain.handle("session:set-remote-hydration-paused", (_e, tabId: string, remoteCwd: string, paused: boolean) => {
-    const t = getTab(tabId);
+  ipcMain.handle("session:set-remote-hydration-paused", (_e, ref: string | TargetRef, remoteCwd: string, paused: boolean) => {
+    const t = resolveTarget(toTargetRef(ref), false);
     if (!t?.remote) return false;
     setRemoteSessionHydrationPaused(remoteSessionCacheKey(t.remote, remoteCwd), paused);
     return true;
   });
-  ipcMain.handle("session:prioritize-remote", (_e, tabId: string, remoteCwd: string, priority = 2) => {
-    const t = getTab(tabId);
+  ipcMain.handle("session:prioritize-remote", (_e, ref: string | TargetRef, remoteCwd: string, priority = 2) => {
+    const t = resolveTarget(toTargetRef(ref), false);
     if (!t?.remote) return false;
     markRemoteSessionPriority(remoteSessionCacheKey(t.remote, remoteCwd), priority);
     void scheduleRemoteHydrationWork();
     return true;
   });
-  ipcMain.handle("session:list-remote", async (_e, tabId: string, remoteCwd?: string) => {
-    const t = getTab(tabId);
-    if (!t?.remote && !t?.wsl) return { sessions: [], error: "远程标签页不存在或已断开" };
+  ipcMain.handle("session:list-remote", async (_e, ref: string | TargetRef, remoteCwd?: string) => {
+    const t = resolveTarget(toTargetRef(ref), false);
+    if (!t?.remote && !t?.wsl) return { sessions: [], error: "远程目标不存在或已断开" };
     const targetDir = remoteCwd ?? t.remoteBrowsePath ?? t.remote?.path ?? t.wsl?.path ?? "~";
     if (t?.wsl) {
       // WSL sessions are plain files under \\wsl$\<distro>\… — same
@@ -2529,7 +2865,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     void scheduleRemoteHydrationWork();
     return { sessions, diagnostics: initial.diagnostics };
   });
-  ipcMain.handle("session:delete", async (_e, payload: { path: string; tabId?: string }) => {
+  ipcMain.handle("session:delete", async (_e, payload: TargetRef & { path: string }) => {
     // 本地文件优先：路径在本机存在就直接本地删除，
     // 避免批量删除受“当前活动标签页是远程”影响而误走 SFTP。
     if (existsSync(payload.path)) {
@@ -2542,7 +2878,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
     }
-    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
+    const t = resolveTarget(payload);
     if (t?.wsl && !existsSync(payload.path)) {
       // WSL session paths are UNC (\\wsl$\<distro>\…) — use them as-is. The
       // Linux-path translation below only covers legacy/edge callers.
@@ -2646,6 +2982,50 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     }
   }
 
+  /** Renderer-supplied connection target: a real tab id, or an explicit
+   *  connection profile when no tab exists (a "virtual target"). Remote/WSL
+   *  file + session operations used to require a live connection tab; a
+   *  profile is enough — SFTP already pools by stableRemoteKey, so no ssh
+   *  session is implied by a profile. */
+  type TargetRef = {
+    tabId?: string;
+    remote?: { host: string; user: string; port?: number; path?: string; password?: string; agentDir?: string };
+    wsl?: { distro: string; path?: string };
+  };
+
+  /** Materialize an explicit profile as a VIRTUAL TabInfo so every remote/WSL
+   *  branch below keeps reading the same fields (remote / wsl /
+   *  remoteBrowsePath / cwd) whether or not a tab exists. A real tab always
+   *  wins: it owns the live browse-path state. `fallbackToActive` mirrors the
+   *  historical `tabId ? getTab(tabId) : getActiveTab()` contract — a stale
+   *  tabId must NOT silently fall back to the active tab. */
+  function resolveTarget(ref: TargetRef | undefined, fallbackToActive = true): TabInfo | undefined {
+    if (ref?.tabId) return getTab(ref.tabId);
+    const remote = ref?.remote;
+    const wsl = ref?.wsl;
+    if (!remote && !wsl) return fallbackToActive ? (getActiveTab() ?? undefined) : undefined;
+    const remoteProfile = remote ? { ...remote } : undefined;
+    if (remoteProfile) rememberRemoteProfile(remoteProfile);
+    return {
+      id: `target:${remoteProfile ? buildRemoteKey(remoteProfile) : `wsl:${wsl!.distro}`}`,
+      kind: "agent",
+      cwd: "",
+      title: "",
+      cols: 80,
+      rows: 24,
+      remote: remoteProfile,
+      wsl: wsl ? { distro: wsl.distro, path: wsl.path || "~" } : undefined,
+      remoteBrowsePath: remoteProfile ? remoteProfile.path || "~" : undefined,
+      remoteKey: remoteProfile ? buildRemoteKey(remoteProfile) : undefined,
+      createdAt: 0,
+    };
+  }
+
+  /** `session:*`-family ref: legacy tabId string, or a TargetRef object. */
+  function toTargetRef(ref: string | TargetRef | undefined): TargetRef | undefined {
+    return typeof ref === "string" ? { tabId: ref } : ref;
+  }
+
   function resolveRemotePath(inputPath: string | undefined, homeDir: string): string {
     const raw = (inputPath || "~").trim();
     if (raw === "~") return homeDir;
@@ -2703,7 +3083,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   }
 
   async function hydrateRemoteSessionsInBackground(
-    tabId: string,
+    remoteKey: string,
     remote: RemoteOpts,
     remoteCwd: string,
     cacheKey: string,
@@ -2736,10 +3116,23 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
         latest?.priority ?? 0,
         latest?.lastRequestedAt ?? Date.now(),
       );
-      emitRemoteSessionsUpdated(tabId, remoteCwd, hydrated, nextTargetCount, currentSessions.length);
-    } catch {
+      // Emit the READABLE profile key (pty.buildRemoteKey), not the internal
+      // sha1 cache key: the renderer keys its remote session caches by the
+      // same readable identity it builds from the sidebar's project rows.
+      emitRemoteSessionsUpdated({ remoteKey: buildRemoteKey(remote), remoteCwd, sessions: hydrated, hydratedCount: nextTargetCount, totalCount: currentSessions.length });
+    } catch (error) {
+      // A DETERMINISTIC failure (auth / permission / missing) must not become a
+      // hot retry loop: the scheduler selects entries by hydratedCount, so
+      // consume the remaining target to take this entry out of the queue. The
+      // entry still expires on its own TTL, and the next fresh listing
+      // re-hydrates from zero — so a transient blip recovers, a broken one
+      // does not spin.
+      console.error(`[remote] session hydration failed (${cacheKey}):`, error instanceof Error ? error.message : String(error));
       const latest = remoteSessionCache.get(cacheKey);
-      if (latest) latest.hydrating = false;
+      if (latest) {
+        latest.hydrating = false;
+        latest.hydratedCount = Math.max(latest.hydratedCount, nextTargetCount);
+      }
     } finally {
       activeRemoteHydrations = Math.max(0, activeRemoteHydrations - 1);
       const latest = remoteSessionCache.get(cacheKey);
@@ -2762,9 +3155,12 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     for (const [cacheKey, entry] of candidates) {
       if (activeRemoteHydrations >= REMOTE_SESSION_MAX_CONCURRENT_HYDRATIONS) break;
       const [remoteKey, remoteCwd] = cacheKey.split("::sessions::");
-      const tab = listTabs().find((item) => item.remote && stableRemoteKey(item.remote) === remoteKey);
-      if (!tab?.remote || !remoteCwd) continue;
-      void hydrateRemoteSessionsInBackground(tab.id, tab.remote, remoteCwd, cacheKey, entry.sessions);
+      // Profile-first: a server with no open tab (virtual target) has no entry
+      // in the tab registry, but hydration must still run for it.
+      const remote = remoteProfiles.get(remoteKey)
+        ?? listTabs().find((item) => item.remote && stableRemoteKey(item.remote) === remoteKey)?.remote;
+      if (!remote || !remoteCwd) continue;
+      void hydrateRemoteSessionsInBackground(remoteKey, remote, remoteCwd, cacheKey, entry.sessions);
     }
   }
 
@@ -2776,7 +3172,20 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   async function listRemoteSessionDir(client: SftpClient, homeDir: string, remoteCwd: string, agentDirOverride?: string): Promise<{ sessions: SessionEntry[]; diagnostics: { resolvedCwd: string; sessionDir: string; fileCount: number } }> {
     const resolvedCwd = resolveRemotePath(remoteCwd, homeDir);
     const sessionDir = posixPath.join(remoteAgentDir({ agentDir: agentDirOverride } as RemoteOpts, homeDir), "sessions", encodeCwd(resolvedCwd));
-    const items = await client.list(sessionDir);
+    // A missing session dir is ROUTINE (pi creates it lazily on the first
+    // session), so it must read as "no sessions yet" — the same semantics the
+    // local SessionIndex gives (`if (!existsSync(dir)) return []`). Without
+    // this the sidebar showed "远程会话加载失败：list: No such file" for a
+    // project that simply has no sessions. Other SFTP failures (auth,
+    // permission, dead channel) still throw and are reported honestly.
+    let items: Awaited<ReturnType<typeof client.list>>;
+    try {
+      items = await client.list(sessionDir);
+    } catch (error) {
+      if (!isSftpMissingPathError(error)) throw error;
+      debugLog("sessions", `remote session dir missing (treated as empty): ${sessionDir}`);
+      return { sessions: [], diagnostics: { resolvedCwd, sessionDir, fileCount: 0 } };
+    }
     const files = items
       .filter((item: { name: string; type: string }) => item.type !== "d" && item.name.endsWith(".jsonl"))
       .sort((a: { modifyTime?: number }, b: { modifyTime?: number }) => (b.modifyTime ?? 0) - (a.modifyTime ?? 0));
@@ -3112,7 +3521,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     const hydratedCount = changed ? 0 : (previous?.hydratedCount ?? 0);
     setCachedRemoteSessions(cacheKey, merged, false, hydratedCount, false, 1, Date.now());
     void scheduleRemoteHydrationWork();
-    if (changed) emitRemoteSessionsUpdated(t.id, targetDir, merged, merged.every((s) => !(s.name === null && s.firstMessage === "" && s.messageCount === 0)) ? merged.length : hydratedCount, merged.length);
+    if (changed) emitRemoteSessionsUpdated({ tabId: t.id, remoteKey, remoteCwd: targetDir, sessions: merged, hydratedCount: merged.every((s) => !(s.name === null && s.firstMessage === "" && s.messageCount === 0)) ? merged.length : hydratedCount, totalCount: merged.length });
     else syncRemoteTabTitles(t.id, targetDir, merged);
   }
 

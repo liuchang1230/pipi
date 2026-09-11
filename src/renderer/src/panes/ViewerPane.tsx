@@ -12,6 +12,11 @@ import { useViewerStore, isManualOpenPending } from "../stores/viewerStore";
 import { ChangesView } from "./ChangesView";
 import { useLayoutStore } from "../stores/layoutStore";
 
+/** How often a remote/WSL tree is re-listed while it is the shown origin.
+ *  Above the main process's 5s remote-file TTL so most ticks reuse its cache
+ *  instead of paying an SFTP round trip; a server has no fs.watch. */
+const REMOTE_TREE_POLL_MS = 6000;
+
 export function ViewerPane() {
   const currentFile = useViewerStore((s) => s.currentFile);
   const fileLoading = useViewerStore((s) => s.fileLoading);
@@ -127,6 +132,20 @@ export function ViewerPane() {
   useEffect(() => {
     if (followTimer.current) clearTimeout(followTimer.current);
   }, [activeTab, isRemote]);
+
+  // Remote/WSL trees have NO fs.watch — the session JSONL lives on the
+  // server, so the local auto-follow watcher never fires and pi-created files
+  // stayed invisible in the sidebar until a manual refresh. Poll the shown
+  // origin instead: the store no-ops for local/preview origins and respects
+  // the main process's 5s remote-file TTL, so each tick costs at most one
+  // SFTP/UNC listing per directory. Skipped while the window is hidden.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void useTreeStore.getState().pollRemote();
+    }, REMOTE_TREE_POLL_MS);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const off = window.api.onAutoFollow(({ path, kind, tabId }) => {

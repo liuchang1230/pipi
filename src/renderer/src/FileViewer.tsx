@@ -10,6 +10,7 @@ import { useMemo, useCallback, useState, useEffect, useRef } from "react";
 import hljs from "highlight.js/lib/common";
 import Markdown from "./Markdown";
 import { Icon } from "./components/Icon";
+import type { RemoteProfileTarget, WslProfileTarget } from "./stores/remote-target";
 
 export interface CurrentFile {
   path: string;
@@ -26,8 +27,11 @@ export interface CurrentFile {
   /** Set when the read failed (e.g. ENOENT); content then carries the message. */
   error?: string;
   /** Tab + preview root the file was opened from — saves go back HERE, not
-   *  to whatever tab/root is active when the user hits Ctrl+S. */
+   *  to whatever tab/root is active when the user hits Ctrl+S. A remote file
+   *  opened from a connection PROFILE (no tab) carries the profile instead. */
   tabId?: string;
+  remote?: RemoteProfileTarget;
+  wsl?: WslProfileTarget;
   rootPath?: string;
   source?: "local" | "remote";
   sourceLabel?: string;
@@ -161,8 +165,9 @@ export default function FileViewer({ file, loading, tabId, onSaved, onToast }: F
     setSaving(true);
     try {
       // Write back to where the file was OPENED from (preview root / origin
-      // tab), never to the currently-active tab/project.
-      const res = await window.api.file.write(file.tabId ?? tabId, file.path, draft, file.rootPath);
+      // tab / connection profile), never to the currently-active tab/project.
+      const writeTarget = file.remote ? { remote: file.remote } : file.wsl ? { wsl: file.wsl } : file.tabId ?? tabId;
+      const res = await window.api.file.write(writeTarget, file.path, draft, file.rootPath);
       if (res.ok) {
         // Stay in save mode until the re-read lands so a quick 编辑 re-click
         // seeds the draft from fresh content.

@@ -25,6 +25,10 @@ export interface TabInfo {
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
+  /** Project directory for remote/WSL tabs ("where this session runs").
+   *  For those tabs `cwd` is the LOCAL path a new tab would inherit, so the
+   *  project name/path shown in the UI comes from here. */
+  remoteDir?: string;
   /** Present for WSL tabs: main's listTabs ships the pty TabInfo.wsl object
    *  ({distro, path}) across IPC; used to distinguish WSL (locally revealable
    *  via \\wsl$ UNC) from SSH remote origins. */
@@ -35,6 +39,9 @@ export interface TabInfo {
   /** Connection shell tabs only: "ready" after the remote shell confirmed
    *  (__PIPI_READY__ marker), "failed" when ssh exited before that. */
   sshState?: "ready" | "failed";
+  /** RPC remote tabs only: true once pi booted and answered get_state. A tab
+   *  EXISTING must never read as "connected". */
+  remoteReady?: boolean;
 }
 
 export interface SessionItem {
@@ -77,6 +84,9 @@ export interface ProjectGroup {
   cwd: string;
   type: "local" | "remote";
   tabId?: string;
+  /** Connection profile key of the owning server (SSH). Tab-independent, so
+   *  a project stays addressable while it has no open tab. */
+  remoteKey?: string;
   host?: string;
   user?: string;
   port?: number;
@@ -112,6 +122,9 @@ export interface RemoteServerGroup {
    *  connecting = connection shell tab exists but not confirmed yet;
    *  failed = ssh exited before confirming; disconnected = no tab. */
   status: ServerStatus;
+  /** Auth needs a password (probe result): the sidebar shows the dot in the
+   *  "needs login" flavor and the click opens the login dialog. */
+  needPassword?: boolean;
   tabId?: string;
   projects: ProjectGroup[];
 }
@@ -127,6 +140,8 @@ export interface WslConnectionGroup {
 export interface RemoteHydrationState {
   phase: "idle" | "loading" | "hydrating";
   tabId?: string;
+  /** Profile-keyed hydration (no tab): the tab-independent identity. */
+  remoteKey?: string;
   remoteCwd?: string;
 }
 

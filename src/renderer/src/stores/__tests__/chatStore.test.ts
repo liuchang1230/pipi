@@ -324,6 +324,24 @@ describe("chatStore session-mode fallback", () => {
     expect(st.autoCompactionEnabled).toBe(false);
   });
 
+  it("ignores unknown get_state fields like modelFallbackMessage", () => {
+    // The SDK backend's get_state may carry pi's modelFallbackMessage (model
+    // restore failure notice). ChatPane toasts it; the store must not choke
+    // on or store the extra field — the state_ready patch shape is unchanged.
+    apply([
+      {
+        type: "state_ready",
+        model: { id: "fallback-default", name: "Default", provider: "p" },
+        sessionName: "s",
+        thinkingLevel: null,
+        modelFallbackMessage: "Could not restore model p/wanted",
+      } as unknown as Record<string, unknown>,
+    ]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.modelId).toBe("fallback-default");
+    expect((st as unknown as Record<string, unknown>).modelFallbackMessage).toBeUndefined();
+  });
+
   it("handles partial queue_update payloads", () => {
     apply([
       { type: "agent_start" },
@@ -336,7 +354,158 @@ describe("chatStore session-mode fallback", () => {
   });
 });
 
+// pi answers every prompt command with a response frame (preflight verdict),
+// emitted BEFORE any agent event. These tests pin the contract that turns that
+// frame into UI truth — without it a refused prompt left "已发送，等待 Pi 开始
+// 处理…" on screen forever (see the production debug log where a prompt got no
+// answer at all and the spinner ran for minutes).
+describe("chatStore prompt verdict", () => {
+  /** Minimal window stub for sendPrompt; captures the command sent to pi. */
+  function stubSend(ok = true): { sent: Array<Record<string, unknown>> } {
+    const sent: Array<Record<string, unknown>> = [];
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: {
+        tab: {
+          rpcSend: (_t: string, cmd: Record<string, unknown>) => {
+            sent.push(cmd);
+            return Promise.resolve(ok);
+          },
+        },
+      },
+    };
+    return { sent };
+  }
+
+  it("tags the prompt with an id and shows pi's acceptance", async () => {
+    const { sent } = stubSend();
+    await useChatStore.getState().sendPrompt(T, "你好");
+    const cmd = sent[0]!;
+    expect(cmd.type).toBe("prompt");
+    expect(typeof cmd.id).toBe("string");
+    expect(useChatStore.getState().states[T]!.turn.phase).toBe("submitting");
+
+    apply([{ type: "response", command: "prompt", success: true, id: cmd.id }]);
+    const st = useChatStore.getState().states[T]!;
+    // Accepted ≠ streaming: the turn is pi's now, but no agent event has
+    // arrived, and the UI must say so honestly.
+    expect(st.turn.phase).toBe("accepted");
+    expect(st.pendingPromptId).toBeUndefined();
+    expect(st.restoreInput).toBeUndefined();
+  });
+
+  it("drops the optimistic bubble and hands the text back when pi refuses", async () => {
+    const { sent } = stubSend();
+    await useChatStore.getState().sendPrompt(T, "一段很长的提示词");
+    expect(useChatStore.getState().states[T]!.messages).toHaveLength(1);
+
+    apply([{
+      type: "response",
+      command: "prompt",
+      success: false,
+      id: sent[0]!.id,
+      error: 'No API key found for provider "deepseek".',
+    }]);
+
+    const st = useChatStore.getState().states[T]!;
+    // pi never saw the message: it must not stay in the transcript, and the
+    // user must not have to retype it.
+    expect(st.messages).toHaveLength(0);
+    expect(st.restoreInput).toBe("一段很长的提示词");
+    expect(st.pendingPromptId).toBeUndefined();
+    expect(st.lastError).toContain("No API key");
+    expect(st.turn.phase).toBe("failed");
+
+    // Read-and-clear: ChatView refills the composer exactly once.
+    expect(useChatStore.getState().consumeRestoreInput(T)).toBe("一段很长的提示词");
+    expect(useChatStore.getState().consumeRestoreInput(T)).toBeUndefined();
+  });
+
+  it("restores the composer when the command never left the app", async () => {
+    stubSend(false);
+    await useChatStore.getState().sendPrompt(T, "离线时输入的话");
+    const st = useChatStore.getState().states[T]!;
+    expect(st.messages).toHaveLength(0);
+    expect(st.restoreInput).toBe("离线时输入的话");
+    expect(st.turn.phase).toBe("failed");
+  });
+
+  it("leaves a running turn alone when a steer is merely queued", async () => {
+    apply([{ type: "agent_start" }, { type: "message_start", message: { role: "assistant", content: [] } }]);
+    const { sent } = stubSend();
+    await useChatStore.getState().sendPrompt(T, "补充一句");
+    expect(sent[0]!.streamingBehavior).toBe("steer");
+
+    apply([{ type: "response", command: "prompt", success: true, id: sent[0]!.id }]);
+    const st = useChatStore.getState().states[T]!;
+    // "Queued into the running turn" is not a new phase — the visible turn is
+    // still streaming.
+    expect(st.turn.phase).not.toBe("accepted");
+    expect(st.isStreaming).toBe(true);
+  });
+
+  it("keeps a running turn's phase when only a steer is refused", async () => {
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "部分输出" } },
+    ]);
+    const streamingPhase = useChatStore.getState().states[T]!.turn.phase;
+    const { sent } = stubSend();
+    await useChatStore.getState().sendPrompt(T, "插入的一句");
+    apply([{ type: "response", command: "prompt", success: false, id: sent[0]!.id, error: "already processing" }]);
+
+    const st = useChatStore.getState().states[T]!;
+    // The agent is still working: only the queued message failed, so the turn
+    // must not be relabelled "failed" (the error banner carries the news).
+    expect(st.turn.phase).toBe(streamingPhase);
+    expect(st.lastError).toBe("already processing");
+    expect(st.restoreInput).toBe("插入的一句");
+    expect(st.isStreaming).toBe(true);
+  });
+
+  it("ignores other prompts' verdicts (model-sync injections)", async () => {
+    const { sent } = stubSend();
+    await useChatStore.getState().sendPrompt(T, "我的问题");
+    apply([{ type: "response", command: "prompt", success: false, id: "sync-abc-123", error: "unrelated" }]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.phase).toBe("submitting");
+    expect(sent).toHaveLength(1);
+  });
+
+  it("keeps a pending prompt visible against a stray state_ready", () => {
+    // The liveness probe and the settings refresh both send get_state; a
+    // snapshot must not repaint an unanswered prompt as "已就绪".
+    useChatStore.getState().applyEvent(T, {
+      type: "state_ready",
+      model: { id: "m", name: "M", provider: "p" },
+      thinkingLevel: null,
+    });
+    expect(useChatStore.getState().states[T]!.turn.phase).toBe("ready");
+
+    useChatStore.setState((s) => ({
+      states: { ...s.states, [T]: { ...s.states[T]!, turn: { phase: "submitting" as const } } },
+    }));
+    useChatStore.getState().applyEvent(T, {
+      type: "state_ready",
+      model: { id: "m", name: "M", provider: "p" },
+      thinkingLevel: null,
+    });
+    expect(useChatStore.getState().states[T]!.turn.phase).toBe("submitting");
+  });
+});
+
 describe("pickExitErrorLine", () => {
+  it("surfaces the disconnect reason in the exit banner detail", () => {
+    // A dropped SSH flow reaches markExited as code -1 + this stderr line, and
+    // the banner must say "连接断开" rather than a bare "异常退出".
+    useChatStore.getState().markExited(T, { code: -1, stderr: "SSH 连接已断开（网络中断或 keepalive 超时）\n" });
+    const st = useChatStore.getState().states[T]!;
+    expect(st.exited).toBe(true);
+    expect(st.exitDetail).toContain("SSH 连接已断开");
+    expect(st.lastError).toContain("SSH 连接已断开");
+  });
+
   it("returns the last useful line, skipping bash -i job-control noise", async () => {
     const { pickExitErrorLine } = await import("../chatStore");
     const stderr =
@@ -361,5 +530,26 @@ describe("pickExitErrorLine", () => {
   it("falls back to the first line when every line is noise", async () => {
     const { pickExitErrorLine } = await import("../chatStore");
     expect(pickExitErrorLine("bash: no job control in this shell")).toBe("bash: no job control in this shell");
+  });
+});
+
+// Closed tabs must not keep their transcript alive: memory used to grow with
+// every session the user ever opened (clear() was only called on view switch).
+describe("retainTabs", () => {
+  it("drops state for tabs that no longer exist", () => {
+    const store = useChatStore.getState();
+    store.ensure("t1");
+    store.ensure("t2");
+    store.ensure("t3");
+    useChatStore.getState().retainTabs(new Set(["t1", "t3"]));
+    expect(Object.keys(useChatStore.getState().states).sort()).toEqual(["t1", "t3"]);
+  });
+
+  it("is a no-op (same object) when nothing was closed", () => {
+    useChatStore.setState({ states: {} }); // isolate from the previous case
+    useChatStore.getState().ensure("t1");
+    const before = useChatStore.getState().states;
+    useChatStore.getState().retainTabs(new Set(["t1"]));
+    expect(useChatStore.getState().states).toBe(before);
   });
 });

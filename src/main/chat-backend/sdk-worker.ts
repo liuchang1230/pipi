@@ -87,6 +87,9 @@ interface OpenRequest {
   agentDir: string;
   sessionPath?: string;
   continueRecent?: boolean;
+  /** App-level subagent-model env (PI_PROVIDER/PI_MODEL), applied to this
+   *  worker's own process.env by openTab. Empty = follow the main model. */
+  subagentEnv?: Record<string, string>;
 }
 interface CmdRequest {
   kind: "cmd";
@@ -397,6 +400,11 @@ async function handleCommand(ts: TabSession, command: Record<string, unknown>): 
         autoCompactionEnabled: session.autoCompactionEnabled,
         messageCount: session.messages.length,
         pendingMessageCount: session.pendingMessageCount,
+        // Surface pi's restore failure (e.g. "Could not restore model p/m —
+        // no auth") so the chat view can warn instead of silently showing the
+        // fallback default model while the TUI prints a banner for the same
+        // session. Frontend clears it on the next get_state without the flag.
+        modelFallbackMessage: ts.runtime.modelFallbackMessage,
       });
     case "set_model": {
       const models = session.modelRuntime.getAvailableSnapshot();
@@ -561,6 +569,14 @@ async function openTab(req: OpenRequest): Promise<void> {
   const startedAt = performance.now();
   const inflight = { cancelled: false };
   opening.set(req.tabId, inflight);
+  // The worker is long-lived and process.env is a per-thread copy: apply the
+  // app's subagent-model setting on every open so a change takes effect for
+  // new sessions without respawning the worker (delegated-agent extensions
+  // spawn their subagent pi from THIS env). Clearing first is what makes
+  // "back to follow-main" actually remove a previously injected model.
+  delete process.env.PI_PROVIDER;
+  delete process.env.PI_MODEL;
+  if (req.subagentEnv) Object.assign(process.env, req.subagentEnv);
   try {
     const infraStartedAt = performance.now();
     await ensureSharedInfra(req.agentDir);

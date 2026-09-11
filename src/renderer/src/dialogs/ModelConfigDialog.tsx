@@ -104,6 +104,12 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [modelApi, setModelApi] = useState<PiApi>("openai-completions");
   const [authHeader, setAuthHeader] = useState(true);
   const [advancedJson, setAdvancedJson] = useState("");
+  /** App-level subagent model (analyst/reviewer/scout). Loaded from the LOCAL
+   *  model list because the setting is global — it is injected into every pi
+   *  the app spawns, whichever target that tab runs on. */
+  const [subagentChoices, setSubagentChoices] = useState<ModelConfigItem[]>([]);
+  const [subagentSel, setSubagentSel] = useState("");
+  const [subagentLoaded, setSubagentLoaded] = useState(false);
 
   const resetModelForm = useCallback(() => {
     setModelName("");
@@ -215,6 +221,52 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Subagent model: independent of the selected target (global setting).
+  useEffect(() => {
+    void (async () => {
+      try {
+        const [list, settings] = await Promise.all([
+          window.api.model.list().catch(() => [] as ModelConfigItem[]),
+          window.api.settings.get().catch(() => null),
+        ]);
+        setSubagentChoices(list);
+        const s = settings?.subagents;
+        setSubagentSel(s?.model ? `${s.provider ?? ""}\u0000${s.model}` : "");
+      } finally {
+        setSubagentLoaded(true);
+      }
+    })();
+  }, []);
+
+  /** Persist the subagent model immediately (no form submit — it is a
+   *  global app setting, not part of the models.json being edited). */
+  const handleSubagentModelChange = useCallback(
+    async (value: string) => {
+      if (busyAction) return;
+      setBusyAction("subagent");
+      try {
+        if (!value) {
+          await window.api.settings.set({ subagents: null });
+          setSubagentSel("");
+          showToast("子代理已改为跟随主模型", "ok");
+          return;
+        }
+        const sep = value.indexOf("\u0000");
+        const provider = sep > 0 ? value.slice(0, sep) : "";
+        const model = sep >= 0 ? value.slice(sep + 1) : value;
+        if (!model) return;
+        await window.api.settings.set({ subagents: provider ? { provider, model } : { model } });
+        setSubagentSel(value);
+        showToast(`子代理模型：${provider ? `${provider}/` : ""}${model}（新会话生效）`, "ok");
+      } catch (error) {
+        showToast(`子代理模型保存失败：${error instanceof Error ? error.message : String(error)}`, "err");
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [busyAction],
+  );
+
   const handleDiscoverModels = useCallback(async () => {
     if (!modelBaseUrl.trim()) {
       showToast("请先填写 Base URL", "err");
@@ -309,6 +361,34 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                 : "写入本机 ~/.pi/agent/"}
             </span>
             {editingModel && <span className="dialog-hint editing-note">正在编辑：{editingModel.provider || editingModel.name}</span>}
+          </div>
+
+          {/* 子代理模型：全局设置，与下方写入目标无关 */}
+          <div className="dialog-section">
+            <div className="section-title">
+              子代理模型 <span className="dialog-hint">（analyst / reviewer / scout 等被委派的子代理；默认跟随主模型）</span>
+            </div>
+            <select
+              className="dialog-input"
+              value={subagentSel}
+              disabled={!subagentLoaded || busyAction !== null}
+              onChange={(e) => void handleSubagentModelChange(e.target.value)}
+            >
+              <option value="">跟随主模型（默认）</option>
+              {subagentChoices.flatMap((item) =>
+                configuredModelIds(item).map((id) => {
+                  const value = `${item.provider ?? ""}\u0000${id}`;
+                  return (
+                    <option key={`${item.id}:${id}`} value={value}>
+                      {`${item.name} · ${item.provider ? `${item.provider}/` : ""}${id}`}
+                    </option>
+                  );
+                }),
+              )}
+            </select>
+            <span className="dialog-hint">
+              作用于被委派的子代理进程（本地/WSL/远程均适用）；改后对新开的会话生效，正在运行的标签需重开。
+            </span>
           </div>
 
           {/* 快速模板：一键填入国内合规渠道的连接信息，只需补 API Key */}

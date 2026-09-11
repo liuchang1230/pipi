@@ -3,7 +3,7 @@
 // writes (which never hit main's mutation handlers) show up immediately,
 // while plain loadTree keeps using the main-process TTL cache.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { useTreeStore, sortFileNodes, __resetTreeRefreshClock } from "../treeStore";
+import { useTreeStore, sortFileNodes, mergeRelistedNodes, __resetTreeRefreshClock } from "../treeStore";
 import { useTabsStore } from "../tabsStore";
 import type { FileNode } from "../types";
 
@@ -219,6 +219,123 @@ describe("expandDir (lazy tree)", () => {
     await first;
     const src = useTreeStore.getState().tree.find((n) => n.path === "src")!;
     expect(src.children?.map((c) => c.name)).toEqual(["fresh.ts"]);
+  });
+});
+
+describe("mergeRelistedNodes (structural sharing)", () => {
+  // Regression context: the 6s remote/WSL poll re-lists the root and every
+  // expanded dir, so brand-new FileNode objects arrived even when nothing had
+  // changed. Replacing `tree` with them changed every row's memo props and
+  // re-rendered the whole "当前项目文件" column every 6s (the reported flicker).
+  const listing = (): FileNode[] => [
+    { name: "src", path: "src", type: "directory", children: [{ name: "a.ts", path: "src/a.ts", type: "file" }] },
+    { name: "README.md", path: "README.md", type: "file" },
+  ];
+
+  it("returns the SAME array for an identical re-listing (no re-render)", () => {
+    const prev = listing();
+    // A re-listing is freshly parsed JSON — equal content, different objects.
+    expect(mergeRelistedNodes(prev, listing())).toBe(prev);
+  });
+
+  it("keeps loaded children when a shallow listing arrives", () => {
+    const prev = listing();
+    // `file:list` returns directories with `children: undefined`; a re-listing
+    // of the PARENT must not blank an already-expanded subtree (that would
+    // flash "…加载中" and discard the user's expansion).
+    const shallow: FileNode[] = [
+      { name: "src", path: "src", type: "directory", children: undefined },
+      { name: "README.md", path: "README.md", type: "file" },
+    ];
+    expect(mergeRelistedNodes(prev, shallow)).toBe(prev);
+  });
+
+  it("takes the new listing when a file was added", () => {
+    const prev = listing();
+    const next: FileNode[] = [...listing(), { name: "b.ts", path: "b.ts", type: "file" }];
+    const merged = mergeRelistedNodes(prev, next);
+    expect(merged).not.toBe(prev);
+    expect(merged.map((n) => n.path)).toEqual(["src", "README.md", "b.ts"]);
+  });
+
+  it("detects a rename at the same row count", () => {
+    const prev = listing();
+    const next: FileNode[] = [
+      { name: "src", path: "src", type: "directory", children: [{ name: "a.ts", path: "src/a.ts", type: "file" }] },
+      { name: "RENAMED.md", path: "RENAMED.md", type: "file" },
+    ];
+    const merged = mergeRelistedNodes(prev, next);
+    expect(merged.map((n) => n.path)).toEqual(["src", "RENAMED.md"]);
+  });
+
+  it("reuses the unchanged rows and only replaces the changed one", () => {
+    const prev = listing();
+    const next: FileNode[] = [
+      { name: "src", path: "src", type: "directory", children: [{ name: "a.ts", path: "src/a.ts", type: "file" }] },
+      { name: "NEW.md", path: "NEW.md", type: "file" },
+    ];
+    const merged = mergeRelistedNodes(prev, next);
+    const src = merged.find((n) => n.path === "src")!;
+    // Same identity → its subtree (and every row under it) never re-renders.
+    expect(src).toBe(prev[0]);
+    expect(src.children).toBe(prev[0]!.children);
+    expect(merged.find((n) => n.path === "NEW.md")).toBe(next[1]);
+  });
+
+  it("reuses a directory whose nested subtree is unchanged", () => {
+    const prev = listing();
+    const next: FileNode[] = [
+      { name: "src", path: "src", type: "directory", children: [{ name: "a.ts", path: "src/a.ts", type: "file" }] },
+      { name: "README.md", path: "README.md", type: "file" },
+    ];
+    expect(mergeRelistedNodes(prev, next)[0]).toBe(prev[0]);
+  });
+
+  it("propagates a nested change up to the parent node", () => {
+    const prev = listing();
+    const next: FileNode[] = [
+      {
+        name: "src",
+        path: "src",
+        type: "directory",
+        children: [
+          { name: "a.ts", path: "src/a.ts", type: "file" },
+          { name: "b.ts", path: "src/b.ts", type: "file" },
+        ],
+      },
+      { name: "README.md", path: "README.md", type: "file" },
+    ];
+    const merged = mergeRelistedNodes(prev, next);
+    expect(merged[0]).not.toBe(prev[0]);
+    expect(merged[0]!.children!.map((c) => c.name)).toEqual(["a.ts", "b.ts"]);
+  });
+});
+
+describe("background re-listing does not churn identities", () => {
+  it("expandDir(refreshLoaded) keeps the tree identity when nothing changed", async () => {
+    const api = makeApi();
+    const loaded: FileNode[] = [{ name: "src", path: "src", type: "directory", children: [{ name: "a.ts", path: "src/a.ts", type: "file" }] }];
+    api.file.listDirChildren.mockResolvedValue([{ name: "a.ts", path: "src/a.ts", type: "file" }] as FileNode[]);
+    useTreeStore.setState({ tree: loaded, expanded: new Set(["src"]), treeOrigin: { rootPath: "/proj", isRemote: false } });
+    const before = useTreeStore.getState().tree;
+    // refreshLoaded=true: the 6s poll's path — re-lists an ALREADY loaded dir.
+    await useTreeStore.getState().expandDir("src", false, true);
+    expect(useTreeStore.getState().tree).toBe(before);
+    expect(useTreeStore.getState().tree[0]).toBe(before[0]);
+  });
+
+  it("loadTree keeps the expanded Set identity when the first dir is already expanded", async () => {
+    const api = makeApi();
+    api.file.list.mockResolvedValue([
+      { name: "src", path: "src", type: "directory", children: undefined },
+      { name: "README.md", path: "README.md", type: "file" },
+    ] as FileNode[]);
+    api.file.listDirChildren.mockResolvedValue([] as FileNode[]);
+    useTreeStore.setState({ tree: [], expanded: new Set(["src"]), treeOrigin: { rootPath: "/proj", isRemote: false } });
+    const before = useTreeStore.getState().expanded;
+    await useTreeStore.getState().loadTree(undefined, "t1", "/proj", { isRemote: false });
+    // A fresh Set here used to invalidate every TreeBranch's props on each poll.
+    expect(useTreeStore.getState().expanded).toBe(before);
   });
 });
 

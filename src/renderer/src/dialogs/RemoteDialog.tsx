@@ -29,6 +29,10 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
   const [remotePath, setRemotePath] = useState("");
   const [remotePassword, setRemotePassword] = useState("");
   const [remoteAgentDir, setRemoteAgentDir] = useState("");
+  // Passwords are never remembered implicitly. This is opt-in and defaults
+  // off; selecting an existing remembered entry turns it on so reconnecting
+  // does not silently erase that user's explicit choice.
+  const [rememberPassword, setRememberPassword] = useState(false);
   const [remoteStatus, setRemoteStatus] = useState<"" | "connecting" | "connected" | "failed">("");
   const [selectedRemoteHistory, setSelectedRemoteHistory] = useState("");
   const [wslDistros, setWslDistros] = useState<Array<{ name: string; default: boolean; running: boolean; version: number }>>([]);
@@ -65,57 +69,67 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
     if (!remoteHost || !remoteUser) return;
     const host = remoteHost.trim();
     const user = remoteUser.trim();
+    const port = parseInt(remotePort) || 22;
+    const agentDir = remoteAgentDir.trim() || undefined;
     setRemoteStatus("connecting");
     try {
-      const id = await window.api.tab.create({
-        cwd: cwd || ".",
-        remote: {
-          host,
-          user,
-          port: parseInt(remotePort) || 22,
-          path: remotePath.trim() || undefined,
-          password: remotePassword || undefined,
-          startPi: false,
-          agentDir: remoteAgentDir.trim() || undefined,
-        },
+      // Connect = probe. No tab is created, so a successful connect never
+      // changes the middle pane; the sidebar dot shows the real state.
+      const probe = await window.api.remote.probe({
+        host,
+        user,
+        port,
+        path: remotePath.trim() || undefined,
+        password: remotePassword || undefined,
+        agentDir,
       });
-      // Honest connect state: "ready" only after the remote shell confirmed
-      // (auth passed + bash up). A password prompt or a hanging handshake
-      // keeps ssh.exe alive without a session — process liveness alone would
-      // falsely report success. Timeout = tab is up, awaiting login (if the
-      // server needs a password, the visible terminal tab is where you type it).
-      const state = await window.api.tab.waitConnState(id, 10000, 250);
-      if (state === "failed") {
+      if (probe.status === "need-password") {
         setRemoteStatus("failed");
-        showToast(`连接失败: ${user}@${host}（请检查地址/密码/免密配置）`, "err");
+        showToast(`需要密码才能连接 ${user}@${host}（或该账号需使用密钥认证）`, "err");
+        return;
+      }
+      if (probe.status === "failed") {
+        setRemoteStatus("failed");
+        showToast(`连接失败: ${user}@${host}（${probe.error ?? "请检查地址与端口"}）`, "err");
         return;
       }
       setRemoteStatus("connected");
-      if (state === "ready") showToast(`已连接到 ${user}@${host}`, "ok");
-      else showToast(`已发起连接；如服务器要求密码，请在终端标签页输入`, "ok");
-      setRemoteHistory(await window.api.remote.listHistory() as typeof remoteHistory);
-      // Refresh cached projects ONLY once the connection is confirmed: against
-      // a still-establishing (password-prompt) tab the SFTP calls would fail
-      // and mark every project "error" transiently.
-      if (state === "ready") {
-        const ss = useSessionsStore.getState();
-        const matchingProjects = projects.filter((p) => p.type === "remote" && sameRemoteProfile(p, host, user, parseInt(remotePort) || 22, remoteAgentDir.trim()));
-        for (const p of matchingProjects) {
-          ss.setProjectSessionStatus((prev) => ({ ...prev, [p.id]: "loading" }));
-          window.api.session.listRemote(id, p.path).then((result) => {
-            ss.setProjectSessions((prev) => ({ ...prev, [p.id]: result.sessions as SessionItem[] }));
-            ss.setProjectErrors((prev) => ({ ...prev, [p.id]: result.error }));
-            ss.setProjectDiagnostics((prev) => ({ ...prev, [p.id]: result.diagnostics }));
-            ss.setProjectSessionStatus((prev) => ({ ...prev, [p.id]: result.error ? "error" : result.sessions.length > 0 ? "ready" : "empty" }));
-          }).catch(() => {
-            ss.setProjectSessionStatus((prev) => ({ ...prev, [p.id]: "error" }));
-          });
-          window.api.file.list(id, p.path).then((nodes) => {
-            ss.setProjectTrees((prev) => ({ ...prev, [p.id]: nodes as FileNode[] }));
-          }).catch(() => undefined);
-        }
+      showToast(`已连接到 ${user}@${host}`, "ok");
+      // Remembering a password is explicitly opt-in. The profile itself may
+      // still be kept as a host/path bookmark, but a one-off password must not
+      // become a credential just because the connection succeeded.
+      try {
+        setRemoteHistory(await window.api.remote.saveHistory({
+          host,
+          user,
+          port,
+          path: remotePath.trim() || undefined,
+          password: rememberPassword ? (remotePassword || undefined) : undefined,
+          agentDir,
+        }) as typeof remoteHistory);
+      } catch {
+        /* history is best-effort */
       }
-      setRemoteHost(""); setRemoteUser(""); setRemotePort("22"); setRemotePath(""); setRemotePassword(""); setRemoteAgentDir("");
+      // Refresh cached projects for this server now that the connection is
+      // confirmed: the profile is the target for both session and file reads.
+      const target = { remote: { host, user, port, path: remotePath.trim() || undefined, password: remotePassword || undefined, agentDir } };
+      const ss = useSessionsStore.getState();
+      const matchingProjects = projects.filter((p) => p.type === "remote" && sameRemoteProfile(p, host, user, port, agentDir ?? ""));
+      for (const p of matchingProjects) {
+        ss.setProjectSessionStatus((prev) => ({ ...prev, [p.id]: "loading" }));
+        window.api.session.listRemote(target, p.path).then((result) => {
+          ss.setProjectSessions((prev) => ({ ...prev, [p.id]: result.sessions as SessionItem[] }));
+          ss.setProjectErrors((prev) => ({ ...prev, [p.id]: result.error }));
+          ss.setProjectDiagnostics((prev) => ({ ...prev, [p.id]: result.diagnostics }));
+          ss.setProjectSessionStatus((prev) => ({ ...prev, [p.id]: result.error ? "error" : result.sessions.length > 0 ? "ready" : "empty" }));
+        }).catch(() => {
+          ss.setProjectSessionStatus((prev) => ({ ...prev, [p.id]: "error" }));
+        });
+        window.api.file.list(target, p.path).then((nodes) => {
+          ss.setProjectTrees((prev) => ({ ...prev, [p.id]: nodes as FileNode[] }));
+        }).catch(() => undefined);
+      }
+      setRemoteHost(""); setRemoteUser(""); setRemotePort("22"); setRemotePath(""); setRemotePassword(""); setRemoteAgentDir(""); setRememberPassword(false);
       setSelectedRemoteHistory("");
       onClose();
     } catch (e) {
@@ -123,7 +137,7 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
       setRemoteStatus("failed");
       showToast(`连接失败: ${e instanceof Error ? e.message : String(e)}`, "err");
     }
-  }, [cwd, onClose, projects, remoteAgentDir, remotePort, remotePath, remotePassword, remoteHost, remoteUser, remoteTab, wslDistro, wslPath]);
+  }, [cwd, onClose, projects, remoteAgentDir, remotePort, remotePath, remotePassword, remoteHost, remoteUser, remoteTab, rememberPassword, wslDistro, wslPath]);
 
   return (
     <div className="dialog-overlay" onClick={() => { onClose(); setRemoteStatus(""); }}>
@@ -150,6 +164,7 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
                     setRemoteUser(item.user);
                     setRemotePort(String(item.port || 22));
                     setRemotePassword(item.password || "");
+                    setRememberPassword(!!item.password);
                     setRemotePath(item.path || "");
                     setRemoteAgentDir(item.agentDir || "");
                   }}
@@ -180,6 +195,10 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
             <label>
               密码 <span className="dialog-hint">（可选，免密可留空）</span>
               <input className="dialog-input" value={remotePassword} onChange={(e) => setRemotePassword(e.target.value)} placeholder="输入 SSH 密码" type="password" />
+            </label>
+            <label className="dialog-check">
+              <input type="checkbox" checked={rememberPassword} onChange={(e) => setRememberPassword(e.target.checked)} />
+              记住此服务器的密码
             </label>
             <label>
               pi 数据目录 <span className="dialog-hint">（可选，默认 ~/.pi/agent；多人共用账号时各填各的目录隔离会话）</span>

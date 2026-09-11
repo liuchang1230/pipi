@@ -17,6 +17,7 @@ import { attachImeHeuristic } from "../xterm-ime-anchor";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
 import { useChatStore } from "../stores/chatStore";
+import { projectLabelForTab } from "../project-label";
 import { useUiStore } from "../stores/uiStore";
 import type { TabInfo } from "../stores/types";
 import { ChatView } from "./ChatPane";
@@ -312,30 +313,48 @@ const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onClo
   return (
     <div className="tab-bar">
       <div className="tabs">
-        {visibleTabs.map((t) => (
-          <div
-            key={t.id}
-            className={`tab ${activeTab === t.id ? "active" : ""}${t.isRemote ? " remote" : ""}`}
-            onClick={() => onSelectTab(t.id)}
-          >
-            {t.isWsl && <span className="tab-remote-icon"><Icon name="penguin" /></span>}
-            {t.isRemote && !t.isWsl && <span className="tab-remote-icon"><Icon name="globe" /></span>}
-            {t.isRemote && !t.isWsl && t.kind === "connection" && (
-              <span
-                className={`tab-connection-state${t.sshState === "ready" ? " ready" : t.sshState === "failed" ? " failed" : " connecting"}`}
-                title={t.sshState === "ready" ? "SSH 已连接" : t.sshState === "failed" ? "SSH 连接失败" : "SSH 连接中"}
-                role="img"
-                aria-label={t.sshState === "ready" ? "SSH 已连接" : t.sshState === "failed" ? "SSH 连接失败" : "SSH 连接中"}
-              />
-            )}
-            <span className="tab-title">{t.title}</span>
-            <button
-              className="tab-close"
-              onClick={(e) => { e.stopPropagation(); onCloseTab(t.id); }}
-              title="关闭"
-            >×</button>
-          </div>
-        ))}
+        {visibleTabs.map((t) => {
+          // Project prefix: with several sessions of one project open, the tab
+          // label (session name) alone does not say where the session lives.
+          // Shown only when it adds information — a fresh tab is titled after
+          // its folder and a connection tab after its host, so "agent · agent"
+          // and "host · host" are both suppressed.
+          const project = projectLabelForTab(t);
+          const showProject =
+            !!project &&
+            t.title.trim().length > 0 &&
+            !t.title.includes(project.short) &&
+            !project.short.includes(t.title.trim());
+          return (
+            <div
+              key={t.id}
+              className={`tab ${activeTab === t.id ? "active" : ""}${t.isRemote ? " remote" : ""}`}
+              onClick={() => onSelectTab(t.id)}
+            >
+              {t.isWsl && <span className="tab-remote-icon"><Icon name="penguin" /></span>}
+              {t.isRemote && !t.isWsl && <span className="tab-remote-icon"><Icon name="globe" /></span>}
+              {t.isRemote && !t.isWsl && t.kind === "connection" && (
+                <span
+                  className={`tab-connection-state${t.sshState === "ready" ? " ready" : t.sshState === "failed" ? " failed" : " connecting"}`}
+                  title={t.sshState === "ready" ? "SSH 已连接" : t.sshState === "failed" ? "SSH 连接失败" : "SSH 连接中"}
+                  role="img"
+                  aria-label={t.sshState === "ready" ? "SSH 已连接" : t.sshState === "failed" ? "SSH 连接失败" : "SSH 连接中"}
+                />
+              )}
+              {showProject && (
+                <span className="tab-project" title={project.full}>
+                  {project.short}
+                </span>
+              )}
+              <span className="tab-title">{t.title}</span>
+              <button
+                className="tab-close"
+                onClick={(e) => { e.stopPropagation(); onCloseTab(t.id); }}
+                title="关闭"
+              >×</button>
+            </div>
+          );
+        })}
       </div>
       {canSwitchToChat && (
         <button

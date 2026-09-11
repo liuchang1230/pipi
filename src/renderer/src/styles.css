@@ -619,19 +619,25 @@ html, body, #root {
 .remote-server-connection > .project-row.server-connected {
   color: var(--accent);
 }
-.server-connect-hint {
-  color: var(--accent);
-  font-size: 11px;
-  margin-left: 2px;
-  opacity: 0.8;
+/* Server connection dot: the state lives NEXT TO the address, so "is this
+ * server up?" no longer requires an open tab anywhere. Green = SSH ready
+ * (probe or live tab), red = failed, pulsing = connecting, hollow = idle. */
+.server-state-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: 0 0 auto;
+  box-shadow: inset 0 0 0 1px var(--border);
 }
-.server-connect-hint.failed {
-  color: var(--danger);
-  opacity: 1;
-}
-.server-connect-hint.connecting {
-  color: var(--text-dim);
-}
+.server-state-dot.connected { background: var(--success); box-shadow: none; }
+.server-state-dot.failed { background: var(--danger); box-shadow: none; }
+.server-state-dot.connecting { background: var(--accent); box-shadow: none; animation: tab-connection-pulse 1.2s ease-in-out infinite; }
+.server-state-dot.need-password { background: var(--warn, #d9a343); box-shadow: none; }
+@media (prefers-reduced-motion: reduce) { .server-state-dot.connecting { animation: none; } }
+/* Login dialog: the target is the headline, the remember box is a row. */
+.dialog-target { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px; }
+.dialog-check { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .project-row {
   display: flex;
   align-items: center;
@@ -872,6 +878,21 @@ html, body, #root {
   border-bottom-color: var(--bg);
 }
 .tab-title { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+/* Project prefix inside a tab: dimmer and narrower than the session name — it
+ * is context, the session name is the identity. */
+.tab-project {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+.tab-project + .tab-title::before {
+  content: "·";
+  margin: 0 4px;
+  color: var(--text-dim);
+}
 .tab-close {
   background: none;
   border: none;
@@ -1775,6 +1796,9 @@ textarea:focus-visible,
 .chat-tool.error {
   border-color: var(--danger);
 }
+.chat-tool.error .chat-tool-head {
+  background: color-mix(in srgb, var(--danger, #f87171) 7%, transparent);
+}
 .chat-tool-head {
   display: flex;
   align-items: center;
@@ -1802,11 +1826,55 @@ textarea:focus-visible,
 .chat-tool-name {
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12px;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+/* One-line collapsed summary: object (cmd/path/task) + result chips. */
+.chat-tool-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  margin-left: 2px;
+}
+.chat-tool-object {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.chat-tool-object-dir {
+  color: var(--text-dim);
+}
+.chat-tool-chip {
+  flex: 0 0 auto;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.chat-tool-chip.chip-fail {
+  color: var(--danger);
+}
+.diffstat-add { color: var(--success, #4ade80); }
+.diffstat-del { color: var(--danger, #f87171); }
+.chat-tool-status {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--success);
+}
+.chat-tool-status.fail {
+  color: var(--danger);
 }
 .chat-tool-toggle {
-  margin-left: auto;
+  margin-left: 0;
   color: var(--text-dim);
   font-size: 11px;
+  flex: 0 0 auto;
 }
 .chat-tool-command {
   border-top: 1px solid var(--border);
@@ -1932,6 +2000,18 @@ textarea:focus-visible,
 }
 .chat-exited-bar .chat-btn + .chat-btn {
   margin-left: 0;
+}
+/* Connection-death banner: same bar as the exited state, but a warning tint —
+ * "no response" is a suspicion (the reconnect button resolves it), not a
+ * confirmed exit like the bar above. */
+.chat-unresponsive-bar {
+  background: color-mix(in srgb, var(--warning, #d69e2e) 12%, transparent);
+  color: var(--text);
+}
+.chat-unresponsive-bar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .chat-input-wrap {
   flex: 0 0 auto;
@@ -2388,54 +2468,96 @@ textarea:focus-visible,
 
 /* --- Session tree dialog (aligned with /tree) --- */
 .tree-dialog {
-  width: 640px;
+  width: 720px;
+  max-width: 94vw;
 }
 .tree-search {
-  margin-bottom: 8px;
+  margin-bottom: 6px;
+}
+.tree-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.tree-chip {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+.tree-chip:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.tree-chip.active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.tree-chip-action {
+  margin-left: auto;
+  border-style: dashed;
 }
 .tree-scroll {
-  max-height: 320px;
+  max-height: 46vh;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 4px 0;
-  font-family: "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+  font-family: var(--mono);
   font-size: 12px;
+  contain: layout paint;
+  overscroll-behavior: contain;
 }
-.tree-row {
+.tree-dialog .tree-row {
   display: flex;
   align-items: baseline;
   gap: 2px;
-  padding: 3px 8px;
+  height: 24px;
+  padding: 0 8px;
   cursor: pointer;
-  line-height: 1.5;
+  line-height: 24px;
   white-space: nowrap;
 }
-.tree-row:hover {
-  background: var(--border);
+.tree-dialog .tree-row:hover {
+  background: var(--hover);
 }
-.tree-row.selected {
-  background: rgba(137, 180, 250, 0.18);
+.tree-dialog .tree-row.selected {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
-.tree-row.current .tree-entrylabel,
-.tree-row.current .tree-entrytext {
+.tree-dialog .tree-row.current .tree-entrylabel,
+.tree-dialog .tree-row.current .tree-entrytext {
   color: var(--accent);
+  font-weight: 600;
 }
 .tree-gutter {
   color: var(--text-dim);
   flex: 0 0 auto;
+  opacity: 0.7;
 }
 .tree-fold {
   flex: 0 0 auto;
   color: var(--accent);
   cursor: pointer;
-  width: 14px;
+  width: 16px;
   text-align: center;
+  border-radius: 4px;
+}
+.tree-fold:hover {
+  background: var(--hover-strong);
 }
 .tree-pathmark {
   flex: 0 0 auto;
   color: var(--accent);
   width: 10px;
+  text-align: center;
 }
 .tree-entrylabel {
   flex: 0 0 auto;
@@ -2443,6 +2565,13 @@ textarea:focus-visible,
 }
 .tree-entrylabel.user { color: var(--accent); }
 .tree-entrylabel.assistant { color: var(--success); }
+.tree-time {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  margin-left: 8px;
+}
 .tree-entrytext {
   flex: 1;
   overflow: hidden;
@@ -2575,6 +2704,30 @@ textarea:focus-visible,
   flex: 0 1 auto;
   color: var(--text);
 }
+/* Project chip: "where this session runs". Left-most header element, so it
+ * reads as context for the model/session controls next to it. Narrower than
+ * the model chip and allowed to shrink — remote project folder names are long
+ * ("CRSCU Intelligence Algorithm Platform") and must never push the model
+ * picker off screen. */
+.chat-project-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-panel));
+  border-radius: 12px;
+  padding: 3px 12px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--text);
+}
+.chat-project-btn:hover {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-panel));
+  border-color: var(--accent);
+}
 .chat-model-btn:hover,
 .chat-think-btn:hover {
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-panel));
@@ -2650,6 +2803,9 @@ textarea:focus-visible,
 .chat-notice-text {
   flex: 1 1 auto;
   min-width: 0;
+  /* Remote-align errors append a paste-ready install command on its own
+     line (\n from update-check.ts) — preserve it instead of collapsing. */
+  white-space: pre-line;
 }
 .chat-notice-btn {
   flex: 0 0 auto;

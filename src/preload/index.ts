@@ -34,12 +34,20 @@ export interface TabSummary {
   pi: boolean;
   isWsl?: boolean;
   wslDistro?: string;
+  /** Project directory for remote/WSL tabs ("where this session runs").
+   *  `cwd` is the LOCAL path for those tabs, so this is the only field that
+   *  can label a session with its project. */
+  remoteDir?: string;
   /** rpc = headless ChatPane (remote/WSL); sdk = in-process ChatPane (local);
    *  pty = terminal view (the default for new tabs). */
   mode?: "rpc" | "sdk" | "pty";
   /** Connection shell tabs only: "ready" after the remote shell confirmed,
    *  "failed" when ssh exited before that. */
   sshState?: "ready" | "failed";
+  /** RPC remote tabs only: true once pi actually booted and answered get_state
+   *  — the sidebar must not call a server "connected" just because a tab
+   *  exists (a session stuck at auth has a tab but no working pi). */
+  remoteReady?: boolean;
 }
 
 export interface SessionListItem {
@@ -86,6 +94,26 @@ export interface RemoteTarget {
   password?: string;
   agentDir?: string;
 }
+
+export interface WslTarget {
+  distro: string;
+  path?: string;
+}
+
+/** Connection target for a remote/WSL operation: a live tab id (string, the
+ *  historical form) or an explicit connection profile. The profile form lets
+ *  file + session reads work without a connection tab existing at all. */
+export type IpcTargetRef = string | { tabId?: string; remote?: RemoteTarget; wsl?: WslTarget };
+
+export interface TargetPayload {
+  tabId?: string;
+  remote?: RemoteTarget;
+  wsl?: WslTarget;
+}
+
+/** Normalize a target ref into the object shape main's handlers read. */
+const targetPayload = (target?: IpcTargetRef): TargetPayload =>
+  typeof target === "string" ? { tabId: target } : target ?? {};
 
 const api = {
   // --- Tabs / terminal ---
@@ -292,28 +320,28 @@ const api = {
 
   // --- File tree + viewer ---
   file: {
-    list: (tabId?: string, dirPath?: string, rootPath?: string, noCache?: boolean): Promise<unknown> =>
-      ipcRenderer.invoke("file:list", { tabId, dirPath, rootPath, noCache }),
+    list: (target?: IpcTargetRef, dirPath?: string, rootPath?: string, noCache?: boolean): Promise<unknown> =>
+      ipcRenderer.invoke("file:list", { ...targetPayload(target), dirPath, rootPath, noCache }),
     /** Lazy tree: list one directory's children on expand (local, SSH, WSL). */
-    listDirChildren: (rootPath: string | undefined, tabId: string | undefined, relDir: string, noCache?: boolean): Promise<unknown> =>
-      ipcRenderer.invoke("file:list-dir", { rootPath, tabId, relDir, noCache }),
+    listDirChildren: (rootPath: string | undefined, target: IpcTargetRef | undefined, relDir: string, noCache?: boolean): Promise<unknown> =>
+      ipcRenderer.invoke("file:list-dir", { ...targetPayload(target), rootPath, relDir, noCache }),
     resolveLink: (input: { tabId?: string; rootPath?: string; currentPath?: string; href: string }): Promise<{ ok: true; relPath: string; tabId?: string; rootPath?: string } | { ok: false }> =>
       ipcRenderer.invoke("file:resolve-link", input),
-    read: (tabId: string | undefined, relPath: string, rootPath?: string, mention?: boolean): Promise<FileReadResult> =>
-      ipcRenderer.invoke("file:read", { tabId, relPath, rootPath, mention }),
+    read: (target: IpcTargetRef | undefined, relPath: string, rootPath?: string, mention?: boolean): Promise<FileReadResult> =>
+      ipcRenderer.invoke("file:read", { ...targetPayload(target), relPath, rootPath, mention }),
     /** Bounded recursive file index for @-mention completion in the chat. */
     searchMentions: (tabId: string, query: string): Promise<FileMentionResult> =>
       ipcRenderer.invoke("file:search-mentions", { tabId, query }),
-    write: (tabId: string | undefined, relPath: string, content: string, rootPath?: string): Promise<FileOpResult> =>
-      ipcRenderer.invoke("file:write", { tabId, relPath, content, rootPath }),
-    mkdir: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
-      ipcRenderer.invoke("file:mkdir", { tabId, relPath, rootPath }),
-    delete: (tabId: string | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
-      ipcRenderer.invoke("file:delete", { tabId, relPath, rootPath }),
-    rename: (tabId: string | undefined, relPath: string, newName: string, rootPath?: string): Promise<FileOpResult> =>
-      ipcRenderer.invoke("file:rename", { tabId, relPath, newName, rootPath }),
+    write: (target: IpcTargetRef | undefined, relPath: string, content: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:write", { ...targetPayload(target), relPath, content, rootPath }),
+    mkdir: (target: IpcTargetRef | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:mkdir", { ...targetPayload(target), relPath, rootPath }),
+    delete: (target: IpcTargetRef | undefined, relPath: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:delete", { ...targetPayload(target), relPath, rootPath }),
+    rename: (target: IpcTargetRef | undefined, relPath: string, newName: string, rootPath?: string): Promise<FileOpResult> =>
+      ipcRenderer.invoke("file:rename", { ...targetPayload(target), relPath, newName, rootPath }),
     /** Reveal a LOCAL file/folder in the OS file explorer (tree right-click). */
-    reveal: (input: { tabId?: string; rootPath?: string; relPath: string }): Promise<FileOpResult> =>
+    reveal: (input: { tabId?: string; remote?: RemoteTarget; wsl?: WslTarget; rootPath?: string; relPath: string }): Promise<FileOpResult> =>
       ipcRenderer.invoke("file:reveal", input),
   },
   onAutoFollow: (callback: (ev: { path: string; kind: "read" | "write"; tabId?: string }) => void): (() => void) => {
@@ -328,9 +356,9 @@ const api = {
   },
 
   settings: {
-    get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; onboarding?: { seenAt?: number; completedAt?: number } }> =>
+    get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }> =>
       ipcRenderer.invoke("settings:get"),
-    set: (patch: { autoFollow?: { enabled?: boolean; followReads?: boolean }; onboarding?: { seenAt?: number; completedAt?: number } }): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; onboarding?: { seenAt?: number; completedAt?: number } }> =>
+    set: (patch: { autoFollow?: { enabled?: boolean; followReads?: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }> =>
       ipcRenderer.invoke("settings:set", patch),
   },
 
@@ -371,37 +399,56 @@ const api = {
   session: {
     list: (cwd?: string): Promise<SessionListItem[]> =>
       ipcRenderer.invoke("session:list", cwd),
+    /** Attempt a transcript straight from the session file (remote/WSL only).
+     *  `ok: false` is NOT an error — the caller falls back to `get_messages`,
+     *  so a pi format change degrades to "slow but correct" instead of blank
+     *  chat. Keeps the multi-MB history off the RPC command loop, which is what
+     *  makes a remote agent look stuck. */
+    transcriptFromFile: (tabId: string): Promise<{ ok: true; messages: unknown[] } | { ok: false; reason: string }> =>
+      ipcRenderer.invoke("session:transcript-from-file", tabId),
     listProjects: (): Promise<string[]> =>
       ipcRenderer.invoke("session:list-projects"),
-    listRemote: (tabId: string, remoteCwd?: string): Promise<RemoteSessionListResult> =>
-      ipcRenderer.invoke("session:list-remote", tabId, remoteCwd),
+    listRemote: (target: IpcTargetRef, remoteCwd?: string): Promise<RemoteSessionListResult> =>
+      ipcRenderer.invoke("session:list-remote", targetPayload(target), remoteCwd),
     onLocalUpdated: (callback: (payload: { cwd: string; sessions: SessionListItem[] }) => void): (() => void) => {
       const handler = (_e: Electron.IpcRendererEvent, payload: { cwd: string; sessions: SessionListItem[] }) => callback(payload);
       ipcRenderer.on("session:local-updated", handler);
       return () => ipcRenderer.removeListener("session:local-updated", handler);
     },
-    delete: (path: string, tabId?: string): Promise<{ ok: boolean; error?: string }> =>
-      ipcRenderer.invoke("session:delete", { path, tabId }),
+    delete: (path: string, target?: IpcTargetRef): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke("session:delete", { path, ...targetPayload(target) }),
     rename: (path: string, name: string): Promise<{ ok: boolean; error?: string }> =>
       ipcRenderer.invoke("session:rename", path, name),
-    onRemoteUpdated: (callback: (payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => void): (() => void) => {
-      const handler = (_e: Electron.IpcRendererEvent, payload: { tabId: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => callback(payload);
+    onRemoteUpdated: (callback: (payload: { tabId?: string; remoteKey?: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => void): (() => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, payload: { tabId?: string; remoteKey?: string; remoteCwd: string; sessions: SessionListItem[]; hydratedCount?: number; totalCount?: number }) => callback(payload);
       ipcRenderer.on("session:remote-updated", handler);
       return () => ipcRenderer.removeListener("session:remote-updated", handler);
     },
-    setRemoteHydrationPaused: (tabId: string, remoteCwd: string, paused: boolean): Promise<boolean> =>
-      ipcRenderer.invoke("session:set-remote-hydration-paused", tabId, remoteCwd, paused),
-    prioritizeRemote: (tabId: string, remoteCwd: string, priority?: number): Promise<boolean> =>
-      ipcRenderer.invoke("session:prioritize-remote", tabId, remoteCwd, priority),
+    setRemoteHydrationPaused: (target: IpcTargetRef, remoteCwd: string, paused: boolean): Promise<boolean> =>
+      ipcRenderer.invoke("session:set-remote-hydration-paused", targetPayload(target), remoteCwd, paused),
+    prioritizeRemote: (target: IpcTargetRef, remoteCwd: string, priority?: number): Promise<boolean> =>
+      ipcRenderer.invoke("session:prioritize-remote", targetPayload(target), remoteCwd, priority),
   },
 
   remote: {
-    setBrowsePath: (tabId: string, path: string): Promise<boolean> =>
-      ipcRenderer.invoke("remote:set-browse-path", tabId, path),
-    getBrowsePath: (tabId: string): Promise<string | null> =>
-      ipcRenderer.invoke("remote:get-browse-path", tabId),
-    getInfo: (tabId: string): Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; isWsl?: boolean } | null> =>
-      ipcRenderer.invoke("remote:get-info", tabId),
+    /** Prove a server is reachable without opening a tab. "need-password"
+     *  drives the login dialog (auth failed and no usable credential). */
+    probe: (remote: RemoteTarget): Promise<{ status: "ready" | "need-password" | "failed"; error?: string; key: string }> =>
+      ipcRenderer.invoke("remote:probe", remote),
+    saveHistory: (remote: RemoteTarget): Promise<any[]> => ipcRenderer.invoke("remote:save-history", remote),
+    /** Main-discovered connection state (SFTP breaker / probe): the dot and the
+     *  login dialog follow this, whatever entry path found the failure. */
+    onStatus: (callback: (ev: { remoteKey: string; status: "connected" | "failed" | "disconnected"; needPassword?: boolean; error?: string; profile?: { host: string; user: string; port?: number; agentDir?: string } }) => void): (() => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, ev: { remoteKey: string; status: "connected" | "failed" | "disconnected"; needPassword?: boolean; error?: string; profile?: { host: string; user: string; port?: number; agentDir?: string } }) => callback(ev);
+      ipcRenderer.on("remote:status", handler);
+      return () => ipcRenderer.removeListener("remote:status", handler);
+    },
+    setBrowsePath: (target: IpcTargetRef, path: string): Promise<boolean> =>
+      ipcRenderer.invoke("remote:set-browse-path", targetPayload(target), path),
+    getBrowsePath: (target: IpcTargetRef): Promise<string | null> =>
+      ipcRenderer.invoke("remote:get-browse-path", targetPayload(target)),
+    getInfo: (target: IpcTargetRef): Promise<{ host: string; user: string; port?: number; path?: string; password?: string; startPi?: boolean; agentDir?: string; isWsl?: boolean } | null> =>
+      ipcRenderer.invoke("remote:get-info", targetPayload(target)),
     listHistory: (): Promise<any[]> => ipcRenderer.invoke("remote:list-history"),
     deleteHistory: (target: { host: string; user: string; port: number; agentDir?: string }): Promise<boolean> =>
       ipcRenderer.invoke("remote:delete-history", target),
