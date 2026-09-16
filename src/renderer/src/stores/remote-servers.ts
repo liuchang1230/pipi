@@ -46,6 +46,27 @@ function isConnectionTab(t: TabInfo): boolean {
   return t.kind === "connection";
 }
 
+/** The tab the sidebar's 「终端」 button should focus for a server, or null when
+ *  a NEW shell tab must be spawned.
+ *
+ *  Only a healthy connection shell tab qualifies. pi session tabs are skipped
+ *  even though they share the remoteKey: a session tab renders the CHAT view,
+ *  so reusing it would answer a click on 「终端」 with a conversation instead of
+ *  a terminal. A FAILED shell tab is skipped too (ssh already exited before the
+ *  ready marker, so activating it silently no-ops) — the caller then spawns a
+ *  fresh shell, which is also the only surface where a password can be typed.
+ *  Among several candidates a confirmed (ready) shell wins over one still
+ *  coming up. */
+export function pickServerTerminalTab(tabs: TabInfo[], remoteKey: string): TabInfo | null {
+  let best: TabInfo | null = null;
+  for (const t of tabs) {
+    if (!t.isRemote || t.isWsl || t.remoteKey !== remoteKey) continue;
+    if (!isConnectionTab(t) || t.sshState === "failed") continue;
+    if (!best || (best.sshState !== "ready" && t.sshState === "ready")) best = t;
+  }
+  return best;
+}
+
 export interface GroupRemoteServersParams {
   projects: ProjectListItem[];
   remoteHistory: RemoteHistoryItem[];
@@ -157,9 +178,19 @@ export function groupRemoteServers(params: GroupRemoteServersParams): RemoteServ
       )
       .map((p): ProjectGroup => {
         const isHydratingTarget = params.remoteHydration.tabId === tab?.id && params.remoteHydration.remoteCwd === p.path;
-        const sessions =
-          params.projectSessions[p.id] ??
-          (tab ? params.remoteSessions[remoteSessionCacheKey(tab.id, p.path!, tab.remoteAgentDir)] ?? [] : []);
+        // The SAME project is cached under EITHER the app's tab id or the
+        // readable profile key, depending on which path listed it
+        // (sessionsStore.toggleProject writes `tabId ?? remoteKey`, while
+        // openRemoteSession writes `remoteKey`). Looking up a single key
+        // silently MISSES and the row flashes back to "加载中…" even though the
+        // sessions were fetched — so try both, newest-first as written.
+        const profileKey = buildRemoteKey(p.host, p.user, p.port, p.agentDir);
+        const cacheIds = tab ? [tab.id, profileKey] : [profileKey];
+        const cachedSessions =
+          cacheIds
+            .map((id) => params.remoteSessions[remoteSessionCacheKey(id, p.path!, p.agentDir ?? "")])
+            .find((list) => !!list && list.length > 0) ?? [];
+        const sessions = params.projectSessions[p.id] ?? cachedSessions;
         return {
           key: p.id,
           label: p.name,

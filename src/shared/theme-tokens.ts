@@ -28,6 +28,10 @@ export interface AppThemeTokens {
   textDim: string;
   border: string;
   accent: string;
+  /** Accent tuned for TEXT on an accent-tinted surface (the active tab).
+   *  The plain `accent` is a surface/rail color: on light mode it only
+   *  reaches 3.7:1 against the 18% accent tint, below the 4.5:1 floor. */
+  accentStrong: string;
   success: string;
   danger: string;
   /** Caution / pending state distinct from destructive errors. */
@@ -62,6 +66,7 @@ export const THEME_TOKENS: Record<ThemeMode, AppThemeTokens> = {
     textDim: "#8a8a94",
     border: "#3c3c46",
     accent: "#8abeb7",
+    accentStrong: "#a9d8d0",
     success: "#b5bd68",
     danger: "#cc6666",
     warning: "#d6a85d",
@@ -85,6 +90,7 @@ export const THEME_TOKENS: Record<ThemeMode, AppThemeTokens> = {
     textDim: "#6b7280",
     border: "#d8dbe2",
     accent: "#3d6bd0",
+    accentStrong: "#2b4f9e",
     success: "#3f9a63",
     danger: "#cf4a4a",
     warning: "#a66a16",
@@ -108,6 +114,7 @@ const TOKEN_VAR_MAP: Array<[keyof AppThemeTokens, string]> = [
   ["textDim", "--text-dim"],
   ["border", "--border"],
   ["accent", "--accent"],
+  ["accentStrong", "--accent-strong"],
   ["success", "--success"],
   ["danger", "--danger"],
   ["warning", "--warning"],

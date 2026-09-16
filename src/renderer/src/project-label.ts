@@ -50,3 +50,30 @@ export function projectLabelForTab(tab: TabInfo | null | undefined): ProjectLabe
   if (!cwd) return null;
   return { short: baseName(cwd), full: cwd };
 }
+
+export interface TabHoverInfo {
+  /** The full session label: pi's session name, or the first user message as
+   *  pi recorded it. The tab strip truncates this to ~140px. */
+  title: string;
+  /** Where the session runs — `user@host:/path` for remote/WSL, the cwd for a
+   *  local tab. Unknown for a record main has not filled in yet. */
+  path: string | null;
+}
+
+/**
+ * Hover card for a tab: the untruncated label plus the location it runs in.
+ * The tab strip can only afford a ~140px label, so with several sessions of one
+ * project open the strip alone does not say WHICH conversation a tab is; the
+ * full label (up to 100 chars on the session-list path) is only readable here.
+ * Null when there is nothing to say — callers render no card rather than an
+ * empty box.
+ */
+export function tabHoverInfo(
+  tab: TabInfo | null | undefined,
+  project: ProjectLabel | null = projectLabelForTab(tab),
+): TabHoverInfo | null {
+  if (!tab) return null;
+  const title = tab.title.trim() || project?.short || "";
+  if (!title) return null;
+  return { title, path: project?.full ?? null };
+}

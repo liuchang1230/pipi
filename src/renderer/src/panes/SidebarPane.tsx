@@ -1086,7 +1086,11 @@ const ProjectItem = memo(function ProjectItem({
       {expanded && (
         <div className="project-sessions">
           {isRemoteSection && <div className="remote-project-path">{project.cwd}</div>}
-          {isRemoteSection && project.error ? <div className="placeholder">远程会话加载失败：{project.error}</div> : isRemoteSection && (projectSessionStatus[project.key] === "loading" || projectSessionStatus[project.key] === "idle") && project.sessions.length === 0 ? <div className="placeholder">远程会话加载中…</div> : projectLoading[project.key] ? <div className="placeholder">加载中…</div> : project.sessions.length === 0 ? <div className="placeholder">（无会话，点 + 新建）</div> : (
+          {/* A non-empty list is NEVER replaced by a loading placeholder: the
+              sessions were already fetched, so swapping them out for "加载中…"
+              on every re-list is what made the sidebar look like it kept
+              reloading. Placeholders are for the EMPTY case only. */}
+          {isRemoteSection && project.error && project.sessions.length === 0 ? <div className="placeholder">远程会话加载失败：{project.error}</div> : project.sessions.length > 0 ? (
             <>
               <div className="session-select-all" onClick={() => onSelectAllSessions(project.sessions)}>
                 {project.sessions.every((s) => selectedSessions.has(s.path)) ? "☑" : "☐"} 全选
@@ -1104,7 +1108,7 @@ const ProjectItem = memo(function ProjectItem({
                 />
               ))}
             </>
-          )}
+          ) : isRemoteSection && (projectSessionStatus[project.key] === "loading" || projectSessionStatus[project.key] === "idle") ? <div className="placeholder">远程会话加载中…</div> : projectLoading[project.key] ? <div className="placeholder">加载中…</div> : <div className="placeholder">（无会话，点 + 新建）</div>}
         </div>
       )}
     </div>
@@ -1296,7 +1300,8 @@ interface RemoteServerSectionProps {
  *  opens the connect dialog; each node's + browses THAT server's directories
  *  (the old picker always targeted the first remote tab, which made a second
  *  server impossible to reach). Clicking a connected node toggles its
- *  projects; the terminal icon opens the raw server shell on demand. */
+ *  projects; the terminal icon opens the raw server shell on demand — in any
+ *  connection state, since that shell is also where a password is entered. */
 const RemoteServerSection = memo(function RemoteServerSection({
   title, titleIcon, emptyText, servers, expandedProjects, projectLoading,
   projectSessionStatus, selectedSessions, activeSessionPath, isProjectActive,
@@ -1359,11 +1364,20 @@ const RemoteServerSection = memo(function RemoteServerSection({
                 role="img"
                 aria-label={dotLabel}
               />
+              {/* Always enabled — even when the server reads "未连接"/"连接失败":
+                  the terminal IS the login surface (ssh asks for the password in
+                  there), so a click must open a shell instead of doing nothing.
+                  The dot next to the address carries the connectivity readout. */}
               <button
                 className="row-action server-terminal-btn"
-                disabled={status !== "connected" && status !== "connecting"}
                 onClick={(e) => { e.stopPropagation(); onOpenServerTerminal(server); }}
-                title={status === "failed" || status === "disconnected" ? "连接后可用" : `打开 ${server.label} 的远程终端（需密码时在此输入）`}
+                title={
+                  status === "connected"
+                    ? `打开 ${server.label} 的远程终端`
+                    : status === "connecting"
+                      ? `打开 ${server.label} 的远程终端（SSH 正在连接）`
+                      : `打开 ${server.label} 的远程终端（${status === "failed" ? "上次连接失败" : "尚未连接"}，将新建 SSH 终端；需密码时在终端里输入）`
+                }
               ><Icon name="terminal" /></button>
               <button
                 className="row-action server-add-btn"

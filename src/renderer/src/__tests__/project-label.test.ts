@@ -2,7 +2,7 @@
 // session run", and for remote tabs `cwd` is the LOCAL path — using it would
 // label a /data/liuchang/… session as "agent".
 import { describe, expect, it } from "vitest";
-import { projectLabelForTab } from "../project-label";
+import { projectLabelForTab, tabHoverInfo } from "../project-label";
 import type { TabInfo } from "../stores/types";
 
 const tab = (over: Partial<TabInfo>): TabInfo => ({ id: "t", cwd: "", title: "", pi: true, ...over });
@@ -51,5 +51,39 @@ describe("projectLabelForTab", () => {
     expect(projectLabelForTab(undefined)).toBeNull();
     expect(projectLabelForTab(null)).toBeNull();
     expect(projectLabelForTab(tab({ cwd: "" }))).toBeNull();
+  });
+});
+
+// The hover card exists because the strip truncates the label to 140px: it must
+// carry the WHOLE session label plus the location, and must not render an empty
+// box for a record main has not filled in yet.
+describe("tabHoverInfo", () => {
+  it("shows the full session label with where it runs", () => {
+    const label = tabHoverInfo(
+      tab({
+        title: "基于悬挂异物_人检测v4模型，对悬挂异物_人检测数据集v5版本数据集进行训练，请",
+        isRemote: true,
+        remoteHost: "192.168.10.49",
+        remoteUser: "crscu",
+        remoteDir: "/data/liuchang/CRSCU Intelligence Algorithm Platform",
+      }),
+    );
+    expect(label).toEqual({
+      title: "基于悬挂异物_人检测v4模型，对悬挂异物_人检测数据集v5版本数据集进行训练，请",
+      path: "crscu@192.168.10.49:/data/liuchang/CRSCU Intelligence Algorithm Platform",
+    });
+  });
+
+  it("falls back to the project name when the label is empty (optimistic tab)", () => {
+    expect(tabHoverInfo(tab({ cwd: "D:/work/agent", title: "   " }))).toEqual({
+      title: "agent",
+      path: "D:/work/agent",
+    });
+  });
+
+  it("has nothing to show for a tab with neither label nor location", () => {
+    expect(tabHoverInfo(undefined)).toBeNull();
+    expect(tabHoverInfo(null)).toBeNull();
+    expect(tabHoverInfo(tab({ cwd: "", title: "" }))).toBeNull();
   });
 });

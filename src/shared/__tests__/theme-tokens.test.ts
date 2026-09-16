@@ -24,7 +24,7 @@ describe("themeCssVars (generated CSS custom properties)", () => {
     const css = themeCssVars();
     for (const name of [
       "--bg", "--bg-panel", "--bg-input", "--tool-bg", "--text", "--text-dim", "--border",
-      "--accent", "--success", "--danger", "--user-bg", "--assistant-bg",
+      "--accent", "--accent-strong", "--success", "--danger", "--user-bg", "--assistant-bg",
       "--terminal-bg", "--hover", "--hover-medium", "--hover-strong",
       "--hover-soft", "--hover-faint", "--mono",
     ]) {

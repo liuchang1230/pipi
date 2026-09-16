@@ -17,7 +17,7 @@ import { attachImeHeuristic } from "../xterm-ime-anchor";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
 import { useChatStore } from "../stores/chatStore";
-import { projectLabelForTab } from "../project-label";
+import { projectLabelForTab, tabHoverInfo } from "../project-label";
 import { useUiStore } from "../stores/uiStore";
 import type { TabInfo } from "../stores/types";
 import { ChatView } from "./ChatPane";
@@ -320,6 +320,7 @@ const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onClo
           // its folder and a connection tab after its host, so "agent · agent"
           // and "host · host" are both suppressed.
           const project = projectLabelForTab(t);
+          const hover = tabHoverInfo(t, project);
           const showProject =
             !!project &&
             t.title.trim().length > 0 &&
@@ -352,6 +353,16 @@ const TabBar = memo(function TabBar({ visibleTabs, activeTab, onSelectTab, onClo
                 onClick={(e) => { e.stopPropagation(); onCloseTab(t.id); }}
                 title="关闭"
               >×</button>
+              {hover && (
+                // Instant hover card instead of a native title tooltip: the
+                // native one delays ~1s, which defeats "glance and know which
+                // conversation this is". pointer-events:none in CSS keeps the
+                // card from stealing the tab's hover state.
+                <span className="tab-tip" role="tooltip">
+                  <span className="tab-tip-title">{hover.title}</span>
+                  {hover.path && <span className="tab-tip-path">{hover.path}</span>}
+                </span>
+              )}
             </div>
           );
         })}

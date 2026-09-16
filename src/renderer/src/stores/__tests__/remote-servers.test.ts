@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupRemoteServers, buildRemoteKey, remoteSessionCacheKey } from "../remote-servers";
+import { groupRemoteServers, buildRemoteKey, remoteSessionCacheKey, pickServerTerminalTab } from "../remote-servers";
 import type { ProjectListItem, RemoteHistoryItem, TabInfo } from "../types";
 
 const empty = {
@@ -449,5 +449,143 @@ describe("groupRemoteServers with probe status", () => {
       remoteHydration: { phase: "idle" },
     });
     expect(groups[0].status).toBe("connected");
+  });
+});
+
+describe("sessions cache-key lookup (regression: list flashed back to 加载中)", () => {
+  // The SAME project is cached under EITHER the app's tab id or the readable
+  // profile key depending on which path listed it — sessionsStore.toggleProject
+  // writes `tabId ?? remoteKey`, openRemoteSession writes `remoteKey`. A
+  // single-key lookup silently missed, so a project whose sessions HAD been
+  // fetched rendered as "加载中…" again.
+  const project: ProjectListItem = {
+    id: "p1",
+    type: "remote",
+    name: "proj",
+    host: "h1",
+    user: "root",
+    port: 22,
+    path: "/srv/proj",
+    key: "p1",
+  } as ProjectListItem;
+
+  const oneSession = (path: string) => [{ path, sessionId: "s", mtime: 1, size: 1, messageCount: 3, firstMessage: "hi", name: null }];
+
+  it("finds sessions cached under the profile key when a tab exists", () => {
+    const tab = sshTab({ id: "t1", kind: "agent", title: "proj" }) as TabInfo;
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: projects([project]),
+      remoteHistory: history([]),
+      tabs: tabs([tab]),
+      // Written by openRemoteSession (profile key), NOT by the tab key.
+      remoteSessions: { [remoteSessionCacheKey(buildRemoteKey("h1", "root", 22), "/srv/proj", "")]: oneSession("/srv/proj/a.jsonl") },
+    });
+    expect(groups[0]!.projects[0]!.sessions.map((s) => s.path)).toEqual(["/srv/proj/a.jsonl"]);
+  });
+
+  it("still finds sessions cached under the tab id", () => {
+    const tab = sshTab({ id: "t1", kind: "agent", title: "proj" }) as TabInfo;
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: projects([project]),
+      remoteHistory: history([]),
+      tabs: tabs([tab]),
+      remoteSessions: { [remoteSessionCacheKey("t1", "/srv/proj", "")]: oneSession("/srv/proj/b.jsonl") },
+    });
+    expect(groups[0]!.projects[0]!.sessions.map((s) => s.path)).toEqual(["/srv/proj/b.jsonl"]);
+  });
+
+  it("prefers projectSessions over both cache keys", () => {
+    const tab = sshTab({ id: "t1", kind: "agent", title: "proj" }) as TabInfo;
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: projects([project]),
+      remoteHistory: history([]),
+      tabs: tabs([tab]),
+      projectSessions: { p1: oneSession("/srv/proj/live.jsonl") },
+      remoteSessions: { [remoteSessionCacheKey("t1", "/srv/proj", "")]: oneSession("/srv/proj/stale.jsonl") },
+    });
+    expect(groups[0]!.projects[0]!.sessions.map((s) => s.path)).toEqual(["/srv/proj/live.jsonl"]);
+  });
+
+  it("ignores an EMPTY cache entry so a populated other-key entry still wins", () => {
+    const tab = sshTab({ id: "t1", kind: "agent", title: "proj" }) as TabInfo;
+    const groups = groupRemoteServers({
+      ...empty,
+      projects: projects([project]),
+      remoteHistory: history([]),
+      tabs: tabs([tab]),
+      remoteSessions: {
+        [remoteSessionCacheKey("t1", "/srv/proj", "")]: [],
+        [remoteSessionCacheKey(buildRemoteKey("h1", "root", 22), "/srv/proj", "")]: oneSession("/srv/proj/kept.jsonl"),
+      },
+    });
+    expect(groups[0]!.projects[0]!.sessions.map((s) => s.path)).toEqual(["/srv/proj/kept.jsonl"]);
+  });
+});
+
+// The sidebar's 「终端」 button asks "which tab do I focus (or null → spawn a
+// fresh shell)?". The whole point of this seam is that it must NOT answer with
+// a chat tab: a pi session tab shares the server's remoteKey but renders the
+// conversation, so reusing it would answer a terminal click with a chat view
+// (the "点终端却进不了终端" report).
+describe("pickServerTerminalTab", () => {
+  it("reuses the server's healthy connection shell tab", () => {
+    const picked = pickServerTerminalTab(
+      [sshTab({ id: "shell", kind: "connection", sshState: "ready" })],
+      "root@h1:22",
+    );
+    expect(picked?.id).toBe("shell");
+  });
+
+  it("refuses a pi session tab with the same remoteKey (chat is not a terminal)", () => {
+    const picked = pickServerTerminalTab(
+      [sshTab({ id: "session", kind: "agent", mode: "rpc", title: "my session" })],
+      "root@h1:22",
+    );
+    expect(picked).toBeNull();
+  });
+
+  it("prefers the shell even when a session tab is listed first", () => {
+    const picked = pickServerTerminalTab(
+      [
+        sshTab({ id: "session", kind: "agent", mode: "rpc" }),
+        sshTab({ id: "shell", kind: "connection" }),
+      ],
+      "root@h1:22",
+    );
+    expect(picked?.id).toBe("shell");
+  });
+
+  it("skips a FAILED shell tab so a fresh ssh is spawned", () => {
+    const picked = pickServerTerminalTab(
+      [sshTab({ id: "dead", kind: "connection", sshState: "failed" })],
+      "root@h1:22",
+    );
+    expect(picked).toBeNull();
+  });
+
+  it("prefers a confirmed shell over one still connecting", () => {
+    const picked = pickServerTerminalTab(
+      [
+        sshTab({ id: "pending", kind: "connection" }),
+        sshTab({ id: "ready", kind: "connection", sshState: "ready" }),
+      ],
+      "root@h1:22",
+    );
+    expect(picked?.id).toBe("ready");
+  });
+
+  it("ignores other servers, WSL tabs and local tabs", () => {
+    expect(
+      pickServerTerminalTab([sshTab({ id: "other", remoteKey: "root@h2:22" })], "root@h1:22"),
+    ).toBeNull();
+    expect(
+      pickServerTerminalTab([sshTab({ id: "wsl", kind: "connection", isWsl: true, wslDistro: "Ubuntu" })], "root@h1:22"),
+    ).toBeNull();
+    expect(
+      pickServerTerminalTab([sshTab({ id: "local", isRemote: false, remoteKey: undefined })], "root@h1:22"),
+    ).toBeNull();
   });
 });

@@ -860,7 +860,10 @@ html, body, #root {
   color: var(--text-dim);
   white-space: nowrap;
   border: 1px solid transparent;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  /* Anchors .tab-tip. The hover card escapes the tab box downward but stays
+   * inside .main's padding box, so it is not clipped by .main's overflow. */
+  position: relative;
 }
 .tab-remote-icon { display: inline-flex; }
 /* Compact glance-only tab state: all truth already comes from TabInfo. */
@@ -870,13 +873,25 @@ html, body, #root {
 .tab-connection-state.connecting { background: var(--accent); animation: tab-connection-pulse 1.2s ease-in-out infinite; }
 @keyframes tab-connection-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .tab-connection-state.connecting { animation: none; } }
-.tab:hover { background: var(--hover); }
+/* Inactive tabs stay quiet (transparent + dim text) so the one accented tab is
+ * unambiguous at a glance. `:not(.active)` keeps the hover tint from fighting
+ * the active treatment. */
+.tab:not(.active):hover { background: var(--hover); color: var(--text); }
+/* Active tab = "this is the session you are in". Three redundant cues because
+ * the old treatment (bg-panel vs bg, 7/255 apart in dark) was invisible:
+ * accent-tinted surface + accent top rail + accent text. */
 .tab.active {
-  color: var(--text);
-  background: var(--bg);
-  border-color: var(--border);
-  border-bottom-color: var(--bg);
+  color: var(--accent-strong, var(--accent));
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  border-bottom-color: transparent;
+  box-shadow: inset 0 2px 0 var(--accent);
 }
+.tab.active .tab-close { color: inherit; }
+.tab.active .tab-close:hover { color: var(--danger); opacity: 1; }
+.tab.active .tab-project { color: inherit; opacity: 0.75; }
+.tab.active .tab-project + .tab-title::before { color: inherit; opacity: 0.6; }
 .tab-title { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
 /* Project prefix inside a tab: dimmer and narrower than the session name — it
  * is context, the session name is the identity. */
@@ -902,8 +917,44 @@ html, body, #root {
   line-height: 1;
   padding: 0 2px;
   border-radius: 2px;
+  /* Revealed on hover / on the active tab instead of always-on: a wall of ×
+   * buttons competes with the labels. Keyboard focus still shows it. */
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
 }
+.tab:hover .tab-close,
+.tab.active .tab-close,
+.tab-close:focus-visible { opacity: 1; }
 .tab-close:hover { color: var(--danger); background: rgba(243, 139, 168, 0.15); }
+
+/* --- Tab hover card -------------------------------------------------------
+ * The strip truncates every label (`max-width: 140px`), so with several
+ * sessions of one project open the tab alone cannot say which conversation it
+ * is. Hover reveals the full label + where it runs, instantly (no ~1s native
+ * title delay). pointer-events:none so the card never steals the hover state
+ * that shows it, and z-index lifts it over the terminal pane. */
+.tab-tip {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 60;
+  max-width: 420px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+  pointer-events: none;
+}
+.tab:hover .tab-tip { display: block; }
+.tab-tip-title { display: block; }
+.tab-tip-path { display: block; margin-top: 2px; color: var(--text-dim); font-size: 11px; }
 
 .terminal-wrap {
   flex: 1;

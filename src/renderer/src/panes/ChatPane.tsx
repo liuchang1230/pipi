@@ -9,7 +9,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import Markdown from "../Markdown";
-import { useChatStore, type ChatBlock, type ChatMessage } from "../stores/chatStore";
+import { useChatStore, exitBannerText, type ChatBlock, type ChatMessage } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
@@ -2102,16 +2102,21 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
 
       <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} bootTimeoutDetail={bootTimeoutDetail} />
 
-      {exited && (
-        <div className="chat-exited-bar">
-          <span title={state?.exitDetail || undefined}>
-            {state?.exitCode === 0 ? "Pi 已正常退出，会话已保存在服务器上" : `Pi 进程异常退出（code ${state?.exitCode ?? "?"}）`}
-            {state?.exitCode !== 0 && state?.exitDetail ? ` · ${state.exitDetail.slice(0, 160)}` : ""}
-          </span>
-          <button className="chat-btn" onClick={resumeSession} disabled={switchBusy}>继续此会话</button>
-          <button className="chat-btn" onClick={switchToTerminal} disabled={switchBusy}>终端视图</button>
-        </div>
-      )}
+      {exited && (() => {
+        const banner = exitBannerText(state?.exitCode, state?.exitDetail);
+        return (
+          <div className="chat-exited-bar">
+            {/* title carries the full untruncated reason (the inline text is
+                bounded so the bar stays one line). */}
+            <span title={banner.detail ? state?.exitDetail ?? undefined : undefined}>
+              {banner.headline}
+              {banner.detail ? ` · ${banner.detail}` : ""}
+            </span>
+            <button className="chat-btn" onClick={resumeSession} disabled={switchBusy}>继续此会话</button>
+            <button className="chat-btn" onClick={switchToTerminal} disabled={switchBusy}>终端视图</button>
+          </div>
+        );
+      })()}
 
       {unresponsive && !exited && (
         <div className="chat-exited-bar chat-unresponsive-bar">

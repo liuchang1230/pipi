@@ -423,6 +423,20 @@ function setRemoteSessionHydrationPaused(key: string, paused: boolean): void {
   hit.hydrationPaused = paused;
 }
 
+/** Only the project the user is actually looking at should hydrate.
+ *
+ * Background hydration of OTHER projects starves the focused one: the scheduler
+ * runs only 2 hydrations at a time and sorts entries that still need their
+ * "head" pass first, so a project the user merely expanded earlier keeps taking
+ * the slots — on a slow link that is most of the perceived "打开远程项目很慢".
+ * Focusing pauses every other entry; focusing AGAIN self-heals, because
+ * markRemoteSessionPriority clears the pause for the matching key. */
+function focusRemoteSessionHydration(key: string): void {
+  for (const [cacheKey, entry] of remoteSessionCache.entries()) {
+    if (cacheKey !== key) entry.hydrationPaused = true;
+  }
+}
+
 function markRemoteSessionPriority(key: string, priority: number): void {
   const now = Date.now();
   for (const [cacheKey, entry] of remoteSessionCache.entries()) {
@@ -2815,7 +2829,11 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
   ipcMain.handle("session:prioritize-remote", (_e, ref: string | TargetRef, remoteCwd: string, priority = 2) => {
     const t = resolveTarget(toTargetRef(ref), false);
     if (!t?.remote) return false;
-    markRemoteSessionPriority(remoteSessionCacheKey(t.remote, remoteCwd), priority);
+    const key = remoteSessionCacheKey(t.remote, remoteCwd);
+    // Focusing is exclusive: see focusRemoteSessionHydration.
+    focusRemoteSessionHydration(key);
+    markRemoteSessionPriority(key, priority);
+    debugLog("remote", `hydrate focus ${remoteCwd} (${remoteSessionCache.size} cache entr${remoteSessionCache.size === 1 ? "y" : "ies"}, others paused)`);
     void scheduleRemoteHydrationWork();
     return true;
   });
@@ -2823,6 +2841,10 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
     const t = resolveTarget(toTargetRef(ref), false);
     if (!t?.remote && !t?.wsl) return { sessions: [], error: "远程目标不存在或已断开" };
     const targetDir = remoteCwd ?? t.remoteBrowsePath ?? t.remote?.path ?? t.wsl?.path ?? "~";
+    // Instrumentation for "是不是在加载所有项目": every listing names its project,
+    // so pipi-debug.log shows exactly which ones are being fetched.
+    const listStartedAt = Date.now();
+    debugLog("remote", `list-remote ${t.wsl ? `wsl:${t.wsl.distro}` : t.remote?.host} ${targetDir}`);
     if (t?.wsl) {
       // WSL sessions are plain files under \\wsl$\<distro>\… — same
       // SessionIndex seam as local (shared snapshot cache + incremental
@@ -3160,6 +3182,9 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
       const remote = remoteProfiles.get(remoteKey)
         ?? listTabs().find((item) => item.remote && stableRemoteKey(item.remote) === remoteKey)?.remote;
       if (!remote || !remoteCwd) continue;
+      // Instrumentation for "怎么还在加载别的项目": every batch names its
+      // project, so the log shows exactly what hydration is spending the link on.
+      debugLog("remote", `hydrate batch ${remoteCwd} ${entry.hydratedCount}/${entry.sessions.length} prio=${entry.priority}`);
       void hydrateRemoteSessionsInBackground(remoteKey, remote, remoteCwd, cacheKey, entry.sessions);
     }
   }

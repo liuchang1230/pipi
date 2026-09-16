@@ -533,6 +533,64 @@ describe("pickExitErrorLine", () => {
   });
 });
 
+// exit code -1 is synthesized by the transport (Ssh2Transport.reportExit), so
+// "Pi 进程异常退出" blamed pi for plain network blips. The transport's own
+// stderr line is the only honest witness — this decides what the banner says.
+describe("exitBannerText", () => {
+  it("blames the connection, not pi, when the SSH flow was reset", async () => {
+    const { exitBannerText } = await import("../chatStore");
+    const banner = exitBannerText(-1, "SSH 连接错误：read ECONNRESET");
+    expect(banner.kind).toBe("connection");
+    expect(banner.headline).toContain("连接已断开");
+    expect(banner.headline).not.toContain("异常退出");
+    expect(banner.detail).toBe("SSH 连接错误：read ECONNRESET");
+  });
+
+  it("recognizes every transport wording we emit, and openssh's", async () => {
+    const { exitBannerText } = await import("../chatStore");
+    for (const detail of [
+      "SSH 连接已断开（对端关闭）",
+      "SSH 连接已断开（网络中断或 keepalive 超时）",
+      "SSH 连接错误：Keepalive timeout",
+      "Connection reset by 192.168.10.49 port 22",
+      "Timeout, server 192.168.10.49 not responding.",
+    ]) {
+      expect(exitBannerText(-1, detail).kind).toBe("connection");
+    }
+  });
+
+  it("still reports a real pi failure as an abnormal exit", async () => {
+    const { exitBannerText } = await import("../chatStore");
+    const banner = exitBannerText(1, "TypeError: webidl.util.markAsUncloneable is not a function");
+    expect(banner.kind).toBe("crash");
+    expect(banner.headline).toContain("异常退出");
+    expect(banner.detail).toContain("TypeError");
+  });
+
+  it("never shows job-control noise as the cause", async () => {
+    const { exitBannerText } = await import("../chatStore");
+    // The noise is the ONLY stderr of an exec-without-pty drop: the banner must
+    // stay vague rather than present a non-error as the reason.
+    const banner = exitBannerText(-1, "bash: cannot set terminal process group (-1): Inappropriate ioctl for device");
+    expect(banner.kind).toBe("crash");
+    expect(banner.detail).toBeNull();
+  });
+
+  it("treats a clean exit as clean, with no cause to show", async () => {
+    const { exitBannerText } = await import("../chatStore");
+    const banner = exitBannerText(0, "SSH 连接已断开（对端关闭）");
+    expect(banner.kind).toBe("clean");
+    expect(banner.detail).toBeNull();
+  });
+
+  it("says 'connection' in lastError too, so the two banners agree", () => {
+    useChatStore.getState().markExited(T, { code: -1, stderr: "SSH 连接错误：read ECONNRESET\n" });
+    const st = useChatStore.getState().states[T]!;
+    expect(st.lastError).toContain("与服务器的连接已断开");
+    expect(st.lastError).not.toContain("pi 进程已退出");
+  });
+});
+
 // Closed tabs must not keep their transcript alive: memory used to grow with
 // every session the user ever opened (clear() was only called on view switch).
 describe("retainTabs", () => {

@@ -8,13 +8,52 @@
  */
 import { create } from "zustand";
 
+/** Bash prints these for EVERY `bash -ic` exec without a pty. They say the
+ *  command had no tty, not that anything failed, so they must never be shown
+ *  as the reason a tab ended. */
+const SHELL_NOISE = /cannot set terminal process group|no job control in this shell/i;
+
 /** Pick the useful line from a failed pi process's stderr for the exit banner.
  * `bash -i` without a TTY prints job-control noise first; pi's own error (the
  * useful line) comes last. Returns null when there is nothing to show. */
 export function pickExitErrorLine(stderr: string | undefined): string | null {
   const lines = (stderr ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
   if (lines.length === 0) return null;
-  return [...lines].reverse().find((l) => !/cannot set terminal process group|no job control in this shell/i.test(l)) ?? lines[0]!;
+  return [...lines].reverse().find((l) => !SHELL_NOISE.test(l)) ?? lines[0]!;
+}
+
+/** Transport-level death, as opposed to pi itself failing: our own ssh2/ssh.exe
+ *  wording first (see Ssh2Transport in main/rpc-session.ts), then openssh's. */
+const CONNECTION_LOSS =
+  /SSH 连接|connection (reset|closed|timed out|refused|aborted)|ECONNRESET|ETIMEDOUT|EPIPE|broken pipe|socket hang up|kex_exchange_identification|ssh_exchange_identification|Timeout, server/i;
+
+export interface ExitBanner {
+  /** "clean" = pi exited on its own; "connection" = the SSH/pipe transport died
+   *  under pi and took it along (pi is not at fault); "crash" = pi itself ended
+   *  abnormally. */
+  kind: "clean" | "connection" | "crash";
+  headline: string;
+  /** The stderr line worth showing (bounded), or null when there is nothing
+   *  informative — job-control noise is not a cause. */
+  detail: string | null;
+}
+
+/**
+ * What to tell the user when a tab's pi is gone.
+ *
+ * The distinction matters: exit code -1 is SYNTHESIZED by our transport when the
+ * ssh2 connection/channel dies (`reportExit(code ?? -1)` in rpc-session.ts), so
+ * a dropped SSH flow under a TUN/VPN proxy reads exactly like a crashed pi. It
+ * reported "Pi 进程异常退出" for plain network blips, which sent users hunting the
+ * wrong problem — the transport's own message must decide.
+ */
+export function exitBannerText(code: number | undefined, detail: string | null | undefined): ExitBanner {
+  if (code === 0) return { kind: "clean", headline: "Pi 已正常退出，会话已保存在服务器上", detail: null };
+  const cause = detail && !SHELL_NOISE.test(detail) ? detail.slice(0, 160) : null;
+  if (cause && CONNECTION_LOSS.test(cause)) {
+    return { kind: "connection", headline: "与服务器的连接已断开（远端 Pi 已随会话结束）", detail: cause };
+  }
+  return { kind: "crash", headline: `Pi 进程异常退出（code ${code ?? "?"}）`, detail: cause };
 }
 
 export type ChatBlock =
@@ -385,6 +424,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   markExited: (tabId, { code, stderr }) => {
     get().ensure(tabId);
     const detail = pickExitErrorLine(stderr);
+    const banner = exitBannerText(code, detail);
     set((s) => ({
       states: {
         ...s.states,
@@ -395,11 +435,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           // Kept separately from lastError so the exit banner can say WHY
           // (a dropped SSH flow reads very differently from a crashed pi).
           exitDetail: detail ?? undefined,
-          lastError: code === 0
-            ? `pi 进程已退出 (code 0)`
-            : detail
-              ? `pi 进程已退出 (code ${code})：${detail}`
-              : `pi 进程已退出 (code ${code})`,
+          // Same classification as the exited bar: an app-killed transport must
+          // not be reported as pi crashing here either.
+          lastError: banner.kind === "connection"
+            ? `与服务器的连接已断开${banner.detail ? `：${banner.detail}` : ""}`
+            : code === 0
+              ? `pi 进程已退出 (code 0)`
+              : `pi 进程已退出 (code ${code})${banner.detail ? `：${banner.detail}` : ""}`,
           exitCode: code,
           turn: { phase: "exited", lastActivityAt: Date.now(), detail: `进程退出（code ${code}）${detail ? ` · ${detail}` : ""}` },
         },

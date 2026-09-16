@@ -30,6 +30,7 @@ import { RemoteDialog } from "./dialogs/RemoteDialog";
 import { RemoteDirPicker } from "./dialogs/RemoteDirPicker";
 import { RemotePasswordDialog } from "./dialogs/RemotePasswordDialog";
 import { serverProfile, type RemoteProfileTarget, type TargetRef } from "./stores/remote-target";
+import { pickServerTerminalTab } from "./stores/remote-servers";
 import { useRemoteStore } from "./stores/remoteStore";
 import { useTabsStore } from "./stores/tabsStore";
 import { useChatStore } from "./stores/chatStore";
@@ -389,27 +390,34 @@ export default function App() {
   /** "远程服务器" section header +: open the connect dialog (new server). */
   const handleAddRemoteServer = useCallback(() => setShowRemote(true), []);
 
-  /** Ensure a connection tab exists for a server node; returns its tab id.
-   *  Reuses an open tab (any tab with the same remoteKey), otherwise spawns a
-   *  connection shell tab (startPi:false) and waits for the honest SSH state:
-   *  ready (remote shell confirmed) vs failed (ssh exited) vs timeout (tab is
-   *  up, probably waiting at a password prompt — the terminal is the login
-   *  surface). Never claims "已连接" without the ready marker. */
+  /** In-flight shell spawns: a second click must reuse the optimistic tab the
+   *  first one registered, not spawn a twin ssh. */
   const serverConnectingRef = useRef<Set<string>>(new Set());
-  const ensureRemoteConnection = useCallback(async (server: RemoteServerGroup): Promise<string | null> => {
-    const tabs = useTabsStore.getState().tabs;
-    // Reuse an open tab, preferring the connection shell tab ("· 连接") so
-    // the server node opens the server's terminal rather than a chat view.
-    // Never reuse a FAILED shell tab (ssh exited before the ready marker):
-    // the renderer may still hold it briefly after main drops it, and
-    // activating a dead tab would silently no-op.
-    const candidates = tabs.filter((t) => t.isRemote && !t.isWsl && t.remoteKey === server.key && t.sshState !== "failed");
-    const existing = candidates.find((t) => t.kind === "connection") ?? candidates[0];
-    if (existing) return existing.id;
-    if (serverConnectingRef.current.has(server.key)) return null; // in flight
+
+  /** 「终端」按钮（服务器行）：打开并聚焦该服务器的**原始 SSH shell**。
+   *
+   *  这是唯一仍然创建连接标签的路径——用户明确要一个终端，而终端也正好是
+   *  需要密码时的输入面。它是**任何状态都可点**的：没探测过 / 曾失败的服务器
+   *  同样开一个 shell（ssh 会在终端里问密码），而不是点了没反应。
+   *
+   *  两处顺序是刻意的：
+   *  ① **先上屏再等握手**——需要密码的服务器是在**这个终端里**提示输入的，
+   *     若等 10s 状态超时才切过去，用户先看到的是十秒“点了没反应”；
+   *  ② **复用只认健康的连接 shell 标签**（`pickServerTerminalTab`）——pi 会话
+   *     标签虽然携带同一个 remoteKey，但渲染的是聊天视图，复用它等于用户点
+   *     「终端」却落到对话里。 */
+  const handleOpenServerTerminal = useCallback(async (server: RemoteServerGroup): Promise<void> => {
+    const existing = pickServerTerminalTab(useTabsStore.getState().tabs, server.key);
+    if (existing) {
+      const ok = await window.api.tab.activate(existing.id);
+      if (ok) useTabsStore.getState().setActiveTab(existing.id);
+      return;
+    }
+    if (serverConnectingRef.current.has(server.key)) return; // in flight
     serverConnectingRef.current.add(server.key);
+    let id: string | undefined;
     try {
-      const id = await window.api.tab.create({
+      id = await window.api.tab.create({
         cwd: useTabsStore.getState().cwd || ".",
         remote: {
           host: server.host,
@@ -421,23 +429,42 @@ export default function App() {
           startPi: false,
         },
       });
-      const state = await window.api.tab.waitConnState(id, 10000, 250);
-      if (state === "failed") {
-        useUiStore.getState().showToast(`连接失败: ${server.user}@${server.host}（请检查地址/密码/免密配置）`, "err");
-        return null;
-      }
-      if (state === "ready") useUiStore.getState().showToast(`已连接到 ${server.user}@${server.host}`, "ok");
-      else useUiStore.getState().showToast(`已发起连接；如服务器要求密码，请在终端标签页输入`, "ok");
-      // tab:create already persisted the history entry on the main side;
-      // refresh the renderer copy so the node survives restarts with password.
-      window.api.remote.listHistory().then((list) => useSessionsStore.getState().setRemoteHistory(list as RemoteHistoryItem[])).catch(() => {});
-      return id;
     } catch (e) {
+      // Only the spawn itself is a connection failure; everything below must
+      // not be reported as one (the shell may well be fine).
       useUiStore.getState().showToast(`连接 ${server.user}@${server.host} 失败: ${e instanceof Error ? e.message : String(e)}`, "err");
-      return null;
+      return;
     } finally {
       serverConnectingRef.current.delete(server.key);
     }
+    if (!id) return;
+    // Register the tab in the renderer BEFORE waiting for anything: the
+    // terminal must be on screen while the SSH handshake runs, and the
+    // optimistic record is what a second click reuses. main's tabs:update
+    // then confirms it (title + resolved browse path).
+    const browsePath = server.path || "~";
+    useTabsStore.getState().showTabImmediately(
+      {
+        id, kind: "connection", cwd: browsePath, title: `${server.user}@${server.host} · 连接`,
+        isRemote: true, remoteKey: server.key, remoteHost: server.host, remoteUser: server.user,
+        remotePort: server.port, remoteAgentDir: server.agentDir, pi: false, mode: "pty",
+      },
+      { cwd: browsePath, isRemote: true, remoteDir: browsePath, remoteLabel: `${server.user}@${server.host}` },
+    );
+    // main does not steal activation for startPi:false tabs, so move it here.
+    await window.api.tab.activate(id).catch(() => {});
+    // Honest readout afterwards: ready (marker seen) / failed (ssh exited) /
+    // timeout → the tab is up but silent, most likely at a password prompt.
+    const state = await window.api.tab.waitConnState(id, 10000, 250);
+    if (state === "failed") {
+      useUiStore.getState().showToast(`连接失败: ${server.user}@${server.host}（请检查地址/密码/免密配置）`, "err");
+      return;
+    }
+    if (state === "ready") useUiStore.getState().showToast(`已连接到 ${server.user}@${server.host}`, "ok");
+    else useUiStore.getState().showToast(`已发起连接；如服务器要求密码，请在终端标签页输入`, "ok");
+    // tab:create already persisted the history entry on the main side;
+    // refresh the renderer copy so the node survives restarts with password.
+    window.api.remote.listHistory().then((list) => useSessionsStore.getState().setRemoteHistory(list as RemoteHistoryItem[])).catch(() => {});
   }, []);
 
   /** Probe a server and make it the connection — NO tab is created, so the
@@ -467,16 +494,6 @@ export default function App() {
   const handleConnectServer = useCallback(async (server: RemoteServerGroup): Promise<boolean> => {
     return connectRemoteProfile(serverProfile(server));
   }, [connectRemoteProfile]);
-
-  /** Explicitly focus a server's raw shell terminal. This is the ONE path
-   * that still creates a connection tab — the user asked for a terminal, and
-   * a terminal tab is exactly where a password prompt can be answered. */
-  const handleOpenServerTerminal = useCallback(async (server: RemoteServerGroup): Promise<void> => {
-    const tabId = await ensureRemoteConnection(server);
-    if (!tabId) return;
-    const ok = await window.api.tab.activate(tabId);
-    if (ok) useTabsStore.getState().setActiveTab(tabId);
-  }, [ensureRemoteConnection]);
 
   /** Server node +: browse THAT server's directories (never the first tab).
    *  Needs a working connection, but a probe — not a tab — decides that. */
