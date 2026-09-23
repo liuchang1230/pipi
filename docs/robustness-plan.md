@@ -1,6 +1,7 @@
 # 稳定性与可诊断性 —— 整体分析与设计规划
 
 状态：规划设计 v2（已过独立评审并修订；v1 的两处根因判断被推翻，见 §7 修订记录）
+实施进度：**Phase 0 已完成**（`ee926a3` + `78196fe`），其余阶段待开工
 日期：2026-09-23
 触发：用户反馈"软件不稳定、鲁棒性不高、容易卡顿、提示不充分、出问题了用户也不知道咋了"
 
@@ -219,19 +220,25 @@ Windows 细节：① `.bak`/`.corrupt-*` **不得复制明文密码**（凭据�
 每阶段独立可发版、可验收。**顺序理由**：A/B/E 直接冲突产品卖点（"在远程服务器上跑 AI 编程"，
 远程链路一卡就是卖点本身）；D 低频高损，必须做但可排后。
 
-### Phase 0 — 止血（1 天，最小改动）
+### Phase 0 — 止血（1 天，最小改动）—— **已完成**
 
-| # | 改动 | 对应 |
-|---|---|---|
-| 0.1 | 提交在飞工作：`ErrorBoundary.tsx` + 不受信解析（`diff-utils.ts`/`tool-summary.ts`/`ChangesView.tsx`/`TreeDialog.tsx`/`styles.css`） | C1 |
-| 0.2 | `toggleProject` 的两个 `file.list` await **加 renderer 侧 deadline**（`Promise.race` → error 态 + 清 `remoteHydration`）。注：`try/finally` **不够**（挂起不 settle），必须带超时 | B2 |
-| 0.3 | `runPiVersion`/`hasNodeInstalled`/`findViaWhere` 的 `spawnSync` 加 timeout（≥8-10s，避免杀软冷扫描误判 → `cachedPiOk=false`；5s TTL 自愈）。保留"优先 node+cli.js"路径（超时只杀直接子进程，不留 cmd.exe 孙进程） | A1 |
-| 0.4 | `render-process-gone` 处理（主进程：落盘 + 提示 + 自动 reload） | C4 |
-| 0.5 | 主进程 `uncaughtException`/`unhandledRejection` 落 `pipi-debug.log` | C3 |
-| 0.6 | `abort`/`/compact` 的 `rpcSend` 失败要可见（不是 `rpc_stalled`——那条已被 30s/40s 覆盖） | E4 |
+| # | 改动 | 对应 | 状态 |
+|---|---|---|---|
+| 0.1 | 提交在飞工作：`ErrorBoundary.tsx` + 不受信解析（`diff-utils.ts`/`tool-summary.ts`/`ChangesView.tsx`/`TreeDialog.tsx`/`styles.css`） | C1 | ✅ |
+| 0.2 | `toggleProject` 的两个 SFTP 读（root 列举 + 会话列表）加 renderer 侧 deadline（`lib/with-deadline.ts`，30s → error 态 + 清 `remoteHydration`）。注：`try/finally` **不够**（挂起不 settle），必须带超时 | B2 | ✅ |
+| 0.3 | `runPiVersion`/`hasNodeInstalled`/`findViaWhere` 的 `spawnSync` 加 10s 超时；预热探测补 kill timer | A1 | ✅ |
+| 0.4 | `render-process-gone` / `unresponsive` / `responsive` 处理（落盘 + 单次自动 reload，跳过 clean-exit 与退出中） | C4 | ✅ |
+| 0.5 | 主进程 `uncaughtException`/`unhandledRejection` 落 `pipi-debug.log` | C3 | ✅ |
+| 0.6 | `abort`/`/compact` 的 `rpcSend` 失败要可见 | E4 | ✅ |
+| 0.7 | **自查新增**：探测超时**非破坏化**——超时（ETIMEDOUT）判为"存在但未验证"，否则 `ensurePiReady` 会用捆绑副本覆盖用户的全局 pi（静默降级用 `pi update` 维护的新版） | A1 副作用 | ✅ |
+| 0.8 | **自查新增**：崩溃 reload 尊重退出（`appQuitting` + `clean-exit` 跳过），退出时的 renderer 销毁不当作崩溃 | C4 | ✅ |
 
 **验收（诚实版）**：① 服务器 normal shutdown（发 RST）→ 每个入口 ≤ 该操作 deadline + 2s 出错误态；
-② 杀软/断网造成的**挂起**路径在 Phase 0 只覆盖 0.2 的两个 await，其余入口的"≤45s 出错误态"归到 Phase 2 验收。
+② 挂起路径 Phase 0 只覆盖 0.2 的两个 SFTP 读，其余入口的"≤45s 出错误态"归到 Phase 2 验收。
+
+**证据**：`npm test` 578 passed（新增 with-deadline 5 例、挂起→终态回归 1 例、abort 失败可见 1 例、
+探测超时语义 4 例）；`npm run typecheck` + `npm run build` 通过。挂起回归例已按本项目惯例验证过
+"改前必失败"（回退 `sessionsStore.ts` 后 5028ms 超时失败）。
 
 ### Phase 1 — 不卡（1–2 天）
 
