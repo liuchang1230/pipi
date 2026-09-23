@@ -63,6 +63,8 @@ let mainWindow: BrowserWindow | null = null;
  *  Guards against a crash-loop: one reload per app run, then leave the
  *  window alone so the user sees the (logged) failure instead of a flicker. */
 let crashReloadedAt = 0;
+/** Set once teardown starts, so the crash-recovery path never fights the quit. */
+let appQuitting = false;
 
 type WorkbenchCommand =
   | "project:open"
@@ -850,6 +852,8 @@ function createWindow() {
   // a working window again; a second death inside the window is left alone so
   // we cannot loop.
   mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    // Teardown also tears the renderer down; that is not a crash.
+    if (appQuitting || details.reason === "clean-exit") return;
     debugLog("renderer", `render-process-gone reason=${details.reason} exitCode=${details.exitCode}`);
     if (crashReloadedAt > 0) return;
     crashReloadedAt = Date.now();
@@ -3606,6 +3610,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
 } // gotSingleInstanceLock
 
 app.on("window-all-closed", async () => {
+  appQuitting = true;
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopSessionsPoll();
   closeAllTabs();
@@ -3617,6 +3622,7 @@ app.on("window-all-closed", async () => {
 });
 
 app.on("before-quit", async () => {
+  appQuitting = true;
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopSessionsPoll();
   closeAllTabs();

@@ -411,13 +411,30 @@ export function hasGlobalPiInstalled(): boolean {
   if (cachedPiOk === false && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
     return false;
   }
+  // A TIMEOUT is inconclusive, and must never be reported as "missing":
+  // ensurePiReady() answers a missing pi by copying the BUNDLED pi over the
+  // user's global install, which would silently downgrade a pi they keep up to
+  // date with `pi update`. Report "present, unverified" for the re-check window
+  // so a wedged probe costs at most one bounded freeze per window, and let the
+  // tab's own watchdogs deal with a pi that really is stuck.
+  if (cachedPiTimedOut && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
+    return true;
+  }
   cachedPiCheckAt = Date.now();
-  cachedPiOk = getPiDetectionDiagnostics().ok;
+  const probe = getPiDetectionDiagnostics();
+  cachedPiTimedOut = probe.timedOut;
+  if (probe.timedOut) {
+    cachedPiOk = null;
+    debugLog("probe", `pi --version timed out after ${DETECT_SPAWN_TIMEOUT_MS}ms (${probe.piBin}) — assuming present, unverified`);
+    return true;
+  }
+  cachedPiOk = probe.ok;
   return cachedPiOk;
 }
 
 export function getPiDetectionDiagnostics(): {
   ok: boolean;
+  timedOut: boolean;
   piBin: string;
   piEnv: string | undefined;
   status: number | null;
@@ -429,6 +446,7 @@ export function getPiDetectionDiagnostics(): {
   const result = runPiVersion(piBin);
   return {
     ok: !result.error && result.status === 0,
+    timedOut: isSpawnTimeout(result),
     piBin,
     piEnv: process.env.PI_CODING_AGENT,
     status: result.status,
@@ -753,6 +771,10 @@ export function startGlobalPiInstall(onOutput?: (line: string) => void): GlobalP
 let cachedPiBin: string | undefined;
 let cachedNodeOk: boolean | null = null;
 let cachedPiOk: boolean | null = null;
+/** True when the last authoritative probe did not finish inside
+ *  DETECT_SPAWN_TIMEOUT_MS. A timeout is INCONCLUSIVE, not "pi is missing" —
+ *  see hasGlobalPiInstalled. */
+let cachedPiTimedOut = false;
 /** When the last authoritative (sync) pi probe ran; used to throttle the
  *  re-verification of a cached false (a transient failure must self-heal,
  *  but a genuinely missing pi shouldn't block the main thread every click). */
@@ -773,6 +795,7 @@ export function invalidatePiDetection(): void {
   cachedNodeOk = null;
   cachedPiOk = null;
   cachedPiCheckAt = null;
+  cachedPiTimedOut = false;
 }
 
 /** Compute the detection caches in the background (best-effort, no dialogs).
@@ -800,6 +823,11 @@ export function warmPiDetection(): void {
   child.once("error", () => {
     /* keep cachedPiOk = null → sync re-check on demand */
   });
+}
+
+/** spawnSync reports hitting its own `timeout` as an ETIMEDOUT error. */
+function isSpawnTimeout(result: { error?: unknown }): boolean {
+  return (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
 }
 
 /** Async version probe (the sync `pi --version` blocks ~1.1s on Windows). */
