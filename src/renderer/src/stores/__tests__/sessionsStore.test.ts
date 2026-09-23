@@ -288,6 +288,34 @@ describe("toggleProject (explorer orchestration)", () => {
     expect(tabs.remoteDir).toBe("/r");
   });
 
+  it("a wedged remote listing lands in a terminal error state (no eternal spinner)", async () => {
+    // The confirmed eternal-spinner path (docs/robustness-plan.md B2): main
+    // bounds only the SFTP *connect*, so an established connection that goes
+    // silent leaves client.list pending forever — and `finally` never runs for
+    // a promise that never settles. Only a caller-side deadline can end it.
+    vi.useFakeTimers();
+    try {
+      const api = makeApi();
+      api.file.list.mockImplementation(() => new Promise<never>(() => {}));
+      api.session.listRemote.mockImplementation(() => new Promise<never>(() => {}));
+      const wslProject = {
+        key: "wp", label: "WP", cwd: "/w/proj", type: "remote" as const,
+        host: "Ubuntu", user: "", port: 0, sessions: [],
+      };
+      const pending = useSessionsStore.getState().toggleProject(wslProject);
+      await vi.advanceTimersByTimeAsync(31_000);
+      await pending;
+
+      const s = useSessionsStore.getState();
+      expect(s.projectLoading.wp).toBe(false);
+      expect(s.remoteHydration.phase).toBe("idle");
+      expect(s.projectSessionStatus.wp).toBe("error");
+      expect(s.projectErrors.wp).toMatch(/未响应/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("deleteProject removes it from the catalog and collapses it", async () => {
     vi.stubGlobal("confirm", () => true);
     const api = makeApi();

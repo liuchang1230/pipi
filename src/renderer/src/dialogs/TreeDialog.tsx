@@ -38,6 +38,7 @@ import { useChatStore } from "../stores/chatStore";
 import { buildTreeFromEntries, type TreeEntry as FlatTreeEntry } from "../../../shared/tree-build";
 import { applyVisibility, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
 import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
+import { parseEditArgs } from "../components/DiffView";
 
 interface TreeEntry {
   id: string;
@@ -695,7 +696,12 @@ export function TreeDialog({
           if (b.kind !== "tool") continue;
           let args: { path?: string; filePath?: string; edits?: Array<{ oldText: string; newText: string }>; content?: string } = {};
           try {
-            args = JSON.parse(b.argsText || "{}");
+            const raw = JSON.parse(b.argsText || "{}") as typeof args;
+            // Normalize untrusted model args: a failed edit call keeps malformed
+            // entries in the session, and main's history walk must only see
+            // usable oldText/newText pairs.
+            const parsed = parseEditArgs(raw);
+            args = { ...raw, path: parsed.path, edits: parsed.edits };
           } catch {
             continue;
           }

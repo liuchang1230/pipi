@@ -24,7 +24,7 @@ import {
   type QQuestion,
 } from "../dialogs/QuestionnaireDialog";
 import { TreeDialog } from "../dialogs/TreeDialog";
-import { DiffView, editsToDiff, isDiffish } from "../components/DiffView";
+import { DiffView, editsToDiff, isDiffish, parseEditArgs } from "../components/DiffView";
 import {
   fmtDuration,
   summarizeTool,
@@ -154,9 +154,8 @@ function ToolBlock({ block }: { block: Extract<ChatBlock, { kind: "tool" }> }) {
   const editDiff = useMemo(() => {
     if (block.name !== "edit") return null;
     try {
-      const args = JSON.parse(block.argsText || "{}") as { path?: string; edits?: Array<{ oldText: string; newText: string }> };
-      if (!Array.isArray(args.edits) || !args.edits.length) return null;
-      return editsToDiff(args.path, args.edits);
+      const { path, edits } = parseEditArgs(JSON.parse(block.argsText || "{}"));
+      return edits.length ? editsToDiff(path, edits) : null;
     } catch {
       return null;
     }
@@ -1413,8 +1412,12 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         return true;
       }
       case "compact": {
-        void window.api.tab.rpcSend(tabId, { type: "compact" });
         setInput("");
+        // A dropped compact used to look identical to a successful one: the
+        // boolean rpcSend returns was ignored and the turn just never compacted.
+        void window.api.tab.rpcSend(tabId, { type: "compact" }).then((sent) => {
+          if (!sent) useUiStore.getState().showToast("压缩失败：会话已断开", "err");
+        });
         return true;
       }
       case "tree":

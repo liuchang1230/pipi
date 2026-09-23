@@ -12,6 +12,7 @@ import { apply, type Updater } from "./utils";
 import { buildRemoteKey, remoteSessionCacheKey } from "./remote-servers";
 import { projectProfile, projectTarget, type TargetRef } from "./remote-target";
 import { useRemoteStore } from "./remoteStore";
+import { withDeadline } from "../lib/with-deadline";
 import type {
   AutoFollowSettings,
   FileNode,
@@ -27,6 +28,14 @@ import type {
 
 // Moved to remote-servers.ts (pure module); re-exported for existing call sites.
 export { buildRemoteKey, remoteSessionCacheKey };
+
+/**
+ * Bound for the two SFTP reads a remote project row depends on (root listing,
+ * session list). 30s is ~2x the worst measured round trip for a hydrated
+ * remote session listing and sits between the two deadline stages Phase 2
+ * introduces (visible stall at ~10s, terminal error at ~30s).
+ */
+const REMOTE_ROOT_LIST_DEADLINE_MS = 30_000;
 
 // --- Shared helpers (were module-level in App.tsx) -------------------------
 
@@ -499,6 +508,44 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     const cachedTree = st.projectTrees[project.key] ?? useTreeStore.getState().remoteTreeCache[remoteCacheKey];
     if (cachedTree) useTreeStore.getState().setTree(sortFileNodes(cachedTree));
 
+    /**
+     * List the remote root and adopt it, with a caller-side deadline.
+     *
+     * Every "plain" IPC channel can hang forever: main bounds only the SFTP
+     * *connect* (15s readyTimeout), so an established connection that goes
+     * silent (NAT drop, roaming laptop, wedged server) leaves `client.list`
+     * pending — and `try/finally` cannot rescue a promise that never settles.
+     * Without this the row showed "远程会话加载中…" plus the "正在补全远程会话信息…"
+     * toast forever: the one confirmed eternal-spinner path (docs/robustness-plan.md B2).
+     */
+    const adoptRemoteRootListing = async ({ clearHydration }: { clearHydration: boolean }): Promise<void> => {
+      try {
+        const nodes = (await withDeadline(
+          window.api.file.list(target, project.cwd),
+          REMOTE_ROOT_LIST_DEADLINE_MS,
+          `列举远程目录 ${project.cwd}`,
+        )) as FileNode[];
+        const sortedNodes = sortFileNodes(nodes);
+        useTreeStore.getState().setTree(sortedNodes);
+        set((s) => ({ projectTrees: { ...s.projectTrees, [project.key]: sortedNodes } }));
+        useTreeStore.setState((s) => ({ remoteTreeCache: { ...s.remoteTreeCache, [remoteCacheKey]: sortedNodes } }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        set((s) => ({
+          projectErrors: { ...s.projectErrors, [project.key]: message },
+          projectSessionStatus: { ...s.projectSessionStatus, [project.key]: "error" },
+        }));
+        // The tree placeholder is the only place a failed listing used to
+        // show, and it is invisible once sessions exist — so say it out loud.
+        useUiStore.getState().showToast(`远程文件加载失败：${message}`, "err");
+      } finally {
+        // Whatever happened (ok / throw / deadline) the flags this path owns
+        // land in a terminal state. Leaving them set is exactly how "一直加载中" happens.
+        set((s) => ({ projectLoading: { ...s.projectLoading, [project.key]: false } }));
+        if (clearHydration) set({ remoteHydration: { phase: "idle" } });
+      }
+    };
+
     if (willExpand) {
       const cachedSessions = st.projectSessions[project.key] ?? st.remoteSessions[remoteCacheKey] ?? [];
       const hasCachedTree = !!cachedTree?.length;
@@ -525,7 +572,14 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
       set({ remoteHydration: { phase: hasCachedSessions ? "hydrating" : "loading", tabId, remoteKey: tabId ? undefined : cacheId, remoteCwd: project.cwd } });
 
       if (!hasCachedSessions) {
-        void window.api.session.listRemote(target, project.cwd).then((listResult) => {
+        // Bounded like the root listing: this SFTP read runs on the same
+        // possibly-wedged lease and it OWNS projectSessionStatus +
+        // remoteHydration — hanging here is the row's eternal "加载中…".
+        void withDeadline(
+          window.api.session.listRemote(target, project.cwd),
+          REMOTE_ROOT_LIST_DEADLINE_MS,
+          `读取远程会话列表 ${project.cwd}`,
+        ).then((listResult) => {
           set((s) => ({
             projectSessions: { ...s.projectSessions, [project.key]: listResult.sessions as SessionItem[] },
             projectErrors: { ...s.projectErrors, [project.key]: listResult.error },
@@ -546,25 +600,11 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         set((s) => ({ projectLoading: { ...s.projectLoading, [project.key]: false } }));
       }
 
-      if (!hasCachedTree) {
-        const nodes = await window.api.file.list(target, project.cwd);
-        const sortedNodes = sortFileNodes(nodes as FileNode[]);
-        useTreeStore.getState().setTree(sortedNodes);
-        set((s) => ({ projectTrees: { ...s.projectTrees, [project.key]: sortedNodes } }));
-        useTreeStore.setState((s) => ({ remoteTreeCache: { ...s.remoteTreeCache, [remoteCacheKey]: sortedNodes } }));
-      }
+      if (!hasCachedTree) await adoptRemoteRootListing({ clearHydration: false });
       return;
     }
 
-    const nodes = await window.api.file.list(target, project.cwd);
-    const sortedNodes = sortFileNodes(nodes as FileNode[]);
-    useTreeStore.getState().setTree(sortedNodes);
-    set((s) => ({
-      projectTrees: { ...s.projectTrees, [project.key]: sortedNodes },
-      projectLoading: { ...s.projectLoading, [project.key]: false },
-    }));
-    useTreeStore.setState((s) => ({ remoteTreeCache: { ...s.remoteTreeCache, [remoteCacheKey]: sortedNodes } }));
-    set({ remoteHydration: { phase: "idle" } });
+    await adoptRemoteRootListing({ clearHydration: true });
   },
 
   deleteProject: async (project) => {

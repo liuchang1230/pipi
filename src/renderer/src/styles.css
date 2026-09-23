@@ -3459,3 +3459,67 @@ textarea:focus-visible,
   gap: 8px;
   flex-shrink: 0;
 }
+
+/* --- render crash fallback (ErrorBoundary) — replaces the old white screen --- */
+.crash-screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text);
+  z-index: 9999;
+}
+.crash-panel {
+  max-width: 620px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  padding: 20px 22px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.crash-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.crash-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+.crash-detail {
+  margin: 12px 0 0;
+  padding: 10px;
+  max-height: 160px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.12);
+  color: var(--text-dim);
+}
+.crash-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+.crash-btn {
+  padding: 6px 14px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+.crash-btn-ghost {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+}

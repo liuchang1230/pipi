@@ -957,11 +957,29 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         },
       },
     }));
-    // Escape in pi's TUI first aborts the active agent turn; if no turn is
-    // running it aborts the active bash command. The RPC path has separate
-    // commands, so mirror the effective cancellation rather than sending a
+    // `rpcSend` RESOLVES false when the tab/session is gone — it never rejects,
+    // so the old `.catch(() => {})` was dead code and a failed abort left the UI
+    // stuck on "正在停止…" with no explanation (docs/robustness-plan.md E4).
+    // Both commands still go out together (Escape aborts the active turn, and
+    // the active bash command when no turn is running); the RPC path has
+    // separate commands, so mirror the cancellation rather than sending a
     // terminal Escape byte to a headless process.
-    void window.api.tab.rpcSend(tabId, { type: "abort" }).catch(() => {});
-    void window.api.tab.rpcSend(tabId, { type: "abort_bash" }).catch(() => {});
+    void (async () => {
+      const [agentSent, bashSent] = await Promise.all([
+        window.api.tab.rpcSend(tabId, { type: "abort" }),
+        window.api.tab.rpcSend(tabId, { type: "abort_bash" }),
+      ]);
+      if (agentSent || bashSent) return;
+      set((s) => ({
+        states: {
+          ...s.states,
+          [tabId]: {
+            ...s.states[tabId]!,
+            turn: { phase: "failed", lastActivityAt: Date.now(), detail: "停止失败：会话已断开" },
+            lastError: "未能发送停止指令：会话已断开，请重新连接后再试。",
+          },
+        },
+      }));
+    })();
   },
 }));

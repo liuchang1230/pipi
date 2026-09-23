@@ -1,5 +1,6 @@
 import { createRoot } from "react-dom/client";
 import { ensureThemeVars } from "./theme-vars";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import App from "./App";
 import "./styles.css";
 
@@ -23,4 +24,9 @@ window.addEventListener("unhandledrejection", (e) => {
 // Inject the token-derived CSS variables before first paint.
 ensureThemeVars();
 
-createRoot(document.getElementById("root")!).render(<App />);
+// A render error anywhere below must never leave a blank window.
+createRoot(document.getElementById("root")!).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>,
+);

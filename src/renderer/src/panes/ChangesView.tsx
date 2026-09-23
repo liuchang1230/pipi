@@ -6,7 +6,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useChatStore } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
-import { DiffView, editsToDiff, isDiffish } from "../components/DiffView";
+import { DiffView, editsToDiff, isDiffish, parseEditArgs } from "../components/DiffView";
 
 export interface DiffFileEntry {
   status: string;
@@ -42,27 +42,18 @@ function aggregateToolDiffs(tabId: string, cwd: string): { files: DiffFileEntry[
     for (const b of msg.blocks) {
       if (b.kind !== "tool") continue;
       const rawResult = b.resultText ?? "";
-      const argsPath = (() => {
+      const rawArgs = (() => {
         try {
-          const args = JSON.parse(b.argsText || "{}") as { path?: string; filePath?: string };
-          return typeof args.path === "string" ? args.path : typeof args.filePath === "string" ? args.filePath : undefined;
+          return parseEditArgs(JSON.parse(b.argsText || "{}"));
         } catch {
-          return undefined;
+          return { path: undefined, edits: [] };
         }
       })();
+      const argsPath = rawArgs.path;
       const p = normalizePath(diffPath(rawResult) ?? argsPath ?? "", cwd);
       if (!p) continue;
       const arr = byPath.get(p) ?? [];
-      const diffText = isDiffish(rawResult)
-        ? rawResult
-        : (() => {
-            try {
-              const args = JSON.parse(b.argsText || "{}") as { path?: string; filePath?: string; edits?: Array<{ oldText: string; newText: string }> };
-              return editsToDiff(args.path ?? args.filePath ?? argsPath, Array.isArray(args.edits) ? args.edits : []);
-            } catch {
-              return "";
-            }
-          })();
+      const diffText = isDiffish(rawResult) ? rawResult : editsToDiff(argsPath, rawArgs.edits);
       if (diffText) arr.push(diffText);
       byPath.set(p, arr);
     }
@@ -177,13 +168,10 @@ export function ChangesView({ tabId, focusPath, onFocusPathHandled }: ChangesVie
       for (const b of msg.blocks) {
         if (b.kind !== "tool" || b.name !== "edit") continue;
         try {
-          const args = JSON.parse(b.argsText || "{}") as {
-            path?: string;
-            filePath?: string;
-            edits?: Array<{ oldText: string; newText: string }>;
-          };
-          if (normalizePath(args.path ?? args.filePath ?? "", cwdRef.current) !== path) continue;
-          const edits = Array.isArray(args.edits) ? args.edits : [];
+          const raw = JSON.parse(b.argsText || "{}") as { path?: string; filePath?: string };
+          const { path: editPath, edits } = parseEditArgs(raw);
+          const filePath = editPath ?? raw.path ?? raw.filePath;
+          if (typeof filePath !== "string" || normalizePath(filePath, cwdRef.current) !== path) continue;
           if (edits.length) events.push({ type: "edit", edits });
         } catch {
           /* partial args */

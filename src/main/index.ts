@@ -59,6 +59,10 @@ interface RemoteModelListResponse {
 import { listRemoteHistory, saveRemoteHistory, deleteRemoteHistory } from "./remote-history";
 
 let mainWindow: BrowserWindow | null = null;
+/** Timestamp of the last automatic reload after a renderer crash (0 = never).
+ *  Guards against a crash-loop: one reload per app run, then leave the
+ *  window alone so the user sees the (logged) failure instead of a flicker. */
+let crashReloadedAt = 0;
 
 type WorkbenchCommand =
   | "project:open"
@@ -840,6 +844,27 @@ function createWindow() {
   // If the renderer never paints (dev server down / broken build), show the
   // window anyway so the failure is visible instead of an invisible app.
   mainWindow.webContents.once("did-fail-load", () => mainWindow?.show());
+  // A renderer process that dies (OOM, GPU/driver fault, V8 crash) otherwise
+  // leaves a blank window with no message, no log line and no way back — the
+  // "窗口白了" report. Record what happened, then reload once so the user has
+  // a working window again; a second death inside the window is left alone so
+  // we cannot loop.
+  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    debugLog("renderer", `render-process-gone reason=${details.reason} exitCode=${details.exitCode}`);
+    if (crashReloadedAt > 0) return;
+    crashReloadedAt = Date.now();
+    try {
+      mainWindow?.webContents.reload();
+    } catch {
+      /* window may already be destroyed — nothing left to do */
+    }
+  });
+  mainWindow.webContents.on("unresponsive", () => {
+    debugLog("renderer", "webContents unresponsive (UI froze > 5s)");
+  });
+  mainWindow.webContents.on("responsive", () => {
+    debugLog("renderer", "webContents responsive again");
+  });
   // Prevent renderer throttling when window is idle.
   // Without this, xterm.js timers drop to ~1 Hz after inactivity, freezing scroll.
   mainWindow.webContents.setBackgroundThrottling(false);
@@ -3602,11 +3627,17 @@ app.on("before-quit", async () => {
 });
 
 process.on("unhandledRejection", (err) => {
+  const detail = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
   console.error("[main] unhandledRejection:", err);
+  // A packaged app has no visible console, so an unhandled rejection used to
+  // leave ZERO trace anywhere. Put it where the user can hand it to us.
+  debugLog("main-REJECTION", detail.split("\n").slice(0, 6).join(" | "));
 });
 // A synchronous throw inside a setInterval/fs.watch/timer callback (e.g. the
 // remote title poll) would otherwise CRASH the whole main process — the
 // terminal app dies with no recovery. Log and keep going.
 process.on("uncaughtException", (err) => {
+  const detail = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
   console.error("[main] uncaughtException:", err);
+  debugLog("main-EXCEPTION", detail.split("\n").slice(0, 8).join(" | "));
 });

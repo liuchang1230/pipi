@@ -155,6 +155,22 @@ describe("chatStore streaming assembly", () => {
     expect(rpcSend).toHaveBeenNthCalledWith(2, T, { type: "abort_bash" });
   });
 
+  it("surfaces a dropped abort instead of leaving the turn on '正在停止…'", async () => {
+    // `rpcSend` resolves false (never rejects) when the tab is gone, so the old
+    // `.catch(() => {})` could never fire: the UI sat on "正在停止…" forever.
+    const rpcSend = vi.fn().mockResolvedValue(false);
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: { tab: { rpcSend } },
+    };
+
+    useChatStore.getState().abort(T);
+    await vi.waitFor(() => expect(useChatStore.getState().states[T]!.lastError).toBeTruthy());
+
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.phase).toBe("failed");
+    expect(st.lastError).toContain("停止指令");
+  });
+
   it("surfaces model stream errors from message_end", () => {
     apply([
       { type: "agent_start" },

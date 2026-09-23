@@ -7,7 +7,7 @@
  *
  * Pure functions — no React, no store access — so they are unit-testable.
  */
-import { editsToDiff, isDiffish } from "./diff-utils";
+import { editsToDiff, isDiffish, parseEditArgs } from "./diff-utils";
 
 export interface ToolSummary {
   /** Main object of the call: command, file path, task text… */
@@ -130,14 +130,12 @@ export function summarizeTool(
   }
 
   if (name === "edit") {
-    const path = str(args.path);
+    // Model args can be malformed (failed validation calls are persisted in the
+    // session file), so normalize instead of trusting the shape.
+    const { path, edits } = parseEditArgs(args);
     const pp = prettyPath(path);
     let stat: ToolSummary["stat"] | undefined;
-    const edits = args.edits;
-    if (Array.isArray(edits) && edits.length) {
-      stat =
-        diffStat(editsToDiff(path, edits as Array<{ oldText: string; newText: string }>)) ?? undefined;
-    }
+    if (edits.length) stat = diffStat(editsToDiff(path, edits)) ?? undefined;
     if (!stat && hasResult) stat = diffStat(resultText) ?? undefined;
     return { object: pp?.base, objectDir: pp?.dir, stat, alert: !!isError };
   }

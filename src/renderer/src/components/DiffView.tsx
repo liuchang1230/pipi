@@ -4,9 +4,9 @@
  * between adjacent −/+ line pairs. Used by tool cards and the changes panel.
  */
 import { useMemo } from "react";
-import { isDiffish, editsToDiff } from "./diff-utils";
+import { isDiffish, editsToDiff, parseEditArgs } from "./diff-utils";
 
-export { isDiffish, editsToDiff };
+export { isDiffish, editsToDiff, parseEditArgs };
 
 const MAX_RENDERED_DIFF_LINES = 1_500;
 

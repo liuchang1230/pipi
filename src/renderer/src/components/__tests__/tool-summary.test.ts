@@ -140,6 +140,23 @@ describe("summarizeTool", () => {
     expect(summarizeTool("edit", '{"path":"a.ts","edits":[{"oldText":"x"', "", false)?.stat).toBeUndefined();
   });
 
+  // Regression: a failed edit call keeps its raw model args in the session file
+  // (pi: `edits.0.oldText: must have required properties oldText`). The card
+  // used to throw here, and an uncaught render throw blanked the whole window.
+  it("edit args that failed pi validation do not throw", () => {
+    const bad = JSON.stringify({ edits: [{ newText: "五个场景的算法统一采用" }] });
+    expect(() => summarizeTool("edit", bad, "Validation failed for tool \"edit\"", true)).not.toThrow();
+    const s = summarizeTool("edit", bad, "Validation failed for tool \"edit\"", true);
+    expect(s?.stat).toBeUndefined();
+    expect(s?.alert).toBe(true);
+  });
+
+  it("edit: legacy single-edit shorthand {path, oldText, newText} still gets a diffstat", () => {
+    const s = summarizeTool("edit", JSON.stringify({ path: "src/b.ts", oldText: "a", newText: "b" }), "", false);
+    expect(s?.object).toBe("b.ts");
+    expect(s?.stat).toEqual({ adds: 1, dels: 1 });
+  });
+
   it("write_file alias with file_path arg", () => {
     const s = summarizeTool("write_file", JSON.stringify({ file_path: "out.txt", content: "a\nb\n" }), "", false);
     expect(s?.object).toBe("out.txt");

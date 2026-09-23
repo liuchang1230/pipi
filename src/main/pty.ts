@@ -395,7 +395,7 @@ export function hasNodeInstalled(): boolean {
     "C:\\Program Files (x86)\\nodejs\\node.exe",
     join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\node.exe"),
   ]);
-  const result = spawnSync(nodeBin, ["--version"], { stdio: "pipe", windowsHide: true });
+  const result = spawnSync(nodeBin, ["--version"], { stdio: "pipe", windowsHide: true, timeout: DETECT_SPAWN_TIMEOUT_MS });
   cachedNodeOk = !result.error && result.status === 0;
   return cachedNodeOk;
 }
@@ -758,6 +758,13 @@ let cachedPiOk: boolean | null = null;
  *  but a genuinely missing pi shouldn't block the main thread every click). */
 let cachedPiCheckAt: number | null = null;
 const PI_RECHECK_TTL_MS = 5000;
+/** Hard cap for every detection spawn (where.exe / node --version / pi --version).
+ *  These run on the tab:create click path, so an unbounded child means an
+ *  unbounded main-process freeze: the whole app (every IPC, every terminal
+ *  stream) stops until the child exits. A timed-out probe reports "not
+ *  detected"; the 5s re-check TTL above lets a transient timeout self-heal
+ *  instead of poisoning the cache for the rest of the session. */
+const DETECT_SPAWN_TIMEOUT_MS = 10_000;
 
 /** Reset the detection caches (after auto-installing pi, so the freshly
  *  installed binary is picked up instead of the stale failure). */
@@ -797,11 +804,17 @@ export function warmPiDetection(): void {
 
 /** Async version probe (the sync `pi --version` blocks ~1.1s on Windows). */
 function spawnVersionProbe(piBin: string): ChildProcess {
-  if (/\.cmd$/i.test(piBin)) {
-    const escaped = piBin.replace(/\//g, "\\");
-    return spawn("cmd.exe", ["/d", "/c", escaped, "--version"], { stdio: "ignore", windowsHide: true });
-  }
-  return spawn(piBin, ["--version"], { stdio: "ignore", windowsHide: true });
+  const child = /\.cmd$/i.test(piBin)
+    ? spawn("cmd.exe", ["/d", "/c", piBin.replace(/\//g, "\\"), "--version"], { stdio: "ignore", windowsHide: true })
+    : spawn(piBin, ["--version"], { stdio: "ignore", windowsHide: true });
+  // The warm probe used to have no kill timer: a hung `pi --version` leaked a
+  // child process and left cachedPiOk null forever, so every later click paid
+  // the authoritative SYNC probe (the 1.1s main-thread freeze this cache
+  // exists to avoid).
+  const killTimer = setTimeout(() => child.kill(), DETECT_SPAWN_TIMEOUT_MS);
+  child.once("exit", () => clearTimeout(killTimer));
+  child.once("error", () => clearTimeout(killTimer));
+  return child;
 }
 
 function findPiBin(): string {
@@ -908,7 +921,7 @@ function findExe(name: string, commonFallbacks: string[]): string {
 }
 
 function findViaWhere(command: string): string | null {
-  const result = spawnSync("where.exe", [command], { encoding: "utf8", stdio: "pipe", windowsHide: true });
+  const result = spawnSync("where.exe", [command], { encoding: "utf8", stdio: "pipe", windowsHide: true, timeout: DETECT_SPAWN_TIMEOUT_MS });
   if (result.error || result.status !== 0) return null;
 
   const candidates = (result.stdout ?? "")
@@ -961,6 +974,7 @@ function runPiVersion(piBin: string) {
       encoding: "utf8",
       stdio: "pipe",
       windowsHide: true,
+      timeout: DETECT_SPAWN_TIMEOUT_MS,
     });
   }
   // Fallback: run the shim/binary directly as before.
@@ -970,12 +984,14 @@ function runPiVersion(piBin: string) {
       encoding: "utf8",
       stdio: "pipe",
       windowsHide: true,
+      timeout: DETECT_SPAWN_TIMEOUT_MS,
     });
   }
   return spawnSync(piBin, ["--version"], {
     encoding: "utf8",
     stdio: "pipe",
     windowsHide: true,
+    timeout: DETECT_SPAWN_TIMEOUT_MS,
   });
 }
 
