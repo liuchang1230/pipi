@@ -3,9 +3,11 @@
 // The delegated-agent extensions (analyst/reviewer/scout) resolve their model
 // from PI_PROVIDER/PI_MODEL in their own process env when the agent .md has no
 // `model:`. The app never set those, so subagents silently ran on pi's default
-// (usually the main) model. These tests pin the injection format: env vars for
+// (usually the session's model, but NOT necessarily: pi cannot rewrite its own
+// env, so the shipped pipi-subagent-model extension now keeps PI_MODEL equal to
+// the LIVE session model). These tests pin the injection format: env vars for
 // directly spawned pi, a quoted shell prefix for WSL/SSH (Windows env does not
-// travel over ssh/WSL), and the "follow main" = no injection rule.
+// travel over ssh/WSL), and the pin marker that makes an explicit choice win.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,7 +19,7 @@ vi.mock("electron", () => ({
   },
 }));
 
-const { subagentEnvFor, subagentShellPrefixFor, subagentEnv, getSubagentModel } = await import("../subagent-model");
+const { SUBAGENT_PINNED_ENV, subagentEnvFor, subagentShellPrefixFor, subagentEnv, getSubagentModel } = await import("../subagent-model");
 const { updateSettings } = await import("../settings");
 
 describe("subagentEnvFor", () => {
@@ -25,11 +27,12 @@ describe("subagentEnvFor", () => {
     expect(subagentEnvFor({ provider: "siliconflow", model: "deepseek-ai/DeepSeek-V3" })).toEqual({
       PI_PROVIDER: "siliconflow",
       PI_MODEL: "deepseek-ai/DeepSeek-V3",
+      [SUBAGENT_PINNED_ENV]: "1",
     });
   });
 
   it("emits only PI_MODEL when the provider is unknown", () => {
-    expect(subagentEnvFor({ model: "glm-4.6" })).toEqual({ PI_MODEL: "glm-4.6" });
+    expect(subagentEnvFor({ model: "glm-4.6" })).toEqual({ PI_MODEL: "glm-4.6", [SUBAGENT_PINNED_ENV]: "1" });
   });
 
   it("emits nothing for null (follow the main model)", () => {
@@ -46,11 +49,13 @@ describe("subagentShellPrefixFor", () => {
     // The remote command is embedded inside an outer single-quoted string;
     // one `'` would terminate it and corrupt the whole command.
     expect(prefix).not.toContain("'");
-    expect(prefix).toBe(`export PI_PROVIDER=${decodeOf("sf")}; export PI_MODEL=${decodeOf("deepseek-ai/DeepSeek-V3")}; `);
+    expect(prefix).toBe(
+      `export PI_PROVIDER=${decodeOf("sf")}; export PI_MODEL=${decodeOf("deepseek-ai/DeepSeek-V3")}; export ${SUBAGENT_PINNED_ENV}=1; `,
+    );
   });
 
   it("omits PI_PROVIDER when not configured", () => {
-    expect(subagentShellPrefixFor({ model: "kimi-k3" })).toBe(`export PI_MODEL=${decodeOf("kimi-k3")}; `);
+    expect(subagentShellPrefixFor({ model: "kimi-k3" })).toBe(`export PI_MODEL=${decodeOf("kimi-k3")}; export ${SUBAGENT_PINNED_ENV}=1; `);
   });
 
   it("carries a single quote through base64 instead of breaking out", () => {
@@ -59,8 +64,15 @@ describe("subagentShellPrefixFor", () => {
     expect(prefix).toContain(`"$(printf %s ${Buffer.from("a'b", "utf8").toString("base64")}`);
   });
 
-  it("is empty for null (no injection, previous behavior)", () => {
+  it("is empty for null (follow the session's model — the shipped extension does that)", () => {
     expect(subagentShellPrefixFor(null)).toBe("");
+  });
+
+  it("pins an explicit choice so the follow-the-session extension defers", () => {
+    // Without the marker, the shipped pipi-subagent-model extension would
+    // overwrite the user's explicit model on the next session model change.
+    expect(subagentEnvFor({ model: "glm-4.6" })[SUBAGENT_PINNED_ENV]).toBe("1");
+    expect(subagentShellPrefixFor({ model: "glm-4.6" })).toContain(`export ${SUBAGENT_PINNED_ENV}=1`);
   });
 });
 
@@ -79,7 +91,7 @@ describe("settings round-trip", () => {
     expect(getSubagentModel()).toBeNull();
     updateSettings({ subagents: { provider: "sf", model: "m1" } });
     expect(getSubagentModel()).toEqual({ provider: "sf", model: "m1" });
-    expect(subagentEnv()).toEqual({ PI_PROVIDER: "sf", PI_MODEL: "m1" });
+    expect(subagentEnv()).toEqual({ PI_PROVIDER: "sf", PI_MODEL: "m1", [SUBAGENT_PINNED_ENV]: "1" });
     updateSettings({ subagents: null });
     expect(getSubagentModel()).toBeNull();
     expect(subagentEnv()).toEqual({});

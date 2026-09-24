@@ -117,3 +117,17 @@
 **尚未覆盖（已知缺口，别当成已修）**：S3 preload 全 channel deadline 表（现由 op-guard 60s + 调用点 `withDeadline` 覆盖）；
 `treeStore.fileTreeStatus` / `sessionsStore.projectLoading` / `remoteHydration` 未迁到任务层（缺"10s 停滞"那一级，
 但已有 30s/60s 终态）；失败面只有少数调用点 opt-in；**远端/WSL 路径只能靠真机使用验证**（smoke 覆盖不到）。
+
+## 子代理模型跟随「当前会话」 (2026-09-24)
+
+用户看到的症状：会话里换了模型，子代理（analyst/reviewer/scout）还是用别的模型。根因不在配置同步，而在**环境变量永远不更新**：
+
+- 子代理由扩展以子进程 `pi --mode json -p` 启动，模型解析 = `agent.md 的 model:` → **自己进程的 `process.env.PI_MODEL`/`PI_PROVIDER`**（`~/.pi/agent/extensions/analyst/index.ts:315-321`；三个 agent 的 `.md` 都没有 `model:`）
+- pi **从不**把这两个变量写进自己的进程 env：`dist/core/tools/bash.js:119-138` 只为 bash 子进程**新建一份** env（先 delete 再按 `ctx.model` 填），bundle 里没有任何 `process.env.PI_MODEL = ...`
+- 所以 pi 进程里的 `PI_MODEL` 永远是**启动时 app 注入的值**（未配置就是空）→ 子代理落到 pi 默认模型；会话中途 `/model`、Ctrl+P、会话恢复都影响不到它
+
+修法 = 随 app 分发新扩展 `src/main/extensions/pipi-subagent-model.ts`：在 `model_select`（`/model`、Ctrl+P、会话恢复都会触发）时把 `process.env.PI_PROVIDER/PI_MODEL` 写成当前会话模型 → **任何**读 env 起子代理的扩展都会跟随（不依赖我们维护那些扩展文件）。
+显式选择优先：用户在「子代理模型」里指定了模型时，app 注入 `PIPI_SUBAGENT_MODEL_PINNED=1`，扩展不覆盖。
+
+真机验证（临时 agent dir + 探针扩展 + `pi --mode rpc`，零模型调用）：扩展被加载且 stderr 干净；`cycle_model` 后 `model_select` 带 `{provider,id}` 触发，探针读到的 `process.env.PI_MODEL` 由继承的 `deepseek-v4-flash` 变成了会话实际模型 `deepseek-flash`。
+注意：`session_start` 事件**不带** model 载荷（实测），且新会话若未切换模型则不发 `model_select` —— 那种情况下两侧都用同一默认值，所以一致；出现分歧只有"中途切换/恢复"，而这两条都被 `model_select` 覆盖。

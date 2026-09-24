@@ -248,7 +248,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         if (!value) {
           await window.api.settings.set({ subagents: null });
           setSubagentSel("");
-          showToast("子代理已改为跟随主模型", "ok");
+          showToast("子代理已改为跟随当前会话模型", "ok");
           return;
         }
         const sep = value.indexOf("\u0000");
@@ -257,7 +257,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         if (!model) return;
         await window.api.settings.set({ subagents: provider ? { provider, model } : { model } });
         setSubagentSel(value);
-        showToast(`子代理模型：${provider ? `${provider}/` : ""}${model}（新会话生效）`, "ok");
+        showToast(`子代理模型：${provider ? `${provider}/` : ""}${model}（已固定，优先于会话模型）`, "ok");
       } catch (error) {
         showToast(`子代理模型保存失败：${error instanceof Error ? error.message : String(error)}`, "err");
       } finally {
@@ -366,7 +366,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
           {/* 子代理模型：全局设置，与下方写入目标无关 */}
           <div className="dialog-section">
             <div className="section-title">
-              子代理模型 <span className="dialog-hint">（analyst / reviewer / scout 等被委派的子代理；默认跟随主模型）</span>
+              子代理模型 <span className="dialog-hint">（analyst / reviewer / scout 等被委派的子代理；默认跟随当前会话模型）</span>
             </div>
             <select
               className="dialog-input"
@@ -374,7 +374,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               disabled={!subagentLoaded || busyAction !== null}
               onChange={(e) => void handleSubagentModelChange(e.target.value)}
             >
-              <option value="">跟随主模型（默认）</option>
+              <option value="">跟随当前会话模型（默认）</option>
               {subagentChoices.flatMap((item) =>
                 configuredModelIds(item).map((id) => {
                   const value = `${item.provider ?? ""}\u0000${id}`;

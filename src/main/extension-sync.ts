@@ -19,6 +19,7 @@ import { remoteAgentDir } from "./pty";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
+import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
 
 const EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
 
@@ -31,6 +32,7 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-static-indicator.ts", content: staticIndicatorSource },
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
   { fileName: "pipi-model-sync.ts", content: modelSyncSource },
+  { fileName: "pipi-subagent-model.ts", content: subagentModelSource },
 ];
 
 /**

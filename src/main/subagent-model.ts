@@ -11,8 +11,15 @@
  * This module turns the user's "子代理模型" setting into the env the agent
  * extensions look for. It is injected at every place the app spawns pi
  * (local pty, local RPC child, SDK worker thread, WSL/SSH commands), so a
- * subagent started from any view picks it up. Absent setting = no injection =
- * the previous "follow the main model" behavior.
+ * subagent started from any view picks it up.
+ *
+ * An absent setting means "no injection" — but that is NOT "follow the main
+ * model": pi never rewrites its own process env, so a subagent would silently
+ * fall back to pi's *default* model, which is not the session's current model
+ * once the user switches (the app's `PIPI_SUBAGENT_MODEL_PINNED` marker exists
+ * because the shipped pipi-subagent-model extension now keeps those two
+ * variables equal to the live session model). File an explicit choice here and
+ * the extension leaves it alone.
  *
  * Values are validated on the way in (settings.ts strips empties), but model
  * ids legitimately contain `/`, `.`, `:`, `-`, so the shell prefix quotes
@@ -20,7 +27,10 @@
  */
 import { getSettings, type SubagentModelSettings } from "./settings";
 
-/** The configured subagent model, or null to follow the main model. */
+/** Marker the shipped extension checks before rewriting PI_MODEL/PI_PROVIDER. */
+export const SUBAGENT_PINNED_ENV = "PIPI_SUBAGENT_MODEL_PINNED";
+
+/** The configured subagent model, or null to follow the session's model. */
 export function getSubagentModel(): SubagentModelSettings | null {
   try {
     return getSettings().subagents ?? null;
@@ -46,6 +56,10 @@ export function subagentEnvFor(model: SubagentModelSettings | null): Record<stri
   return {
     ...(model.provider ? { PI_PROVIDER: model.provider } : {}),
     PI_MODEL: model.model,
+    // Explicit choice wins: the shipped pipi-subagent-model extension rewrites
+    // PI_MODEL/PI_PROVIDER on every session model change (so subagents follow the
+    // session by default), and must NOT override a model the user pinned here.
+    [SUBAGENT_PINNED_ENV]: "1",
   };
 }
 
@@ -76,5 +90,5 @@ export function subagentShellPrefixFor(model: SubagentModelSettings | null): str
   if (!model) return "";
   const decode = (value: string): string =>
     `"$(printf %s ${b64(value)} | base64 -d 2>/dev/null || printf %s ${b64(value)} | base64 -D 2>/dev/null)"`;
-  return `${model.provider ? `export PI_PROVIDER=${decode(model.provider)}; ` : ""}export PI_MODEL=${decode(model.model)}; `;
+  return `${model.provider ? `export PI_PROVIDER=${decode(model.provider)}; ` : ""}export PI_MODEL=${decode(model.model)}; export ${SUBAGENT_PINNED_ENV}=1; `;
 }
