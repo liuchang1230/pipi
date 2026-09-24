@@ -966,7 +966,18 @@ const Sidebar = memo(function Sidebar({
       </div>
       <div className="sidebar-resizer" onMouseDown={onSidebarResizerDown} />
       <div className="sidebar-bottom" style={{ height: `${100 - sidebarSplit}%` }}>
-        <div className="panel-label">当前项目文件</div>
+        <div className="panel-label">
+          当前项目文件
+          {/* A background re-list of an ALREADY visible tree is not a state the
+              user must act on, so it never becomes a placeholder row above the
+              listing (that pushed the tree down, moved the whole column, and —
+              when the flag leaked — sat there claiming to refresh forever). */}
+          {fileTreeStatus === "refreshing" ? (
+            <span className="tree-refresh-hint" title="正在后台重新列出远程目录">
+              刷新中…
+            </span>
+          ) : null}
+        </div>
         {(isRemote ? remoteDir : cwd) ? (
           <div className="tree-path" title={isRemote ? remoteDir! : cwd}>
             <Icon name="folder-open" className="tree-path-icon" /> {(isRemote ? remoteDir! : cwd).replace(/^\/home\/[^/]+/, "~")}
@@ -975,11 +986,6 @@ const Sidebar = memo(function Sidebar({
         <div className="tree-scroll" onContextMenu={(e) => onTreeCtx(e, null)}>
           {fileTreeStatus === "loading" ? (
             <div className="placeholder">远程文件加载中…</div>
-          ) : fileTreeStatus === "refreshing" ? (
-            <>
-              <div className="placeholder">远程文件刷新中…</div>
-              {renderTree(tree, 0)}
-            </>
           ) : fileTreeStatus === "error" ? (
             <div className="placeholder">远程文件加载失败{fileTreeError ? `：${fileTreeError}` : "，请重试"}</div>
           ) : tree.length === 0 && !isRemote ? (

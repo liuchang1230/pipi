@@ -43,6 +43,9 @@ interface TreeState {
   setTree: (updater: Updater<FileNode[]>) => void;
   setExpanded: (updater: Updater<Set<string>>) => void;
   setFileTreeStatus: (status: "idle" | "loading" | "refreshing" | "error") => void;
+  /** Clear a stale loading/refreshing status when the request that set it was
+   *  superseded by a request that never sets a status (silent background poll). */
+  settleTreeStatus: (reqSeq: number) => void;
   setFileTreeError: (error: string | null) => void;
   setRemoteTreeCache: (updater: Updater<Record<string, FileNode[]>>) => void;
   setTreeOrigin: (origin: TreeOrigin | null) => void;
@@ -207,6 +210,23 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
   setRemoteTreeCache: (updater) => set((s) => ({ remoteTreeCache: apply(s.remoteTreeCache, updater) })),
   setTreeOrigin: (treeOrigin) => set({ treeOrigin }),
 
+  /**
+   * Settle `fileTreeStatus` from the request that is allowed to speak for it.
+   *
+   * The newest request ALWAYS settles, including a silent background poll: a
+   * silent poll never *sets* a status, but it DOES supersede the request that
+   * set one (`treeReqSeq` is bumped), and a superseded request returns early
+   * without clearing. That is exactly the reported bug — 「远程文件刷新中…」
+   * stayed under 当前项目文件 forever while the (cached) listing was already on
+   * screen: a click-path load set "refreshing", the 6s `pollRemote` tick
+   * superseded it, and nothing ever cleared the flag afterwards.
+   */
+  settleTreeStatus: (reqSeq: number) => {
+    if (reqSeq !== treeReqSeq.current) return; // a newer request owns the status
+    const status = get().fileTreeStatus;
+    if (status === "loading" || status === "refreshing") set({ fileTreeStatus: "idle" });
+  },
+
   refresh: async () => {
     // Cooldown: an editing agent writes continuously; refresh churns must be
     // clamped so the tree (and the pty's event loop) isn't hammered.
@@ -246,7 +266,7 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
     if (!tabId && !origin.remote && !origin.wsl) return;
     // force/noCache stay false so the main process's 5s remote-file TTL does
     // the deduping — each poll costs at most one SFTP/WSL listing per dir.
-    // silent: a background tick must not flash "远程文件刷新中…" or surface a
+    // silent: a background tick must not flash a refresh hint or surface a
     // transient SFTP error banner.
     await get().loadTree(dirPath, tabId, undefined, { isRemote: true, silent: true, remote: origin.remote, wsl: origin.wsl });
     for (const dir of get().expanded) {
@@ -333,9 +353,9 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
     const cacheKey = remoteMode && target && resolvedDir ? `${targetKey(target)}:${resolvedDir}` : null;
     const cached = !force && cacheKey ? get().remoteTreeCache[cacheKey] : undefined;
     if (cacheKey && cached?.length) {
+      if (!silent) set({ fileTreeStatus: "refreshing" });
       set({
         tree: mergeRelistedNodes(get().tree, sortFileNodes(cached)),
-        ...(silent ? {} : { fileTreeStatus: "refreshing" as const }),
         fileTreeError: null,
       });
       // Cache hit: show immediately, refresh in background via main-process
@@ -347,12 +367,12 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
         set((s) => ({
           tree: mergeRelistedNodes(get().tree, sortedNodes),
           remoteTreeCache: { ...s.remoteTreeCache, [cacheKey]: sortedNodes },
-          ...(silent ? {} : { fileTreeStatus: "idle" as const }),
           fileTreeError: null,
         }));
-      } else if (!silent) {
-        set({ fileTreeStatus: "idle", fileTreeError: null });
       }
+      // Also on a silent poll (and on a failed background re-list): clear a
+      // status left behind by a request this one superseded.
+      get().settleTreeStatus(reqSeq);
       return;
     }
     if (!silent) {
@@ -386,12 +406,17 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
         // Lazy: the auto-expanded first directory loads its children on demand.
         if (first.type === "directory") void get().expandDir(first.path);
       }
-      if (!silent) set({ fileTreeStatus: "idle", fileTreeError: null });
+      get().settleTreeStatus(reqSeq);
     } catch (error) {
       if (reqSeq !== treeReqSeq.current) return; // superseded by a newer load
-      // A silent poll keeps the last good tree and status: a transient SFTP
-      // hiccup must not blank the pane or show an error banner.
-      if (silent) return;
+      // A silent poll keeps the last good tree and the error banner muted: a
+      // transient SFTP hiccup must not blank the pane. It must still clear a
+      // status that a superseded request left behind, or the pane claims to be
+      // refreshing forever.
+      if (silent) {
+        get().settleTreeStatus(reqSeq);
+        return;
+      }
       if (!cacheKey || !get().remoteTreeCache[cacheKey]?.length) set({ tree: [] });
       set({
         fileTreeStatus: remoteMode ? "error" : "idle",

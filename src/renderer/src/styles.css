@@ -230,6 +230,16 @@ html, body, #root {
   font-weight: 600;
   flex-shrink: 0;
 }
+/* Inline "refreshing" hint on the 当前项目文件 label. Deliberately NOT a
+   placeholder row inside the tree: a background re-list must not move the
+   listing or look like a state the user has to wait for. */
+.tree-refresh-hint {
+  margin-left: 6px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.7;
+}
 .tree-path {
   font-family: var(--mono);
   font-size: 11px;

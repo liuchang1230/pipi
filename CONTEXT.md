@@ -254,3 +254,25 @@
    `get_state RESP 13731ms`）也在 20s 之内，不会误报。
 
 反向验证：把 `steer` 判定改回"只看 isStreaming" → 3 个用例失败；去掉应答期限 → 1 个用例失败。
+
+## 「远程文件刷新中…」永远不消失 (2026-09-24)
+
+用户反馈：`当前项目文件` 下方一直显示「远程文件刷新中…」，但目录已经列出来了。
+
+根因是**状态所有权漏洞**，不是 SFTP 慢：
+- 点击路径命中主进程缓存时，`loadTree` 先设 `fileTreeStatus = "refreshing"`，再 `await` 后台重列。
+- `pollRemote`（远程 6s 一次，`silent: true`）会 **bump `treeReqSeq`**，于是那个还在 await 的
+  非 silent 请求 `reqSeq !== treeReqSeq.current` → **直接 return，清状态的那句被跳过**。
+- 而 silent 请求**从不设置状态**，所以没人把 `refreshing` 收回 → 目录（来自缓存）正常显示，
+  提示永远挂着。
+
+修法与教训：
+- **`settleTreeStatus(reqSeq)`：最新那个请求必须"收尾"状态，哪怕它自己从没设置过状态。**
+  silent 轮询、被抢占的老请求都不能留下 loading/refreshing；silent 失败也要收尾（保留上一份好
+  目录，不弹错误条）。这就是 hydration 那条教训的同一条：**状态必须由"有资格说话的那个请求"
+  拥有，而不是靠某个事件来清**。
+- **后台刷新不进入列表区域**：`refreshing` 不再渲染成树上方的一行占位（那会把整列往下推、看起来
+  像"卡住了"），改为 `当前项目文件` 标签行里的 `刷新中…` 小字（`.tree-refresh-hint`）。
+  `loading`（还没有任何目录）仍走占位。
+
+反向验证：把 `settleTreeStatus` 短路成 no-op → 3 个用例失败（状态停在 refreshing/loading）。

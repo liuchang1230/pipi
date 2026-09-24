@@ -371,3 +371,94 @@ describe("refresh with lazy expanded dirs", () => {
     expect(api.file.list).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * Regression: 「当前项目文件」下方一直显示「远程文件刷新中…」，但下面已经列出目录了.
+ *
+ * Root cause: a click-path listing that HIT the main-process cache set
+ * `fileTreeStatus = "refreshing"`, then awaited the background re-list. The 6s
+ * `pollRemote` tick (silent) bumped `treeReqSeq` while that await was pending,
+ * so the older request returned on the "superseded" check WITHOUT clearing the
+ * status — and a silent request never sets one. The flag therefore never
+ * returned to idle while the (cached) listing was already on screen.
+ */
+describe("treeStore status ownership", () => {
+  /** A remote tab whose every file listing is resolved by hand. */
+  function makeRemote(seedCache: boolean) {
+    const pending: Array<{ resolve: (n: FileNode[]) => void; reject: (e: unknown) => void }> = [];
+    (globalThis as any).window = {
+      api: {
+        file: {
+          list: () =>
+            new Promise<FileNode[]>((resolve, reject) => {
+              pending.push({ resolve, reject });
+            }),
+          listDirChildren: async () => [] as FileNode[],
+        },
+      },
+    };
+    useTabsStore.setState({
+      tabs: [{ id: "t1", title: "x" } as any],
+      activeTab: "t1",
+      isRemote: true,
+      cwd: "/proj",
+      remoteDir: "/remote/dir",
+      remoteLabel: "",
+    });
+    const nodes: FileNode[] = [{ name: "a.txt", path: "a.txt", type: "file" }];
+    useTreeStore.setState({
+      tree: [],
+      expanded: new Set<string>(),
+      fileTreeStatus: "idle",
+      fileTreeError: null,
+      remoteTreeCache: seedCache ? { "t1:/remote/dir": nodes } : {},
+      treeOrigin: null,
+    });
+    return { pending, nodes };
+  }
+
+  it("a silent poll never leaves 刷新中 behind (the reported stuck notice)", async () => {
+    const { pending, nodes } = makeRemote(true);
+    // Click path: cache hit → "refreshing" → background re-list in flight.
+    const first = useTreeStore.getState().loadTree(undefined, "t1", undefined, { isRemote: true });
+    await Promise.resolve();
+    expect(useTreeStore.getState().fileTreeStatus).toBe("refreshing");
+
+    // The 6s background poll supersedes it (exactly what `pollRemote` does).
+    const poll = useTreeStore.getState().pollRemote();
+    await Promise.resolve();
+
+    for (const p of pending) p.resolve(nodes);
+    await Promise.all([first, poll]);
+
+    expect(useTreeStore.getState().fileTreeStatus).toBe("idle");
+    expect(useTreeStore.getState().tree.length).toBeGreaterThan(0);
+  });
+
+  it("a failed silent poll still clears the stale 刷新中", async () => {
+    const { pending, nodes } = makeRemote(true);
+    const first = useTreeStore.getState().loadTree(undefined, "t1", undefined, { isRemote: true });
+    await Promise.resolve();
+    const poll = useTreeStore.getState().pollRemote();
+    await Promise.resolve();
+    pending[0]!.resolve(nodes);
+    pending[1]!.reject(new Error("SFTP 掉了"));
+    await Promise.all([first, poll]);
+    expect(useTreeStore.getState().fileTreeStatus).toBe("idle");
+    // The last good tree survives: a transient hiccup must not blank the pane.
+    expect(useTreeStore.getState().tree.length).toBeGreaterThan(0);
+  });
+
+  it("a superseding silent poll clears 加载中 too", async () => {
+    // No seeded cache: the cold path shows "loading" until the listing lands.
+    const { pending, nodes } = makeRemote(false);
+    const first = useTreeStore.getState().loadTree(undefined, "t1", undefined, { isRemote: true });
+    await Promise.resolve();
+    expect(useTreeStore.getState().fileTreeStatus).toBe("loading");
+    const poll = useTreeStore.getState().pollRemote();
+    await Promise.resolve();
+    for (const p of pending) p.resolve(nodes);
+    await Promise.all([first, poll]);
+    expect(useTreeStore.getState().fileTreeStatus).toBe("idle");
+  });
+});
