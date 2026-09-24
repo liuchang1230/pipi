@@ -537,7 +537,12 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
         }));
         // The tree placeholder is the only place a failed listing used to
         // show, and it is invisible once sessions exist — so say it out loud.
-        useUiStore.getState().showToast(`远程文件加载失败：${message}`, "err");
+        useUiStore.getState().showToast(`远程文件加载失败：${message}`, "err", {
+          failure: true,
+          cause: message,
+          target: { host: project.host, path: project.cwd },
+          retry: () => void get().toggleProject(project),
+        });
       } finally {
         // Whatever happened (ok / throw / deadline) the flags this path owns
         // land in a terminal state. Leaving them set is exactly how "一直加载中" happens.

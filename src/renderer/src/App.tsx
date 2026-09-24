@@ -38,6 +38,7 @@ import { useSessionsStore } from "./stores/sessionsStore";
 import { useTreeStore } from "./stores/treeStore";
 import { useViewerStore } from "./stores/viewerStore";
 import { useUiStore } from "./stores/uiStore";
+import { FailureCenter } from "./components/FailureCenter";
 import { useLayoutStore } from "./stores/layoutStore";
 import type { RemoteServerGroup, SessionItem, RemoteHistoryItem } from "./stores/types";
 
@@ -682,6 +683,7 @@ export default function App() {
       {/* Toast notification */}
       <RemoteLoginDialogHost />
       <ToastHost />
+      <FailureCenter />
       <BusyPill />
       <UpdateBanner />
     </div>

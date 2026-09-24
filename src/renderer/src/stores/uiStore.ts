@@ -7,6 +7,8 @@
 // views, no chat page) and the in-chat notice bar (ChatPane), so a dismiss in
 // either place is global.
 import { create } from "zustand";
+import { useFailureStore } from "./failureStore";
+import type { AppErrorTarget } from "../../../shared/outcome";
 
 export type ToastType = "ok" | "err";
 
@@ -44,7 +46,13 @@ export interface PiUpdateResult {
 
 interface UiState {
   toast: { text: string; type: ToastType } | null;
-  showToast: (text: string, type: ToastType) => void;
+  /**
+   * Transient feedback. Pass `failure: true` when this is a real failure rather
+   * than a hint ("请把 <会话名> 替换成实际名称"): it is ALSO recorded in the failure
+   * center, which persists, carries advice, and can offer a retry. A 3s toast
+   * must never be the only trace that something failed.
+   */
+  showToast: (text: string, type: ToastType, opts?: { failure?: boolean; cause?: string; target?: AppErrorTarget; retry?: () => void }) => void;
   clearToast: () => void;
   /** A newer pipi desktop installer is published on GitHub Releases. */
   appUpdateInfo: AppUpdateNoticeInfo | null;
@@ -88,7 +96,10 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
 export const useUiStore = create<UiState>()((set) => ({
   toast: null,
-  showToast: (text, type) => {
+  showToast: (text, type, opts) => {
+    if (opts?.failure) {
+      useFailureStore.getState().report({ title: text, cause: opts.cause, target: opts.target, retry: opts.retry });
+    }
     if (toastTimer) clearTimeout(toastTimer);
     set({ toast: { text, type } });
     toastTimer = setTimeout(() => set({ toast: null }), 3000);

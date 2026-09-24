@@ -156,7 +156,10 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
       useTreeStore.getState().setPreviewPath(relPath);
     } catch (error) {
       if (seq === openReq.seq) {
-        useUiStore.getState().showToast(error instanceof Error ? error.message : "读取文件失败", "err");
+        useUiStore.getState().showToast(error instanceof Error ? error.message : "读取文件失败", "err", {
+          failure: true,
+          retry: () => void get().openFile(relPath, followed, originOverride),
+        });
       }
     } finally {
       if (openReq.manualSeq === seq) openReq.manualSeq = null;

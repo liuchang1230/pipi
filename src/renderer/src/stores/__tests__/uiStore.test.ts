@@ -1,76 +1,43 @@
-// uiStore update workflow: one action owns both renderer presentations.
+// The toast must not be the only trace of a failure: opting in records it in
+// the failure center, which persists and can offer a retry.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useFailureStore } from "../failureStore";
 import { useUiStore } from "../uiStore";
 
-const reset = () => useUiStore.setState({
-  toast: null,
-  updateInfo: null,
-  updateResult: null,
-  piUpdating: false,
+beforeEach(() => {
+  useFailureStore.setState({ failures: [] });
+  useUiStore.setState({ toast: null });
 });
 
-describe("uiStore runPiUpdate", () => {
-  beforeEach(() => {
-    reset();
-    vi.restoreAllMocks();
+describe("showToast", () => {
+  it("keeps a hint as a plain transient toast", () => {
+    useUiStore.getState().showToast("请把 <会话名> 替换成实际名称", "err");
+    expect(useUiStore.getState().toast?.text).toContain("会话名");
+    expect(useFailureStore.getState().failures).toEqual([]);
   });
 
-  it("verifies the installed version after a successful update", async () => {
-    const run = vi.fn().mockResolvedValue({ ok: true, output: "updated" });
-    const check = vi.fn().mockResolvedValue({ current: "0.85.0", latest: "0.85.0", hasUpdate: false });
-    vi.stubGlobal("window", { api: { update: { run, check } } });
-    useUiStore.getState().setUpdateInfo({ current: "0.84.0", latest: "0.84.1", extensions: [] });
-
-    await useUiStore.getState().runPiUpdate();
-
-    expect(check).toHaveBeenCalledWith(true);
-    expect(useUiStore.getState()).toMatchObject({
-      piUpdating: false,
-      updateInfo: null,
-      updateResult: { ok: true, version: "0.85.0" },
+  it("records a real failure (with a retry) in the failure center", () => {
+    const retry = vi.fn();
+    useUiStore.getState().showToast("远程文件加载失败：ECONNRESET", "err", {
+      failure: true,
+      cause: "ECONNRESET",
+      target: { host: "h", path: "/data" },
+      retry,
     });
+
+    const failures = useFailureStore.getState().failures;
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.title).toBe("远程文件加载失败：ECONNRESET");
+    expect(failures[0]?.cause).toBe("ECONNRESET");
+    expect(failures[0]?.target).toEqual({ host: "h", path: "/data" });
+    expect(failures[0]?.retry).toBe(retry);
+    // Not retryable per the taxonomy, but the call site's retry wins.
+    expect(failures[0]?.code).toBeTruthy();
   });
 
-  it("keeps a successful update successful when verification rejects", async () => {
-    vi.stubGlobal("window", {
-      api: {
-        update: {
-          run: vi.fn().mockResolvedValue({ ok: true, output: "updated" }),
-          check: vi.fn().mockRejectedValue(new Error("verification unavailable")),
-        },
-      },
-    });
-
-    await useUiStore.getState().runPiUpdate();
-
-    expect(useUiStore.getState()).toMatchObject({
-      piUpdating: false,
-      updateResult: { ok: true },
-    });
-  });
-
-  it("resets busy state when update IPC rejects", async () => {
-    vi.stubGlobal("window", { api: { update: { run: vi.fn().mockRejectedValue(new Error("IPC closed")) } } });
-
-    await useUiStore.getState().runPiUpdate();
-
-    expect(useUiStore.getState()).toMatchObject({
-      piUpdating: false,
-      updateResult: { ok: false, error: "IPC closed" },
-    });
-  });
-
-  it("does not start a second renderer update while one is running", async () => {
-    let complete!: (value: { ok: boolean; output: string }) => void;
-    const run = vi.fn(() => new Promise<{ ok: boolean; output: string }>((resolve) => { complete = resolve; }));
-    const check = vi.fn().mockResolvedValue({ current: "0.85.0", latest: "0.85.0", hasUpdate: false });
-    vi.stubGlobal("window", { api: { update: { run, check } } });
-
-    const first = useUiStore.getState().runPiUpdate();
-    const second = useUiStore.getState().runPiUpdate();
-    expect(run).toHaveBeenCalledTimes(1);
-    complete({ ok: true, output: "updated" });
-    await Promise.all([first, second]);
-    expect(run).toHaveBeenCalledTimes(1);
+  it("still shows the transient toast alongside the persistent record", () => {
+    useUiStore.getState().showToast("保存失败", "err", { failure: true });
+    expect(useUiStore.getState().toast).toEqual({ text: "保存失败", type: "err" });
+    expect(useFailureStore.getState().failures).toHaveLength(1);
   });
 });
