@@ -2,7 +2,7 @@
 // terminal error. The regression it locks down: a promise that never settles
 // (wedged SFTP op) must not leave a spinner up.
 import { describe, expect, it, vi } from "vitest";
-import { DeadlineError, withDeadline } from "../with-deadline";
+import { DeadlineError, isDeadlineError, withDeadline } from "../with-deadline";
 
 describe("withDeadline", () => {
   it("passes through a value that arrives in time", async () => {
@@ -48,5 +48,21 @@ describe("withDeadline", () => {
       clear.mockRestore();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("isDeadlineError", () => {
+  it("recognises our own timeout from either realm (name-based fallback)", () => {
+    expect(isDeadlineError(new DeadlineError("列举远程目录", 30_000))).toBe(true);
+    // A structurally identical error from another module instance still counts:
+    // instanceof is not reliable across bundles.
+    const lookalike = new Error("x");
+    lookalike.name = "DeadlineError";
+    expect(isDeadlineError(lookalike)).toBe(true);
+  });
+
+  it("does not claim ordinary failures", () => {
+    expect(isDeadlineError(new Error("ECONNRESET"))).toBe(false);
+    expect(isDeadlineError("timeout")).toBe(false);
   });
 });

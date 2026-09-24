@@ -12,7 +12,7 @@ import { apply, type Updater } from "./utils";
 import { buildRemoteKey, remoteSessionCacheKey } from "./remote-servers";
 import { projectProfile, projectTarget, type TargetRef } from "./remote-target";
 import { useRemoteStore } from "./remoteStore";
-import { withDeadline } from "../lib/with-deadline";
+import { withDeadline } from "../../../shared/with-deadline";
 import type {
   AutoFollowSettings,
   FileNode,

@@ -32,6 +32,7 @@ import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./sess
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
 import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
 import { trackIpcHandlersOn } from "./in-flight";
+import { withOpGuard } from "./op-guard";
 import { createLagMonitor, type LagMonitor } from "./perf";
 import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
 import { INTERNAL_RPC_ID_PREFIX } from "../shared/transcript";
@@ -1716,10 +1717,33 @@ if (gotSingleInstanceLock) {
         });
         return { files };
       } else if (t.wsl) {
+        // Bounded: this spawn had NO timeout, so a wedged `wsl.exe` (or a find
+        // over a huge/slow \\wsl$ tree) left the IPC promise pending forever —
+        // the mention menu's "正在搜索项目文件…" spinner never cleared.
         stdout = await new Promise<string>((resolve, reject) => {
           const child = spawn("wsl.exe", ["-d", t.wsl!.distro, "--", "bash", "-lc", `cd -- ${shellCwd(t.wsl!.path || "~")} && ${shell}`]);
-          let out = ""; child.stdout.setEncoding("utf8"); child.stdout.on("data", (data: string) => { out += data; });
-          child.on("close", (code) => code === 0 ? resolve(out) : reject(new Error(`wsl exited ${code}`))); child.on("error", reject);
+          let out = ""; let settled = false;
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try { child.kill(); } catch { /* already gone */ }
+            reject(new Error("WSL 文件搜索超时（10s）"));
+          }, 10_000);
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (data: string) => { out += data; });
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            if (settled) return;
+            settled = true;
+            if (code === 0) resolve(out);
+            else reject(new Error(`wsl exited ${code}`));
+          });
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            if (settled) return;
+            settled = true;
+            reject(err);
+          });
         });
       } else {
         return { files: await localSearch() };
@@ -3073,6 +3097,19 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
   ipcMain.handle("settings:set", (_e, patch: Partial<AppSettings>) => updateSettings(patch));
 
   // --- Remote file operations (SFTP) ---
+  /**
+   * Hard bound for ONE SFTP operation.
+   *
+   * 60s is ~3× the worst measured single-operation latency and deliberately
+   * loose: it exists to bound an INFINITE hang (a wedged established connection
+   * — main only limits the connect, `readyTimeout`), not to enforce snappiness.
+   * The earlier, user-visible "still waiting" state belongs to the renderer's
+   * task layer (10s stall → cancel/retry), which does not have to know that the
+   * connection is wedged. A false timeout on a merely slow link would be worse
+   * than waiting, so do not tighten this without measurements.
+   */
+  const SFTP_OP_DEADLINE_MS = 60_000;
+
   async function withSftp<T>(remote: RemoteOpts, fn: (client: SftpClient, homeDir: string) => Promise<T>): Promise<T> {
     const lease = await getSftpLease(remote);
     lease.refCount += 1;
@@ -3082,8 +3119,33 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
       lease.idleTimer = null;
     }
     try {
-      return await fn(lease.client, lease.homeDir);
+      return await withOpGuard(
+        `sftp:${remote.host}`,
+        {
+          deadlineMs: SFTP_OP_DEADLINE_MS,
+          target: { host: remote.host, path: remote.path },
+          timeoutTitle: "远程文件操作超时",
+          failureTitle: "远程文件操作失败",
+          onTimeout: async (info) => {
+            // `ssh2-sftp-client` has no per-operation cancellation: closing the
+            // connection IS the cancellation (it rejects every in-flight request
+            // and reclaims the socket). Without it the refCount incremented above
+            // stays elevated forever — `scheduleSftpLeaseCleanup` refuses while
+            // refCount > 0 — so the dead lease would stay in the pool and every
+            // later call would burn its own deadline.
+            // NOT recorded in `sftpFailures`: a slow link is not a broken server,
+            // and the breaker's 20s blackout would turn a slow read into a
+            // server-wide outage. A genuinely dead server trips the breaker on
+            // the next CONNECT instead.
+            debugLogWarn("remote", `sftp op timeout after ${info.elapsedMs}ms on ${remote.host} — destroying lease`);
+            await destroySftpLease(lease);
+            emitRemoteStatus(remote, "failed", { error: `${info.name} 超时（${Math.round(info.elapsedMs / 1000)}s）` });
+          },
+        },
+        () => fn(lease.client, lease.homeDir),
+      );
     } catch (error) {
+      // A timed-out op already destroyed the lease; destroying twice is a no-op.
       await destroySftpLease(lease);
       throw error;
     } finally {
