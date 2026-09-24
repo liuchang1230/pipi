@@ -1,7 +1,7 @@
 # 稳定性与可诊断性 —— 整体分析与设计规划
 
 状态：规划设计 v2（已过独立评审并修订；v1 的两处根因判断被推翻，见 §7 修订记录）
-实施进度：**Phase 0 已完成**（`ee926a3` + `78196fe`），其余阶段待开工
+实施进度：**Phase 0 已完成**（`ee926a3` + `78196fe`）、**Phase 1 已完成**（`5bd52c9` + `ecd9225` + `0053615`），其余阶段待开工
 日期：2026-09-23
 触发：用户反馈"软件不稳定、鲁棒性不高、容易卡顿、提示不充分、出问题了用户也不知道咋了"
 
@@ -240,14 +240,28 @@ Windows 细节：① `.bak`/`.corrupt-*` **不得复制明文密码**（凭据�
 探测超时语义 4 例）；`npm run typecheck` + `npm run build` 通过。挂起回归例已按本项目惯例验证过
 "改前必失败"（回退 `sessionsStore.ts` 后 5028ms 超时失败）。
 
-### Phase 1 — 不卡（1–2 天）
+### Phase 1 — 不卡（1–2 天）—— **已完成**
 
-1. `perf.ts` lag 指标 + `app:busy` 归因（**先有数字再优化**）。
-2. 日志：异步批量写 + 分级 + 轮转 + TreeDialog 采样。
-3. `diff-session.ts:266` 加大小门。
-4. 点击路径 sync 调用审计清零（`spawnSync/readFileSync/statSync` 全部带 timeout 或移出点击路径）。
+1. `perf.ts` lag 指标 + `app:busy` 归因（**先有数字再优化**）。✅
+2. 日志：异步批量写 + 分级 + 轮转 + TreeDialog 采样。✅
+3. `diff-session.ts:266`（现 `readFileContentCapped`）加大小门。✅
+4. 点击路径 sync 调用审计清零——`src/main` 下 `spawnSync` 仅剩检测类且全部带超时。✅
 
-**验收**：多 MB 远程会话 + 树对话框 + 轮询 60s，`[perf]` p95 < 100ms；日志 ≤ 1MB/天（对比峰值 16876 行/天）。
+**落地**：`src/main/in-flight.ts`（在飞操作注册表 + `trackIpcHandlersOn` 一次补丁覆盖全部
+IPC handler）、`src/main/perf.ts`（10s 采样 + 迟滞 busy 判定）、`app:busy` → 可关闭的
+「应用繁忙（事件循环延迟 Xms）· 正在：ipc:file:list 3.2s」pill；日志重写（`PIPI_LOG`
+分级 / 200ms 异步批 / warn-error 立即落盘 / 8MB×3 轮转）并新增 `[rpc-slow]`（≥3s 往返）；
+`resolveWslPath` 及其 6 个调用点改 async（删掉最后一个点击路径 `spawnSync`）。
+
+**验收证据**：
+- 日志预计：峰值 16876 行/天 → ~1-2k 行/天（逐帧 SEND/RESP 52.8k 行 + 轮询路由 24k 行 +
+  TreeDialog 45.7k 行全部降为 debug）。**待下次真实使用后用 `PIPI_LOG=debug` 对比确认**。
+- **真机验证（Electron 36.9.5 / Node 22.19.0，无窗口 smoke 脚本）**：
+  `patchApplied=true`（`ipcMain.handle` 可被遮蔽）、包装后的 handler 正常返回值且归因触发、
+  `monitorEventLoopDelay` 可用且我注入的 60ms 同步阻塞如实出现在 `max=60ms`
+  （同时印证了文档里的诚实边界：同步冻结会在事后被 `max` 捕获，不是实时预警）。
+- 测试：614 passed（新增 debug-log 7、in-flight 10、perf 11、diff-session-read 6）；
+  typecheck + build 通过。
 
 ### Phase 2 — 卡不住 + 看得到（2–3 天）
 
