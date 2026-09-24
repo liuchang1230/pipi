@@ -18,7 +18,8 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "dist": "npm run build && electron-builder",
     "dist:dir": "npm run build && electron-builder --dir",
-    "dist:portable": "npm run build && electron-builder --win portable"
+    "dist:portable": "npm run build && electron-builder --win portable",
+    "smoke:robustness": "node scripts/robustness-smoke.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",
