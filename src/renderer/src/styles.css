@@ -2741,6 +2741,55 @@ textarea:focus-visible,
   width: 10px;
   text-align: center;
 }
+
+/* --- "where is the current conversation?" ---------------------------------
+   The active path is what a reader needs to follow; dimming everything else is
+   what makes it obvious at a glance (a lone • marker was not). */
+.tree-dialog .tree-row.on-active-path {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 18%, transparent) 0 3px, transparent 3px);
+}
+.tree-dialog .tree-row.on-active-path .tree-entrytext {
+  color: var(--text);
+}
+.tree-dialog .tree-row.off-path {
+  opacity: 0.62;
+}
+.tree-dialog .tree-row.off-path:hover {
+  opacity: 1;
+}
+/* The current node is the answer to the question — strongest treatment. */
+.tree-dialog .tree-row.current {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.tree-leaf-tag {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 10px;
+  line-height: 15px;
+  align-self: center;
+}
+/* Branch point: where the reader must choose. */
+.tree-branchcount {
+  flex: 0 0 auto;
+  margin-right: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 15px;
+  align-self: center;
+}
+/* Connectors carry the hierarchy — make them readable, not decorative. */
+.tree-dialog .tree-gutter {
+  color: color-mix(in srgb, var(--text-dim) 85%, transparent);
+  opacity: 0.9;
+}
 .tree-entrylabel {
   flex: 0 0 auto;
   color: var(--text-dim);

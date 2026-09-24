@@ -11,11 +11,32 @@
  * is reconstructed here with an iterative, cycle-safe build.
  */
 
+/**
+ * One session-tree entry (pi's JSONL record, flattened for transport).
+ *
+ * The named fields exist so consumers get real types rather than having to cast
+ * out of the index signature (which stays for forward compatibility with newer
+ * pi versions). Rendering a tree means reading `message.role`/`content` on every
+ * row; leaving those `unknown` pushed casts into the UI layer, where a shape
+ * change would then fail at runtime instead of at compile time.
+ */
 export interface TreeEntry {
   type: string;
   id: string;
   parentId: string | null;
   timestamp?: string;
+  message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string; toolCallId?: string };
+  modelId?: string;
+  thinkingLevel?: string;
+  summary?: string;
+  name?: string;
+  customType?: string;
+  content?: unknown;
+  tokensBefore?: number;
+  toolName?: string;
+  toolCallId?: string;
+  command?: string;
+  label?: string;
   [k: string]: unknown;
 }
 

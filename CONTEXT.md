@@ -131,3 +131,31 @@
 
 真机验证（临时 agent dir + 探针扩展 + `pi --mode rpc`，零模型调用）：扩展被加载且 stderr 干净；`cycle_model` 后 `model_select` 带 `{provider,id}` 触发，探针读到的 `process.env.PI_MODEL` 由继承的 `deepseek-v4-flash` 变成了会话实际模型 `deepseek-flash`。
 注意：`session_start` 事件**不带** model 载荷（实测），且新会话若未切换模型则不发 `model_select` —— 那种情况下两侧都用同一默认值，所以一致；出现分歧只有"中途切换/恢复"，而这两条都被 `model_select` 覆盖。
+
+## 会话分支树：定位当前对话 + 跳转稳定性 (2026-09-24)
+
+用户反馈三点，逐个落到根因：
+
+1. **"找不到当前对话在什么位置"** —— `flattenTree` 早已算出 `containsActive`（哪棵子树含叶子），
+   但**只用于把活跃分支排到前面**，没有用于高亮；行上只有一个极小的 `•`，且打开时用
+   `scrollIntoView({block:"nearest"})` 贴边对齐。现在：整条 root→leaf 路径行加 `on-active-path`
+   （左侧 accent 竖条 + 正常亮度），非路径行 `off-path` 降为 0.62 透明度（一屏之内就看得出走向），
+   当前节点额外 `inset` 强调 + `当前` 徽标，并在**打开时把当前节点滚到视口中央**
+   （另有「定位到当前」按钮随时回中）。
+2. **"每个分支看着不明显"** —— 分支点行加 `⑂N` 计数徽标（此处必须做选择的地方），连接线/竖线对比度提高。
+3. **"分支跳转不稳定"** —— 两个真实原因：
+   - **完成判定错了**。原规则是"leafId **变化**了就算成功"，而**跳到当前节点本身**（最常见：
+     点最底下那条、点高亮的那个、点一个恰好就是叶子的分支点）叶子**不会变** → 判定永不触发 →
+     一直等到 **60s 超时** → 弹「导航超时」，但会话其实早就在那儿了。新规则
+     `isNavigationSettled(entries,{targetId,startLeafId,leafId})`：目标等于起始叶 → **立即完成**（不发任何请求）；
+     否则要求"叶子确实动了，且目标在当前叶子的路径上"（这样 summarize 产生的新条目也算落地，
+     而"叶子因为别的原因跑到另一条分支"不再被误判为成功）。反过来也修了假成功。
+   - **扩展命令缺失时会被当成用户消息**。RPC/WSL 路径靠 `/pipi-tree-nav <id>` 提示词桥接；pi 对
+     **未知斜杠命令不报错**，而是当普通用户消息入库 → agent 回答 → 树跑到无关位置 + 会话里多一条假消息。
+     现在打开对话框时后台 `get_commands` 探测一次（复用 commands.ts 的缓存），确知缺失就拒绝跳转并给出原因。
+     这正是 CONTEXT.md 早先记下的那条教训（任何 prompt 通道先 get_commands 验证）在树的跳转上缺席。
+
+顺带把纯逻辑抽到 `src/shared/tree-layout.ts`（`flattenTree` / `ancestorIds` / `isOnLeafPath` /
+`isAlreadyAtTarget` / `isNavigationSettled`），TreeDialog 里那份**没有测试**的重复实现删掉；
+并把 `TreeDialog` 私有的 `TreeEntry`/`TreeNode` 与 shared 的统一（此前是两套不兼容类型，
+`applyVisibility` 传参处靠巧合编译通过）。

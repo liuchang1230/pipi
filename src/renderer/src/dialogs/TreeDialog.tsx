@@ -35,36 +35,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
-import { buildTreeFromEntries, type TreeEntry as FlatTreeEntry } from "../../../shared/tree-build";
+import { buildTreeFromEntries, type TreeEntry, type TreeNode } from "../../../shared/tree-build";
+import { flattenTree, isAlreadyAtTarget, isNavigationSettled, type TreeFlatRow } from "../../../shared/tree-layout";
 import { applyVisibility, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
 import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
 import { parseEditArgs } from "../components/DiffView";
-
-interface TreeEntry {
-  id: string;
-  parentId: string | null;
-  type: string;
-  timestamp?: string;
-  message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string };
-  modelId?: string;
-  thinkingLevel?: string;
-  summary?: string;
-  name?: string;
-  customType?: string;
-  content?: unknown;
-  tokensBefore?: number;
-  toolName?: string;
-  toolCallId?: string;
-  command?: string;
-  label?: string;
-}
-
-interface TreeNode {
-  entry: TreeEntry;
-  children: TreeNode[];
-  label?: string;
-  labelTimestamp?: string;
-}
+import { fetchCommands } from "../commands";
 
 interface TreeResponse {
   tree?: TreeNode[];
@@ -117,65 +93,6 @@ function formatToolCall(name: string, args: unknown): string {
 }
 
 // --- flattening (mirrors TreeSelectorComponent.flattenTree) -----------------
-
-interface FlatNode {
-  node: TreeNode;
-  indent: number;
-  showConnector: boolean;
-  isLast: boolean;
-  isVirtualRootChild: boolean;
-  /** Vertical │ gutters at ancestor levels (position = display indent level). */
-  gutters: Array<{ position: number; show: boolean }>;
-}
-
-function flattenTree(roots: TreeNode[], leafId: string | null): { flat: FlatNode[] } {
-  const containsActive = new Map<string, boolean>();
-  // Post-order: does a subtree contain the active leaf?
-  {
-    const all: TreeNode[] = [];
-    const stack = [...roots];
-    while (stack.length) {
-      const n = stack.pop()!;
-      all.push(n);
-      for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]!);
-    }
-    for (let i = all.length - 1; i >= 0; i--) {
-      const n = all[i]!;
-      let has = leafId !== null && n.entry.id === leafId;
-      for (const c of n.children) if (containsActive.get(c.entry.id)) has = true;
-      containsActive.set(n.entry.id, has);
-    }
-  }
-  const flat: FlatNode[] = [];
-  const multipleRoots = roots.length > 1;
-  const orderedRoots = [...roots].sort((a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)));
-  const stack: Array<[TreeNode, number, boolean, boolean, boolean, Array<{ position: number; show: boolean }>, boolean]> = [];
-  for (let i = orderedRoots.length - 1; i >= 0; i--) {
-    stack.push([orderedRoots[i]!, multipleRoots ? 1 : 0, multipleRoots, multipleRoots, i === orderedRoots.length - 1, [], multipleRoots]);
-  }
-  while (stack.length) {
-    const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop()!;
-    flat.push({ node, indent, showConnector, isLast, isVirtualRootChild, gutters });
-    const children = node.children;
-    const multipleChildren = children.length > 1;
-    const orderedChildren = [...children].sort((a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)));
-    let childIndent: number;
-    if (multipleChildren) childIndent = indent + 1;
-    else if (justBranched && indent > 1) childIndent = indent + 1;
-    else childIndent = indent;
-    // The connector this node drew leaves a vertical gutter for its
-    // descendants (continues while the node is not the last child) — this is
-    // what keeps deep branches visually attached to their parent elbow.
-    const connectorDisplayed = showConnector && !isVirtualRootChild;
-    const displayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
-    const connectorPosition = Math.max(0, displayIndent - 1);
-    const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
-    for (let i = orderedChildren.length - 1; i >= 0; i--) {
-      stack.push([orderedChildren[i]!, childIndent, multipleChildren, multipleChildren, i === orderedChildren.length - 1, childGutters, false]);
-    }
-  }
-  return { flat };
-}
 
 // --- entry display (mirrors getEntryDisplayText) ----------------------------
 
@@ -283,7 +200,7 @@ export function TreeDialog({
   const [slowTicks, setSlowTicks] = useState(0); // ~3s each; drives the "still loading" hint
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /** Last applied snapshot (entries + leaf) — identical polls are dropped. */
-  const lastSnapshotRef = useRef<{ entries: FlatTreeEntry[]; leafId: string | null } | null>(null);
+  const lastSnapshotRef = useRef<{ entries: TreeEntry[]; leafId: string | null } | null>(null);
   // Mirrors for timers/closures that must not capture stale render values.
   const treeStatusRef = useRef(treeStatus);
   treeStatusRef.current = treeStatus;
@@ -332,7 +249,7 @@ export function TreeDialog({
     };
     /** Apply a fetched snapshot, dropping no-op polls so nothing re-renders
      *  while the session is unchanged (the 3s poll stays free). */
-    const applySnapshot = (entries: FlatTreeEntry[], nextLeaf: string | null) => {
+    const applySnapshot = (entries: TreeEntry[], nextLeaf: string | null) => {
       const prev = lastSnapshotRef.current;
       const prevLeaf = prev?.leafId ?? null;
       if (prev && prevLeaf === nextLeaf && prev.entries.length === entries.length) {
@@ -368,7 +285,7 @@ export function TreeDialog({
           // flight — the snapshot's stale leaf must not trip the navigation
           // completion detector (which fires on leafId change + navigatingId).
           if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.entries)) {
-            const entries = res.entries as FlatTreeEntry[];
+            const entries = res.entries as TreeEntry[];
             lastSnapshotRef.current = { entries, leafId: res.leafId ?? null };
             setTree(buildTreeFromEntries(entries).tree);
             setLeafId(res.leafId ?? null);
@@ -499,7 +416,7 @@ export function TreeDialog({
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
         window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE entries=${data.entries.length} leaf=${data.leafId ?? "null"}`, "debug");
-        applySnapshot(data.entries as FlatTreeEntry[], data.leafId ?? null);
+        applySnapshot(data.entries as TreeEntry[], data.leafId ?? null);
       } else {
         setTreeStatus("error");
         setError(friendlyTreeError(String(event.error ?? "获取会话树失败")));
@@ -545,37 +462,11 @@ export function TreeDialog({
 
   const { flat } = useMemo(() => flattenTree(tree, leafId), [tree, leafId]);
 
-  const activePath = useMemo(() => {
-    const set = new Set<string>();
-    let cur: string | null = leafId;
-    const byId = new Map<string, TreeEntry>();
-    const walk = (nodes: TreeNode[]) => {
-      for (const n of nodes) {
-        byId.set(n.entry.id, n.entry);
-        walk(n.children);
-      }
-    };
-    walk(tree);
-    while (cur) {
-      set.add(cur);
-      const e = byId.get(cur);
-      cur = e?.parentId ?? null;
-    }
-    return set;
-  }, [tree, leafId]);
+  // Filter/search over the flattened rows. `onActivePath`/`isCurrent` come from
+  // the shared layout (src/shared/tree-layout.ts), which is unit-tested — the
+  // dialog no longer keeps a second, untested copy of the ancestor walk.
+  const visible = useMemo(() => applyVisibility(flat, filterMode, query, leafId), [flat, filterMode, query, leafId]);
 
-  // Visibility + search, mirroring the TUI's applyFilter: bookkeeping entries
-  // hidden in the default view, tool-call-only assistant rows hidden (unless
-  // error/aborted/current leaf), multi-token AND search. FlatNode satisfies
-  // the structural TreeFlatLike, so the result stays fully typed.
-  const visible = useMemo(
-    () => applyVisibility(flat, filterMode, query, leafId),
-    [flat, filterMode, query, leafId],
-  );
-
-  // Folding hides DESCENDANTS (mirrors the TUI's fold handling): a child whose
-  // parent (or any nearer ancestor) is folded is skipped, so its row collapses
-  // into the folded parent instead of dangling detached.
   const filtered = useMemo(() => {
     if (folded.size === 0) return visible;
     const skip = new Set<string>();
@@ -747,6 +638,16 @@ export function TreeDialog({
   const doNavigate = (summarize?: string, instructions?: string) => {
     if (!selected || navigatingId) return;
     const targetId = selected.entry.id;
+    // Already there? pi would no-op, and the leaf would never "change" — which
+    // used to leave the dialog waiting out its 60s timer and then reporting
+    // 导航超时. Finish immediately instead.
+    if (isAlreadyAtTarget(targetId, leafId)) {
+      useUiStore.getState().showToast("已在当前位置", "ok");
+      onNavigated?.(undefined);
+      onClose();
+      return;
+    }
+    navStartLeafRef.current = leafId;
     setNavPhase("navigating");
     setNavigatingId(targetId);
     // SDK tabs navigate via the native `navigate_tree` RPC: a direct session
@@ -755,6 +656,22 @@ export function TreeDialog({
     // target and waits for input. RPC-backed tabs (remote/WSL, upstream pi
     // has no native command) fall back to the pipi-tree-nav extension bridge.
     const tab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
+    // RPC-backed tabs navigate through the pipi-tree-nav extension command. If
+    // that extension is not loaded on this target, sending the prompt would be
+    // taken as an ordinary user message: the agent replies, the tree moves to an
+    // unrelated place and a bogus message lands in the transcript. So refuse
+    // when we already KNOW it is missing (probed on mount, cached per tab).
+    if (tab?.mode !== "sdk" && treeNavAvailableRef.current === false) {
+      setNavPhase("idle");
+      setNavigatingId(null);
+      useUiStore
+        .getState()
+        .showToast("该会话未加载 pipi-tree-nav 扩展，无法跳转（可切到终端视图用 /tree）", "err", {
+          failure: true,
+          cause: "get_commands 未返回 pipi-tree-nav：扩展未同步到该主机（远程/WSL）或 pi 版本不支持扩展命令",
+        });
+      return;
+    }
     const started = Date.now();
     const requestId = `tree-nav-${started}`;
     pendingNavRequestId.current = requestId;
@@ -807,6 +724,19 @@ export function TreeDialog({
 
   const pendingNavTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const pendingNavRequestId = useRef<string | null>(null);
+  /** The leaf when the current navigation started (the settle rule needs it). */
+  const navStartLeafRef = useRef<string | null>(null);
+  /** Does the RPC bridge command exist? null = not probed yet. */
+  const treeNavAvailableRef = useRef<boolean | null>(null);
+  /** On open, centre the CURRENT conversation once — "where am I?" answered. */
+  const didFocusCurrentRef = useRef(false);
+  const focusCurrent = () => {
+    if (!leafId) return;
+    const idx = filtered.findIndex((f) => f.node.entry.id === leafId);
+    if (idx < 0) return;
+    ensureWindowCovers(idx);
+    requestAnimationFrame(() => rowRefs.current.get(leafId)?.scrollIntoView({ block: "center" }));
+  };
   /**
    * Single-flight gate for `get_entries` (both the 3s refresh poll and the
    * 1s navigation poll). The RPC link can be FAR slower than the poll
@@ -850,29 +780,54 @@ export function TreeDialog({
     }
   }, [tabId]);
 
-  // Detect navigation completion via leafId change in the get_tree responses.
+  // Detect navigation completion. The honest question is not "did the leaf
+  // change" but "is the session now at/under the node I asked for" (see
+  // isNavigationSettled — a no-op jump is handled in doNavigate, and a summarize
+  // appends a NEW entry below the target, which still counts as landing).
   useEffect(() => {
-    if (prevLeafRef.current === null) {
+    if (!navigatingId) {
       prevLeafRef.current = leafId;
       return;
     }
-    if (leafId !== prevLeafRef.current && navigatingId) {
-      prevLeafRef.current = leafId;
-      if (pendingNavTimer.current) {
-        clearInterval(pendingNavTimer.current);
-        pendingNavTimer.current = null;
-      }
-      pendingNavRequestId.current = null;
-      const editorText = isUserMsg && selectedText ? selectedText : undefined;
-      setNavPhase("idle");
-      setNavigatingId(null);
-      useUiStore.getState().showToast("已导航到目标位置", "ok");
-      onNavigated?.(editorText);
-      onClose();
-    } else {
-      prevLeafRef.current = leafId;
+    const entries = lastSnapshotRef.current?.entries ?? [];
+    const settled = isNavigationSettled(entries, { targetId: navigatingId, startLeafId: navStartLeafRef.current, leafId });
+    prevLeafRef.current = leafId;
+    if (!settled) return;
+    if (pendingNavTimer.current) {
+      clearInterval(pendingNavTimer.current);
+      pendingNavTimer.current = null;
     }
+    pendingNavRequestId.current = null;
+    const editorText = isUserMsg && selectedText ? selectedText : undefined;
+    setNavPhase("idle");
+    setNavigatingId(null);
+    useUiStore.getState().showToast("已导航到目标位置", "ok");
+    onNavigated?.(editorText);
+    onClose();
   }, [leafId, navigatingId, selected, selectedText, isUserMsg, onNavigated, onClose]);
+
+  // Probe the RPC bridge command in the background: by the time the user presses
+  // Enter it is usually known, and a missing extension is reported instead of
+  // silently turning the jump into a user message.
+  useEffect(() => {
+    const tab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
+    if (tab?.mode === "sdk") {
+      treeNavAvailableRef.current = true;
+      return;
+    }
+    let cancelled = false;
+    void fetchCommands(tabId)
+      .then((r) => {
+        if (cancelled) return;
+        treeNavAvailableRef.current = r.commands.some((c) => c.name === "pipi-tree-nav");
+      })
+      .catch(() => {
+        /* unknown — keep sending the prompt (previous behavior) */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tabId]);
 
   // Initial selection: current leaf.
   useEffect(() => {
@@ -966,6 +921,15 @@ export function TreeDialog({
     if (query) searchRef.current?.focus();
   }, [query]);
 
+  // "I cannot find where the current conversation is": on open, put it in the
+  // middle of the viewport once (the tree can be hundreds of rows long).
+  useEffect(() => {
+    if (didFocusCurrentRef.current || treeStatus !== "ready" || !leafId || filtered.length === 0) return;
+    didFocusCurrentRef.current = true;
+    focusCurrent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, leafId, treeStatus]);
+
   const selectedIsCurrent = selectedId === leafId;
 
   return (
@@ -994,6 +958,16 @@ export function TreeDialog({
                 {FILTER_LABELS[m]}
               </button>
             ))}
+            <button
+              className="tree-chip tree-chip-action"
+              onClick={() => {
+                focusCurrent();
+                if (leafId) setSelectedId(leafId);
+              }}
+              title="把当前对话所在的位置滚到视图中间"
+            >
+              定位到当前
+            </button>
             {folded.size > 0 && (
               <button className="tree-chip tree-chip-action" onClick={() => setFolded(new Set())} title="展开所有折叠的分支">
                 展开全部({folded.size})
@@ -1056,13 +1030,16 @@ export function TreeDialog({
               return (
                 <>
                   {win.start > 0 && <div style={{ height: win.start * 24 }} aria-hidden="true" />}
-                  {slice.map((f: FlatNode) => {
+                  {slice.map((f: TreeFlatRow) => {
                     const e = f.node.entry;
                     const d = entryDisplay(f.node, toolCalls);
-                    const isOnActive = activePath.has(e.id);
+                    const isOnActive = f.onActivePath;
                     const isSelected = e.id === selectedId;
-                    const isCurrent = e.id === leafId;
+                    const isCurrent = f.isCurrent;
                     const hasChildren = f.node.children.length > 0;
+                    // A branch point is where the reader has to make a choice —
+                    // mark it, so the alternatives are visible at a glance.
+                    const branchCount = f.node.children.length;
                     const isFolded = folded.has(e.id);
                     // TUI gutter: │ continuation at ancestor levels, ├/└ at
                     // the connector level; the ⊞/⊟ fold glyph lives in its
@@ -1089,7 +1066,7 @@ export function TreeDialog({
                           if (el) rowRefs.current.set(e.id, el);
                           else rowRefs.current.delete(e.id);
                         }}
-                        className={`tree-row${isSelected ? " selected" : ""}${isCurrent ? " current" : ""}`}
+                        className={`tree-row${isSelected ? " selected" : ""}${isOnActive ? " on-active-path" : ""}${isCurrent ? " current" : ""}${leafId && !isOnActive ? " off-path" : ""}`}
                         onClick={() => {
                           setSelectedId(e.id);
                           setNavPhase("idle");
@@ -1105,6 +1082,11 @@ export function TreeDialog({
                           {hasChildren ? (isFolded ? "⊞" : "⊟") : ""}
                         </span>
                         <span className="tree-pathmark">{isOnActive ? "•" : ""}</span>
+                        {branchCount > 1 && (
+                          <span className="tree-branchcount" title={`此处有 ${branchCount} 条分支`}>
+                            ⑂{branchCount}
+                          </span>
+                        )}
                         {f.node.label && <span className="tree-branch-tag">[{f.node.label}]</span>}
                         <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
                         <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>

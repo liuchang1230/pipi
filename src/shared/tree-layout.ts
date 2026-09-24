@@ -1,0 +1,158 @@
+/**
+ * tree-layout.ts — the pure geometry of the session tree.
+ *
+ * Extracted from TreeDialog.tsx (which cannot be unit-tested without a DOM) so
+ * the two things users actually complain about are verifiable:
+ *
+ *  1. **"Where is the current conversation?"** `flattenTree` already computed
+ *     `containsActive` (which subtree holds the leaf) but only used it to SORT
+ *     the active branch first. It now also reports `onActivePath` / `isCurrent`
+ *     per row, so the renderer can actually highlight the path and scroll to it.
+ *  2. **"Jumping between branches is flaky."** The dialog used to declare a
+ *     navigation complete when the leaf ID *changed*, which never happens when
+ *     the target IS the current leaf — a very common click (the bottom-most
+ *     node, the highlighted one, a branch point that is already the leaf). The
+ *     result was a 60s wait and a bogus "导航超时" while the session had already
+ *     been there all along. `isNavigationSettled` states the honest rule: the
+ *     navigation is done when the target is on the path of the CURRENT leaf
+ *     (itself included), which also covers a summarize creating a NEW child.
+ */
+import type { TreeEntry, TreeNode } from "./tree-build";
+
+export interface TreeFlatRow {
+  node: TreeNode;
+  indent: number;
+  showConnector: boolean;
+  isLast: boolean;
+  isVirtualRootChild: boolean;
+  /** Vertical │ gutters at ancestor levels (position = display indent level). */
+  gutters: Array<{ position: number; show: boolean }>;
+  /** This node lies on the path from a root to the current leaf (or IS it). */
+  onActivePath: boolean;
+  /** This node IS the current leaf — "the conversation is here". */
+  isCurrent: boolean;
+}
+
+/** Ancestor ids of `nodeId`, nearest first (excludes `nodeId` itself). */
+export function ancestorIds(entries: readonly TreeEntry[], nodeId: string): string[] {
+  const parentOf = new Map<string, string | null>();
+  for (const e of entries) parentOf.set(e.id, e.parentId ?? null);
+  const out: string[] = [];
+  let current = parentOf.get(nodeId) ?? null;
+  // Bounded by the entry count: a malformed parent chain must not loop forever.
+  for (let guard = 0; current !== null && guard <= entries.length; guard++) {
+    out.push(current);
+    current = parentOf.get(current) ?? null;
+  }
+  return out;
+}
+
+/**
+ * Is `targetId` the current position, or an ancestor of it?
+ *
+ * This is "the session is now sitting at/under the node I clicked". Checking
+ * the PATH rather than "the leaf changed" is what makes navigating to the
+ * already-current node settle immediately instead of timing out, and it keeps
+ * a summarize (which appends a NEW entry as the leaf) counted as settled.
+ */
+export function isOnLeafPath(entries: readonly TreeEntry[], targetId: string, leafId: string | null): boolean {
+  if (!leafId) return false;
+  if (targetId === leafId) return true;
+  return ancestorIds(entries, leafId).includes(targetId);
+}
+
+/** Is the session already sitting exactly at the target? (a no-op navigation) */
+export function isAlreadyAtTarget(targetId: string, leafId: string | null): boolean {
+  return leafId !== null && targetId === leafId;
+}
+
+export interface NavigationState {
+  targetId: string;
+  /** The leaf when the user pressed Enter — the reference point. */
+  startLeafId: string | null;
+  /** The leaf as of the latest snapshot. */
+  leafId: string | null;
+}
+
+/**
+ * Has the navigation actually landed?
+ *
+ * The old rule was "the leaf ID changed", which is wrong in both directions:
+ * navigating to the node you are already on never *changes* anything (the
+ * dialog then sat on its 60s timer and reported 导航超时 although nothing was
+ * wrong), and ANY other change moving the leaf counted as success even if the
+ * session had not reached the target.
+ *
+ * The honest rule needs three facts — the target, where we started, and where
+ * we are now:
+ *  - nothing moved yet (`leafId === startLeafId`) → not settled (pi may still
+ *    be working, and a summarize appends its entry afterwards);
+ *  - the leaf moved AND the target sits on the new leaf's path → landed. This
+ *    covers "pi made the target the leaf" and "pi appended a summary entry
+ *    under the target".
+ */
+export function isNavigationSettled(entries: readonly TreeEntry[], state: NavigationState): boolean {
+  if (state.leafId === null) return false;
+  if (state.leafId === state.startLeafId) return false;
+  return isOnLeafPath(entries, state.targetId, state.leafId);
+}
+
+/** Pure geometry: rows to render, active branch first, with path flags set. */
+export function flattenTree(roots: TreeNode[], leafId: string | null): { flat: TreeFlatRow[] } {
+  const containsActive = new Map<string, boolean>();
+  {
+    const all: TreeNode[] = [];
+    const stack = [...roots];
+    while (stack.length) {
+      const n = stack.pop()!;
+      all.push(n);
+      for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]!);
+    }
+    // Post-order: does a subtree contain the active leaf?
+    for (let i = all.length - 1; i >= 0; i--) {
+      const n = all[i]!;
+      let has = leafId !== null && n.entry.id === leafId;
+      for (const c of n.children) if (containsActive.get(c.entry.id)) has = true;
+      containsActive.set(n.entry.id, has);
+    }
+  }
+  const flat: TreeFlatRow[] = [];
+  const multipleRoots = roots.length > 1;
+  const orderedRoots = [...roots].sort((a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)));
+  const stack: Array<[TreeNode, number, boolean, boolean, boolean, Array<{ position: number; show: boolean }>, boolean]> = [];
+  for (let i = orderedRoots.length - 1; i >= 0; i--) {
+    stack.push([orderedRoots[i]!, multipleRoots ? 1 : 0, multipleRoots, multipleRoots, i === orderedRoots.length - 1, [], multipleRoots]);
+  }
+  while (stack.length) {
+    const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop()!;
+    const onActivePath = containsActive.get(node.entry.id) === true;
+    flat.push({
+      node,
+      indent,
+      showConnector,
+      isLast,
+      isVirtualRootChild,
+      gutters,
+      onActivePath,
+      isCurrent: leafId !== null && node.entry.id === leafId,
+    });
+    const children = node.children;
+    const multipleChildren = children.length > 1;
+    const orderedChildren = [...children].sort((a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)));
+    let childIndent: number;
+    if (multipleChildren) childIndent = indent + 1;
+    else if (justBranched && indent > 1) childIndent = indent + 1;
+    else childIndent = indent;
+    // The connector this node drew leaves a vertical gutter for its
+    // descendants (continues while the node is not the last child) — this is
+    // what keeps deep branches visually attached to their parent elbow.
+    const connectorDisplayed = showConnector && !isVirtualRootChild;
+    const displayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
+    const connectorPosition = Math.max(0, displayIndent - 1);
+    const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
+    for (let i = orderedChildren.length - 1; i >= 0; i--) {
+      stack.push([orderedChildren[i]!, childIndent, multipleChildren, multipleChildren, i === orderedChildren.length - 1, childGutters, false]);
+    }
+  }
+  return { flat };
+}
