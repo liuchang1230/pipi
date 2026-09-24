@@ -646,29 +646,10 @@ async function getSftpLease(remote: RemoteOpts): Promise<SftpLease> {
  *  Shared with wsl.ts (unit-tested there). */
 // (implemented in ./wsl as wslToWinPath; re-exported for local call sites)
 
-/** Get the WSL user's home directory via `wsl.exe`. Cached per distro — but
- *  only successful results are cached, so a cold-start timeout/failure is
- *  retried on the next call instead of poisoning the session with a wrong
- *  fallback home. */
+/** WSL home per distro. Only successful results are cached, so a cold-start
+ *  timeout/failure is retried on the next call instead of poisoning the session
+ *  with a wrong fallback home. */
 const wslHomeCache = new Map<string, string>();
-function getWslHome(distro: string): string {
-  const cached = wslHomeCache.get(distro);
-  if (cached) return cached;
-  const { spawnSync } = require("node:child_process");
-  const result = spawnSync("wsl.exe", ["-d", distro, "--", "bash", "-c", "echo $HOME"], {
-    encoding: "utf8",
-    stdio: "pipe",
-    windowsHide: true,
-    timeout: 5000,
-  });
-  const home = (result.stdout ?? "").trim();
-  if (home) {
-    wslHomeCache.set(distro, home);
-    return home;
-  }
-  // Fallback that is NOT cached — next call retries wsl.exe.
-  return `/home/${distro.split("-")[0].toLowerCase()}`;
-}
 
 /** Async (non-blocking) variant of getWslHome for background provisioning:
  *  same cache, so a sync call earlier in the click path makes this resolve
@@ -708,11 +689,21 @@ function getWslHomeAsync(distro: string): Promise<string> {
   });
 }
 
-/** Resolve a WSL path that may start with ~ to an absolute Linux path. */
-function resolveWslPath(distro: string, linuxPath: string): string {
-  let p = linuxPath.trim();
-  if (p === "~" || p === "") return getWslHome(distro);
-  if (p.startsWith("~/")) return getWslHome(distro) + "/" + p.slice(2);
+/**
+ * Resolve a WSL path that may start with ~ to an absolute Linux path.
+ *
+ * Async on purpose: this sat on the click path (tab:create, file:list,
+ * file:write/delete, session:delete, file:reveal) and used `spawnSync` — a cold
+ * wsl.exe blocked the ENTIRE main process (every IPC, every terminal stream)
+ * for up to 5s. The probe is cached and pre-warmed when distros are listed, and
+ * a miss now costs an await instead of a freeze. Do NOT replace this with a
+ * synchronous guess: a wrong base directory would be used for destructive file
+ * operations.
+ */
+async function resolveWslPath(distro: string, linuxPath: string): Promise<string> {
+  const p = (linuxPath ?? "").trim();
+  if (p === "~" || p === "") return getWslHomeAsync(distro);
+  if (p.startsWith("~/")) return (await getWslHomeAsync(distro)) + "/" + p.slice(2);
   return p;
 }
 
@@ -1278,7 +1269,7 @@ if (gotSingleInstanceLock) {
     }
     // Resolve WSL ~ paths to absolute Linux paths before spawning.
     if (opts.wsl) {
-      opts.wsl = { ...opts.wsl, path: resolveWslPath(opts.wsl.distro, opts.wsl.path || "~") };
+      opts.wsl = { ...opts.wsl, path: await resolveWslPath(opts.wsl.distro, opts.wsl.path || "~") };
     }
     // Validate the optional per-user remote data dir (keeps sessions/models
     // isolated when several people share one SSH account). Invalid values are
@@ -1477,7 +1468,7 @@ if (gotSingleInstanceLock) {
     if (!payload?.rootPath) {
       if (t?.wsl) {
         const targetDir = dirPath ?? payload?.rootPath ?? t.wsl.path ?? "~";
-        const resolved = resolveWslPath(t.wsl.distro, targetDir);
+        const resolved = await resolveWslPath(t.wsl.distro, targetDir);
         const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
         if (!payload?.noCache) {
           const cached = getCachedRemoteFileTree(cacheKey);
@@ -1519,7 +1510,7 @@ if (gotSingleInstanceLock) {
   ipcMain.handle("file:list-dir", async (_e, payload?: TargetRef & { rootPath?: string; relDir: string; noCache?: boolean }) => {
     const t = resolveTarget(payload);
     if (!payload?.rootPath && t?.wsl && payload?.relDir) {
-      const resolved = resolveWslPath(t.wsl.distro, payload.relDir);
+      const resolved = await resolveWslPath(t.wsl.distro, payload.relDir);
       const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
       if (!payload?.noCache) {
         const cached = getCachedRemoteFileTree(cacheKey);
@@ -1769,7 +1760,7 @@ if (gotSingleInstanceLock) {
         });
       } else if (t.wsl) {
         const wsl = t.wsl;
-        const root = resolveWslPath(wsl.distro, wsl.path || "~");
+        const root = await resolveWslPath(wsl.distro, wsl.path || "~");
         await walk(root, "", async (dir): Promise<Array<{ name: string; type: "file" | "directory" }>> =>
           (await readdir(wslToWinPath(wsl.distro, dir), { withFileTypes: true }))
             .flatMap((item): Array<{ name: string; type: "file" | "directory" }> => item.isDirectory() ? [{ name: item.name, type: "directory" }] : item.isFile() ? [{ name: item.name, type: "file" }] : []));
@@ -1792,7 +1783,7 @@ if (gotSingleInstanceLock) {
     if (!payload.rootPath) {
       if (t?.wsl) {
         try {
-          return await readPreviewFromAbs(wslFullPath(t, relPath), relPath);
+          return await readPreviewFromAbs(await wslFullPath(t, relPath), relPath);
         } catch (err) {
           return { content: `⚠️ 读取失败: ${err instanceof Error ? err.message : String(err)}`, bytes: 0, isBinary: false, error: String(err) };
         }
@@ -1837,13 +1828,13 @@ if (gotSingleInstanceLock) {
     return full;
   }
 
-  function wslBaseDirFor(t: TabInfo): string {
+  function wslBaseDirFor(t: TabInfo): Promise<string> {
     return resolveWslPath(t.wsl!.distro, t.wsl!.path || "~");
   }
 
-  function wslFullPath(t: TabInfo, relPath: string): string {
+  async function wslFullPath(t: TabInfo, relPath: string): Promise<string> {
     const distro = t.wsl!.distro;
-    const baseWin = wslToWinPath(distro, wslBaseDirFor(t));
+    const baseWin = wslToWinPath(distro, await wslBaseDirFor(t));
     const rawWin = relPath.startsWith("/")
       ? wslToWinPath(distro, relPath)
       : `${baseWin}\\${relPath.replace(/\//g, "\\")}`;
@@ -1878,14 +1869,14 @@ if (gotSingleInstanceLock) {
     await client.rename(full, target);
   }
 
-  function wslWrite(t: TabInfo, relPath: string, content: string): Promise<void> {
-    const win = wslFullPath(t, relPath);
+  async function wslWrite(t: TabInfo, relPath: string, content: string): Promise<void> {
+    const win = await wslFullPath(t, relPath);
     const dir = win.substring(0, win.lastIndexOf("\\"));
     return mkdir(dir, { recursive: true }).then(() => writeFile(win, content, "utf8"));
   }
 
   async function wslDelete(t: TabInfo, relPath: string): Promise<void> {
-    const win = wslFullPath(t, relPath);
+    const win = await wslFullPath(t, relPath);
     try {
       await access(win);
     } catch {
@@ -1896,7 +1887,7 @@ if (gotSingleInstanceLock) {
 
   async function wslRename(t: TabInfo, relPath: string, newName: string): Promise<void> {
     if (!isValidName(newName)) throw new Error("名称不合法（不能包含 / 或 \\）");
-    const win = wslFullPath(t, relPath);
+    const win = await wslFullPath(t, relPath);
     const target = `${win.substring(0, win.lastIndexOf("\\"))}\\${newName}`;
     if (target !== win) {
       let exists = false;
@@ -1987,7 +1978,7 @@ if (gotSingleInstanceLock) {
     }
     return mutateFile(payload, relPath, async (t) => {
       if (t.wsl) {
-        await mkdir(wslFullPath(t, relPath), { recursive: true });
+        await mkdir(await wslFullPath(t, relPath), { recursive: true });
       } else if (t.remote) {
         await withSftp(t.remote, async (client, homeDir) => {
           await client.mkdir(remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), true);
@@ -2049,7 +2040,7 @@ if (gotSingleInstanceLock) {
    *  SSH nodes live on a remote disk — the renderer never offers the action
    *  for those origins, and the handler refuses them anyway (rootPath =
    *  explicit local preview root, tab route = non-remote or WSL tab only). */
-  ipcMain.handle("file:reveal", (_e, payload?: TargetRef & { rootPath?: string; relPath?: string }) => {
+  ipcMain.handle("file:reveal", async (_e, payload?: TargetRef & { rootPath?: string; relPath?: string }) => {
     const relPath = payload?.relPath ?? "";
     // Tree node paths are posix root-relative and never contain NUL. Same
     // containment the sibling local ops enforce (resolveWithin) — this also
@@ -2071,7 +2062,7 @@ if (gotSingleInstanceLock) {
       if (t.remote) return { ok: false, error: "远程文件不支持在系统资源管理器中定位" };
       try {
         abs = t.wsl
-          ? wslFullPath(t, relPath)
+          ? await wslFullPath(t, relPath)
           : resolveWithin(t.cwd ?? process.cwd(), relPath);
       } catch {
         return { ok: false, error: "路径越界，无法定位" };
@@ -2171,7 +2162,7 @@ if (gotSingleInstanceLock) {
     return listRemoteHistory();
   });
 
-  ipcMain.handle("remote:set-browse-path", (_e, ref: string | TargetRef, path: string) => {
+  ipcMain.handle("remote:set-browse-path", async (_e, ref: string | TargetRef, path: string) => {
     const target = toTargetRef(ref);
     // Virtual target (explicit profile): no tab owns the browse path — the
     // renderer passes the directory on every read, so there is nothing to
@@ -2180,7 +2171,7 @@ if (gotSingleInstanceLock) {
     const tabId = target.tabId;
     const t = getTab(tabId);
     if (t?.wsl) {
-      t.wsl.path = resolveWslPath(t.wsl.distro, path);
+      t.wsl.path = await resolveWslPath(t.wsl.distro, path);
       if (getActiveTab()?.id === tabId) emitActive();
       return true;
     }
@@ -2316,7 +2307,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   try {
     if (tab.wsl) {
       const home = await getWslHomeAsync(tab.wsl.distro);
-      const cwd = resolveWslPath(tab.wsl.distro, tab.wsl.path || "~");
+      const cwd = await resolveWslPath(tab.wsl.distro, tab.wsl.path || "~");
       const dir = join(wslToWinPath(tab.wsl.distro, home), ".pi", "agent", "sessions", encodeCwd(cwd));
       return await latestJsonlInDir(dir);
     }
@@ -2530,12 +2521,11 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
   // --- WSL distro list ---
   ipcMain.handle("wsl:list-distros", async () => {
     const distros = await listWslDistros();
-    // Warm the home-dir cache in the background. The sync getWslHome() on WSL
-    // click paths uses spawnSync("wsl.exe") with a 5s timeout, which BLOCKS
-    // the whole main process (all IPC, terminal streaming) when cold — the
-    // "app freezes when I open a WSL tab/tree" report. Listing distros always
-    // precedes those clicks (sidebar + remote dialog), so by the time one
-    // lands the async probe has usually filled the shared cache.
+    // Warm the home-dir cache in the background. WSL click paths now AWAIT this
+    // cache (resolveWslPath → getWslHomeAsync) instead of calling spawnSync, so a
+    // cold miss costs an await rather than freezing the whole main process; this
+    // warm-up just makes the common case instant. Listing distros always
+    // precedes those clicks (sidebar + remote dialog).
     for (const d of distros.slice(0, 4)) void getWslHomeAsync(d.name);
     return distros;
   });
@@ -2847,7 +2837,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
 
   ipcMain.handle("model:transplant-to-wsl", async (_e, distro: string) => {
     try {
-      const home = getWslHome(distro);
+      const home = await getWslHomeAsync(distro);
       const winHome = wslToWinPath(distro, home);
       const piDir = join(winHome, ".pi", "agent");
       const { modelsPath, authPath } = readLocalPiConfigs();
@@ -3004,7 +2994,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
       // WSL session paths are UNC (\\wsl$\<distro>\…) — use them as-is. The
       // Linux-path translation below only covers legacy/edge callers.
       const isUnc = /^\\\\wsl\$\\/i.test(payload.path);
-      const winPath = isUnc ? payload.path : wslToWinPath(t.wsl.distro, resolveWslPath(t.wsl.distro, payload.path));
+      const winPath = isUnc ? payload.path : wslToWinPath(t.wsl.distro, await resolveWslPath(t.wsl.distro, payload.path));
       try {
         if (existsSync(winPath)) {
           unlinkSync(winPath);

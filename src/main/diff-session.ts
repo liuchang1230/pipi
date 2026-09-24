@@ -9,7 +9,7 @@
  * tool-result diffs from the session event stream.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client as SshClient } from "ssh2";
 import { findWslBin } from "./pty";
@@ -146,7 +146,7 @@ function execRemote(remote: RemoteOpts, cmd: string): Promise<ExecResult> {
   ]);
 }
 
-interface GitCtx {
+export interface GitCtx {
   kind: "local" | "wsl" | "remote";
   /** git -C dir (undefined → default cwd / home) */
   dir?: string;
@@ -273,6 +273,44 @@ async function readFileContent(ctx: GitCtx, path: string): Promise<string> {
   return r.stdout;
 }
 
+/**
+ * Cap for a synthetic "whole file" diff of an UNTRACKED file.
+ *
+ * Display-only: a diff of a multi-MB generated file is unreadable anyway, while
+ * the cost is real — a synchronous whole-file read on the main process (event
+ * loop blocked = the whole app freezes) plus a multi-MB IPC payload.
+ * Deliberately NOT applied to `readFileContent`'s other callers (`getFileAt`),
+ * where truncation could be written back to disk by a rollback.
+ */
+export const MAX_SYNTHETIC_DIFF_BYTES = 2 * 1024 * 1024;
+
+function oversizeMessage(bytes: number, cap: number): string {
+  return `文件过大（${(bytes / 1024 / 1024).toFixed(1)}MB > ${(cap / 1024 / 1024).toFixed(1)}MB），未生成整文件差异`;
+}
+
+/**
+ * Read a file for the synthetic-diff path, refusing anything over `capBytes`.
+ * `read` is injectable so the remote/WSL branches (which stream the content
+ * instead of stat-ing it) are testable without a server.
+ */
+export async function readFileContentCapped(
+  ctx: GitCtx,
+  path: string,
+  capBytes: number = MAX_SYNTHETIC_DIFF_BYTES,
+  read: (ctx: GitCtx, path: string) => Promise<string> = readFileContent,
+): Promise<string> {
+  if (ctx.kind === "local") {
+    const size = statSync(join(ctx.dir ?? "", path)).size;
+    if (size > capBytes) throw new Error(oversizeMessage(size, capBytes));
+    return read(ctx, path);
+  }
+  // WSL/SSH have no cheap stat here; the content is streamed and already bounded
+  // by the exec timeout, so gate on what actually came back.
+  const content = await read(ctx, path);
+  if (Buffer.byteLength(content, "utf8") > capBytes) throw new Error(oversizeMessage(Buffer.byteLength(content, "utf8"), capBytes));
+  return content;
+}
+
 /** Unified diff for one file; untracked files get a synthetic full-file diff. */
 export async function getFileDiff(tabId: string, path: string): Promise<FileDiffResult> {
   const ctx = gitCtxFor(tabId);
@@ -283,7 +321,9 @@ export async function getFileDiff(tabId: string, path: string): Promise<FileDiff
   const u = await runGit(ctx, ["ls-files", "--others", "--exclude-standard", "--", path]);
   if (!u.stdout.trim()) return { diff: "", isUntracked: false };
   try {
-    const content = await readFileContent(ctx, path);
+    // Not `readFileContent`: the synthetic diff is display-only, so an oversize
+    // file is refused with a reason instead of blocking the main process.
+    const content = await readFileContentCapped(ctx, path);
     const lines = content.split(/\r?\n/);
     if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
     const diff =
