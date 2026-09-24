@@ -1809,7 +1809,10 @@ if (gotSingleInstanceLock) {
         try {
           return await readPreviewFromAbs(await wslFullPath(t, relPath), relPath);
         } catch (err) {
-          return { content: `⚠️ 读取失败: ${err instanceof Error ? err.message : String(err)}`, bytes: 0, isBinary: false, error: String(err) };
+          // `content` stays empty: the failure lives in `error`. Returning the
+          // message as content meant a future consumer that forgets to check
+          // `error` would send "⚠️ 读取失败…" to the model or save it to disk.
+          return { content: "", bytes: 0, isBinary: false, error: err instanceof Error ? err.message : String(err) };
         }
       }
       if (t?.remote) {
@@ -1819,10 +1822,10 @@ if (gotSingleInstanceLock) {
       }
     }
     return readFileContent(payload.rootPath ?? t?.cwd ?? process.cwd(), relPath).catch((err) => ({
-      content: `⚠️ 读取失败: ${err instanceof Error ? err.message : String(err)}`,
+      content: "",
       bytes: 0,
       isBinary: false,
-      error: String(err),
+      error: err instanceof Error ? err.message : String(err),
     }));
   });
 
@@ -3226,11 +3229,12 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
       });
       return entries;
     } catch (e) {
-      return [{
-        name: `（WSL 浏览失败: ${e instanceof Error ? e.message : String(e)}）`,
-        path: "",
-        type: "file" as const,
-      }];
+      // A failure must stay a failure. This used to return ONE fake "file" row
+      // (`（WSL 浏览失败: …）`) so the tree rendered a nonsense entry instead of an
+      // error state — and an error that is disguised as data is one the user
+      // cannot act on (docs/robustness-plan.md B5). Throwing lets the tree show
+      // its error state with a retry.
+      throw new Error(`无法列出 WSL 目录 ${linuxPath}：${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -3247,11 +3251,10 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
         return entries;
       });
     } catch (e) {
-      return [{
-        name: `（远程浏览失败: ${e instanceof Error ? e.message : String(e)}）`,
-        path: "",
-        type: "file" as const,
-      }];
+      // See wslListFiles: an error returned as a tree row is data-shaped
+      // garbage that hides the failure. Throw instead — the tree has an error
+      // state, and an empty directory is already handled as an empty list.
+      throw new Error(`无法列出远程目录 ${dirPath ?? remote.path ?? "~"}：${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -3575,7 +3578,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
         };
       });
     } catch (e) {
-      return { content: `⚠️ 读取失败: ${e instanceof Error ? e.message : String(e)}`, bytes: 0, isBinary: false, error: String(e) };
+      return { content: "", bytes: 0, isBinary: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
 

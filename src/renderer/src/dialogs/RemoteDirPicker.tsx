@@ -12,16 +12,22 @@ export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClos
   const [pickerPath, setPickerPath] = useState("~");
   const [pickerEntries, setPickerEntries] = useState<FileNode[]>([]);
   const [pickerLoading, setPickerLoading] = useState(false);
+  /** Failure state, NOT a fake row: a placeholder entry named
+   *  "（远程目录加载失败）" looks like a file and could be double-clicked to
+   *  "enter" it (docs/robustness-plan.md B5). */
+  const [pickerError, setPickerError] = useState("");
 
   const listDir = useCallback(
     async (dir: string) => {
       setPickerPath(dir);
       setPickerLoading(true);
+      setPickerError("");
       try {
         const entries = (await window.api.file.list(target, dir)) as FileNode[];
         setPickerEntries(entries);
-      } catch {
-        setPickerEntries([{ name: "（远程目录加载失败）", path: "", type: "file" }]);
+      } catch (error) {
+        setPickerEntries([]);
+        setPickerError(error instanceof Error ? error.message : String(error));
       }
       setPickerLoading(false);
     },
@@ -76,6 +82,11 @@ export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClos
             )}
             {pickerLoading ? (
               <div className="placeholder">加载中…</div>
+            ) : pickerError ? (
+              <div className="placeholder picker-error">
+                <div>无法加载该目录：{pickerError}</div>
+                <button className="btn" onClick={() => void listDir(pickerPath)}>重试</button>
+              </div>
             ) : pickerEntries.length === 0 ? (
               <div className="placeholder">（空目录）</div>
             ) : (

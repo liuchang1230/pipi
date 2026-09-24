@@ -1710,6 +1710,15 @@ textarea:focus-visible,
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
+/* A failure inside the remote dir picker: message + retry, never a fake row. */
+.picker-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
 /* --- Chat pane (RPC tabs) --- */
 .chat-pane {
   display: flex;
