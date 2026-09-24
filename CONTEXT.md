@@ -88,3 +88,32 @@
   3. **首次列会话慢是固有的**：标签/首条消息来自**每个会话的 SFTP 头 128KB（+超限时尾 64KB）**读，批次 8、2 并发——慢链路上这就是主要开销（不是列表本身）。所以真正可做的就是 1（别把链路花在别的项目上）；想再快必须走“头 N 条 + 尾 M 条“渐进或分页（另议）。
   诊断手法：**日志里根本没有远程会话列表/水合的埋点**（只有 probe/title/rpc/transcript/mem/tree），所以无法从日志分“是列了所有项目”还是“只是慢”。已补 `[remote] list-remote <host> <dir>` 与 `[remote] hydrate batch <dir> n/N prio=` 与 `[remote] hydrate focus …`，**下次复现可直接从日志看出到底在给哪些项目花链路**——这是“先可观测再优化”的前提。教训：① **“谁在抢稀缺资源”必须能观测**，否则优化只能猜；本轮三个抱怨中有两个的真实原因（多键查找落空、占位符替换非空列表）都不是网速问题；② **并行后台工作必须有“焦点”概念**——“未暂停”不等于“用户在看”，默认可并行会把用户的等待时间拿去服务他不在看的对象；③ 同一实体被两条代码路径用两个不同 key 写入，就是定时炸弹，且症状只是“偶尔空白”，不是报错。
 - **「远程终端」按钮必须无条件可用，且必须落在终端（2026-09-11）**：用户报“点左侧远程服务器的终端按钮，应该能直接进远程终端——有时就是需要进终端”。两个真原因，都是“设计没走完”而非缺少功能：① **按钮被禁用**——`disabled={status !== "connected" && status !== "connecting"}`，于是**从未探测过（disconnected）或上次失败（failed）的服务器根本点不动**（title 写着“连接后可用”），而连接设计里恰恰把“显式点终端”当作**唯一能手动输密码的落点**（`startPi:false` 的 ssh shell 就是登录输入面）——禁止这条路径等于禁止登录；② **复用逻辑会给出聊天标签**——`ensureRemoteConnection` 的候选是“同 remoteKey 的任意标签，优先 connection”，只有 pi 会话标签时回退 `candidates[0]`，而会话标签渲染的是 **ChatView**：用户点「终端」，界面给对话。三处修：① 抽纯函数 `pickServerTerminalTab(tabs, remoteKey)`（只认 `kind === "connection"` 且非 failed，ready 优先）并单测 6 例（含“同 remoteKey 的会话标签必须返回 null”的回归锁定）；② `handleOpenServerTerminal` 改走该函数、**先 `showTabImmediately` 上屏 + `tab:activate`，再 `waitConnState` 报真相**——需要密码的服务器是在**这个终端里**提示输入的，等 10s 状态超时才切过去，用户先看到的是“点了十秒没反应”（`startPi:false` 的标签 main 不会抢 activeId，必须显式 activate）；③ SidebarPane 去掉 `disabled`，title 分三态（已连接 / SSH 连接中 / 未连接或上次失败）。教训：① **“显式入口”与“隐式推导状态”冲突时，入口优先**——把“未连接就禁用”当成礼貌，实际是把唯一的凭据输入面锁在门外；状态点已经承担了“连没连”的表达，按钮该承担“我要干什么”；② **“复用同 key 的对象”必须校验对象的能力，而不是它的身份**——同一个 remoteKey 的标签可能渲染完全不同的视图，key 相等 ≠ 可替换；③ **先上屏再等结果**：任何“等握手/等就绪再切页面”的流程，都要先问“用户要等的时候，输入面在哪”。
+
+## 稳定性契约 / Stability Contract（2026-09-24）
+
+一次系统性的稳定性整改（诊断与规划见 `docs/robustness-plan.md`）。上面那些"教训"条目是**逐例**修出来的；
+这一节把它们固化成**规则**，并写清每条规则靠什么守住。**新增代码违反规则时，在评审里按 bug 处理。**
+
+| # | 规则 | 为什么（本仓库的复发证据） | 靠什么守住 |
+|---|---|---|---|
+| 1 | **跨进程/跨网络的调用必须有 deadline**，且 deadline 到期必须在 UI 上可见（停滞 → 终态） | `tree-poll-guard`（get_entries 12949 次）→ `history-gate`（get_messages 多 MB 重下）→ 本轮 `get_messages` 17–45s；同一个教训出现三次 | `src/main/op-guard.ts`（主进程，超时**必须**释放资源）、`src/shared/with-deadline.ts`（两侧共用）、`src/renderer/src/__tests__/no-eternal-spinner.test.ts` |
+| 2 | **loading 状态不得手写**：从任务注册表派生（置位必复位由构造保证） | 曾有 7 个手写标志分布在 4 个 store，靠"记得清" | `src/renderer/src/stores/tasksStore.ts`（T1 停滞/T2 终态）；`viewerStore` 已迁移，`treeStore`/`sessionsStore` 用 `withDeadline` 兜住 |
+| 3 | **interval / 事件驱动 + 大载荷 + 慢链路** 必须 single-flight + 失败退避 | 同 #1 的三次 | `tree-poll-guard.ts` / `history-gate.ts`（待合并为 shared 原语） |
+| 4 | **来自模型/网络/文件的渲染期数据 = 不受信**，在 store/纯函数边界归一化 | 畸形 edit args（`{"edits":[{"newText":…}]}` 缺 `oldText`）在渲染期抛错 → 白屏 | `components/diff-utils.ts` 的 `parseEditArgs`/`normalizeEdits` + 根级 `ErrorBoundary` |
+| 5 | **禁止裸 `catch {}`**：要么进 error 态，要么显式 best-effort | 多处 `.catch(() => undefined)` 把失败变成"没有反应" | 评审 + `failureStore`（失败必须留痕） |
+| 6 | **错误不得伪装成数据**（不得把失败文案写进 `content` 或返回成占位节点） | 远程浏览失败曾返回一行假"文件"；`file:read` 曾把 `⚠️ 读取失败` 当 `content`（会被保存回磁盘） | `src/shared/outcome.ts`（`Outcome` 互斥）+ `robustness-smoke.mjs` 的断言"失败读 → 有 error 且 content 为空" |
+| 7 | **用户数据写入必须原子 + 可恢复**；解析失败不得静默返回空值 | `writeFileSync` 直写 + 读失败 `return []` + `writeProjects` 读-改-写 → 一次损坏读就把全部项目写没 | `src/main/json-store.ts`（tmp→fsync→rename、`.bak`、`.corrupt-*`、**写封锁**）+ `projects-corrupt.test.ts` |
+| 8 | **失败必须带 code + 人话标题 + 技术原因 + 可执行建议 + 可复制证据** | 三种错误契约并存；错误是现场拼的字符串，无法聚合也无从下手 | `shared/outcome.ts`（每个 code 一条 hint）、`failureStore` + `FailureCenter`（持久 + 复制全部） |
+
+**诊断层**（"卡"和"没反应"必须能变成数字，而不是感觉）：
+- `src/main/perf.ts` + `src/main/in-flight.ts`：事件循环 lag 采样 + **归因**（启动时对 `ipcMain.handle` 打一次补丁，
+  覆盖全部 handler，无需逐点记账）→ 渲染层「应用繁忙（延迟 Xms）· 正在：ipc:file:list」。诚实边界：同步冻结只能事后记录。
+- 日志：`PIPI_LOG=debug|info|warn|error`（默认 info）。逐帧 RPC、轮询路由、对话框轮询是 **debug**；
+  失败一律 warn（立即落盘）。异步批量写 + 8MB×3 轮转。实测 11.4MB/13 万行 → 一次完整运行 ~345 字节。
+- 异常必须落盘：主进程 `uncaughtException`/`unhandledRejection`、渲染进程 `render-process-gone`（+ 单次自动 reload）、
+  配置损坏（`config:problems` 拉 + `config:corrupt` 推）。
+- 真机回归：`npm run smoke:robustness`（CDP 驱动打包版，26 项断言，不依赖模型回复；含"损坏配置必须被用户看见"）。
+
+**尚未覆盖（已知缺口，别当成已修）**：S3 preload 全 channel deadline 表（现由 op-guard 60s + 调用点 `withDeadline` 覆盖）；
+`treeStore.fileTreeStatus` / `sessionsStore.projectLoading` / `remoteHydration` 未迁到任务层（缺"10s 停滞"那一级，
+但已有 30s/60s 终态）；失败面只有少数调用点 opt-in；**远端/WSL 路径只能靠真机使用验证**（smoke 覆盖不到）。

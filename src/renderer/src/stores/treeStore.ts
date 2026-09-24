@@ -3,6 +3,7 @@
 // callbacks per render; a monotonic request id prevents a slow listing for
 // tab A from clobbering a newer one for tab B.
 import { create } from "zustand";
+import { withDeadline } from "../../../shared/with-deadline";
 import { useTabsStore } from "./tabsStore";
 import { apply, type Updater } from "./utils";
 import { targetKey, targetOfOrigin, type RemoteProfileTarget, type TargetRef, type WslProfileTarget } from "./remote-target";
@@ -167,6 +168,18 @@ export function sortFileNodes(nodes: FileNode[]): FileNode[] {
   });
 }
 
+/**
+ * Bound for the two visible directory listings (root + expand).
+ *
+ * `file:list` can hang: main bounds its own side (op-guard 60s on SFTP), but the
+ * renderer must not depend on that — the placeholder is driven HERE, so the
+ * bound belongs here too. 30s matches the tree's "visible stall → terminal"
+ * stage; the plain `withDeadline` + existing catch turns it into
+ * `fileTreeStatus: "error"` with a retryable message instead of an eternal
+ * "加载中…" (docs/robustness-plan.md B1/B3).
+ */
+const TREE_LIST_DEADLINE_MS = 30_000;
+
 export const useTreeStore = create<TreeState>()((set, get) => ({
   tree: [],
   expanded: new Set<string>(),
@@ -255,7 +268,11 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
     try {
       // The main process selects local, SSH, or WSL from this origin's tab.
       // `relDir` is root-relative locally and absolute on SSH/WSL.
-      const nodes = (await window.api.file.listDirChildren(rootPath, target, relDir, force ? true : undefined)) as FileNode[];
+      const nodes = await withDeadline(
+        window.api.file.listDirChildren(rootPath, target, relDir, force ? true : undefined) as Promise<FileNode[]>,
+        TREE_LIST_DEADLINE_MS,
+        `展开目录 ${relDir}`,
+      );
       if (expandSeqs.get(relDir) !== seq) return; // superseded by a newer expand of THIS dir
       const cur = get();
       // Discard if the origin changed, the dir was collapsed, or the node
@@ -346,7 +363,11 @@ export const useTreeStore = create<TreeState>()((set, get) => ({
       }
     }
     try {
-      const nodes = (await window.api.file.list(target, dirPath, rootPath, options?.noCache)) as FileNode[];
+      const nodes = await withDeadline(
+        window.api.file.list(target, dirPath, rootPath, options?.noCache) as Promise<FileNode[]>,
+        TREE_LIST_DEADLINE_MS,
+        `列举目录 ${dirPath ?? rootPath ?? ""}`,
+      );
       if (reqSeq !== treeReqSeq.current) return; // superseded by a newer load
       const sortedNodes = sortFileNodes(nodes);
       set((s) => ({
