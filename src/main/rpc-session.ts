@@ -22,7 +22,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
-import { debugLog } from "./debug-log";
+import { debugLog, debugLogDebug, debugLogWarn } from "./debug-log";
 import { isSshAuthError } from "./sftp-failure";
 import { subagentEnv, subagentShellPrefix } from "./subagent-model";
 import {
@@ -301,6 +301,13 @@ function wslSessionToLinux(distro: string, sessionPath: string): string {
 export const SEND_SILENCE_MS = 90000;
 
 /**
+ * Round trip above which a response is worth a line at the DEFAULT log level.
+ * Measured: a remote `get_messages` took 17-45s while the app looked stuck, and
+ * every one of those trips was buried among 26k per-frame `RESP` lines.
+ */
+const SLOW_RESPONSE_MS = 3000;
+
+/**
  * "Wrote a command, nothing came back" clock. Pure state machine: the timer
  * only polls it, so the policy is unit-testable without a transport.
  * `take` disarms, so one silence window produces exactly ONE report — a dead
@@ -361,6 +368,8 @@ export class RpcSession {
   private buffer = "";
   private exited = false;
   private pendingResponses = new Set<(r: RpcResponse) => void>();
+  /** Send time per request id, so a response can report its round trip. */
+  private readonly sentAt = new Map<string, number>();
   /** Zero-output watchdog state (see constructor). */
   private sawOutput = false;
   private noOutputTimer: ReturnType<typeof setTimeout> | null = null;
@@ -473,7 +482,7 @@ export class RpcSession {
         this.reportAuthFailure(opts.remote, "认证失败：需要密码或密钥未授权");
       }
       console.log(`[rpc] tab ${id} exited: ${code}`);
-      debugLog("rpc", `tab ${id} EXIT ${code} stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-600))}`);
+      debugLogWarn("rpc", `tab ${id} EXIT ${code} stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-600))}`);
       if (this.noOutputTimer) {
         clearTimeout(this.noOutputTimer);
         this.noOutputTimer = null;
@@ -493,7 +502,7 @@ export class RpcSession {
       if (this.exited || this.sawOutput) return;
       console.error(`[rpc] tab ${id} produced no output in 40s — auth/exec stalled`);
       const stderrTail = this.lastStderr.trimEnd().slice(-400);
-      debugLog("rpc", `tab ${id} NO-OUTPUT-40s stderr=${JSON.stringify(stderrTail)}`);
+      debugLogWarn("rpc", `tab ${id} NO-OUTPUT-40s stderr=${JSON.stringify(stderrTail)}`);
       forwardEvent(id, { type: "rpc_no_output", seconds: 40, stderr: stderrTail });
     }, 40000);
     // Stalled-connection diagnosis: bytes ARE flowing but pi never answers
@@ -504,7 +513,7 @@ export class RpcSession {
       this.stallTimer = null;
       if (this.exited || this.responsesSeen > 0) return;
       console.error(`[rpc] tab ${id} no JSONL response in 60s (sawOutput=${this.sawOutput}) junk=${JSON.stringify(this.junkLines)}`);
-      debugLog("rpc", `tab ${id} STALLED-60s sawOutput=${this.sawOutput} junk=${JSON.stringify(this.junkLines)}`);
+      debugLogWarn("rpc", `tab ${id} STALLED-60s sawOutput=${this.sawOutput} junk=${JSON.stringify(this.junkLines)}`);
       forwardEvent(id, { type: "rpc_stalled", sawOutput: this.sawOutput, junkLines: this.junkLines });
     }, 60000);
     debugLog("rpc", `tab ${id} SPAWNED ${label} (password=${!!opts.remote?.password} wsl=${!!opts.wsl} sessionPath=${opts.sessionPath ?? "-"})`);
@@ -513,10 +522,20 @@ export class RpcSession {
   /** Send a command (JSONL to stdin). Returns false if the process is gone. */
   send(cmd: RpcCommand): boolean {
     if (this.exited || !this.transport.stdin.writable) {
-      debugLog("rpc", `tab ${this.id} SEND ${String(cmd.type)} DROPPED (exited=${this.exited} writable=${this.transport.stdin.writable})`);
+      debugLogWarn("rpc", `tab ${this.id} SEND ${String(cmd.type)} DROPPED (exited=${this.exited} writable=${this.transport.stdin.writable})`);
       return false;
     }
-    debugLog("rpc", `tab ${this.id} SEND ${String(cmd.type)}${cmd.id ? ` id=${String(cmd.id)}` : ""}`);
+    // Per-message sends are debug (they were 26k of the log's lines); what
+    // matters at the default level is the round trip, logged on the response.
+    debugLogDebug("rpc", `tab ${this.id} SEND ${String(cmd.type)}${cmd.id ? ` id=${String(cmd.id)}` : ""}`);
+    if (cmd.id !== undefined) {
+      this.sentAt.set(String(cmd.id), Date.now());
+      // Unanswered requests would leak; ids are also deleted on response.
+      if (this.sentAt.size > 200) {
+        const oldest = this.sentAt.keys().next().value;
+        if (oldest !== undefined) this.sentAt.delete(oldest);
+      }
+    }
     this.transport.stdin.write(JSON.stringify(cmd) + "\n");
     this.armSilenceWatchdog();
     return true;
@@ -547,7 +566,7 @@ export class RpcSession {
       const silentMs = this.silence.take(Date.now());
       if (silentMs === null) return;
       console.error(`[rpc] tab ${this.id} no bytes for ${Math.round(silentMs / 1000)}s after a command — connection presumed dead`);
-      debugLog("rpc", `tab ${this.id} UNRESPONSIVE ${Math.round(silentMs / 1000)}s stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-400))}`);
+      debugLogWarn("rpc", `tab ${this.id} UNRESPONSIVE ${Math.round(silentMs / 1000)}s stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-400))}`);
       forwardEvent(this.id, {
         type: "rpc_unresponsive",
         silentMs,
@@ -607,7 +626,19 @@ export class RpcSession {
     const type = msg.type;
     if (type === "response") {
       this.responsesSeen++;
-      debugLog("rpc", `tab ${this.id} RESP ${String(msg.command)} success=${msg.success}${msg.id ? ` id=${String(msg.id)}` : ""}${msg.error ? ` err=${String(msg.error).slice(0, 120)}` : ""}`);
+      const id = msg.id === undefined ? null : String(msg.id);
+      const startedAt = id === null ? undefined : this.sentAt.get(id);
+      if (id !== null) this.sentAt.delete(id);
+      const elapsedMs = startedAt === undefined ? null : Date.now() - startedAt;
+      const detail =
+        `tab ${this.id} RESP ${String(msg.command)} success=${String(msg.success)}` +
+        `${id ? ` id=${id}` : ""}${elapsedMs === null ? "" : ` ${elapsedMs}ms`}` +
+        `${msg.error ? ` err=${String(msg.error).slice(0, 120)}` : ""}`;
+      // A response is normally debug noise, but a SLOW one is the signal that
+      // used to be buried among them: a 45s get_messages (the agent looking
+      // stuck) is now one greppable line at the default level.
+      if (elapsedMs !== null && elapsedMs >= SLOW_RESPONSE_MS) debugLog("rpc-slow", detail);
+      else debugLogDebug("rpc", detail);
       this.pendingResponses.forEach((cb) => cb(msg as unknown as RpcResponse));
       forwardEvent(this.id, msg);
       return;

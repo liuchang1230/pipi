@@ -241,8 +241,10 @@ declare global {
         fromFile: (tabId: string) => Promise<{ ok: boolean; entries?: unknown[]; leafId?: string | null; error?: string }>;
       };
       debug: {
-        /** Append a renderer-side diagnostic line to the main-process log file. */
-        log: (msg: string) => void;
+        /** Append a renderer-side diagnostic line to the main-process log file.
+         *  `level` defaults to "info"; poll loops pass "debug" so they are only
+         *  recorded when PIPI_LOG=debug. */
+        log: (msg: string, level?: "debug" | "info" | "warn" | "error") => void;
       };
       onWorkbenchCommand: (callback: (command: "project:open" | "remote:connect" | "session:new" | "session:close" | "view:toggle-viewer" | "view:toggle-theme" | "models:configure" | "help:shortcuts") => void) => () => void;
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;

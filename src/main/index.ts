@@ -30,7 +30,7 @@ import { pickWslEventTab } from "./wsl-event-tab";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
-import { debugLog } from "./debug-log";
+import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
 import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
 import { INTERNAL_RPC_ID_PREFIX } from "../shared/transcript";
 import { isSftpMissingPathError } from "./sftp-errors";
@@ -168,6 +168,23 @@ type SftpLease = {
   idleTimer: NodeJS.Timeout | null;
   connectPromise: Promise<SftpLease> | null;
 };
+
+/**
+ * RPC commands the renderer issues on a TIMER (tree refresh, liveness probe,
+ * capability refresh) rather than in response to a user action. Their route
+ * lines are repetition — 24k of 28k `[rpc-send]` lines measured — so they are
+ * logged at debug while the app's own actions stay at info. See docs/robustness-plan.md A3.
+ */
+const POLL_RPC_COMMANDS = new Set<string>([
+  "get_entries",
+  "get_session_stats",
+  "get_state",
+  "get_commands",
+  "get_available_models",
+  "get_available_thinking_levels",
+  "get_tree",
+  "get_messages",
+]);
 
 const REMOTE_SESSION_CACHE_TTL_MS = 12_000;const REMOTE_FILE_TREE_CACHE_TTL_MS = 5_000;
 // Idle TTL for the shared SFTP lease. 20s was too aggressive: every lease
@@ -2201,16 +2218,39 @@ if (gotSingleInstanceLock) {
     const sdk = getSdkTab(tabId);
     if (sdk) {
       const ok = sdkSend(tabId, cmd);
-      debugLog("rpc-send", `tab ${tabId} ${String(cmd.type)} -> sdk ok=${ok}`);
+      logRpcSend(tabId, cmd, ok, "sdk");
       return ok;
     }
     const session = getRpcSession(tabId);
     const ok = session ? session.send(cmd) : false;
-    debugLog("rpc-send", `tab ${tabId} ${String(cmd.type)} -> rpc ok=${ok} (session=${!!session})`);
+    logRpcSend(tabId, cmd, ok, session ? "rpc" : "rpc (no session)");
     return ok;
   });
+
+  /**
+   * Renderer→pi command tracing. The renderer also polls on timers (tree
+   * refresh, liveness probe), so these lines are mostly repetition: measured on
+   * a real log, `get_entries` + `get_session_stats` were 24k of the 28k route
+   * lines. Those are debug; a FAILED send — the case that explains "点了没反应" —
+   * always warns, and commands a user actually triggers stay at info.
+   */
+  function logRpcSend(tabId: string, cmd: Record<string, unknown>, ok: boolean, route: string): void {
+    const text = `tab ${tabId} ${String(cmd.type)} -> ${route} ok=${ok}`;
+    if (!ok) debugLogWarn("rpc-send", text);
+    else if (POLL_RPC_COMMANDS.has(String(cmd.type))) debugLogDebug("rpc-send", text);
+    else debugLog("rpc-send", text);
+  }
+
   // Renderer-side diagnostics (tree dialog actions) land in the same log file.
-  ipcMain.on("debug:log", (_e, msg: unknown) => debugLog("renderer", String(msg ?? "")));
+  // They are untrusted input for the log — a poll loop can send thousands of
+  // lines — so the level decides whether they are recorded at all.
+  ipcMain.on("debug:log", (_e, msg: unknown, level?: unknown) => {
+    const text = String(msg ?? "");
+    if (level === "debug") return debugLogDebug("renderer", text);
+    if (level === "warn") return debugLogWarn("renderer", text);
+    if (level === "error") return debugLogError("renderer", text);
+    return debugLog("renderer", text);
+  });
   // Session tree straight from the session file — the fast paint path for
   // the chat tree dialog. The RPC get_tree path can be slow while the
   // remote pi is still booting (or unresponsive if it died), but the
@@ -3611,6 +3651,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
 
 app.on("window-all-closed", async () => {
   appQuitting = true;
+  flushLog();
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopSessionsPoll();
   closeAllTabs();
@@ -3623,6 +3664,7 @@ app.on("window-all-closed", async () => {
 
 app.on("before-quit", async () => {
   appQuitting = true;
+  flushLog();
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopSessionsPoll();
   closeAllTabs();

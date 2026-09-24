@@ -294,8 +294,11 @@ const api = {
       ipcRenderer.invoke("tree:from-file", tabId),
   },
   debug: {
-    /** Append a renderer-side diagnostic line to the main-process log file. */
-    log: (msg: string): void => ipcRenderer.send("debug:log", msg),
+    /** Append a renderer-side diagnostic line to the main-process log file.
+     *  Poll loops pass "debug": those lines were ~35% of a real log and hid
+     *  the signal. */
+    log: (msg: string, level?: "debug" | "info" | "warn" | "error"): void =>
+      ipcRenderer.send("debug:log", msg, level),
   },
   theme: {
     setMode: (mode: "dark" | "light"): Promise<boolean> =>

@@ -315,7 +315,7 @@ export function TreeDialog({
       if (!tryAcquireEntriesSlot()) return;
       void window.api.tab.rpcSend(tabId, { type: "get_entries" })
         .then((ok) => {
-          window.api.debug.log(`TreeDialog(${tabId}) get_entries sent ok=${ok}`);
+          window.api.debug.log(`TreeDialog(${tabId}) get_entries sent ok=${ok}`, ok ? "debug" : "warn");
           if (!ok) {
             releaseEntriesSlot();
             if (!pendingNavRequestId.current) {
@@ -379,7 +379,7 @@ export function TreeDialog({
           }
         })
         .catch((err) => {
-          window.api.debug.log(`TreeDialog(${tabId}) fromFile REJECTED ${err instanceof Error ? err.message : String(err)}`);
+          window.api.debug.log(`TreeDialog(${tabId}) fromFile REJECTED ${err instanceof Error ? err.message : String(err)}`, "error");
           fileAttemptRef.current = { error: "", at: Date.now() };
           // File read unavailable (session not yet linked, transient SFTP
           // failure) — the RPC path below is the fallback.
@@ -419,7 +419,7 @@ export function TreeDialog({
       // Entry diagnostics: which events actually reach this handler (a
       // response here proves the event channel is alive end-to-end).
       if (event.type === "response") {
-        window.api.debug.log(`TreeDialog(${tabId}) EVENT resp ${String(event.command)}${event.success === false ? " success=false" : ""}${event.id ? ` id=${String(event.id)}` : ""}`);
+        window.api.debug.log(`TreeDialog(${tabId}) EVENT resp ${String(event.command)}${event.success === false ? " success=false" : ""}${event.id ? ` id=${String(event.id)}` : ""}`, "debug");
       }
       if (event.type === "rpc_no_output") {
         // Remote pi produced ZERO bytes (ssh2 auth hang / exec stalled /
@@ -498,7 +498,7 @@ export function TreeDialog({
       if (event.success && Array.isArray(data.entries)) {
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
-        window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE entries=${data.entries.length} leaf=${data.leafId ?? "null"}`);
+        window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE entries=${data.entries.length} leaf=${data.leafId ?? "null"}`, "debug");
         applySnapshot(data.entries as FlatTreeEntry[], data.leafId ?? null);
       } else {
         setTreeStatus("error");
