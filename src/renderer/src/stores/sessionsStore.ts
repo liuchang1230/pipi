@@ -30,6 +30,19 @@ import type {
 export { buildRemoteKey, remoteSessionCacheKey };
 
 /**
+ * A remote session listing carries metadata only (path/mtime); name, preview and
+ * message count come from a later per-file hydration. Until that lands, the row
+ * has no name, no preview and a placeholder count of 0 — rendering "0 条" would
+ * be a lie. This predicate is the ONE definition of that state: the row's
+ * "同步中…" label and the project's "正在补全会话信息（x/y）" note both use it, so
+ * the notice cannot outlive the rows it describes (the floating notice it
+ * replaces was driven by a separate flag and got stuck after a lost event).
+ */
+export function needsHydration(session: SessionItem): boolean {
+  return session.name === null && session.firstMessage === "" && session.messageCount === 0;
+}
+
+/**
  * Bound for the two SFTP reads a remote project row depends on (root listing,
  * session list). 30s is ~2x the worst measured round trip for a hydrated
  * remote session listing and sits between the two deadline stages Phase 2
@@ -100,6 +113,8 @@ interface SessionsState {
   // Project explorer orchestration (hydration phases + cache fast paths)
   toggleProject: (project: ProjectGroup) => Promise<void>;
   deleteProject: (project: ProjectGroup) => Promise<void>;
+  /** Re-list one remote project (hydration retry). */
+  refreshRemoteSessions: (project: ProjectGroup) => Promise<void>;
   /** Cascade-delete a whole SSH server node: close its tabs, remove its
    *  project entries and its saved connection (server files untouched). */
   deleteServer: (server: RemoteServerGroup) => Promise<void>;
@@ -610,6 +625,34 @@ export const useSessionsStore = create<SessionsState>()((set, get) => ({
     }
 
     await adoptRemoteRootListing({ clearHydration: true });
+  },
+
+  /**
+   * Re-request one remote project's session list. Used by the "still completing"
+   * note when rows stay unhydrated: main dequeues a failed hydration, so only a
+   * fresh list re-schedules it. Does not touch expansion state.
+   */
+  refreshRemoteSessions: async (project) => {
+    const target = projectTarget(project);
+    try {
+      await window.api.session.prioritizeRemote(target, project.cwd, 2);
+      const listResult = await withDeadline(
+        window.api.session.listRemote(target, project.cwd),
+        REMOTE_ROOT_LIST_DEADLINE_MS,
+        `读取远程会话列表 ${project.cwd}`,
+      );
+      set((s) => ({
+        projectSessions: { ...s.projectSessions, [project.key]: listResult.sessions as SessionItem[] },
+        projectErrors: { ...s.projectErrors, [project.key]: listResult.error },
+        projectDiagnostics: { ...s.projectDiagnostics, [project.key]: listResult.diagnostics },
+        projectSessionStatus: {
+          ...s.projectSessionStatus,
+          [project.key]: listResult.error ? "error" : listResult.sessions.length > 0 ? "ready" : "empty",
+        },
+      }));
+    } catch (error) {
+      useUiStore.getState().showToast(error instanceof Error ? error.message : "重新读取会话列表失败", "err", { failure: true });
+    }
   },
 
   deleteProject: async (project) => {

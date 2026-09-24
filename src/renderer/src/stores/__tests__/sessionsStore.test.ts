@@ -2,10 +2,12 @@
 // "refresh caches after delete" invariant (the multi-project case is the one
 // that used to clobber with a stale snapshot).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useSessionsStore, sessionLabel, remoteSessionCacheKey, buildRemoteKey } from "../sessionsStore";
+import { useSessionsStore, sessionLabel, needsHydration, remoteSessionCacheKey, buildRemoteKey } from "../sessionsStore";
 import { useTabsStore } from "../tabsStore";
 import { useTreeStore } from "../treeStore";
 import { useRemoteStore } from "../remoteStore";
+import { useUiStore } from "../uiStore";
+import { useFailureStore } from "../failureStore";
 import type { SessionItem, ProjectGroup, ProjectListItem, RemoteHistoryItem, RemoteServerGroup } from "../types";
 
 const SESSION: SessionItem = {
@@ -56,6 +58,7 @@ function makeApi(opts: { sessionList?: (cwd?: string) => Promise<SessionItem[]> 
 
 beforeEach(() => {
   makeApi();
+  useFailureStore.setState({ failures: [] });
   useSessionsStore.setState({
     projects: [],
     sessions: [],
@@ -523,5 +526,58 @@ describe("deleteServer (cascade)", () => {
     expect(api.tab.close).not.toHaveBeenCalled();
     expect(api.project.delete).not.toHaveBeenCalled();
     expect(api.remote.deleteHistory).not.toHaveBeenCalled();
+  });
+});
+
+describe("needsHydration (the one definition of \"still metadata only\")", () => {
+  it("is true for a listing entry before its file was read", () => {
+    expect(needsHydration({ ...SESSION, name: null, firstMessage: "", messageCount: 0 })).toBe(true);
+  });
+
+  it("is false once ANY of the three fields arrived", () => {
+    expect(needsHydration({ ...SESSION, name: "改名了", firstMessage: "", messageCount: 0 })).toBe(false);
+    expect(needsHydration({ ...SESSION, name: null, firstMessage: "第一句话", messageCount: 0 })).toBe(false);
+    expect(needsHydration({ ...SESSION, name: null, firstMessage: "", messageCount: 12 })).toBe(false);
+  });
+
+  it("drives BOTH the row label and the project note, so they cannot disagree", () => {
+    // The removed floating notice used a separate flag: it kept showing after the
+    // rows had filled in (a lost progress event), and it showed for projects that
+    // were not hydrating at all — including a brand-new session.
+    const listed = [
+      { ...SESSION, path: "/a.jsonl", name: null, firstMessage: "", messageCount: 0 },
+      { ...SESSION, path: "/b.jsonl", name: "B", firstMessage: "hi", messageCount: 3 },
+    ];
+    expect(listed.filter(needsHydration)).toHaveLength(1);
+    expect(listed.filter((x) => !needsHydration(x))).toHaveLength(1);
+  });
+});
+
+describe("refreshRemoteSessions (hydration retry)", () => {
+  it("re-requests the list and adopts the result", async () => {
+    const api = makeApi();
+    api.session.listRemote.mockResolvedValue({
+      sessions: [{ ...SESSION, path: "/fresh.jsonl", name: "Fresh", messageCount: 5 }],
+      error: undefined,
+      diagnostics: undefined,
+    });
+    const project = { key: "rp", label: "RP", cwd: "/r", type: "remote" as const, host: "h", user: "u", port: 22, password: "p", sessions: [] };
+
+    await useSessionsStore.getState().refreshRemoteSessions(project);
+
+    expect(api.session.prioritizeRemote).toHaveBeenCalledWith(expect.anything(), "/r", 2);
+    expect(useSessionsStore.getState().projectSessions.rp?.map((x) => x.path)).toEqual(["/fresh.jsonl"]);
+    expect(useSessionsStore.getState().projectSessionStatus.rp).toBe("ready");
+  });
+
+  it("surfaces a failure instead of leaving the note spinning", async () => {
+    const api = makeApi();
+    api.session.listRemote.mockRejectedValue(new Error("ECONNRESET"));
+    const project = { key: "rp", label: "RP", cwd: "/r", type: "remote" as const, host: "h", user: "u", port: 22, password: "p", sessions: [] };
+
+    await useSessionsStore.getState().refreshRemoteSessions(project);
+
+    expect(useUiStore.getState().toast?.type).toBe("err");
+    expect(useFailureStore.getState().failures.length).toBeGreaterThan(0);
   });
 });

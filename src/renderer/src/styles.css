@@ -1629,7 +1629,11 @@ textarea:focus-visible,
 /* --- Toast notifications --- */
 .toast {
   position: fixed;
-  bottom: 24px;
+  /* Top-centre, NOT bottom-centre: the middle pane's composer occupies the
+     bottom band of the window, so a bottom toast landed right under/over the
+     input box ("提示的位置很奇怪"). Above the tab bar is both conventional and
+     collision-free. */
+  top: 56px;
   left: 50%;
   transform: translateX(-50%);
   max-width: min(560px, calc(100vw - 32px));
@@ -1650,6 +1654,29 @@ textarea:focus-visible,
   background: rgba(243, 139, 168, 0.15);
   border: 1px solid rgba(243, 139, 168, 0.3);
   color: var(--danger);
+}
+
+/* --- Remote session hydration progress ---
+   Inline, inside the project's own session list: the progress belongs to those
+   rows, and a floating toast (previously fixed at the bottom of the window)
+   showed while ANY project was hydrating — even for a brand-new session. */
+.remote-hydration-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 4px 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11px;
+  text-decoration: underline;
 }
 
 /* --- "应用繁忙" pill (main-process lag with attribution) ---
@@ -1706,7 +1733,7 @@ textarea:focus-visible,
   50% { opacity: 0.35; }
 }
 @keyframes toast-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px); }
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 

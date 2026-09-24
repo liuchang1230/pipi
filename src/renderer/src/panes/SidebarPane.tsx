@@ -13,6 +13,7 @@ import { FileContextMenu, PromptDialog, ConfirmDialog } from "../FileDialogs";
 import { sortFileNodes, useTreeStore } from "../stores/treeStore";
 import {
   useSessionsStore,
+  needsHydration,
   sessionLabel,
   remoteSessionCacheKey,
   buildRemoteKey,
@@ -679,13 +680,6 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
         onTreeCtx={openTreeMenu}
       />
 
-      {/* Hydration feedback: bottom-right, clear of the viewer. */}
-      {remoteHydration.phase !== "idle" && isRemote && (
-        <div className="toast toast-ok" style={{ right: viewerCollapsed ? 20 : rightWidth + 20, bottom: 20 }}>
-          {remoteHydration.phase === "loading" ? "远程会话加载中…" : "正在补全远程会话信息…"}
-        </div>
-      )}
-
       {/* Session context menu */}
       {ctxMenuSession && (
         <>
@@ -1058,6 +1052,21 @@ const ProjectItem = memo(function ProjectItem({
   onOpenRemoteSession, onDeleteSession, onHandleSessionCtx,
   onSelectAllSessions, onToggleSessionSelect,
 }: ProjectItemProps) {
+  // How many of THIS project's rows are still metadata-only, and whether that
+  // has stopped moving (main dequeues a failed hydration, so nothing arrives).
+  // Derived from the rows themselves — never from a separate flag — so the note
+  // below cannot outlive the state it describes.
+  const pendingHydration = isRemoteSection ? project.sessions.filter(needsHydration).length : 0;
+  const [hydrationStalled, setHydrationStalled] = useState(false);
+  useEffect(() => {
+    if (pendingHydration === 0) {
+      setHydrationStalled(false);
+      return;
+    }
+    const timer = setTimeout(() => setHydrationStalled(true), 20_000);
+    return () => clearTimeout(timer);
+  }, [pendingHydration]);
+
   const disabled = !!project.disabled;
   const onOpen = (session: SessionItem) => {
     if (isRemoteSection) {
@@ -1086,6 +1095,29 @@ const ProjectItem = memo(function ProjectItem({
       {expanded && (
         <div className="project-sessions">
           {isRemoteSection && <div className="remote-project-path">{project.cwd}</div>}
+          {/* Completion progress belongs to THIS project's list (the previous
+              floating toast was global: it showed while some other project was
+              hydrating — even for a brand-new session — and, sitting on the
+              composer, its position made no sense). Derived from the rows
+              themselves, so it cannot outlive them. */}
+          {isRemoteSection && pendingHydration > 0 && (
+            <div className="remote-hydration-note">
+              <span>
+                正在补全会话信息（{project.sessions.length - pendingHydration}/{project.sessions.length}）
+                {hydrationStalled ? " · 停滞较久" : ""}
+              </span>
+              <button
+                className="link-btn"
+                title="重新读取该项目的会话列表（补全失败时需要的重试）"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void useSessionsStore.getState().refreshRemoteSessions(project);
+                }}
+              >
+                重试
+              </button>
+            </div>
+          )}
           {/* A non-empty list is NEVER replaced by a loading placeholder: the
               sessions were already fetched, so swapping them out for "加载中…"
               on every re-list is what made the sidebar look like it kept
@@ -1435,8 +1467,10 @@ interface SessionRowProps {
 
 const SessionRow = memo(function SessionRow({ session, active, checked, onToggleChecked, onOpen, onDelete, onContextMenu }: SessionRowProps) {
   // Remote metadata-only entries (not yet hydrated) carry no name/firstMessage
-  // and a placeholder count of 0 — rendering "0 条" would be misleading.
-  const hydrating = session.name === null && session.firstMessage === "" && session.messageCount === 0;
+  // and a placeholder count of 0 — rendering "0 条" would be misleading. The
+  // predicate is shared with the project-level "正在补全…" note, so the two
+  // cannot disagree (stores/sessionsStore.ts: needsHydration).
+  const hydrating = needsHydration(session);
   return (
     <div
       className={`session-row${active ? " active" : ""}`}

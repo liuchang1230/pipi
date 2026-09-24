@@ -159,3 +159,26 @@
 `isAlreadyAtTarget` / `isNavigationSettled`），TreeDialog 里那份**没有测试**的重复实现删掉；
 并把 `TreeDialog` 私有的 `TreeEntry`/`TreeNode` 与 shared 的统一（此前是两套不兼容类型，
 `applyVisibility` 传参处靠巧合编译通过）。
+
+## 远程会话补全提示：从"全局浮层"改成"属于该项目行内" (2026-09-24)
+
+用户反馈：打开已有会话时下方一直显示「正在补全远程会话信息」，会话都出来了还在；**新建会话也显示**；而且提示位置很奇怪（在输入框下方一点）。
+
+三个症状是同一个设计错误 + 一个 CSS 定位错误的叠加：
+
+- **作用域错误**：那条提示读的是**全局** `sessionsStore.remoteHydration`，条件只是 `phase !== "idle" && isRemote`。
+  于是「任何**别的**项目正在水合」都会在**当前**中间页显示 —— 新建会话（完全不涉及水合）也会显示。
+- **清除条件脆弱**：清除要求 `onRemoteSessionsUpdated` 事件里 `hydratedCount >= totalCount` **且** key（tabId/remoteKey+cwd）
+  与 `prev` 完全匹配。事件丢一次、或用户中途切项目/收起、或 main 侧水合失败后把条目出队不再发事件 —— 就永远停在非 idle。
+- **位置错误**：它复用了通用 `.toast`（`position: fixed; bottom: 24px; left: 50%`）。
+  中间面板底部就是输入框，于是这个"提示"正好压在/紧贴输入框那条带上 —— 这才是"位置很奇怪"的真凶，
+  与表格里的水合状态无关。
+
+修法（结构性，不是调文案）：
+1. **提示由数据派生**：`needsHydration(session)`（`name===null && firstMessage==="" && messageCount===0`）成为
+   **唯一定义**，行级「同步中…」与项目级「正在补全（x/y）」都用它 → 提示不可能活得比它所描述的行更久。
+2. **作用域收到所属项目**：提示改为渲染在**该项目的会话列表内**（`remote-project-path` 下方），
+   别的水合、别的项目、新建会话都不会触发。
+3. **停滞可恢复**：pending 持续 20s 后追加「· 停滞较久」并给「重试」（`refreshRemoteSessions`：
+   prioritize + 重新 listRemote）。main 侧失败会出队，只有重新拉列表才会重新排队。
+4. **通用 toast 移到顶部居中**（`top: 56px`）：底部那条带属于输入框，任何浮层放那里都会撞。
