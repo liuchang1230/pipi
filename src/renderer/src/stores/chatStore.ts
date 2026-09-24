@@ -7,6 +7,7 @@
  * contentIndex; message_end.message is the authoritative snapshot.
  */
 import { create } from "zustand";
+import { isCancelledTurnMessage } from "../../../shared/abort-message";
 
 /** Bash prints these for EVERY `bash -ic` exec without a pty. They say the
  *  command had no tty, not that anything failed, so they must never be shown
@@ -78,6 +79,20 @@ export interface ChatMessage {
   blocks: ChatBlock[];
   /** Model stream error on this message (e.g. "Provider finish_reason: error"). */
   error?: string;
+  /**
+   * The turn ended because the USER stopped it (not a failure). Rendered as a
+   * neutral "已停止" marker: pi reports an abort as `stopReason: "error"` with
+   * "This operation was aborted", and showing that as a model error blamed the
+   * model for something the user did (see shared/abort-message.ts).
+   */
+  interrupted?: boolean;
+  /**
+   * Which turn produced this message. Events are matched by turn instead of
+   * "whatever message is last": the aborted turn's final message only arrives
+   * AFTER the next prompt was already appended, and positional matching is what
+   * put "⚠ 模型错误" underneath a prompt the user had just sent.
+   */
+  turnSeq?: number;
 }
 
 export type TurnPhase =
@@ -96,6 +111,8 @@ export type TurnPhase =
   | "compacting"
   | "queued"
   | "cancelling"
+  /** Terminal: the user stopped this turn. Not an error, not a completion. */
+  | "cancelled"
   | "completed"
   | "failed"
   | "exited";
@@ -142,6 +159,22 @@ export interface ChatTabState {
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage: string } | null;
   /** Context compaction running (auto/manual). */
   compacting?: boolean;
+  /** Monotonic turn counter. A prompt that STARTS a turn increments it; a steer
+   *  into the running turn keeps it. Assistant messages are tagged with it so a
+   *  late event cannot mutate a newer turn's bubble. */
+  turnSeq: number;
+  /** When the user pressed stop (any path). The only thing that can justify
+   *  reading an error-shaped message as "cancelled". */
+  abortRequestedAt?: number;
+  /** Which turn the user aborted — its late fallout is attributed to IT. */
+  abortedTurnSeq?: number;
+  /** The outstanding abort has been accounted for. */
+  abortResolved?: boolean;
+  /** The assistant message currently streaming: events target it by identity
+   *  instead of "whatever is last". */
+  liveAssistantId?: string;
+  /** This turn ended by user cancellation (terminal, not an error). */
+  turnCancelled?: boolean;
   /** Pending steering messages (queue_update; delivered between turns). */
   steeringQueue?: string[];
   /** Pending follow-up messages (queue_update; delivered when agent settles). */
@@ -181,7 +214,25 @@ const emptyState = (): ChatTabState => ({
   exited: false,
   retryInfo: null,
   compacting: false,
+  turnSeq: 0,
 });
+
+/**
+ * Is a user-requested stop still outstanding?
+ *
+ * While true, assistant messages arriving from pi are the ABORT's fallout, not
+ * the new turn's output — they belong to `abortedTurnSeq`. Resolved by
+ * `agent_start` (a fresh turn is running, so the abort is over), by the abort's
+ * own message_end, and by `agent_settled`.
+ */
+function abortOutstanding(st: ChatTabState): boolean {
+  return st.abortRequestedAt !== undefined && !st.abortResolved;
+}
+
+/** The turn a streaming event should be attributed to. */
+function eventTurn(st: ChatTabState): number {
+  return abortOutstanding(st) && st.abortedTurnSeq !== undefined ? st.abortedTurnSeq : st.turnSeq;
+}
 
 let localSeq = 0;
 
@@ -328,6 +379,20 @@ function resultTextOf(res: { content?: unknown; details?: { diff?: unknown; patc
   return text;
 }
 
+/** Character count of a pi message content (empty content ⇒ nothing produced). */
+function contentLengthOf(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let n = 0;
+  for (const raw of content) {
+    const b = raw as { type?: string; text?: string; thinking?: string; name?: string };
+    n += (b.text ?? b.thinking ?? "").length;
+    // A tool call IS produced output: the turn did something before it died.
+    if (b.type === "toolCall") n += 1;
+  }
+  return n;
+}
+
 /** Convert a pi AgentMessage content array into ChatBlocks (assistant side). */
 function blocksFromContent(content: unknown): ChatBlock[] {
   if (typeof content === "string") {
@@ -465,13 +530,22 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         });
       } else if (m.role === "assistant") {
         const raw = m as { errorMessage?: string; stopReason?: string };
-        const error = raw.errorMessage || raw.stopReason === "error" ? (raw.errorMessage ?? "模型返回错误") : undefined;
+        // Reopening a session must not resurrect an abort as a model error: the
+        // persisted pair is `stopReason: "error"` + "This operation was aborted"
+        // (see shared/abort-message.ts) — a normal "I pressed stop" turn.
+        const cancelled = isCancelledTurnMessage({
+          stopReason: raw.stopReason,
+          errorMessage: raw.errorMessage,
+          contentLength: contentLengthOf(m.content),
+        });
+        const error = cancelled ? undefined : raw.errorMessage || raw.stopReason === "error" ? (raw.errorMessage ?? "模型返回错误") : undefined;
         chatMessages.push({
           id: m.id ?? `hist-${chatMessages.length}`,
           role: "assistant",
           status: "done",
           blocks: blocksFromContent(m.content),
           error,
+          interrupted: cancelled || undefined,
         });
       } else if (m.role === "toolResult") {
         toolResults.push(m as ToolResultLike);
@@ -564,6 +638,10 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       patch({
         isStreaming: true,
         lastError: undefined,
+        // A fresh turn is running: whatever the previous abort was, it is over.
+        abortResolved: true,
+        turnCancelled: false,
+        liveAssistantId: undefined,
         turn: { phase: "thinking", startedAt: Date.now(), lastActivityAt: Date.now() },
       });
       return;
@@ -576,9 +654,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         steeringQueue: [],
         followUpQueue: [],
         pendingUserText: undefined,
-        turn: st.lastError || st.turn.phase === "failed"
-          ? { phase: "failed", lastActivityAt: Date.now(), detail: st.turn.detail ?? st.lastError }
-          : { phase: "completed", completedAt: Date.now(), lastActivityAt: Date.now() },
+        abortResolved: true,
+        liveAssistantId: undefined,
+        turn: st.turnCancelled
+          ? { phase: "cancelled" as const, lastActivityAt: Date.now(), detail: "已停止" }
+          : st.lastError || st.turn.phase === "failed"
+            ? { phase: "failed", lastActivityAt: Date.now(), detail: st.turn.detail ?? st.lastError }
+            : { phase: "completed", completedAt: Date.now(), lastActivityAt: Date.now() },
       });
       return;
     }
@@ -700,10 +782,28 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         });
       } else if (m.role === "assistant") {
         const blocks = blocksFromContent(m.content);
-        patchMessages((msgs) => [
-          ...msgs,
-          { id: m.id ?? `msg-${localSeq++}`, role: "assistant", status: "streaming", blocks },
-        ]);
+        const id = m.id ?? `msg-${localSeq++}`;
+        // An abort's own message (empty, arriving after the user already sent
+        // the next prompt) must not masquerade as that new turn's output: tag it
+        // with the aborted turn and insert it BEFORE the new prompt, so the
+        // transcript reads "…aborted turn / 已停止 / next prompt" instead of
+        // putting the fallout underneath the prompt.
+        const aborting = abortOutstanding(st);
+        const owner = eventTurn(st);
+        patchMessages((msgs) => {
+          if (aborting && msgs.some((x) => x.role === "assistant" && x.turnSeq === owner && x.status === "streaming")) {
+            // The aborted turn already has its streaming bubble: the abort's
+            // message is that one, and message_end will finalize it in place.
+            return msgs;
+          }
+          const entry: ChatMessage = { id, role: "assistant", status: "streaming", blocks, turnSeq: owner };
+          if (aborting) {
+            const firstNew = msgs.findIndex((x) => x.turnSeq === st.turnSeq);
+            if (firstNew >= 0) return [...msgs.slice(0, firstNew), entry, ...msgs.slice(firstNew)];
+          }
+          return [...msgs, entry];
+        });
+        patch(aborting ? {} : { liveAssistantId: id });
       }
       return;
     }
@@ -716,20 +816,64 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       // message_end without errorMessage and clears the transient banner).
       const errMsg = (m as { errorMessage?: string; stopReason?: string }).errorMessage;
       const stopReason = (m as { stopReason?: string }).stopReason;
-      const error = errMsg || stopReason === "error" ? (errMsg ?? "模型返回错误") : undefined;
-      patch({ lastError: error });
+      // A user-requested stop is not a model failure. pi records an abort as
+      // `stopReason: "error"` + "This operation was aborted" (verified in a real
+      // session file), so without this check pressing 停止 painted a red
+      // "⚠ 模型错误" over a turn the user had cancelled on purpose.
+      const cancelled = isCancelledTurnMessage({
+        stopReason,
+        errorMessage: errMsg,
+        contentLength: contentLengthOf(m.content),
+        abortRequestedAt: st.abortRequestedAt,
+      });
+      const error = cancelled ? undefined : errMsg || stopReason === "error" ? (errMsg ?? "模型返回错误") : undefined;
+      const blocks = blocksFromContent(m.content);
+      // Attribute the event to the turn that produced it, never to "whatever is
+      // last": the aborted turn's message arrives AFTER the next prompt, so a
+      // positional match attached its error to the NEW bubble.
+      // A cancelled message ALWAYS belongs to the aborted turn — never to the
+      // current one, even after the abort was resolved and a new answer is
+      // streaming (that is the "error under my new prompt" bug in its last form).
+      const owner = cancelled && st.abortedTurnSeq !== undefined ? st.abortedTurnSeq : eventTurn(st);
+      let applied = false;
       patchMessages((msgs) => {
-        const idx = msgs.length - 1;
-        if (idx < 0 || msgs[idx]!.role !== "assistant") return msgs;
+        const target = msgs.findIndex(
+          (x) => x.role === "assistant" && x.status === "streaming" && (x.turnSeq === owner || x.id === st.liveAssistantId),
+        );
+        if (target < 0) return msgs;
+        applied = true;
         return [
-          ...msgs.slice(0, idx),
+          ...msgs.slice(0, target),
           {
-            ...msgs[idx]!,
+            ...msgs[target]!,
             status: "done" as const,
-            blocks: blocksFromContent(m.content),
+            blocks: blocks.length ? blocks : msgs[target]!.blocks,
             error,
+            interrupted: cancelled ? true : msgs[target]!.interrupted,
           },
+          // Everything after the target stays put: the aborted turn's bubble
+          // keeps its place ABOVE the prompt the user sent next.
+          ...msgs.slice(target + 1),
         ];
+      });
+      // A stale event that matched nothing is DROPPED: it belongs to a turn that
+      // is already gone, and touching the newest bubble is exactly the bug.
+      if (!applied) return;
+      // Was this the fallout of an abort the user already moved on from? Then
+      // the turn STATUS belongs to the new turn (it is running/queued), and only
+      // the message marker may change. Relabelling the current turn "已停止"
+      // would be a second lie in the same place.
+      const stale = cancelled && owner !== st.turnSeq;
+      patch({
+        lastError: error,
+        liveAssistantId: undefined,
+        ...(cancelled ? { abortResolved: true } : {}),
+        ...(cancelled && !stale
+          ? {
+              turnCancelled: true,
+              turn: { phase: "cancelled" as const, lastActivityAt: Date.now(), detail: "已停止" },
+            }
+          : {}),
       });
       return;
     }
@@ -744,8 +888,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         toolCall?: { id?: string; name?: string; arguments?: unknown };
       };
       patchMessages((msgs) => {
-        const idx = msgs.length - 1;
-        if (idx < 0 || msgs[idx]!.role !== "assistant") return msgs;
+        // Same attribution rule as message_end: the turn that owns this event,
+        // by identity when we know the live message.
+        const ownerIds = abortOutstanding(st) ? st.abortedTurnSeq : st.turnSeq;
+        const idx =
+          st.liveAssistantId !== undefined
+            ? msgs.findIndex((x) => x.id === st.liveAssistantId && x.role === "assistant")
+            : msgs.findIndex((x) => x.role === "assistant" && x.status === "streaming" && x.turnSeq === ownerIds);
+        if (idx < 0 || msgs[idx]!.role !== "assistant" || msgs[idx]!.status !== "streaming") return msgs;
         const msg = msgs[idx]!;
         const ci = ev.contentIndex ?? 0;
         const blocks = msg.blocks.map((b) => ({ ...b }));
@@ -924,6 +1074,12 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           pendingUserText: displayText,
           pendingPromptId: promptId,
           restoreInput: undefined,
+          // A steer joins the running turn; a new prompt starts a new one. The
+          // tag is what keeps a late event from the previous (aborted) turn from
+          // landing on this prompt's answer.
+          turnSeq: st.isStreaming ? st.turnSeq : st.turnSeq + 1,
+          turnCancelled: false,
+          liveAssistantId: undefined,
           // A steer joins a turn that is already running: "已发送，等待 Pi 开始
           // 处理…" would be a lie (pi is mid-stream), and the queue banner
           // (queue_update) is the honest feedback for it.
@@ -932,7 +1088,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
             : { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
           messages: [
             ...s.states[tabId]!.messages,
-            { id, role: "user", status: "done", blocks: [{ kind: "text", contentIndex: 0, text: displayText, done: true }] },
+            {
+              id,
+              role: "user",
+              status: "done",
+              blocks: [{ kind: "text", contentIndex: 0, text: displayText, done: true }],
+              turnSeq: st.isStreaming ? st.turnSeq : st.turnSeq + 1,
+            },
           ],
         },
       },
@@ -954,6 +1116,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         [tabId]: {
           ...s.states[tabId]!,
           turn: { phase: "cancelling", lastActivityAt: Date.now(), detail: "正在停止…" },
+          // Remember that THIS stop was ours: it is what lets a later
+          // error-shaped message from pi be read as "cancelled", and it tells us
+          // which turn that fallout belongs to.
+          abortRequestedAt: Date.now(),
+          abortedTurnSeq: s.states[tabId]!.turnSeq,
+          abortResolved: false,
+          turnCancelled: true,
         },
       },
     }));

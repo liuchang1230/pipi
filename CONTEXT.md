@@ -182,3 +182,40 @@
 3. **停滞可恢复**：pending 持续 20s 后追加「· 停滞较久」并给「重试」（`refreshRemoteSessions`：
    prioritize + 重新 listRemote）。main 侧失败会出队，只有重新拉列表才会重新排队。
 4. **通用 toast 移到顶部居中**（`top: 56px`）：底部那条带属于输入框，任何浮层放那里都会撞。
+
+## 中断 ≠ 报错；事件必须按回合归属 (2026-09-24)
+
+用户反馈：「点停止中断会话，然后快速输入另一个 prompt 发送，结果**先显示这个 prompt，下方才显示**
+`⚠ 模型错误：This operation was aborted`」。
+
+证据（真实会话文件 + pi 0.85.1 bundle）：
+- pi 把"被用户中断"记成 `stopReason: "error"` + `errorMessage: "This operation was aborted"`、
+  content 为空（`createAbortedMessage` 走的是 `aborted` + "Request was aborted"，provider 路径把
+  原始 AbortError 归一成 `error`）。所以**只看 stopReason 不够**，`src/shared/abort-message.ts`
+  用三重判定：`aborted` 标记 / 取消措辞（**先排除** "Connection aborted." 这类真连接故障）/
+  「我方刚按过停止 + 该消息无任何产出」。
+- 顺序错乱是**按位置归属**造成的：`message_end` 把错误贴到 `messages[last]`，而中止的那条消息
+  总是在**下一个 prompt 之后**才到达 → 错误就落在了新 prompt 下面。现在每条 assistant 消息带
+  `turnSeq`，事件按 turn 归属；被取消的消息**永远归属于被中止的那个 turn**，找不到目标就
+  **丢弃**（绝不碰最新的气泡）。中止的痕迹插在新 prompt **之前**，turn 状态不会被带偏。
+
+教训：**"用户自己做的事"绝不能渲染成"模型出错"**。同类：`compaction_end` 早有 `!event.aborted`，
+`auto_retry_end` 早有 "Retry cancelled" 特判，唯独 `message_end` 漏了。
+
+## 分支树卡顿的两个真实原因 (2026-09-24)
+
+1. **`buildTreeFromEntries` 的环检查是 O(n·depth)**：每个条目都从 parent 往上游走一遍去查环。
+   3000 条线性会话实测 **150ms**（`layout` 3ms / `filter` 2ms），而且每份快照都要付一次
+   （打开、3s 轮询、文件回退），全在主线程 —— 这就是"打开有点卡"。改成**带记忆的染色**，
+   整体 O(n)：同一测试 **150ms → 4ms**。`src/shared/__tests__/tree-perf.test.ts` 把预算
+   钉在两者之间（build<30ms / 合计<60ms），算法退化会当场失败。
+2. **滚动时每一帧都在重渲染全部 ~80 行**：`recomputeWindow` 每个 scroll 事件都 setState，
+   行 JSX（gutter 前缀 + `entryDisplay` 文本归一化）在父组件里内联计算，还带一个**每帧新建的
+   inline `ref` 回调**（React 会把 80 行的 ref 全部 detach/attach 一遍）。现在：行抽成 `memo`
+   组件（派生值下沉到行内 `useMemo`）、窗口更新用 rAF 合并、ref Map 换成 `data-row-id` +
+   索引数学（`revealRow`）、行高用 `ROW_H` 单一定义。**打开时不再用 `scrollIntoView`**
+   ——它会连祖先容器一起滚动并对整个对话框强制同步布局，改为纯索引算术 + 上下 spacer 恒定总高。
+
+验证：`742 passed`、typecheck、build、打包、真机 smoke **30/30**（新增 4 条：树对话框能打开/
+不崩/内容自洽/能关闭）。反向验证：去掉取消判定 → 6 个用例失败；把归属改回"最后一条消息" →
+3 个用例失败。

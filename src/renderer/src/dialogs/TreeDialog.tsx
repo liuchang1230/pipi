@@ -31,7 +31,7 @@
  * "（无匹配）". Identical snapshots (same entries + leaf) are dropped
  * instead of re-rendering — the poll costs nothing while nothing changes.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
@@ -166,6 +166,97 @@ const FILTER_LABELS: Record<TreeFilterMode, string> = {
 
 /** Row window around the viewport — long sessions mount ~2×40 rows, not all. */
 const WINDOW_MARGIN = 20;
+/** `.tree-row` height from styles.css. One definition, because the window math
+ *  and the spacer heights must agree or the scrollbar jitters. */
+const ROW_H = 24;
+
+/**
+ * One tree row.
+ *
+ * Extracted + memoized because the windowed list re-renders on EVERY scroll
+ * event: without memo each wheel tick reconciled all ~80 rows (each rebuilding
+ * its gutter prefix and re-normalizing its entry text — `entryDisplay` walks the
+ * message content), which is what made scrolling feel sticky on long sessions.
+ * With memo, a scroll only mounts/unmounts the rows entering and leaving the
+ * window; the ~70 rows that stay are skipped entirely.
+ *
+ * All per-row derived values (gutter prefix, display label/text) are computed
+ * HERE, from props that are stable between renders, so the parent does not have
+ * to hand down freshly-allocated objects (which would defeat the memo).
+ */
+const TreeRow = memo(function TreeRow({
+  row,
+  toolCalls,
+  selectedId,
+  folded,
+  leafId,
+  editPoint,
+  multipleRoots,
+  onSelect,
+  onToggleFold,
+}: {
+  row: TreeFlatRow;
+  toolCalls: Map<string, { name: string; args: unknown }>;
+  selectedId: string | null;
+  folded: Set<string>;
+  leafId: string | null;
+  editPoint: { path?: string } | undefined;
+  /** Tree has several roots (offset the whole gutter by one column). */
+  multipleRoots: boolean;
+  onSelect: (id: string) => void;
+  onToggleFold: (id: string) => void;
+}) {
+  const e = row.node.entry;
+  const d = useMemo(() => entryDisplay(row.node, toolCalls), [row.node, toolCalls]);
+  const prefix = useMemo(() => {
+    const displayIndent = multipleRoots ? Math.max(0, row.indent - 1) : row.indent;
+    const connectorPosition = row.showConnector && !row.isVirtualRootChild ? displayIndent - 1 : -1;
+    let out = "";
+    for (let level = 0; level < displayIndent; level++) {
+      const g = row.gutters.find((x) => x.position === level);
+      if (g) out += g.show ? "│  " : "   ";
+      else if (level === connectorPosition) out += (row.isLast ? "└" : "├") + "─ ";
+      else out += "   ";
+    }
+    return out;
+  }, [row, multipleRoots]);
+
+  const isSelected = e.id === selectedId;
+  const hasChildren = row.node.children.length > 0;
+  const branchCount = row.node.children.length;
+  const isFolded = folded.has(e.id);
+  const ts = formatEntryTime(e.timestamp);
+
+  return (
+    <div
+      data-row-id={e.id}
+      className={`tree-row${isSelected ? " selected" : ""}${row.onActivePath ? " on-active-path" : ""}${row.isCurrent ? " current" : ""}${leafId && !row.onActivePath ? " off-path" : ""}`}
+      onClick={() => onSelect(e.id)}
+      onDoubleClick={() => hasChildren && onToggleFold(e.id)}
+      title={d.text || e.id}
+    >
+      <span className="tree-gutter">{prefix}</span>
+      <span
+        className="tree-fold"
+        onClick={(ev) => { ev.stopPropagation(); hasChildren && onToggleFold(e.id); }}
+      >
+        {hasChildren ? (isFolded ? "⊞" : "⊟") : ""}
+      </span>
+      <span className="tree-pathmark">{row.onActivePath ? "•" : ""}</span>
+      {branchCount > 1 && (
+        <span className="tree-branchcount" title={`此处有 ${branchCount} 条分支`}>
+          ⑂{branchCount}
+        </span>
+      )}
+      {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
+      <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
+      <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
+      {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
+      {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
+      {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
+    </div>
+  );
+});
 
 export function TreeDialog({
   tabId,
@@ -500,48 +591,96 @@ export function TreeDialog({
   const isUserMsg = selected?.entry.type === "message" && selected.entry.message?.role === "user";
   const isLeaf = selected?.entry.id === leafId;
 
-  const toggleFold = (id: string) => {
+  /** Stable identities: an inline arrow here would defeat TreeRow's memo and
+   *  re-render all ~80 rows on every scroll event. */
+  const selectRow = useCallback((id: string) => {
+    setSelectedId(id);
+    setNavPhase("idle");
+  }, []);
+  const toggleFold = useCallback((id: string) => {
     setFolded((s) => {
       const next = new Set(s);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
+  }, []);
 
   // Windowed rows: only entries within WINDOW_MARGIN of the viewport mount.
   const scrollRef = useRef<HTMLDivElement>(null);
-  const rowRefs = useRef(new Map<string, HTMLDivElement>());
   const [win, setWin] = useState({ start: 0, end: 80 });
   const winRef = useRef(win);
   winRef.current = win;
-  const recomputeWindow = () => {
+  /**
+   * Recompute the mounted window from the scroll offset.
+   *
+   * rAF-throttled: a wheel can emit several scroll events per frame, and each
+   * update re-renders the windowed list. Coalescing them to one update per
+   * frame is what keeps long sessions scrollable at frame rate.
+   */
+  const rafRef = useRef<number | null>(null);
+  const recomputeWindow = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const rowH = 24; // .tree-row fixed height (see styles.css)
-    const start = Math.max(0, Math.floor(el.scrollTop / rowH) - WINDOW_MARGIN);
-    const count = Math.ceil(el.clientHeight / rowH) + WINDOW_MARGIN * 2;
+    const start = Math.max(0, Math.floor(el.scrollTop / ROW_H) - WINDOW_MARGIN);
+    const count = Math.ceil(el.clientHeight / ROW_H) + WINDOW_MARGIN * 2;
     setWin((w) => (w.start === start && w.end === start + count ? w : { start, end: start + count }));
-  };
-  /** Nudge the window so `index` is inside it (Home/End, big selection jumps)
-   *  and set the scroller near the row so it mounts, then scrollIntoView lands
-   *  on it. Without this a jump past the window's edge never mounts the row
-   *  and can never scroll to it. */
-  const ensureWindowCovers = (index: number) => {
+  }, []);
+  const onScroll = useCallback(() => {
+    if (rafRef.current !== null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      recomputeWindow();
+    });
+  }, [recomputeWindow]);
+  /**
+   * Scroll so `index` is visible — pure index arithmetic instead of
+   * `scrollIntoView`.
+   *
+   * Two reasons: (1) `scrollIntoView` also scrolls every scrollable ANCESTOR
+   * (the dialog, the page) and forces a synchronous layout of all of it, which
+   * is what made opening the dialog on a long session janky; (2) the total
+   * height is constant (top + bottom spacers), so a row does not even have to be
+   * mounted for its position to be known.
+   */
+  const revealRow = useCallback((index: number, mode: "center" | "nearest" = "nearest", retry = true) => {
+    const el = scrollRef.current;
+    if (!el || index < 0) return;
+    // Not laid out yet (clientHeight 0 right after mount): try once more on the
+    // next frame instead of scrolling to a position computed from a zero height.
+    if (el.clientHeight === 0) {
+      if (retry) requestAnimationFrame(() => revealRow(index, mode, false));
+      return;
+    }
+    const top = index * ROW_H;
+    const bottom = top + ROW_H;
+    const view = el.clientHeight;
+    if (mode === "center") {
+      el.scrollTop = Math.max(0, top - (view - ROW_H) / 2);
+    } else if (top < el.scrollTop) {
+      el.scrollTop = top;
+    } else if (bottom > el.scrollTop + view) {
+      el.scrollTop = bottom - view;
+    }
+  }, []);
+  /** Nudge the window so `index` is inside it (Home/End, big selection jumps). */
+  const ensureWindowCovers = useCallback((index: number) => {
     const w = winRef.current;
     if (index >= w.start && index < w.end) return;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = Math.max(0, index * 24 - el.clientHeight / 2);
     const start = Math.max(0, index - WINDOW_MARGIN);
     setWin({ start, end: start + WINDOW_MARGIN * 2 + 40 });
-  };
+  }, []);
   useEffect(() => {
     recomputeWindow();
     const el = scrollRef.current;
     if (!el) return;
-    el.addEventListener("scroll", recomputeWindow, { passive: true });
-    return () => el.removeEventListener("scroll", recomputeWindow);
-  }, []);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [recomputeWindow, onScroll]);
   // Clamp the window when the list size changes (filter switch, tree update).
   useEffect(() => {
     setWin((w) => ({
@@ -735,7 +874,7 @@ export function TreeDialog({
     const idx = filtered.findIndex((f) => f.node.entry.id === leafId);
     if (idx < 0) return;
     ensureWindowCovers(idx);
-    requestAnimationFrame(() => rowRefs.current.get(leafId)?.scrollIntoView({ block: "center" }));
+    revealRow(idx, "center");
   };
   /**
    * Single-flight gate for `get_entries` (both the 3s refresh poll and the
@@ -903,17 +1042,16 @@ export function TreeDialog({
     return () => document.removeEventListener("keydown", onKeyDown, true);
   }, [filtered, selectedId, navPhase, leafId, onClose]);
 
-  // Windowed rendering: keep the selected row scrolled into view. The row
-  // refs only hold MOUNTED rows, so jumps beyond the window (Home/End, the
-  // initial pre-selection on a long session) must first move the window —
-  // ensureWindowCovers sets scrollTop so the row mounts, then the DOM
-  // scrollIntoView below fine-tunes it into view.
+  // Windowed rendering: keep the selected row in view. Jumps beyond the window
+  // (Home/End, the initial pre-selection on a long session) first move the
+  // window; the scroll position itself is index math, so the row does not have
+  // to be mounted for this to land correctly.
   useEffect(() => {
     if (!selectedId || filtered.length === 0) return;
     const idx = filtered.findIndex((f) => f.node.entry.id === selectedId);
-    if (idx >= 0) ensureWindowCovers(idx);
-    const el = rowRefs.current.get(selectedId);
-    el?.scrollIntoView({ block: "nearest" });
+    if (idx < 0) return;
+    ensureWindowCovers(idx);
+    revealRow(idx, "nearest");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
@@ -1024,79 +1162,36 @@ export function TreeDialog({
             {filtered.length === 0 && treeStatus === "ready" && tree.length > 0 && <div className="tree-empty">（无匹配）</div>}
             {(() => {
               // Windowed render: only rows near the viewport mount, so a
-              // thousand-entry session costs the same as a 80-row one.
+              // thousand-entry session costs the same as a 80-row one. The top
+              // and bottom spacers keep the scrolled height CONSTANT, so moving
+              // the window never changes the scrollbar range (a changing range
+              // is what makes a virtualized list stutter while scrolling).
               const multipleRoots = tree.length > 1;
               const slice = filtered.slice(win.start, win.end);
               return (
                 <>
-                  {win.start > 0 && <div style={{ height: win.start * 24 }} aria-hidden="true" />}
+                  {win.start > 0 && <div style={{ height: win.start * ROW_H }} aria-hidden="true" />}
                   {slice.map((f: TreeFlatRow) => {
                     const e = f.node.entry;
-                    const d = entryDisplay(f.node, toolCalls);
-                    const isOnActive = f.onActivePath;
-                    const isSelected = e.id === selectedId;
-                    const isCurrent = f.isCurrent;
-                    const hasChildren = f.node.children.length > 0;
-                    // A branch point is where the reader has to make a choice —
-                    // mark it, so the alternatives are visible at a glance.
-                    const branchCount = f.node.children.length;
-                    const isFolded = folded.has(e.id);
-                    // TUI gutter: │ continuation at ancestor levels, ├/└ at
-                    // the connector level; the ⊞/⊟ fold glyph lives in its
-                    // own fixed column (same information, bigger target).
-                    const displayIndent = multipleRoots ? Math.max(0, f.indent - 1) : f.indent;
-                    const showOwnConnector = f.showConnector && !f.isVirtualRootChild;
-                    const connectorPosition = showOwnConnector ? displayIndent - 1 : -1;
-                    let prefix = "";
-                    for (let level = 0; level < displayIndent; level++) {
-                      const g = f.gutters.find((x) => x.position === level);
-                      if (g) prefix += g.show ? "│  " : "   ";
-                      else if (level === connectorPosition) prefix += (f.isLast ? "└" : "├") + "─ ";
-                      else prefix += "   ";
-                    }
-                    const ts = formatEntryTime(e.timestamp);
-                    // rollback checkpoint badge on file-edit tool nodes
                     const cp = e.type === "message" && e.message?.role === "toolResult"
                       ? editPoints.get((e.message as { toolCallId?: string }).toolCallId ?? "")
                       : undefined;
                     return (
-                      <div
+                      <TreeRow
                         key={e.id}
-                        ref={(el) => {
-                          if (el) rowRefs.current.set(e.id, el);
-                          else rowRefs.current.delete(e.id);
-                        }}
-                        className={`tree-row${isSelected ? " selected" : ""}${isOnActive ? " on-active-path" : ""}${isCurrent ? " current" : ""}${leafId && !isOnActive ? " off-path" : ""}`}
-                        onClick={() => {
-                          setSelectedId(e.id);
-                          setNavPhase("idle");
-                        }}
-                        onDoubleClick={() => hasChildren && toggleFold(e.id)}
-                        title={d.text || e.id}
-                      >
-                        <span className="tree-gutter">{prefix}</span>
-                        <span
-                          className="tree-fold"
-                          onClick={(ev) => { ev.stopPropagation(); hasChildren && toggleFold(e.id); }}
-                        >
-                          {hasChildren ? (isFolded ? "⊞" : "⊟") : ""}
-                        </span>
-                        <span className="tree-pathmark">{isOnActive ? "•" : ""}</span>
-                        {branchCount > 1 && (
-                          <span className="tree-branchcount" title={`此处有 ${branchCount} 条分支`}>
-                            ⑂{branchCount}
-                          </span>
-                        )}
-                        {f.node.label && <span className="tree-branch-tag">[{f.node.label}]</span>}
-                        <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
-                        <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
-                        {cp && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${cp.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
-                        {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
-                        {isCurrent && <span className="tree-leaf-tag">当前</span>}
-                      </div>
+                        row={f}
+                        toolCalls={toolCalls}
+                        selectedId={selectedId}
+                        folded={folded}
+                        leafId={leafId}
+                        editPoint={cp}
+                        multipleRoots={multipleRoots}
+                        onSelect={selectRow}
+                        onToggleFold={toggleFold}
+                      />
                     );
                   })}
-                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * 24 }} aria-hidden="true" />}
+                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * ROW_H }} aria-hidden="true" />}
                 </>
               );
             })()}

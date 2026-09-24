@@ -69,6 +69,50 @@ export function buildTreeFromEntries(entries: TreeEntry[]): { tree: TreeNode[] }
   for (const e of entries) {
     nodeMap.set(e.id, { entry: e, children: [] });
   }
+  // Cycle detection must not walk the parent chain once PER ENTRY: on a linear
+  // session that is O(n·depth), which measured 150ms for a 3000-entry session —
+  // paid on every snapshot (open, 3s poll, file fallback) and squarely on the
+  // main thread, i.e. exactly the "打开分支有点卡顿" the user reported. Instead
+  // the chains are coloured once with memoization, so the total work is O(n).
+  const parentOf = new Map<string, string | null>();
+  for (const e of entries) parentOf.set(e.id, e.parentId ?? null);
+  const UNKNOWN = 0;
+  const VISITING = 1;
+  const CLEAN = 2; // provably not on a cycle (may lead into one)
+  const ON_CYCLE = 3;
+  const cycleState = new Map<string, number>();
+  /** Is `start` itself part of a parentId ring (A→B→A)? */
+  const isOnCycle = (start: string): boolean => {
+    // Memoized answer for `start` ITSELF (a ring member queried a second time:
+    // "leads into a ring" and "is on a ring" are different answers).
+    const known = cycleState.get(start) ?? UNKNOWN;
+    if (known === ON_CYCLE) return true;
+    if (known === CLEAN) return false;
+    const path: string[] = [];
+    let cur: string | null = start;
+    let result = false;
+    for (;;) {
+      if (cur === null) break;
+      const state = cycleState.get(cur) ?? UNKNOWN;
+      if (state === ON_CYCLE || state === CLEAN) break;
+      if (state === VISITING) {
+        // Closed a ring: everything from `cur` onwards is on it, the prefix
+        // merely leads into it.
+        const at = path.indexOf(cur);
+        for (let i = 0; i < at; i++) cycleState.set(path[i]!, CLEAN);
+        for (let i = at; i < path.length; i++) cycleState.set(path[i]!, ON_CYCLE);
+        result = cycleState.get(start) === ON_CYCLE;
+        break;
+      }
+      cycleState.set(cur, VISITING);
+      path.push(cur);
+      cur = parentOf.get(cur) ?? null;
+    }
+    // Anything still marked VISITING ran into a null parent: it is clean.
+    for (const id of path) if ((cycleState.get(id) ?? UNKNOWN) === VISITING) cycleState.set(id, CLEAN);
+    return result;
+  };
+
   const roots: TreeNode[] = [];
   for (const e of entries) {
     const node = nodeMap.get(e.id);
@@ -82,24 +126,10 @@ export function buildTreeFromEntries(entries: TreeEntry[]): { tree: TreeNode[] }
       roots.push(node);
       continue;
     }
-    // Cycle check: walking UP the parent chain from the parent must never
-    // reach this node — attaching then would create a ring (A→B→A) whose
-    // nested serialization explodes in contextBridge. A ring member is
-    // promoted to a root instead.
-    let cyclic = false;
-    const seen = new Set<string>();
-    let cur: string | null = e.parentId;
-    while (cur) {
-      if (cur === e.id) {
-        cyclic = true;
-        break;
-      }
-      if (seen.has(cur)) break;
-      seen.add(cur);
-      cur = nodeMap.get(cur)?.entry.parentId ?? null;
-    }
+    // Attaching a ring member would create a cycle whose nested serialization
+    // explodes in contextBridge, so it is promoted to a root instead.
     const parent = nodeMap.get(e.parentId as string);
-    if (parent && parent !== node && !cyclic) {
+    if (parent && parent !== node && !isOnCycle(e.id)) {
       parent.children.push(node);
     } else {
       roots.push(node);

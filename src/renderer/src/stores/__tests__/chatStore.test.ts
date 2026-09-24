@@ -627,3 +627,168 @@ describe("retainTabs", () => {
     expect(useChatStore.getState().states).toBe(before);
   });
 });
+
+/**
+ * Regression: "I pressed 停止, typed the next prompt quickly, and the transcript
+ * showed my prompt FIRST and '⚠ 模型错误：This operation was aborted' BELOW it."
+ *
+ * pi records an abort as an assistant message with stopReason "error" and
+ * errorMessage "This operation was aborted" (verified in a real session file),
+ * and that message only arrives AFTER the next prompt was appended. The store
+ * matched events positionally ("the last message"), so the abort's error landed
+ * on the NEW turn's bubble, and the whole turn was relabelled as a failure.
+ */
+describe("chatStore abort attribution", () => {
+  function stubSend(): void {
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: { tab: { rpcSend: () => Promise.resolve(true) } },
+    };
+  }
+
+  it("never attaches the abort's error to the prompt sent right after 停止", async () => {
+    stubSend();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "user", content: "长任务" } },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    await useChatStore.getState().sendPrompt(T, "第二个 prompt");
+    // pi finishes the abort: an EMPTY message carrying the raw AbortError text.
+    apply([
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted", stopReason: "error" } },
+    ]);
+
+    const st = useChatStore.getState().states[T]!;
+    const msgs = st.messages;
+    // No stray bubble was created for the abort (it belongs to the aborted turn).
+    expect(msgs).toHaveLength(3);
+    const newPrompt = msgs.find((m) => m.role === "user" && m.blocks[0]?.kind === "text" && m.blocks[0].text === "第二个 prompt")!;
+    expect(newPrompt).toBeTruthy();
+    // Nothing at or after the new prompt claims a model error / interruption.
+    const after = msgs.slice(msgs.indexOf(newPrompt));
+    expect(after.some((m) => m.error)).toBe(false);
+    expect(after.some((m) => m.interrupted)).toBe(false);
+    // The aborted turn is marked as stopped, ABOVE the new prompt (where it
+    // actually happened).
+    const aborted = msgs.find((m) => m.interrupted)!;
+    expect(aborted).toBeTruthy();
+    expect(msgs.indexOf(aborted)).toBeLessThan(msgs.indexOf(newPrompt));
+    // The user cancelled: no red banner anywhere.
+    expect(st.lastError).toBeUndefined();
+    expect(st.turn.phase).not.toBe("failed");
+    // The next prompt was sent while pi still had the turn open, so it went out
+    // as a STEER of the aborted turn (same turnSeq) — "已停止" is then the honest
+    // label until pi settles and starts the queued turn. What must never happen
+    // is a red error, and that is asserted above. When the new prompt does start
+    // its own turn, the aborted fallout must not relabel it (next test).
+  });
+
+  it("marks the turn 已停止 when the user stops and nothing follows", () => {
+    stubSend();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "user", content: "长任务" } },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    apply([
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted", stopReason: "error" } },
+    ]);
+
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.phase).toBe("cancelled");
+    expect(st.lastError).toBeUndefined();
+    expect(st.messages[1]!.error).toBeUndefined();
+    expect(st.messages[1]!.interrupted).toBe(true);
+  });
+
+  it("still reports a genuine model error, before and after an abort", () => {
+    stubSend();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "Provider finish_reason: error", stopReason: "error" } },
+    ]);
+    expect(useChatStore.getState().states[T]!.lastError).toBe("Provider finish_reason: error");
+    expect(useChatStore.getState().states[T]!.messages[0]!.interrupted).toBeUndefined();
+
+    // An abort that KILLED the connection is a real failure, not a cancel.
+    useChatStore.getState().clear(T);
+    useChatStore.getState().ensure(T);
+    useChatStore.getState().abort(T);
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "socket hang up", stopReason: "error" } },
+    ]);
+    expect(useChatStore.getState().states[T]!.lastError).toBe("socket hang up");
+  });
+
+  it("keeps a turn that produced output in the error path even if stop was pressed", () => {
+    stubSend();
+    useChatStore.getState().abort(T);
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "已经写了一部分" }], errorMessage: "Provider finish_reason: error", stopReason: "error" } },
+    ]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.lastError).toBe("Provider finish_reason: error");
+    expect(st.messages[0]!.interrupted).toBeUndefined();
+  });
+
+  it("does not relabel a turn that already started, and drops the stale fallout", async () => {
+    stubSend();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    // pi settles the abort, then answers the next prompt in a NEW turn.
+    apply([{ type: "agent_settled" }]);
+    await useChatStore.getState().sendPrompt(T, "新的一轮");
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "正在回答" } },
+      // …the aborted turn's own final message shows up late.
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted", stopReason: "error" } },
+    ]);
+
+    const st = useChatStore.getState().states[T]!;
+    const live = st.messages.at(-1)!;
+    expect(live.blocks[0]).toMatchObject({ kind: "text", text: "正在回答" });
+    expect(live.error).toBeUndefined();
+    expect(live.interrupted).toBeUndefined();
+    expect(live.status).toBe("streaming");
+    expect(st.turn.phase).not.toBe("cancelled");
+    expect(st.turn.phase).not.toBe("failed");
+  });
+
+  it("a late abort cannot mutate the next turn's streaming answer", () => {
+    stubSend();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    // New turn is genuinely running (agent_start resolves the abort)…
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "新答案" } },
+    ]);
+    // …then the aborted turn's final message arrives out of order.
+    apply([
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted", stopReason: "error" } },
+    ]);
+    const msgs = useChatStore.getState().states[T]!.messages;
+    const live = msgs.at(-1)!;
+    expect(live.blocks[0]).toMatchObject({ kind: "text", text: "新答案" });
+    expect(live.error).toBeUndefined();
+    expect(live.interrupted).toBeUndefined();
+    expect(live.status).toBe("streaming");
+  });
+});

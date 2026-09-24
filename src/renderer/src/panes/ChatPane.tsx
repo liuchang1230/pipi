@@ -375,6 +375,10 @@ const MessageView = memo(function MessageView({ message }: { message: ChatMessag
       <div className="chat-bubble assistant">
         <AssistantBlocks blocks={message.blocks} />
         {message.error && <div className="chat-msg-error">⚠ 模型错误：{message.error}</div>}
+        {/* A user-requested stop, NOT a failure: pi reports an abort as
+            `stopReason: "error"` + "This operation was aborted", which used to
+            render as the red 模型错误 above (see shared/abort-message.ts). */}
+        {message.interrupted && <div className="chat-msg-interrupted">■ 已停止（你中断了本轮）</div>}
       </div>
     </div>
   );
@@ -1285,11 +1289,12 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     compacting: "正在压缩上下文…",
     queued: state?.turn.detail ?? "消息已排队",
     cancelling: "正在停止…",
+    cancelled: "■ 已停止",
     completed: "✓ Agent 已完成",
     failed: state?.turn.detail ?? "本轮出现错误",
     exited: "Pi 已退出",
   };
-  const phaseActive = !["ready", "completed", "failed", "exited"].includes(phase);
+  const phaseActive = !["ready", "completed", "failed", "exited", "cancelled"].includes(phase);
 
   // Live elapsed clock while the agent is working — the "已运行 Xs" on the
   // banner makes a long think/tool run obviously alive instead of hung.

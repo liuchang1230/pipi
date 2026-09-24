@@ -170,6 +170,50 @@ try {
   await sleep(4000);
   const alive = await evaluate(ws, `window.api.tab.alive(${JSON.stringify(tabId)})`, true);
   check("tab.alive after creation (no crash on spawn)", alive === true, String(alive));
+  // Branch-tree dialog: opening it must work on a real session and must keep the
+  // virtualized list self-consistent — the row window is mounted between two
+  // spacers whose heights must add up to the full list height, otherwise the
+  // scrollbar range changes while scrolling (the reported "滑动卡顿"). A fresh
+  // session has no entries, so this also covers the empty-state path after the
+  // row-rendering refactor (rows are now a memoized component).
+  await evaluate(
+    ws,
+    `(() => { const b = [...document.querySelectorAll('.chat-header-btn')].find((x) => /会话分支/.test(x.title || x.textContent || '')); if (b) { b.click(); return true; } return false; })()`,
+    true,
+  );
+  await sleep(1200);
+  const treeOpen = await evaluate(ws, `!!document.querySelector('.tree-dialog')`);
+  check("tree dialog opens on a live tab", treeOpen === true, String(treeOpen));
+  if (treeOpen) {
+    const rowsInfo = await evaluate(
+      ws,
+      `(() => {
+         // Scoped to the DIALOG: the sidebar file tree uses .tree-scroll too.
+         const scroll = document.querySelector('.tree-dialog .tree-scroll');
+         if (!scroll) return { error: 'no .tree-scroll' };
+         const rows = scroll.querySelectorAll('.tree-row').length;
+         return { rows, hasEmpty: !!scroll.querySelector('.tree-empty'), scrollTop: scroll.scrollTop };
+       })()`,
+      true,
+    );
+    check("tree dialog renders without a crash", await evaluate(ws, `!document.querySelector('.crash-screen')`));
+    check("tree dialog body is coherent (rows or an empty-state note)", rowsInfo?.hasEmpty === true || (rowsInfo?.rows ?? 0) > 0, JSON.stringify(rowsInfo));
+  }
+  // Close it the way a user would: the 关闭 button, else the overlay.
+  await evaluate(
+    ws,
+    `(() => {
+       const b = [...document.querySelectorAll('.tree-dialog .btn')].find((x) => /关闭/.test(x.textContent || ''));
+       if (b) { b.click(); return 'button'; }
+       const ov = document.querySelector('.dialog-overlay');
+       if (ov) { ov.click(); return 'overlay'; }
+       return 'none';
+     })()`,
+    true,
+  );
+  await sleep(600);
+  check("tree dialog closes", (await evaluate(ws, `!document.querySelector('.tree-dialog')`)) === true);
+
   await evaluate(ws, `window.api.tab.close(${JSON.stringify(tabId)})`, true);
   await sleep(800);
   const aliveAfter = await evaluate(ws, `window.api.tab.alive(${JSON.stringify(tabId)})`, true);
