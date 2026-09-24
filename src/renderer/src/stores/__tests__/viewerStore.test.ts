@@ -3,7 +3,8 @@
 // pinning, error toast). These tests pin that behavior so the refactor that
 // moved it out of App.tsx cannot silently regress it.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { useViewerStore, isManualOpenPending } from "../viewerStore";
+import { useViewerStore, isManualOpenPending, VIEWER_TASK } from "../viewerStore";
+import { useTasksStore } from "../tasksStore";
 import { useTabsStore } from "../tabsStore";
 import { useTreeStore } from "../treeStore";
 import { useUiStore } from "../uiStore";
@@ -30,7 +31,8 @@ function deferred() {
 
 beforeEach(() => {
   makeApi(async () => OK_FILE);
-  useViewerStore.setState({ currentFile: null, fileLoading: false, followCfg: { enabled: true, followReads: true }, followDegraded: false });
+  useViewerStore.setState({ currentFile: null, followCfg: { enabled: true, followReads: true }, followDegraded: false });
+  useTasksStore.setState({ tasks: {} });
   useTabsStore.setState({ activeTab: "t1", isRemote: false, cwd: "/proj", remoteDir: null, remoteLabel: "" });
   useTreeStore.setState({ tree: [], expanded: new Set(), fileTreeStatus: "idle", fileTreeError: null, remoteTreeCache: {}, treeOrigin: null });
   useUiStore.setState({ toast: null });
@@ -46,7 +48,8 @@ describe("openFile", () => {
     expect(f?.path).toBe("src/a.ts");
     expect(f?.content).toBe("hello");
     expect(f?.followed).toBe(false);
-    expect(useViewerStore.getState().fileLoading).toBe(false);
+    // The wait is a task now, and it must be settled (no eternal spinner).
+    expect(useTasksStore.getState().tasks[VIEWER_TASK]?.phase).toBe("done");
   });
 
   it("keeps an opened preview when the active session context changes", () => {

@@ -8,7 +8,8 @@ import FileViewer, { type CurrentFile } from "../FileViewer";
 import { useTabsStore } from "../stores/tabsStore";
 import { useTreeStore } from "../stores/treeStore";
 import { useUiStore } from "../stores/uiStore";
-import { useViewerStore, isManualOpenPending } from "../stores/viewerStore";
+import { useViewerStore, isManualOpenPending, VIEWER_TASK } from "../stores/viewerStore";
+import { useTask } from "../stores/tasksStore";
 import { ChangesView } from "./ChangesView";
 import { useLayoutStore } from "../stores/layoutStore";
 
@@ -19,7 +20,10 @@ const REMOTE_TREE_POLL_MS = 6000;
 
 export function ViewerPane() {
   const currentFile = useViewerStore((s) => s.currentFile);
-  const fileLoading = useViewerStore((s) => s.fileLoading);
+  // Waiting state comes from the task registry (task phase replaces the old
+  // hand-set `fileLoading` boolean).
+  const viewerTask = useTask(VIEWER_TASK);
+  const fileLoading = viewerTask?.phase === "running" || viewerTask?.phase === "stalled";
   const followCfg = useViewerStore((s) => s.followCfg);
   const setFollowCfg = useViewerStore((s) => s.setFollowCfg);
   const followDegraded = useViewerStore((s) => s.followDegraded);

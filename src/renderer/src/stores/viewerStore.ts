@@ -3,6 +3,7 @@
 // one race-safe seam (seq-guarded, latest-wins). The counters are module-level
 // (like treeReqSeq) — they are not reactive state.
 import { create } from "zustand";
+import { useTasksStore } from "./tasksStore";
 import { useTabsStore } from "./tabsStore";
 import { useTreeStore } from "./treeStore";
 import { useUiStore } from "./uiStore";
@@ -10,6 +11,9 @@ import { useLayoutStore } from "./layoutStore";
 import { targetOfOrigin, type RemoteProfileTarget, type TargetRef, type WslProfileTarget } from "./remote-target";
 import type { CurrentFile } from "../FileViewer";
 import type { AutoFollowSettings } from "./types";
+
+/** Task key for "a file read is in flight" (viewer store + ViewerPane + FileViewer). */
+export const VIEWER_TASK = "viewer:open";
 
 /** Module-level open sequencing: every open gets a number; only the latest
  *  may render. `manualSeq` marks an in-flight MANUAL open so auto-follow
@@ -37,11 +41,9 @@ interface ViewerState {
   /** File to focus when the changes panel opens (e.g. the file in the viewer). */
   changesFocusPath: string | null;
   setChangesFocusPath: (path: string | null) => void;
-  fileLoading: boolean;
   followCfg: AutoFollowSettings;
   followDegraded: boolean;
   setCurrentFile: (file: CurrentFile | null) => void;
-  setFileLoading: (v: boolean) => void;
   setFollowCfg: (cfg: AutoFollowSettings | ((prev: AutoFollowSettings) => AutoFollowSettings)) => void;
   setFollowDegraded: (v: boolean) => void;
   /** Open a file (relative to the tree origin) into the viewer. `followed`
@@ -52,7 +54,6 @@ interface ViewerState {
 
 export const useViewerStore = create<ViewerState>()((set, get) => ({
   currentFile: null,
-  fileLoading: false,
   followCfg: { enabled: true, followReads: true },
   followDegraded: false,
   viewerMode: "viewer",
@@ -60,7 +61,6 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
   changesFocusPath: null,
   setChangesFocusPath: (path) => set({ changesFocusPath: path }),
   setCurrentFile: (currentFile) => set({ currentFile }),
-  setFileLoading: (fileLoading) => set({ fileLoading }),
   setFollowCfg: (cfg) =>
     set((s) => ({ followCfg: typeof cfg === "function" ? (cfg as (prev: AutoFollowSettings) => AutoFollowSettings)(s.followCfg) : cfg })),
   setFollowDegraded: (followDegraded) => set({ followDegraded }),
@@ -81,7 +81,16 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
     const rootPath = originOverride?.rootPath ?? origin?.rootPath;
     const seq = ++openReq.seq;
     if (!followed) openReq.manualSeq = seq;
-    set({ fileLoading: true });
+    // The wait is a TASK, not a boolean: it cannot be forgotten, it says how
+    // long it has been waiting, and it offers a retry (docs/robustness-plan.md
+    // B1/B3). The read itself is bounded too (preload channel deadline +
+    // main-side SFTP op-guard), so this cannot become an eternal spinner.
+    const tasks = useTasksStore.getState();
+    tasks.begin(VIEWER_TASK, {
+      label: "读取中…",
+      restart: true,
+      retry: () => void get().openFile(relPath, followed, originOverride),
+    });
     try {
       let res = await window.api.file.read(target, relPath, rootPath);
       // Write-tool race: auto-follow fires when pi's toolCall is recorded in
@@ -151,7 +160,9 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
       }
     } finally {
       if (openReq.manualSeq === seq) openReq.manualSeq = null;
-      if (seq === openReq.seq) set({ fileLoading: false });
+      // Only the newest request owns the task (a superseded read must not clear
+      // the spinner of the one that replaced it).
+      if (seq === openReq.seq) useTasksStore.getState().settle(VIEWER_TASK);
     }
   },
 }));

@@ -111,7 +111,18 @@ export function classifyError(error: unknown): ErrCode {
   const code = (error as { code?: unknown } | null)?.code;
   const errno = typeof code === "string" ? code.toLowerCase() : "";
 
-  if (isDeadline(error) || errno === "etimedout" || text.includes("未响应")) return "timeout";
+  if (
+    isDeadline(error) ||
+    errno === "etimedout" ||
+    // Peer errors frequently expose the code ONLY in the message
+    // ("connect ETIMEDOUT") — ssh2 does this.
+    text.includes("etimedout") ||
+    text.includes("timed out") ||
+    text.includes("超时") ||
+    text.includes("未响应")
+  ) {
+    return "timeout";
+  }
   if (errno === "eacces" || errno === "eperm" || text.includes("eacces") || text.includes("eperm")) return "permission";
   if (errno === "enoent" || text.includes("enoent") || text.includes("no such file") || text.includes("not found")) return "notfound";
   if (errno === "eexist" || text.includes("eexist") || text.includes("已存在")) return "conflict";

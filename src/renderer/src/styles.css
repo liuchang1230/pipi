@@ -1710,6 +1710,32 @@ textarea:focus-visible,
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
+.load-stalled,
+.load-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 12px;
+  text-align: left;
+}
+.load-error-title {
+  color: var(--danger);
+  font-weight: 600;
+}
+.load-error-cause {
+  opacity: 0.75;
+  word-break: break-all;
+  font-size: 12px;
+}
+.load-error-hint {
+  opacity: 0.85;
+  font-size: 12px;
+}
+.load-retry {
+  margin-top: 2px;
+}
+
 /* A failure inside the remote dir picker: message + retry, never a fake row. */
 .picker-error {
   display: flex;
