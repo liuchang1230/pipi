@@ -219,3 +219,38 @@
 验证：`742 passed`、typecheck、build、打包、真机 smoke **30/30**（新增 4 条：树对话框能打开/
 不崩/内容自洽/能关闭）。反向验证：去掉取消判定 → 6 个用例失败；把归属改回"最后一条消息" →
 3 个用例失败。
+
+## "停止后发消息，模型不回复就停了" —— steer 掉进了死回合 (2026-09-24)
+
+真实日志（用户机器，info 级）给出硬证据：
+
+```
+06:04:11.218 [rpc-send] tab rpc-5 abort -> rpc ok=true
+06:04:14.619 [rpc-send] tab rpc-5 prompt -> rpc ok=true   ← 消息发出去了
+（此后没有任何事件）
+```
+
+根因在 **pi 的语义 + 我们的选择** 组合：
+- `sendPrompt` 只要 `isStreaming` 为真就发 `streamingBehavior:"steer"`，而 `isStreaming` 只有
+  `agent_settled` 才落下 —— 远程 SSH 下 3~4 秒内还没落下很常见。
+- steer 不是新回合，而是**排进正在运行的那个回合的队列**（pi `_queueSteer`）。
+- pi 的续跑链是 `_runAgentPrompt: await agent.prompt(); while (await _handlePostAgentRun())
+  await agent.continue();`，而 `_handlePostAgentRun()` 第一行是 `if (!msg) return false`
+  （`msg = _lastAssistantMessage`）。**在"思考阶段"就被中断的回合没有 assistant 消息 → 直接
+  return false → 不会 continue → 队列里的 steer 永远不被投递。** 消息就这样滞留在 pi 里，
+  而 UI 先显示"等待"、随后把回合标成终态（"已停止"）。
+
+修法（三处，都是结构性）：
+1. **绝不 steer 进"我刚要求停止"的回合**：`abortOutstanding` 期间发消息改为**延迟投递**
+   （`deferredPrompts`）——消息气泡立刻出现、状态显示「上一轮正在停止，随后自动发送这条消息」，
+   等 abort 落地（settled / 被取消的 message_end / 新的 agent_start）再以**普通 prompt**（非
+   steer）发出；8s 兜底：abort 一直不落地就直接发，pi 要么受理要么明确拒绝（拒绝→文本回到输入框）。
+2. **不把"上一轮的 settle"画成当前消息的终态**：`agent_settled` 时若仍有待发送的消息或
+   `pendingPromptId` 未答复，保持进行中状态（而不是 `✓ 已完成` / `■ 已停止`）——这正是"看起来
+   正常结束了、其实没人回答"的谎言。
+3. **未被受理的消息不再无限等待**：`agent_settled` 后 20s 仍未收到 pi 对该 prompt 的应答
+   （pi 对 prompt 的应答是 preflight，不含模型调用），就把内容放回输入框并说明"Pi 没有受理这条
+   消息（上一轮停止时可能被丢弃）"。正常消息的应答是即时的，远程 13s 往返（本机日志实测
+   `get_state RESP 13731ms`）也在 20s 之内，不会误报。
+
+反向验证：把 `steer` 判定改回"只看 isStreaming" → 3 个用例失败；去掉应答期限 → 1 个用例失败。

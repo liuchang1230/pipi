@@ -1280,7 +1280,9 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   const phaseLabel: Record<string, string> = {
     booting: "正在启动 Pi…",
     ready: "已就绪",
-    submitting: "已发送，等待 Pi 开始处理…",
+    // `detail` wins when set: a message held back until the previous turn
+    // finishes stopping must SAY so, not claim it was already sent.
+    submitting: state?.turn.detail ?? "已发送，等待 Pi 开始处理…",
     accepted: "Pi 已受理，等待模型响应…",
     thinking: "正在思考…",
     streaming: "正在回复…",

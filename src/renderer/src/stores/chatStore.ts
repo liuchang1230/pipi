@@ -236,9 +236,115 @@ function eventTurn(st: ChatTabState): number {
 
 let localSeq = 0;
 
+/**
+ * A prompt the user sent while an abort was still in flight.
+ *
+ * Why it cannot be sent immediately: pi's `prompt` with `streamingBehavior:
+ * "steer"` only QUEUES the message into the running turn, and a turn that is
+ * aborted never drains that queue — pi's `_handlePostAgentRun()` starts with
+ * `if (!msg) return false` (no assistant message yet, e.g. the abort landed
+ * during thinking), so the continuation that would deliver the queue never
+ * happens. The message then sits in pi forever (verified in the real app log:
+ * `[rpc-send] abort` … `[rpc-send] prompt -> ok=true` and then nothing at all),
+ * while the UI shows "等待" and finally "已停止".
+ *
+ * pi rejects a NON-steer prompt while it is streaming ("Agent is already
+ * processing…"), so the honest sequence is: wait for the abort to land, then send
+ * the prompt as a normal turn. That is what this deferral does.
+ */
+interface DeferredPrompt {
+  id: string;
+  promptId: string;
+  text: string;
+  images: unknown;
+  displayText: string;
+}
+const deferredPrompts = new Map<string, DeferredPrompt>();
+const deferredTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** Upper bound on waiting for the abort to land before sending anyway. */
+const DEFER_AFTER_ABORT_MS = 8_000;
+/**
+ * A prompt pi settled WITHOUT answering used to leave the UI on "等待…" forever
+ * (the turn simply stopped, with no reply and no explanation). If pi is idle and
+ * still has not acknowledged the prompt after this long, the message was dropped
+ * — hand the text back to the composer instead of spinning.
+ */
+const PROMPT_ACK_DEADLINE_MS = 20_000;
+const promptAckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearPromptAckTimer(tabId: string): void {
+  const timer = promptAckTimers.get(tabId);
+  if (timer !== undefined) clearTimeout(timer);
+  promptAckTimers.delete(tabId);
+}
+
+/**
+ * pi settled while a prompt of ours was still unacknowledged: start the clock.
+ * (An acknowledged prompt clears pendingPromptId, and the deferral case is
+ * handled separately — it has not been written to pi yet at all.)
+ */
+function armPromptAckDeadline(tabId: string): void {
+  clearPromptAckTimer(tabId);
+  promptAckTimers.set(
+    tabId,
+    setTimeout(() => {
+      promptAckTimers.delete(tabId);
+      const cur = useChatStore.getState().states[tabId];
+      if (!cur || cur.pendingPromptId === undefined) return;
+      if (deferredPrompts.has(tabId)) return;
+      rejectPrompt(tabId, "Pi 没有受理这条消息（上一轮停止时可能被丢弃），内容已放回输入框，请重新发送。");
+    }, PROMPT_ACK_DEADLINE_MS),
+  );
+}
+
 /** Turn phases that represent work already in flight (never "reset" to ready
  *  by an unrelated state_ready snapshot). */
 const pendingTurnPhases = new Set<TurnPhase>(["submitting", "accepted", "thinking", "streaming", "tool", "cancelling", "compacting"]);
+
+/** Cancel a pending deferral (tab closed / prompt rejected). */
+function clearDeferredPrompt(tabId: string): void {
+  const timer = deferredTimers.get(tabId);
+  if (timer !== undefined) clearTimeout(timer);
+  deferredTimers.delete(tabId);
+  deferredPrompts.delete(tabId);
+}
+
+/**
+ * Deliver a prompt that was waiting for an abort to land, as a NORMAL turn.
+ * Called the moment the abort resolves (settle / cancelled message / a new
+ * agent_start) and by a timer as a backstop.
+ */
+function flushDeferredPrompt(tabId: string): void {
+  const pending = deferredPrompts.get(tabId);
+  if (!pending) return;
+  clearDeferredPrompt(tabId);
+  const timer = deferredTimers.get(tabId);
+  if (timer !== undefined) clearTimeout(timer);
+  const store = useChatStore.getState();
+  const st = store.states[tabId];
+  if (!st) return;
+  useChatStore.setState((s) => ({
+    states: {
+      ...s.states,
+      [tabId]: {
+        ...s.states[tabId]!,
+        // The outstanding abort is over: the fallout of the old turn can no
+        // longer be mistaken for this turn's events.
+        abortResolved: true,
+        turn: { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
+      },
+    },
+  }));
+  void window.api.tab
+    .rpcSend(tabId, { type: "prompt", message: pending.text, images: pending.images, id: pending.promptId })
+    .then((sent) => {
+      if (!sent) {
+        rejectPrompt(tabId, "消息未能发送到 Pi，请重试或切换到终端视图检查连接。");
+        return;
+      }
+      armPromptAckDeadline(tabId);
+    });
+}
 
 /**
  * pi refused the prompt (or the write never left the app), so the message
@@ -248,6 +354,8 @@ const pendingTurnPhases = new Set<TurnPhase>(["submitting", "accepted", "thinkin
  * about the session's actual history.
  */
 function rejectPrompt(tabId: string, errorText: string): void {
+  clearDeferredPrompt(tabId);
+  clearPromptAckTimer(tabId);
   useChatStore.setState((s) => {
     const cur = s.states[tabId];
     if (!cur) return {};
@@ -466,6 +574,8 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   clear: (tabId) => {
     // A closed/switched session must never receive a stale rAF-batched delta.
     pendingStreamEvents.delete(tabId);
+    clearDeferredPrompt(tabId);
+    clearPromptAckTimer(tabId);
     set((s) => {
       const states = { ...s.states };
       delete states[tabId];
@@ -478,7 +588,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     // does not re-render every chat on each tab-list update.
     const dropped = Object.keys(get().states).filter((id) => !liveTabIds.has(id));
     if (dropped.length === 0) return;
-    for (const id of dropped) pendingStreamEvents.delete(id);
+    for (const id of dropped) {
+      pendingStreamEvents.delete(id);
+      clearDeferredPrompt(id);
+      clearPromptAckTimer(id);
+    }
     set((s) => {
       const states = { ...s.states };
       for (const id of dropped) delete states[id];
@@ -635,6 +749,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "agent_start") {
+      flushDeferredPrompt(tabId);
       patch({
         isStreaming: true,
         lastError: undefined,
@@ -647,21 +762,35 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "agent_settled") {
+      // A settle can belong to the turn the user just rejected, while the next
+      // message is still queued or still waiting for pi's verdict. Painting a
+      // terminal label ("✓ Agent 已完成" / "■ 已停止") over a message that has not
+      // been answered yet is the lie that made "模型不回复" look like a normal end.
+      const awaitingSend = deferredPrompts.has(tabId) || st.pendingPromptId !== undefined;
       patch({
         isStreaming: false,
         retryInfo: null,
         compacting: false,
         steeringQueue: [],
         followUpQueue: [],
-        pendingUserText: undefined,
+        pendingUserText: awaitingSend ? st.pendingUserText : undefined,
         abortResolved: true,
         liveAssistantId: undefined,
-        turn: st.turnCancelled
-          ? { phase: "cancelled" as const, lastActivityAt: Date.now(), detail: "已停止" }
-          : st.lastError || st.turn.phase === "failed"
-            ? { phase: "failed", lastActivityAt: Date.now(), detail: st.turn.detail ?? st.lastError }
-            : { phase: "completed", completedAt: Date.now(), lastActivityAt: Date.now() },
+        turn: awaitingSend
+          ? pendingTurnPhases.has(st.turn.phase)
+            ? st.turn
+            : { phase: "queued" as const, lastActivityAt: Date.now(), detail: "上一轮已结束，消息待发送" }
+          : st.turnCancelled
+            ? { phase: "cancelled" as const, lastActivityAt: Date.now(), detail: "已停止" }
+            : st.lastError || st.turn.phase === "failed"
+              ? { phase: "failed", lastActivityAt: Date.now(), detail: st.turn.detail ?? st.lastError }
+              : { phase: "completed", completedAt: Date.now(), lastActivityAt: Date.now() },
       });
+      flushDeferredPrompt(tabId);
+      // Settled with our prompt still unacknowledged and no deferral waiting:
+      // give pi a moment, then admit the message was dropped rather than showing
+      // "等待" forever (the "停止后发消息，模型不回复" report).
+      if (!deferredPrompts.has(tabId) && st.pendingPromptId !== undefined) armPromptAckDeadline(tabId);
       return;
     }
     if (type === "queue_update") {
@@ -737,6 +866,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         rejectPrompt(tabId, reason);
         return;
       }
+      clearPromptAckTimer(tabId);
       patch({
         pendingPromptId: undefined,
         restoreInput: undefined,
@@ -859,6 +989,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       // A stale event that matched nothing is DROPPED: it belongs to a turn that
       // is already gone, and touching the newest bubble is exactly the bug.
       if (!applied) return;
+      if (cancelled) flushDeferredPrompt(tabId);
       // Was this the fallout of an abort the user already moved on from? Then
       // the turn STATUS belongs to the new turn (it is running/queued), and only
       // the message marker may change. Relabelling the current turn "已停止"
@@ -1066,6 +1197,17 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     // payload when @mentions expanded a file. Pi will echo the payload in its
     // message_start event, so pendingUserText keeps reconciliation on the
     // display-safe version as well.
+    // Steering into a turn the user just asked to stop is what made the message
+    // vanish: pi queues a steer into the running turn, and an aborted turn never
+    // drains that queue (see deferredPrompts above). Defer it instead.
+    const stopping = abortOutstanding(st);
+    if (stopping && deferredPrompts.has(tabId)) {
+      // An earlier prompt is already waiting: send it now so both are delivered
+      // in the order the user typed them.
+      flushDeferredPrompt(tabId);
+    }
+    const steer = st.isStreaming && !stopping;
+    const nextTurnSeq = steer ? st.turnSeq : st.turnSeq + 1;
     set((s) => ({
       states: {
         ...s.states,
@@ -1077,15 +1219,17 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           // A steer joins the running turn; a new prompt starts a new one. The
           // tag is what keeps a late event from the previous (aborted) turn from
           // landing on this prompt's answer.
-          turnSeq: st.isStreaming ? st.turnSeq : st.turnSeq + 1,
+          turnSeq: nextTurnSeq,
           turnCancelled: false,
           liveAssistantId: undefined,
           // A steer joins a turn that is already running: "已发送，等待 Pi 开始
           // 处理…" would be a lie (pi is mid-stream), and the queue banner
           // (queue_update) is the honest feedback for it.
-          turn: st.isStreaming
-            ? st.turn
-            : { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
+          turn: stopping
+            ? { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "上一轮正在停止，随后自动发送这条消息" }
+            : st.isStreaming
+              ? st.turn
+              : { phase: "submitting", startedAt: Date.now(), lastActivityAt: Date.now(), detail: "已发送，等待 Pi 开始处理" },
           messages: [
             ...s.states[tabId]!.messages,
             {
@@ -1099,13 +1243,28 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         },
       },
     }));
-    const cmd: Record<string, unknown> = st.isStreaming
+    if (stopping) {
+      // Hold it until pi confirms the turn is gone, then send it as a normal
+      // turn. The timeout is a backstop: if the abort never lands we send anyway
+      // (pi either accepts it or tells us why, and rejectPrompt hands the text
+      // back to the composer instead of losing it).
+      deferredPrompts.set(tabId, { id, promptId, text: message, images, displayText });
+      const timer = deferredTimers.get(tabId);
+      if (timer !== undefined) clearTimeout(timer);
+      deferredTimers.set(tabId, setTimeout(() => flushDeferredPrompt(tabId), DEFER_AFTER_ABORT_MS));
+      return;
+    }
+    const cmd: Record<string, unknown> = steer
       ? { type: "prompt", message, images, streamingBehavior: "steer" }
       : { type: "prompt", message, images };
     const sent = await window.api.tab.rpcSend(tabId, { ...cmd, id: promptId });
     if (!sent) {
       rejectPrompt(tabId, "消息未能发送到 Pi，请重试或切换到终端视图检查连接。");
+      return;
     }
+    // pi answers a prompt immediately (preflight, no model call). If that answer
+    // never comes the message was not accepted — say so instead of waiting.
+    armPromptAckDeadline(tabId);
   },
 
   abort: (tabId) => {

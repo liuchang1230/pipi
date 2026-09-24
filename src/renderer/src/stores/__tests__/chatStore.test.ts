@@ -792,3 +792,164 @@ describe("chatStore abort attribution", () => {
     expect(live.status).toBe("streaming");
   });
 });
+
+/**
+ * Regression: "停止后发消息，显示等待，然后模型也不回复了，就停止了".
+ *
+ * Root cause (pi source + a real app log): `sendPrompt` sent the message as
+ * `streamingBehavior: "steer"` whenever `isStreaming` was still true, and
+ * `isStreaming` is only cleared by `agent_settled`. A steer is QUEUED into the
+ * running turn, and an aborted turn never drains that queue — pi's
+ * `_handlePostAgentRun()` starts with `if (!msg) return false`, so when the abort
+ * landed before any assistant message existed there is no continuation to
+ * deliver it. The message stayed in pi forever while the UI waited and then
+ * showed a terminal state.
+ */
+describe("chatStore prompt after abort", () => {
+  function stubRecording(): { sent: Array<Record<string, unknown>> } {
+    const sent: Array<Record<string, unknown>> = [];
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: {
+        tab: {
+          rpcSend: (_t: string, cmd: Record<string, unknown>) => {
+            sent.push(cmd);
+            return Promise.resolve(true);
+          },
+        },
+      },
+    };
+    return { sent };
+  }
+
+  it("does NOT steer into the turn it just asked to stop", async () => {
+    const { sent } = stubRecording();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    sent.length = 0; // ignore the abort commands themselves
+    await useChatStore.getState().sendPrompt(T, "停止后的消息");
+
+    const prompts = sent.filter((c) => c.type === "prompt");
+    expect(prompts).toHaveLength(0); // deferred, not written yet
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.detail).toContain("上一轮正在停止");
+    // The bubble is in the transcript so the user sees their message, and it is
+    // still recoverable (pendingUserText survives until delivery).
+    expect(st.messages.at(-1)).toMatchObject({ role: "user" });
+    expect(st.pendingUserText).toBe("停止后的消息");
+  });
+
+  it("sends it as a normal prompt the moment the abort lands", async () => {
+    const { sent } = stubRecording();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    sent.length = 0;
+    await useChatStore.getState().sendPrompt(T, "停止后的消息");
+    expect(sent.filter((c) => c.type === "prompt")).toHaveLength(0);
+
+    // pi confirms the turn is gone.
+    apply([{ type: "agent_settled" }]);
+    await Promise.resolve();
+
+    const prompts = sent.filter((c) => c.type === "prompt");
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toMatchObject({ type: "prompt", message: "停止后的消息" });
+    // NOT a steer: a steer into a dead turn is what got lost.
+    expect(prompts[0]!.streamingBehavior).toBeUndefined();
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.phase).toBe("submitting");
+    expect(st.turn.detail).toContain("等待 Pi");
+  });
+
+  it("keeps the prompt after a cancelled message_end and sends it then", async () => {
+    const { sent } = stubRecording();
+    apply([
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [] } },
+    ]);
+    useChatStore.getState().abort(T);
+    await useChatStore.getState().sendPrompt(T, "再来一次");
+    sent.length = 0;
+    apply([
+      { type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted", stopReason: "error" } },
+    ]);
+    await Promise.resolve();
+    const prompts = sent.filter((c) => c.type === "prompt");
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.streamingBehavior).toBeUndefined();
+    // The aborted turn is still reported as stopped, the message is on its way.
+    expect(useChatStore.getState().states[T]!.messages.some((m) => m.interrupted)).toBe(true);
+  });
+
+  it("never paints a terminal label over a message that is still pending", async () => {
+    stubRecording();
+    apply([{ type: "agent_start" }]);
+    // A prompt is written and pi has not answered it yet.
+    const sending = useChatStore.getState().sendPrompt(T, "等待回答的问题");
+    apply([{ type: "agent_settled" }]);
+    await sending;
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.phase).not.toBe("completed");
+    expect(st.turn.phase).not.toBe("cancelled");
+  });
+
+  it("an ordinary prompt is still steered while a turn streams", async () => {
+    const { sent } = stubRecording();
+    apply([{ type: "agent_start" }]);
+    await useChatStore.getState().sendPrompt(T, "插一句");
+    const prompts = sent.filter((c) => c.type === "prompt");
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.streamingBehavior).toBe("steer");
+  });
+});
+
+describe("chatStore prompt acknowledgement deadline", () => {
+  function stubQuiet(): void {
+    // A bridge that accepts writes but where pi NEVER answers the prompt.
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: { tab: { rpcSend: () => Promise.resolve(true) } },
+    };
+  }
+
+  it("gives the text back instead of waiting forever for an unaccepted prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      stubQuiet();
+      await useChatStore.getState().sendPrompt(T, "会被丢弃的消息");
+      expect(useChatStore.getState().states[T]!.pendingPromptId).toBeTruthy();
+      // pi settles without ever acknowledging the prompt.
+      apply([{ type: "agent_settled" }]);
+      vi.advanceTimersByTime(20_001);
+      const st = useChatStore.getState().states[T]!;
+      expect(st.pendingPromptId).toBeUndefined();
+      expect(st.restoreInput).toBe("会被丢弃的消息");
+      expect(st.lastError).toContain("没有受理");
+      // The optimistic bubble is removed: pi never saw the message.
+      expect(st.messages.some((m) => m.role === "user")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays quiet when pi acknowledges the prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      stubQuiet();
+      await useChatStore.getState().sendPrompt(T, "正常消息");
+      const promptId = useChatStore.getState().states[T]!.pendingPromptId!;
+      apply([{ type: "response", command: "prompt", id: promptId, success: true }]);
+      apply([{ type: "agent_settled" }]);
+      vi.advanceTimersByTime(20_001);
+      const st = useChatStore.getState().states[T]!;
+      expect(st.restoreInput).toBeUndefined();
+      expect(st.lastError).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
