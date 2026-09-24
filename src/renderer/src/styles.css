@@ -1651,6 +1651,60 @@ textarea:focus-visible,
   border: 1px solid rgba(243, 139, 168, 0.3);
   color: var(--danger);
 }
+
+/* --- "应用繁忙" pill (main-process lag with attribution) ---
+   Deliberately NOT a toast: it stays until the loop recovers or the user
+   dismisses it, because the point is to explain a slow UI while it is slow. */
+.busy-pill {
+  position: fixed;
+  bottom: 24px;
+  left: 24px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(520px, calc(100vw - 48px));
+  padding: 8px 10px 8px 14px;
+  border-radius: 8px;
+  background: rgba(249, 226, 175, 0.14);
+  border: 1px solid rgba(249, 226, 175, 0.3);
+  color: var(--warning, #f9e2af);
+  font-size: 12px;
+  line-height: 1.4;
+  z-index: 1000;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+  animation: toast-in 0.25s ease;
+}
+.busy-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: busy-pulse 1.2s ease-in-out infinite;
+}
+.busy-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.busy-dismiss {
+  flex: none;
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.busy-dismiss:hover {
+  opacity: 1;
+}
+@keyframes busy-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
 @keyframes toast-in {
   from { opacity: 0; transform: translateX(-50%) translateY(8px); }
   to { opacity: 1; transform: translateX(-50%) translateY(0); }

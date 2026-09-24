@@ -31,6 +31,8 @@ import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
 import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
+import { trackIpcHandlersOn } from "./in-flight";
+import { createLagMonitor, type LagMonitor } from "./perf";
 import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
 import { INTERNAL_RPC_ID_PREFIX } from "../shared/transcript";
 import { isSftpMissingPathError } from "./sftp-errors";
@@ -65,6 +67,20 @@ let mainWindow: BrowserWindow | null = null;
 let crashReloadedAt = 0;
 /** Set once teardown starts, so the crash-recovery path never fights the quit. */
 let appQuitting = false;
+/** Event-loop lag monitor (started on ready) so "卡顿" leaves a number behind. */
+let lagMonitor: LagMonitor | null = null;
+
+/**
+ * Attribute event-loop stalls to the IPC call they happen under.
+ *
+ * One patch at startup instead of bookkeeping in ~60 handlers: the channel name
+ * is exactly the granularity a user report can be matched against ("I clicked
+ * the file tree and then it froze" → `ipc:file:list`). Must run BEFORE the first
+ * `ipcMain.handle` below.
+ */
+function trackIpcHandlers(): void {
+  trackIpcHandlersOn(ipcMain as unknown as Parameters<typeof trackIpcHandlersOn>[0]);
+}
 
 type WorkbenchCommand =
   | "project:open"
@@ -1076,6 +1092,20 @@ if (!gotSingleInstanceLock) {
 if (gotSingleInstanceLock) {
   app.whenReady().then(async () => {
   logMemory("startup");
+  // Must run BEFORE any ipcMain.handle below.
+  trackIpcHandlers();
+  // Lag numbers with attribution: a busy window names the in-flight IPC call,
+  // and the renderer shows it instead of leaving the user with a spinning UI.
+  lagMonitor = createLagMonitor({
+    log: debugLogWarn,
+    debug: debugLogDebug,
+    onBusy: (report) => {
+      const payload = report
+        ? { busy: true, p95Ms: report.sample.p95Ms, maxMs: report.sample.maxMs, ops: report.opsText }
+        : { busy: false };
+      for (const win of BrowserWindow.getAllWindows()) win.webContents.send("app:busy", payload);
+    },
+  });
   const memTimer = setInterval(() => logMemory("tick"), 120_000);
   memTimer.unref?.();
   // Ship app-bundled pi extensions (static working indicator etc.) BEFORE any
@@ -3652,6 +3682,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
 app.on("window-all-closed", async () => {
   appQuitting = true;
   flushLog();
+  lagMonitor?.stop();
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopSessionsPoll();
   closeAllTabs();
@@ -3665,6 +3696,7 @@ app.on("window-all-closed", async () => {
 app.on("before-quit", async () => {
   appQuitting = true;
   flushLog();
+  lagMonitor?.stop();
   if (remotePollTimer) clearInterval(remotePollTimer);
   stopSessionsPoll();
   closeAllTabs();

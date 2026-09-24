@@ -75,6 +75,13 @@ interface UiState {
   appDialog: "model-config" | null;
   openAppDialog: (d: "model-config") => void;
   closeAppDialog: () => void;
+  /**
+   * Main-process event-loop lag crossed the busy threshold. This is the honest
+   * answer to "为什么这么卡": the app IS busy, here is the delay and the
+   * operation it is waiting on (see src/main/perf.ts + in-flight.ts). Null = fine.
+   */
+  busy: { p95Ms: number; maxMs: number; ops: string } | null;
+  setBusy: (busy: UiState["busy"]) => void;
 }
 
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -151,4 +158,6 @@ export const useUiStore = create<UiState>()((set) => ({
   appDialog: null,
   openAppDialog: (appDialog) => set({ appDialog }),
   closeAppDialog: () => set({ appDialog: null }),
+  busy: null,
+  setBusy: (busy) => set({ busy }),
 }));

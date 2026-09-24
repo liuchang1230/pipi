@@ -248,6 +248,7 @@ declare global {
       };
       onWorkbenchCommand: (callback: (command: "project:open" | "remote:connect" | "session:new" | "session:close" | "view:toggle-viewer" | "view:toggle-theme" | "models:configure" | "help:shortcuts") => void) => () => void;
       onTabsUpdate: (callback: (tabs: TabSummary[]) => void) => () => void;
+      onAppBusy: (callback: (ev: { busy: boolean; p95Ms?: number; maxMs?: number; ops?: string }) => void) => () => void;
       onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void) => () => void;
       theme: {
         setMode: (mode: "dark" | "light") => Promise<boolean>;

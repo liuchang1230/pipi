@@ -48,6 +48,34 @@ function ToastHost() {
   return <div className={`toast toast-${toast.type}`}>{toast.text}</div>;
 }
 
+/**
+ * "应用繁忙" pill: the main process told us its event loop is delayed and named
+ * the operation responsible. Dismissible, because it is information rather than
+ * an error — but stated plainly, because a frozen UI with no explanation is
+ * what "不稳定" feels like from the outside.
+ */
+function BusyPill() {
+  const busy = useUiStore((s) => s.busy);
+  const [dismissed, setDismissed] = useState(false);
+  // A new busy window re-arms the pill.
+  useEffect(() => {
+    if (busy) setDismissed(false);
+  }, [busy]);
+  if (!busy || dismissed) return null;
+  return (
+    <div className="busy-pill">
+      <span className="busy-dot" />
+      <span className="busy-text">
+        应用繁忙（事件循环延迟 {busy.p95Ms}ms）
+        {busy.ops ? ` · 正在：${busy.ops}` : ""}
+      </span>
+      <button className="busy-dismiss" title="忽略" onClick={() => setDismissed(true)}>
+        ×
+      </button>
+    </div>
+  );
+}
+
 /** 预览面板折叠后，悬浮在窗口右缘的展开按钮（订阅自己的 slice，App 本体不订阅）。 */
 function ViewerExpandButton() {
   const collapsed = useLayoutStore((s) => s.viewerCollapsed);
@@ -244,6 +272,13 @@ export default function App() {
     // Main-discovered connection state (SFTP breaker / probe). The dialog host
     // component above consumes it, so App itself stays subscription-free.
     const offRemoteStatus = window.api.remote.onStatus((ev) => useRemoteStore.getState().applyStatusEvent(ev));
+    // Main-process lag: surface it with the operation it is waiting on, instead
+    // of leaving the user with a UI that is simply slow for no stated reason.
+    const offBusy = window.api.onAppBusy((ev) => {
+      useUiStore.getState().setBusy(
+        ev.busy ? { p95Ms: ev.p95Ms ?? 0, maxMs: ev.maxMs ?? 0, ops: ev.ops ?? "" } : null,
+      );
+    });
     const offActive = window.api.onActiveTab(async ({ id, cwd: c, isRemote: r, sessions: payloadSessions }) => {
       const prevActive = activeTabRef.current;
       if (!id) {
@@ -341,6 +376,7 @@ export default function App() {
       offTabs();
       offActive();
       offRemoteStatus();
+      offBusy();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -646,6 +682,7 @@ export default function App() {
       {/* Toast notification */}
       <RemoteLoginDialogHost />
       <ToastHost />
+      <BusyPill />
       <UpdateBanner />
     </div>
   );

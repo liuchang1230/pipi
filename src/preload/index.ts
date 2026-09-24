@@ -314,6 +314,13 @@ const api = {
     ipcRenderer.on("tabs:update", handler);
     return () => ipcRenderer.removeListener("tabs:update", handler);
   },
+  /** Main-process event-loop lag crossed the busy threshold (or recovered).
+   *  Payload names the in-flight operation so the UI can say WHAT is slow. */
+  onAppBusy: (callback: (ev: { busy: boolean; p95Ms?: number; maxMs?: number; ops?: string }) => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, ev: { busy: boolean; p95Ms?: number; maxMs?: number; ops?: string }) => callback(ev);
+    ipcRenderer.on("app:busy", handler);
+    return () => ipcRenderer.removeListener("app:busy", handler);
+  },
   onActiveTab: (callback: (payload: { id: string | null; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) => void): (() => void) => {
     const handler = (_e: Electron.IpcRendererEvent, payload: { id: string; cwd: string; isRemote?: boolean; sessions?: SessionListItem[] }) =>
       callback(payload);
