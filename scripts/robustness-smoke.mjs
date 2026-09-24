@@ -31,8 +31,8 @@ const workDir = mkdtempSync(join(tmpdir(), "pipi-smoke-"));
 
 const mainLines = [];
 let app = null;
-function launch() {
-  const child = spawn(exe, [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`], {
+function launch(port = PORT) {
+  const child = spawn(exe, [`--remote-debugging-port=${port}`, `--user-data-dir=${profile}`], {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: "1" },
@@ -48,10 +48,10 @@ function launch() {
 }
 app = launch();
 
-async function getWsUrl() {
+async function getWsUrl(port = PORT) {
   for (let i = 0; i < 60; i++) {
     try {
-      const res = await fetch(`http://127.0.0.1:${PORT}/json`);
+      const res = await fetch(`http://127.0.0.1:${port}/json`);
       const targets = await res.json();
       const page = targets.find((t) => t.type === "page");
       if (page) return page.webSocketDebuggerUrl;
@@ -197,8 +197,20 @@ try {
   try {
     mkdirSync(profile, { recursive: true });
     writeFileSync(join(profile, "projects.json"), '[{"id":"p1","type":"local"');
-    app = launch();
-    const wsUrl2 = await getWsUrl();
+    // A fresh port: the phase-1 endpoint can outlive its process for a moment
+    // (TIME_WAIT), and reusing it makes the second boot unreachable.
+    const phase2Port = PORT + 1;
+    for (let i = 0; i < 40; i++) {
+      try {
+        await fetch(`http://127.0.0.1:${PORT}/json`);
+        await sleep(250); // still answering → the old endpoint is alive
+      } catch {
+        break;
+      }
+    }
+    app = launch(phase2Port);
+    const wsUrl2 = await getWsUrl(phase2Port);
+    if (!wsUrl2) throw new Error("phase 2: no CDP target (second boot did not come up)");
     ws = await connect(wsUrl2);
     await send(ws, "Runtime.enable");
     await sleep(4000);
