@@ -1,7 +1,9 @@
 # 稳定性与可诊断性 —— 整体分析与设计规划
 
 状态：规划设计 v2（已过独立评审并修订；v1 的两处根因判断被推翻，见 §7 修订记录）
-实施进度：**Phase 0 已完成**（`ee926a3` + `78196fe`）、**Phase 1 已完成**（`5bd52c9` + `ecd9225` + `0053615`），其余阶段待开工
+实施进度：**Phase 0 / 1 已完成**；**Phase 2 已完成主体**（S1 Outcome、S2 op-guard、S4 任务中心、
+S5 失败面、B5 错误不再伪装成数据），剩余：S3 preload deadline 表、treeStore/sessionsStore 标志迁移；
+Phase 3 / 4 待开工
 日期：2026-09-23
 触发：用户反馈"软件不稳定、鲁棒性不高、容易卡顿、提示不充分、出问题了用户也不知道咋了"
 
@@ -263,14 +265,30 @@ IPC handler）、`src/main/perf.ts`（10s 采样 + 迟滞 busy 判定）、`app:
 - 测试：614 passed（新增 debug-log 7、in-flight 10、perf 11、diff-session-read 6）；
   typecheck + build 通过。
 
-### Phase 2 — 卡不住 + 看得到（2–3 天）
+### Phase 2 — 卡不住 + 看得到（2–3 天）—— **主体已完成**
 
-1. S1 `Outcome` + S2 `op-guard`（含 SFTP 中毒/销毁）+ S3 `call()` + 全 channel deadline 表。
-2. S4 `tasksStore` + `<LoadState>` + 两段式 deadline（含 4 处真实卡死点迁移 + 旧字段同步删除）。
-3. S5 `failureStore` + `FailureCenter` + 重试；B5 的"错误数据契约"删除。
+| 项 | 状态 | 落地 |
+|---|---|---|
+| S1 `Outcome` + 错误分类 | ✅ | `src/shared/outcome.ts`（ErrCode/AppError/Outcome + 表驱动 `classifyError` 含“只有文本才有 ETIMEDOUT”这类实际情形 + 每个 code 一条可执行 hint） |
+| S2 op-guard | ✅ | `src/main/op-guard.ts`；`withSftp` 接入（60s 硬上限 + 超时 **destroySftpLease**，不记熔断避免把“慢”放大成“服务器挂了”）；顺带修掉 WSL fd/find 搜索无 timeout |
+| S4 任务中心 | ✅ | `stores/tasksStore.ts`（T1 10s → stalled、T2 30s → error、单 sweep 定时器、background 不进计数、迟到响应仍被接受）；
+`components/LoadState.tsx`；**`viewerStore.fileLoading` 已删除并迁移**到 `viewer:open` 任务 |
+| S5 失败面 | ✅ | `stores/failureStore.ts`（去重计数 + 上限 20 + retry）+ `components/FailureCenter.tsx`（持久条 + 列表 + 复制全部）；
+`showToast(text, "err", {failure:true,…})` 显式 opt-in（避免把提示当失败） |
+| B5 错误伪装成数据 | ✅ | 远程/WSL 列目录失败不再返回假“文件”行（改 throw → 树进 error 态）；`file:read` 错误不再写进 `content`；
+RemoteDirPicker 用独立 error 态 + 重试代替假行 |
+| S3 preload deadline 表 | ⏳ 未做 | 目前有界性来自 op-guard（主进程 60s）+ 各调用点 `withDeadline`；
+下一步是把表收到 preload 一处，并豁免 `rpcRequest`/`waitUntilAlive`/`waitConnState`/`writeInput` |
+| treeStore / sessionsStore 迁移 | ⏳ 未做 | 两处的卡死风险已由 op-guard 60s + withDeadline 兜住，
+缺的是“停滞升级”这一层（`fileTreeStatus` / `projectLoading` / `remoteHydration`） |
+| 失败面接入面 | ⏳ 部分 | 已接入 viewer 读文件失败、远程文件加载失败；其余 `showToast(…,"err")` 调用点需逐个判断是否是"失败" |
 
-**验收（自动化，"鲁棒性"的定义本身）**：注入"永不 resolve / 立即 reject"的假 api，
-**每个面板在 deadline + 5s 内进入终态**（无 loading 残留）；SFTP 超时后 lease 被销毁、下一次调用经熔断快速失败（无 refCount 泄漏）。
+**验收（自动化）**：注入“永不 resolve”的假 api → 任务层在自己 deadline 内进终态（`tasksStore` 测试已锁定
+这条行为：escalates a never-settling task to stalled then error）。整体“每个面板都进终态”的回归网
+（no-eternal-spinner）在第 Phase 4。
+
+**测试**：670 passed（新增 tasksStore 18、failureStore 10、uiStore 3、op-guard 8、outcome 11、
+shared/with-deadline 7）；typecheck + build 通过。
 
 ### Phase 3 — 查得到 + 数据不丢（1–2 天）
 
