@@ -1,6 +1,6 @@
 import { app } from "electron";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { readJsonRecoverable, writeJsonAtomic } from "./json-store";
 
 export interface RemoteHistoryEntry {
   id: string;
@@ -18,20 +18,13 @@ function historyPath(): string {
 }
 
 function readHistory(): RemoteHistoryEntry[] {
-  const file = historyPath();
-  if (!existsSync(file)) return [];
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
+  // Losing this file silently means losing saved server passwords, so a damaged
+  // one is preserved as .corrupt-<ts> and reported rather than replaced.
+  return readJsonRecoverable<RemoteHistoryEntry[]>(historyPath(), [], (raw) => (Array.isArray(raw) ? (raw as RemoteHistoryEntry[]) : null)).value;
 }
 
 function writeHistory(list: RemoteHistoryEntry[]): void {
-  const file = historyPath();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(list, null, 2), "utf8");
+  writeJsonAtomic(historyPath(), list);
 }
 
 export function listRemoteHistory(): RemoteHistoryEntry[] {

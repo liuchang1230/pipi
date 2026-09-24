@@ -11,7 +11,7 @@
 //
 // Usage: node scripts/robustness-smoke.mjs   (needs release/win-unpacked/pipi.exe)
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -29,19 +29,24 @@ if (!existsSync(exe)) {
 rmSync(profile, { recursive: true, force: true });
 const workDir = mkdtempSync(join(tmpdir(), "pipi-smoke-"));
 
-const app = spawn(exe, [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`], {
-  cwd: process.cwd(),
-  stdio: ["ignore", "pipe", "pipe"],
-  env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: "1" },
-});
 const mainLines = [];
-for (const stream of [app.stdout, app.stderr]) {
-  stream.on("data", (d) => {
-    const s = String(d);
-    mainLines.push(s);
-    if (/error|Error|uncaught|unhandled|crash/i.test(s)) process.stdout.write("[main] " + s.slice(0, 300));
+let app = null;
+function launch() {
+  const child = spawn(exe, [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`], {
+    cwd: process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: "1" },
   });
+  for (const stream of [child.stdout, child.stderr]) {
+    stream.on("data", (d) => {
+      const s = String(d);
+      mainLines.push(s);
+      if (/uncaught|unhandled|crash/i.test(s)) process.stdout.write("[main] " + s.slice(0, 300));
+    });
+  }
+  return child;
 }
+app = launch();
 
 async function getWsUrl() {
   for (let i = 0; i < 60; i++) {
@@ -180,11 +185,47 @@ try {
   check("smoke run completed", false, e instanceof Error ? e.message : String(e));
 } finally {
   try {
-    app.kill();
+    app?.kill();
   } catch {
     /* already gone */
   }
   await sleep(1500);
+
+  // ---- phase 2: a damaged config file is surfaced to the user --------------
+  // (verified end-to-end: verifyConfigFiles at startup → config:problems pull →
+  // failure center bar, plus the damaged bytes preserved as .corrupt-*)
+  try {
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(join(profile, "projects.json"), '[{"id":"p1","type":"local"');
+    app = launch();
+    const wsUrl2 = await getWsUrl();
+    ws = await connect(wsUrl2);
+    await send(ws, "Runtime.enable");
+    await sleep(4000);
+
+    check("corrupt config: failure bar shown to the user", await evaluate(ws, `!!document.querySelector('.failure-bar')`));
+    check(
+      "corrupt config: the bar names the file (not a generic error)",
+      await evaluate(ws, `(document.querySelector('.failure-bar')?.textContent ?? '').includes('配置文件损坏')`),
+      await evaluate(ws, `(document.querySelector('.failure-bar')?.textContent ?? '').slice(0, 120)`),
+    );
+    check("corrupt config: no crash screen", await evaluate(ws, `!document.querySelector('.crash-screen')`));
+    const corrupted = readdirSync(profile).filter((f) => f.includes("projects.json.corrupt-"));
+    check("corrupt config: damaged bytes preserved as .corrupt-*", corrupted.length === 1, corrupted.join(","));
+    check(
+      "corrupt config: damaged bytes kept verbatim",
+      corrupted[0] ? readFileSync(join(profile, corrupted[0]), "utf8") === '[{"id":"p1","type":"local"' : false,
+    );
+  } catch (e) {
+    check("corrupt-config phase completed", false, e instanceof Error ? e.message : String(e));
+  } finally {
+    try {
+      app?.kill();
+    } catch {
+      /* already gone */
+    }
+    await sleep(1200);
+  }
 
   // Log-file assertions: the file must exist, carry the info line, and NOT
   // carry the debug line (that is the whole point of the level gate).

@@ -4,6 +4,7 @@
 // directory as a project through the sessionsStore project actions.
 import { useCallback, useEffect, useState } from "react";
 import { useSessionsStore } from "../stores/sessionsStore";
+import { useUiStore } from "../stores/uiStore";
 import type { FileNode } from "../stores/types";
 import type { TargetRef } from "../stores/remote-target";
 import { Icon } from "../components/Icon";
@@ -40,7 +41,7 @@ export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClos
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target]);
 
-  const pickerSelect = useCallback(async () => {
+  const pickerSelectInner = useCallback(async () => {
     const remote = await window.api.remote.getInfo(target);
     if (remote) {
       const ss = useSessionsStore.getState();
@@ -60,6 +61,16 @@ export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClos
     }
     onClose();
   }, [pickerPath, target, onClose]);
+
+  const pickerSelect = useCallback(async () => {
+    try {
+      await pickerSelectInner();
+    } catch (error) {
+      // A refused write (damaged config file, permission problem) must be
+      // visible: adding the project did NOT happen.
+      useUiStore.getState().showToast(error instanceof Error ? error.message : "添加项目失败", "err", { failure: true });
+    }
+  }, [pickerSelectInner]);
 
   return (
     <div className="dialog-overlay" onClick={onClose}>

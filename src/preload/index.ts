@@ -365,6 +365,20 @@ const api = {
     return () => ipcRenderer.removeListener("file:autofollow-status", handler);
   },
 
+  /** Config-file integrity: a damaged config is preserved as .corrupt-<ts> and
+   *  writes to it are refused — the user must be told, not left with "my
+   *  projects disappeared". `problems()` is the pull (findings from startup),
+   *  `onCorrupt` the push (found while running). */
+  config: {
+    problems: (): Promise<Array<{ file: string; backupPath: string; reason: string; at: number }>> =>
+      ipcRenderer.invoke("config:problems"),
+    onCorrupt: (callback: (report: { file: string; backupPath: string; reason: string; at: number }) => void): (() => void) => {
+      const handler = (_e: Electron.IpcRendererEvent, report: { file: string; backupPath: string; reason: string; at: number }) => callback(report);
+      ipcRenderer.on("config:corrupt", handler);
+      return () => ipcRenderer.removeListener("config:corrupt", handler);
+    },
+  },
+
   settings: {
     get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }> =>
       ipcRenderer.invoke("settings:get"),

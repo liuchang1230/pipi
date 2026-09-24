@@ -269,6 +269,10 @@ declare global {
       };
       onAutoFollow: (callback: (ev: AutoFollowEvent) => void) => () => void;
       onAutoFollowStatus: (callback: (status: AutoFollowStatus) => void) => () => void;
+      config: {
+        problems: () => Promise<Array<{ file: string; backupPath: string; reason: string; at: number }>>;
+        onCorrupt: (callback: (report: { file: string; backupPath: string; reason: string; at: number }) => void) => () => void;
+      };
       settings: {
         get: () => Promise<AppSettings>;
         set: (patch: Partial<AppSettings>) => Promise<AppSettings>;

@@ -5,8 +5,9 @@
  * Keep this module self-contained: read → merge defaults → write.
  */
 import { app } from "electron";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { readJsonRecoverable, writeJsonAtomic } from "./json-store";
 
 export interface AutoFollowSettings {
   enabled: boolean;
@@ -45,24 +46,25 @@ function cloneDefaults(): AppSettings {
 }
 
 export function getSettings(): AppSettings {
-  const file = settingsPath();
-  if (!existsSync(file)) return cloneDefaults();
-  try {
-    const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
-    const r = raw as Partial<AppSettings> | null;
-    const af = r?.autoFollow;
-    return {
-      ...r,
-      autoFollow: {
-        enabled: typeof af?.enabled === "boolean" ? af.enabled : DEFAULTS.autoFollow.enabled,
-        followReads: typeof af?.followReads === "boolean" ? af.followReads : DEFAULTS.autoFollow.followReads,
-      },
-      subagents: normalizeSubagents(r?.subagents),
-      onboarding: r?.onboarding,
-    };
-  } catch {
-    return cloneDefaults();
-  }
+  // A corrupt settings.json keeps its bytes as .corrupt-<ts> and blocks writes
+  // (json-store) instead of being silently replaced by the defaults.
+  const { value } = readJsonRecoverable<Partial<AppSettings>>(
+    settingsPath(),
+    {},
+    (raw) => (raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Partial<AppSettings>) : null),
+  );
+  const r = value;
+  if (Object.keys(r).length === 0) return cloneDefaults();
+  const af = r.autoFollow;
+  return {
+    ...r,
+    autoFollow: {
+      enabled: typeof af?.enabled === "boolean" ? af.enabled : DEFAULTS.autoFollow.enabled,
+      followReads: typeof af?.followReads === "boolean" ? af.followReads : DEFAULTS.autoFollow.followReads,
+    },
+    subagents: normalizeSubagents(r.subagents),
+    onboarding: r.onboarding,
+  };
 }
 
 /** Keep only a usable {provider, model}; anything else means "follow main". */
@@ -91,8 +93,6 @@ export function updateSettings(patch: Partial<AppSettings>): AppSettings {
     subagents: patch.subagents === undefined ? prev.subagents : (normalizeSubagents(patch.subagents) ?? undefined),
     onboarding: patch.onboarding ? { ...prev.onboarding, ...patch.onboarding } : prev.onboarding,
   };
-  const file = settingsPath();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(next, null, 2), "utf8");
+  writeJsonAtomic(settingsPath(), next);
   return next;
 }

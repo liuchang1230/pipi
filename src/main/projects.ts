@@ -1,5 +1,6 @@
 import { app } from "electron";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { readJsonRecoverable, writeJsonAtomic } from "./json-store";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
 import { specForModel } from "../shared/model-specs";
@@ -63,56 +64,33 @@ function piModelsPath(): string {
 }
 
 function readProjects(): ProjectEntry[] {
-  const file = projectsPath();
-  if (!existsSync(file)) return [];
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
+  // Corrupt JSON used to return [] — and the next add() then wrote that empty
+  // list back, destroying every project. Now the file is kept as .corrupt-<ts>,
+  // writes to it are refused, and the problem is reported (json-store.ts).
+  return readJsonRecoverable<ProjectEntry[]>(projectsPath(), [], (raw) => (Array.isArray(raw) ? (raw as ProjectEntry[]) : null)).value;
 }
 
 function writeProjects(projects: ProjectEntry[]): void {
-  const file = projectsPath();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(projects, null, 2), "utf8");
+  writeJsonAtomic(projectsPath(), projects);
 }
 
 function readModels(): ModelConfigEntry[] {
-  const file = modelsPath();
-  if (!existsSync(file)) return [];
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
+  return readJsonRecoverable<ModelConfigEntry[]>(modelsPath(), [], (raw) => (Array.isArray(raw) ? (raw as ModelConfigEntry[]) : null)).value;
 }
 
 function writeModels(models: ModelConfigEntry[]): void {
-  const file = modelsPath();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(models, null, 2), "utf8");
+  writeJsonAtomic(modelsPath(), models);
 }
 
 function readPiModelsFile(): PiModelsFile {
-  const file = piModelsPath();
-  if (!existsSync(file)) return { providers: {} };
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    return raw && typeof raw === "object" && raw.providers && typeof raw.providers === "object"
-      ? raw as PiModelsFile
-      : { providers: {} };
-  } catch {
-    return { providers: {} };
-  }
+  return readJsonRecoverable<PiModelsFile>(piModelsPath(), { providers: {} }, (raw) => {
+    const obj = raw as PiModelsFile | null;
+    return obj && typeof obj === "object" && obj.providers && typeof obj.providers === "object" ? obj : null;
+  }).value;
 }
 
 function writePiModelsFile(config: PiModelsFile): void {
-  const file = piModelsPath();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(config, null, 2), "utf8");
+  writeJsonAtomic(piModelsPath(), config);
 }
 
 function piAuthPath(): string {
@@ -120,25 +98,29 @@ function piAuthPath(): string {
 }
 
 function readPiAuthFile(): Record<string, { type: string; key?: string; env?: Record<string, string> }> {
-  const file = piAuthPath();
-  if (!existsSync(file)) return {};
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    return raw && typeof raw === "object" ? raw as Record<string, { type: string; key?: string; env?: Record<string, string> }> : {};
-  } catch {
-    return {};
-  }
+  return readJsonRecoverable<Record<string, { type: string; key?: string; env?: Record<string, string> }>>(
+    piAuthPath(),
+    {},
+    (raw) => (raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, { type: string; key?: string; env?: Record<string, string> }>) : null),
+  ).value;
 }
 
 function writePiAuthFile(auth: Record<string, { type: string; key?: string; env?: Record<string, string> }>): void {
-  const file = piAuthPath();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(auth, null, 2), "utf8");
-  try {
-    chmodSync(file, 0o600);
-  } catch {
-    /* best effort on Windows */
-  }
+  // 0600: this file holds API keys (mode re-applied to the temp file, which is
+  // what gets renamed into place).
+  writeJsonAtomic(piAuthPath(), auth, { mode: 0o600 });
+}
+
+/**
+ * Read every config file once so a damaged one is discovered AT STARTUP — not
+ * the next time the user adds a project, which is exactly when the old
+ * read-modify-write would have replaced it with the empty fallback.
+ */
+export function verifyConfigFiles(): void {
+  readProjects();
+  readModels();
+  readPiModelsFile();
+  readPiAuthFile();
 }
 
 function projectNameFromPath(path: string): string {

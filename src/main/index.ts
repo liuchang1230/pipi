@@ -32,6 +32,7 @@ import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./sess
 import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
 import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
 import { trackIpcHandlersOn } from "./in-flight";
+import { drainCorruptReports, onCorruptReport, type CorruptFileReport } from "./json-store";
 import { withOpGuard } from "./op-guard";
 import { createLagMonitor, type LagMonitor } from "./perf";
 import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
@@ -54,7 +55,9 @@ import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileC
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
 import { getSettings, updateSettings, type AppSettings } from "./settings";
-import { addLocalProject, addRemoteProject, addWslProject, addModel, updateModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync } from "./projects";
+import { addLocalProject, addRemoteProject, addWslProject, addModel, updateModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync,
+  verifyConfigFiles,
+} from "./projects";
 
 interface RemoteModelListResponse {
   data?: Array<{ id?: string }>;
@@ -1086,6 +1089,20 @@ if (gotSingleInstanceLock) {
   logMemory("startup");
   // Must run BEFORE any ipcMain.handle below.
   trackIpcHandlers();
+
+  // Config integrity: discover a damaged config file NOW. The old behaviour only
+  // found it on the next read, i.e. exactly when a read-modify-write was about
+  // to replace the user's data with the empty fallback (json-store blocks that
+  // write, but the report must reach the user, not just the log).
+  verifyConfigFiles();
+  const reportCorruptConfig = (report: CorruptFileReport): void => {
+    const detail = `文件=${report.file} 备份=${report.backupPath || "（未能移出，已被占用）"} 原因=${report.reason}`;
+    debugLogError("config", `损坏的配置文件：${detail}`);
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send("config:corrupt", report);
+  };
+  onCorruptReport(reportCorruptConfig);
+  // The renderer pulls whatever was found before it existed (see config:problems).
+  ipcMain.handle("config:problems", () => drainCorruptReports());
   // Lag numbers with attribution: a busy window names the in-flight IPC call,
   // and the renderer shows it instead of leaving the user with a spinning UI.
   lagMonitor = createLagMonitor({

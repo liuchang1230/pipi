@@ -25,7 +25,8 @@
  * config and the live report only works if that config is already an auto
  * mapping.
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { writeJsonAtomic } from "./json-store";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type SftpClient from "ssh2-sftp-client";
@@ -63,7 +64,8 @@ export function ensureLocalThemeFiles(): string[] {
     const content = JSON.stringify(theme.pi, null, 2) + "\n";
     const existing = existsSync(file) ? readFileSync(file, "utf8") : null;
     if (existing !== content) {
-      writeFileSync(file, content, "utf8");
+      // pi reads these; a half-written theme file would break its startup.
+      writeJsonAtomic(file, theme.pi, { backup: false });
       written.push(file);
     }
   }
@@ -118,7 +120,9 @@ export function ensureLocalSettingsTheme(): boolean {
   if (settings.theme === AUTO_THEME_SETTING) return false;
   settings.theme = AUTO_THEME_SETTING;
   mkdirSync(agentDir(), { recursive: true });
-  writeFileSync(file, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  // pi's OWN settings.json, read-modify-written: atomic (a torn write breaks
+  // pi's startup) and with a .bak, because everything else in it is the user's.
+  writeJsonAtomic(file, settings);
   return true;
 }
 

@@ -273,6 +273,19 @@ export default function App() {
     // Main-discovered connection state (SFTP breaker / probe). The dialog host
     // component above consumes it, so App itself stays subscription-free.
     const offRemoteStatus = window.api.remote.onStatus((ev) => useRemoteStore.getState().applyStatusEvent(ev));
+    // A damaged config file is preserved (.corrupt-*) and writes to it are
+    // refused, so the user must hear about it — otherwise "my projects are gone"
+    // looks like the app losing data for no reason.
+    const reportConfigProblem = (r: { file: string; backupPath: string; reason: string }) => {
+      useUiStore.getState().showToast(`配置文件损坏：${r.file}`, "err", {
+        failure: true,
+        cause: `${r.reason}${r.backupPath ? `（原内容已备份：${r.backupPath}）` : "（原内容无法移出）"}`,
+      });
+    };
+    window.api.config.problems().then((problems) => {
+      for (const r of problems) reportConfigProblem(r);
+    }).catch(() => undefined);
+    const offConfigCorrupt = window.api.config.onCorrupt(reportConfigProblem);
     // Main-process lag: surface it with the operation it is waiting on, instead
     // of leaving the user with a UI that is simply slow for no stated reason.
     const offBusy = window.api.onAppBusy((ev) => {
@@ -378,6 +391,7 @@ export default function App() {
       offActive();
       offRemoteStatus();
       offBusy();
+      offConfigCorrupt();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -386,9 +400,16 @@ export default function App() {
   const handleSelectDir = useCallback(async (): Promise<boolean> => {
     const dir = await window.api.selectDir();
     if (!dir) return false;
-    await useSessionsStore.getState().addLocalProject(dir);
-    await window.api.tab.create({ cwd: dir });
-    return true;
+    try {
+      await useSessionsStore.getState().addLocalProject(dir);
+      await window.api.tab.create({ cwd: dir });
+      return true;
+    } catch (error) {
+      // The project could not be persisted (e.g. a damaged projects.json blocks
+      // the write to protect the user's data) — say so instead of failing quietly.
+      useUiStore.getState().showToast(error instanceof Error ? error.message : "添加项目失败", "err", { failure: true });
+      return false;
+    }
   }, []);
 
   const skipOnboarding = useCallback(() => {

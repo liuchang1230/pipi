@@ -8,7 +8,8 @@
  * the network beyond a short timeout.
  */
 import { app } from "electron";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { writeJsonAtomic } from "./json-store";
 import { dirname, join } from "node:path";
 
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
@@ -55,11 +56,11 @@ function loadCache(): { fetchedAt: number; entries: Map<string, SpecHints> } {
 
 function persistCache(c: { fetchedAt: number; entries: Map<string, SpecHints> }): void {
   try {
-    const file = cachePath();
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ fetchedAt: c.fetchedAt, models: Object.fromEntries(c.entries) }, null, 2), "utf8");
+    // Regenerable cache: atomic so a torn file can never be read back as
+    // "no specs", but no .bak clutter.
+    writeJsonAtomic(cachePath(), { fetchedAt: c.fetchedAt, models: Object.fromEntries(c.entries) }, { backup: false });
   } catch {
-    /* best effort */
+    /* best effort — a cache must never break a model add */
   }
 }
 
