@@ -459,7 +459,7 @@ describe("chatStore prompt verdict", () => {
     expect(st.isStreaming).toBe(true);
   });
 
-  it("keeps a running turn's phase when only a steer is refused", async () => {
+  it("keeps a running turn's phase when only a steer is refused (and retries it as a normal prompt)", async () => {
     apply([
       { type: "agent_start" },
       { type: "message_start", message: { role: "assistant", content: [] } },
@@ -472,11 +472,12 @@ describe("chatStore prompt verdict", () => {
     apply([{ type: "response", command: "prompt", success: false, id: sent[0]!.id, error: "already processing" }]);
 
     const st = useChatStore.getState().states[T]!;
-    // The agent is still working: only the queued message failed, so the turn
-    // must not be relabelled "failed" (the error banner carries the news).
+    // "already processing" means pi would not take the message into the run it is
+    // finishing — the message is not lost, it is re-issued as its own normal turn.
+    // The turn that is still running must not be relabelled meanwhile.
     expect(st.turn.phase).toBe(streamingPhase);
-    expect(st.lastError).toBe("already processing");
-    expect(st.restoreInput).toBe("插入的一句");
+    expect(st.restoreInput).toBeUndefined();
+    expect(st.pendingPromptId).toBe(sent[0]!.id);
     expect(st.isStreaming).toBe(true);
   });
 
@@ -866,7 +867,7 @@ describe("chatStore prompt after abort", () => {
     expect(st.turn.detail).toContain("等待 Pi");
   });
 
-  it("keeps the prompt after a cancelled message_end and sends it then", async () => {
+  it("does NOT send on the cancelled message_end (pi is still unwinding), only on settle", async () => {
     const { sent } = stubRecording();
     apply([
       { type: "agent_start" },
@@ -875,15 +876,22 @@ describe("chatStore prompt after abort", () => {
     useChatStore.getState().abort(T);
     await useChatStore.getState().sendPrompt(T, "再来一次");
     sent.length = 0;
+    // pi finalizes the aborted message from INSIDE the run, so `activeRun` is
+    // still set: sending now earns "Agent is already processing…" (real app log
+    // 05:23:21 abort → 05:23:28 prompt refused). Wait for the settle instead.
     apply([
       { type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted", stopReason: "error" } },
     ]);
     await Promise.resolve();
+    expect(sent.filter((c) => c.type === "prompt")).toHaveLength(0);
+    // The aborted turn is still reported as stopped.
+    expect(useChatStore.getState().states[T]!.messages.some((m) => m.interrupted)).toBe(true);
+
+    apply([{ type: "agent_settled" }]);
+    await Promise.resolve();
     const prompts = sent.filter((c) => c.type === "prompt");
     expect(prompts).toHaveLength(1);
     expect(prompts[0]!.streamingBehavior).toBeUndefined();
-    // The aborted turn is still reported as stopped, the message is on its way.
-    expect(useChatStore.getState().states[T]!.messages.some((m) => m.interrupted)).toBe(true);
   });
 
   it("never paints a terminal label over a message that is still pending", async () => {
@@ -948,6 +956,104 @@ describe("chatStore prompt acknowledgement deadline", () => {
       const st = useChatStore.getState().states[T]!;
       expect(st.restoreInput).toBeUndefined();
       expect(st.lastError).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * Regression: 中断后输入「太慢了吧」→ pi 回 "Agent is already processing.
+ * Specify streamingBehavior ('steer' or 'followUp') to queue the message."，
+ * 消息没有送进去、也没有回复。
+ *
+ * pi's refusal is TRANSIENT: `Agent.prompt()` throws while `activeRun` is still
+ * set, and the run clears it a moment later. Re-issuing the same prompt id is the
+ * honest fix — the alternative (asking the user to send it again) loses a message
+ * the app could have delivered itself.
+ */
+describe("chatStore transient prompt refusal", () => {
+  function stubRecording(): { sent: Array<Record<string, unknown>> } {
+    const sent: Array<Record<string, unknown>> = [];
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: {
+        tab: {
+          rpcSend: (_t: string, cmd: Record<string, unknown>) => {
+            sent.push(cmd);
+            return Promise.resolve(true);
+          },
+        },
+      },
+    };
+    return { sent };
+  }
+
+  const REFUSAL = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+
+  it("re-sends a prompt pi refused because it was still busy", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sent } = stubRecording();
+      await useChatStore.getState().sendPrompt(T, "太慢了吧");
+      const promptId = useChatStore.getState().states[T]!.pendingPromptId!;
+      sent.length = 0;
+      apply([{ type: "response", command: "prompt", id: promptId, success: false, error: REFUSAL }]);
+      // Still pending, not rejected: the message has not been given up on.
+      let st = useChatStore.getState().states[T]!;
+      expect(st.pendingPromptId).toBe(promptId);
+      expect(st.restoreInput).toBeUndefined();
+      expect(st.turn.detail).toContain("自动重发");
+
+      vi.advanceTimersByTime(401);
+      const prompts = sent.filter((c) => c.type === "prompt");
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]!.id).toBe(promptId);
+      expect(prompts[0]!.message).toBe("太慢了吧");
+
+      // pi accepted it this time.
+      apply([{ type: "response", command: "prompt", id: promptId, success: true }]);
+      st = useChatStore.getState().states[T]!;
+      expect(st.pendingPromptId).toBeUndefined();
+      expect(st.lastError).toBeUndefined();
+      expect(st.restoreInput).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives the text back when pi never becomes idle", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sent } = stubRecording();
+      await useChatStore.getState().sendPrompt(T, "太慢了吧");
+      const promptId = useChatStore.getState().states[T]!.pendingPromptId!;
+      for (let i = 0; i < 5; i += 1) {
+        apply([{ type: "response", command: "prompt", id: promptId, success: false, error: REFUSAL }]);
+        vi.advanceTimersByTime(401);
+      }
+      const st = useChatStore.getState().states[T]!;
+      expect(sent.filter((c) => c.type === "prompt").length).toBeLessThanOrEqual(4);
+      expect(st.pendingPromptId).toBeUndefined();
+      expect(st.restoreInput).toBe("太慢了吧");
+      expect(st.lastError).toContain("没能送进去");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a real refusal (e.g. missing API key)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sent } = stubRecording();
+      await useChatStore.getState().sendPrompt(T, "写点东西");
+      const promptId = useChatStore.getState().states[T]!.pendingPromptId!;
+      sent.length = 0;
+      apply([{ type: "response", command: "prompt", id: promptId, success: false, error: "No API key found for provider deepseek" }]);
+      vi.advanceTimersByTime(2_000);
+      expect(sent.filter((c) => c.type === "prompt")).toHaveLength(0);
+      const st = useChatStore.getState().states[T]!;
+      expect(st.restoreInput).toBe("写点东西");
+      expect(st.lastError).toContain("No API key");
     } finally {
       vi.useRealTimers();
     }

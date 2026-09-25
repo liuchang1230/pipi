@@ -183,6 +183,16 @@ export interface ChatTabState {
   steeringMode?: string;
   followUpMode?: string;
   autoCompactionEnabled?: boolean;
+  /** Session mode (auto/plan/edit) reported by the shipped pipi-mode-switch
+   *  extension: parse from its setStatus("pipi-mode:…") push. Undefined =
+   *  extension not present / not yet reported. */
+  sessionMode?: "auto" | "plan" | "edit";
+  /** Plan execution progress (done/total) while executing a plan. */
+  sessionModeProgress?: { done: number; total: number };
+  /** Numbered plan steps while a plan exists/ executes (widget rendering). */
+  sessionModeTodos?: Array<{ text: string; completed: boolean }>;
+  /** True while a /mode switch command is in flight (button spinner). */
+  sessionModeSwitching?: boolean;
 }
 
 interface ChatStore {
@@ -270,6 +280,16 @@ const DEFER_AFTER_ABORT_MS = 8_000;
  * — hand the text back to the composer instead of spinning.
  */
 const PROMPT_ACK_DEADLINE_MS = 20_000;
+/**
+ * pi refuses a prompt while its previous run is still unwinding: `Agent.prompt()`
+ * throws "Agent is already processing. Specify streamingBehavior …" while
+ * `activeRun` is set, and the run clears it a moment later. That is a TRANSIENT
+ * state, not a dead end — a real app log showed the prompt written 6.7s after the
+ * abort and still refused ("我先中断，然后输入『太慢了吧』… 也没有回复了"). Re-issue it a
+ * few times before admitting failure.
+ */
+const PROMPT_REFUSAL_RETRY_MS = 400;
+const PROMPT_REFUSAL_MAX_RETRIES = 3;
 const promptAckTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function clearPromptAckTimer(tabId: string): void {
@@ -335,6 +355,7 @@ function flushDeferredPrompt(tabId: string): void {
       },
     },
   }));
+  rememberPrompt(tabId, pending.promptId, pending.text, pending.images);
   void window.api.tab
     .rpcSend(tabId, { type: "prompt", message: pending.text, images: pending.images, id: pending.promptId })
     .then((sent) => {
@@ -356,6 +377,7 @@ function flushDeferredPrompt(tabId: string): void {
 function rejectPrompt(tabId: string, errorText: string): void {
   clearDeferredPrompt(tabId);
   clearPromptAckTimer(tabId);
+  clearPromptRefusal(tabId);
   useChatStore.setState((s) => {
     const cur = s.states[tabId];
     if (!cur) return {};
@@ -382,6 +404,80 @@ function rejectPrompt(tabId: string, errorText: string): void {
       },
     };
   });
+}
+
+const promptRefusals = new Map<string, { count: number; id: string; message: string; images: unknown }>();
+
+/** Is this refusal pi's "I am not idle yet" (retryable) rather than a real one? */
+export function isTransientPromptRefusal(message: string): boolean {
+  return /already processing|already in progress|compaction in progress|正在处理/i.test(message);
+}
+
+function clearPromptRefusal(tabId: string): void {
+  promptRefusals.delete(tabId);
+}
+
+/** Record the last prompt we wrote, so a refusal can re-issue it. */
+function rememberPrompt(tabId: string, id: string, message: string, images: unknown): void {
+  promptRefusals.set(tabId, { count: 0, id, message, images });
+}
+
+/**
+ * Re-issue a prompt pi refused because it was still busy.
+ *
+ * The retry is sent as a NORMAL prompt (no `streamingBehavior`): the whole reason
+ * we were refused is that pi would not take it into the run it was finishing. The
+ * prompt id is kept, so the eventual verdict is still correlated exactly once, and
+ * the text stays recoverable if every attempt fails.
+ */
+function retryRefusedPrompt(tabId: string, errorText: string): void {
+  const entry = promptRefusals.get(tabId);
+  if (!entry || !isTransientPromptRefusal(errorText)) {
+    rejectPrompt(tabId, errorText);
+    return;
+  }
+  if (entry.count >= PROMPT_REFUSAL_MAX_RETRIES) {
+    rejectPrompt(tabId, `Pi 仍在结束上一轮，这条消息没能送进去：${errorText}（内容已放回输入框）`);
+    return;
+  }
+  entry.count += 1;
+  const attempt = entry.count;
+  useChatStore.setState((s) => {
+    const cur = s.states[tabId];
+    if (!cur) return {};
+    return {
+      states: {
+        ...s.states,
+        [tabId]: {
+          ...cur,
+          // A refused STEER must not relabel the turn that is still running —
+          // only a turn we are actually waiting on gets the retry wording.
+          turn: cur.isStreaming
+            ? cur.turn
+            : {
+                phase: "submitting" as const,
+                lastActivityAt: Date.now(),
+                detail: `Pi 仍在结束上一轮，正在自动重发（第 ${attempt} 次）…`,
+              },
+        },
+      },
+    };
+  });
+  setTimeout(() => {
+    const state = useChatStore.getState().states[tabId];
+    const current = promptRefusals.get(tabId);
+    // Gone (tab closed) or superseded (the user sent something else): stand down.
+    if (!state || !current || state.pendingPromptId !== current.id) return;
+    void window.api.tab
+      .rpcSend(tabId, { type: "prompt", message: current.message, images: current.images, id: current.id })
+      .then((sent) => {
+        if (!sent) {
+          rejectPrompt(tabId, "消息未能发送到 Pi，请重试或切换到终端视图检查连接。");
+          return;
+        }
+        armPromptAckDeadline(tabId);
+      });
+  }, PROMPT_REFUSAL_RETRY_MS);
 }
 
 // Streaming can produce hundreds of tiny deltas per second. Expose one
@@ -576,6 +672,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     pendingStreamEvents.delete(tabId);
     clearDeferredPrompt(tabId);
     clearPromptAckTimer(tabId);
+    clearPromptRefusal(tabId);
     set((s) => {
       const states = { ...s.states };
       delete states[tabId];
@@ -592,6 +689,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       pendingStreamEvents.delete(id);
       clearDeferredPrompt(id);
       clearPromptAckTimer(id);
+      clearPromptRefusal(id);
     }
     set((s) => {
       const states = { ...s.states };
@@ -738,6 +836,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         steeringMode: (event.steeringMode as string | undefined) ?? st.steeringMode,
         followUpMode: (event.followUpMode as string | undefined) ?? st.followUpMode,
         autoCompactionEnabled: (event.autoCompactionEnabled as boolean | undefined) ?? st.autoCompactionEnabled,
+        // Optimistic /mode switch: sessionModeSwitching is cleared when the
+        // authoritative setStatus push arrives (parseModeStatus in ChatPane).
+        sessionMode: (event.sessionMode as ChatTabState["sessionMode"] | undefined) ?? st.sessionMode,
+        sessionModeSwitching:
+          event.sessionModeSwitching !== undefined
+            ? Boolean(event.sessionModeSwitching)
+            : st.sessionModeSwitching,
         booted: true,
         bootStage: "ready",
         // A pending prompt (written, not yet answered by pi) is in-flight
@@ -746,6 +851,21 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         // "已就绪" and hide that the message is still unanswered.
         turn: st.isStreaming || pendingTurnPhases.has(st.turn.phase) ? st.turn : { phase: "ready", lastActivityAt: Date.now() },
       });
+      return;
+    }
+    if (type === "mode_status") {
+      // Authoritative session mode from the pipi-mode-switch extension,
+      // forwarded by ChatPane after parsing its setStatus("pipi-mode:…") text.
+      // An undefined mode (extension absent/cleared) keeps the last value —
+      // the extension pushes on every transition, so absence is not a signal.
+      const patchMode: Partial<ChatTabState> = {};
+      if (typeof event.mode === "string") patchMode.sessionMode = event.mode as ChatTabState["sessionMode"];
+      patchMode.sessionModeProgress =
+        (event.progress as ChatTabState["sessionModeProgress"] | undefined) ?? undefined;
+      patchMode.sessionModeTodos = (event.todos as ChatTabState["sessionModeTodos"] | undefined) ?? undefined;
+      // The authoritative push always concludes an optimistic switch.
+      patchMode.sessionModeSwitching = false;
+      patch(patchMode);
       return;
     }
     if (type === "agent_start") {
@@ -863,10 +983,12 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       if (!st.pendingPromptId || respId !== st.pendingPromptId) return;
       if (event.success === false) {
         const reason = typeof event.error === "string" && event.error ? event.error : "Pi 拒绝了这条消息";
-        rejectPrompt(tabId, reason);
+        clearPromptAckTimer(tabId);
+        retryRefusedPrompt(tabId, reason);
         return;
       }
       clearPromptAckTimer(tabId);
+      clearPromptRefusal(tabId);
       patch({
         pendingPromptId: undefined,
         restoreInput: undefined,
@@ -989,7 +1111,10 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       // A stale event that matched nothing is DROPPED: it belongs to a turn that
       // is already gone, and touching the newest bubble is exactly the bug.
       if (!applied) return;
-      if (cancelled) flushDeferredPrompt(tabId);
+      // NOTE: a cancelled message_end is NOT proof that pi is idle — pi emits it
+      // from inside the run (before `activeRun` is cleared), so flushing a
+      // deferred prompt here gets it refused with "Agent is already processing".
+      // The settle event (pi's `finally`) is the first honest "now you may send".
       // Was this the fallout of an abort the user already moved on from? Then
       // the turn STATUS belongs to the new turn (it is running/queued), and only
       // the message marker may change. Relabelling the current turn "已停止"
@@ -1257,6 +1382,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     const cmd: Record<string, unknown> = steer
       ? { type: "prompt", message, images, streamingBehavior: "steer" }
       : { type: "prompt", message, images };
+    rememberPrompt(tabId, promptId, message, images);
     const sent = await window.api.tab.rpcSend(tabId, { ...cmd, id: promptId });
     if (!sent) {
       rejectPrompt(tabId, "消息未能发送到 Pi，请重试或切换到终端视图检查连接。");

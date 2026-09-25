@@ -276,3 +276,43 @@
   `loading`（还没有任何目录）仍走占位。
 
 反向验证：把 `settleTreeStatus` 短路成 no-op → 3 个用例失败（状态停在 refreshing/loading）。
+
+## 中断后立刻发消息被 pi 拒绝："Agent is already processing" (2026-09-25)
+
+用户反馈：中断 → 输入「太慢了吧」→ 界面显示
+`■ 已停止（你中断了本轮）` + `Agent is already processing. Specify streamingBehavior
+('steer' or 'followUp') to queue the message.`，没有回复。真实日志：
+
+```
+05:23:21.824 [rpc-send] abort      -> ok=true
+05:23:28.504 [rpc-send] prompt     -> ok=true   ← 6.7s 后才写出去，仍被拒
+```
+
+根因是**投递时机选错了边界**：上一轮修复把"abort 落地"的触发点放在了**被取消的
+`message_end`** 上，而 pi 是在 **run 还没结束时就发出这条事件**的。真机探针
+（`scripts/pi-abort-probe.mjs`，假 provider + 本地 SSE 慢流，零真实模型调用）实测：
+
+```
+message_start(assistant) .551 → (abort) → message_end .775 → turn_end .775
+→ agent_end .775 → agent_settled .776
+```
+
+`message_end` 与 `agent_settled` 只差 1ms：此刻 `Agent.activeRun` 仍然存在，
+`Agent.prompt()` 就会抛 "Agent is already processing…"。本地这个窗口极窄（探针里两个时机
+都被接受），但用户是**远程 SSH + 正在跑 bash 工具**的回合，abort 收尾要 6.7s —— 那 6.7s
+正是被拒的窗口。
+
+修法：
+1. **`agent_settled` 才是"现在可以发"的第一个诚实时刻**：延迟投递不再在
+   被取消的 `message_end` 上触发（该事件被明确注释为"不能证明 pi 空闲"），只在
+   `agent_settled`（pi 的 `finally`，`activeRun` 已清除）或 8s 兜底时触发。
+2. **把 "already processing" 当作暂态而不是死局**（`isTransientPromptRefusal`）：
+   pi 拒绝的原因就是它正在收尾，重发即可。最多 3 次、每次 400ms，**用普通 prompt 重发**
+   （不带 `streamingBehavior` —— 被拒的理由正是"它不收进那个正在结束的 run"），
+   prompt id 保持不变，所以最终裁决仍然只被关联一次。次数用尽才把原文放回输入框并说明。
+3. 被拒的 **steer** 不重标正在运行的回合（`isStreaming` 时不覆盖该回合的 phase 文案）。
+4. 重发成功后重新武装 20s 应答期限。
+
+测试 775 passed（含：不在 `message_end` 上投递、暂态拒绝自动重发并成功、用尽次数后回收文本、
+真实拒绝（No API key）不重试）；typecheck + build + 打包 + smoke 30/30。
+反向验证：恢复 `message_end` 触发 → 失败；关掉暂态重发 → 失败。
