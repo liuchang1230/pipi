@@ -584,6 +584,11 @@ function resultTextOf(res: { content?: unknown; details?: { diff?: unknown; patc
 }
 
 /** Character count of a pi message content (empty content ⇒ nothing produced). */
+/** The visible text of one of OUR chat bubbles (not a raw pi content block). */
+function bubbleText(message: ChatMessage): string {
+  return message.blocks.map((block) => (block.kind === "text" ? block.text : "")).join("");
+}
+
 function contentLengthOf(content: unknown): number {
   if (typeof content === "string") return content.length;
   if (!Array.isArray(content)) return 0;
@@ -1007,30 +1012,63 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         // The optimistic bubble already shows the authored @path form. When
         // pi echoes the full expanded prompt back, keep the display version
         // instead of letting the file contents leak into the transcript.
-        const display = st.pendingUserText && st.pendingUserText.trim() ? st.pendingUserText : collapseFileAttachments(textOf(m.content));
+        // The echo's OWN text is the only key that can tell two outstanding
+        // prompts apart: `pendingUserText` always describes the newest one, so
+        // matching on it swapped the two bubbles.
+        const echoText = collapseFileAttachments(textOf(m.content));
+        const pendingDisplay = st.pendingUserText && st.pendingUserText.trim() ? st.pendingUserText : echoText;
         patchMessages((msgs) => {
-          const last = msgs[msgs.length - 1];
-          // Replace the optimistic user bubble with the real entry.
-          if (last && last.role === "user" && last.id.startsWith("local-")) {
-            return [
-              ...msgs.slice(0, -1),
-              {
-                id: m.id ?? last.id,
-                role: "user" as const,
-                status: "done" as const,
-                blocks: [{ kind: "text" as const, contentIndex: 0, text: display, done: true }],
-              },
-            ];
+          // Replace the optimistic bubble with the real entry — WHEREVER it is,
+          // matched by ITS OWN text first. Requiring it to be the last message was
+          // half of the duplicated prompt: an abort's fallout can be inserted
+          // before it, and pi's echo was then appended as a second copy.
+          let optimistic = -1;
+          let fallback = -1;
+          for (let i = msgs.length - 1; i >= 0; i -= 1) {
+            const x = msgs[i]!;
+            if (x.role !== "user" || !x.id.startsWith("local-")) continue;
+            if (fallback < 0) fallback = i;
+            if (bubbleText(x) === echoText) {
+              optimistic = i;
+              break;
+            }
           }
-          return [
-            ...msgs,
-            {
-              id: m.id ?? `msg-${localSeq++}`,
-              role: "user" as const,
-              status: "done" as const,
-              blocks: [{ kind: "text" as const, contentIndex: 0, text: display, done: true }],
-            },
-          ];
+          if (optimistic < 0) optimistic = fallback;
+          const source = optimistic >= 0 ? msgs[optimistic] : undefined;
+          const real: ChatMessage = {
+            id: m.id ?? (source ? source.id : `msg-${localSeq++}`),
+            role: "user",
+            status: "done",
+            // WHICH text to show:
+            //  - no bubble to inherit from → the pending display text (or the echo);
+            //  - a bubble we authored most recently (its text IS pendingUserText) →
+            //    the display-safe form, so an @mention's expanded file contents
+            //    never leak into the transcript;
+            //  - an earlier outstanding bubble → keep ITS text (the two-prompt case);
+            //  - a foreign/unknown bubble (no pending prompt at all) → pi's echo is
+            //    authoritative.
+            blocks: [
+              {
+                kind: "text",
+                contentIndex: 0,
+                text: !source
+                  ? pendingDisplay
+                  : st.pendingUserText && st.pendingUserText.trim()
+                    ? bubbleText(source) === st.pendingUserText.trim()
+                      ? st.pendingUserText
+                      : bubbleText(source)
+                    : echoText,
+                done: true,
+              },
+            ],
+            turnSeq: source ? source.turnSeq : st.turnSeq,
+          };
+          if (source) {
+            const next = msgs.slice();
+            next[optimistic] = real;
+            return next;
+          }
+          return [...msgs, real];
         });
       } else if (m.role === "assistant") {
         const blocks = blocksFromContent(m.content);
@@ -1362,7 +1400,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
               role: "user",
               status: "done",
               blocks: [{ kind: "text", contentIndex: 0, text: displayText, done: true }],
-              turnSeq: st.isStreaming ? st.turnSeq : st.turnSeq + 1,
+              // MUST equal the turn this prompt starts (nextTurnSeq). With the
+              // old `st.isStreaming ? ... : ...` expression the bubble of a
+              // prompt sent while an abort was outstanding got a tag that did
+              // not match, so the abort's own message could not be inserted
+              // before it and was appended underneath — and the user saw their
+              // prompt twice after pi echoed it ("进度如何 … ■ 已停止 … 进度如何").
+              turnSeq: nextTurnSeq,
             },
           ],
         },

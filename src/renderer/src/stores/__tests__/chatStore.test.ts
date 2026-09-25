@@ -1059,3 +1059,84 @@ describe("chatStore transient prompt refusal", () => {
     }
   });
 });
+
+/**
+ * Regression: 中断后立刻输入，输入出现了两次
+ *   「进度如何 / ■ 已停止（你中断了本轮）/ 进度如何」
+ *
+ * Two small defects combined:
+ *  1. the optimistic user bubble carried a turn tag that did not match the turn it
+ *     started, so the abort's own message could not be inserted BEFORE the new
+ *     prompt and was appended under it; and
+ *  2. reconciliation of pi's echoed user message only looked at the LAST message,
+ *     so once (1) had pushed something below the bubble, the echo was appended as
+ *     a second copy of the same prompt.
+ */
+describe("chatStore: no duplicated user prompt after an abort", () => {
+  function stub(): { sent: Array<Record<string, unknown>> } {
+    const sent: Array<Record<string, unknown>> = [];
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: { tab: { rpcSend: (_t: string, cmd: Record<string, unknown>) => { sent.push(cmd); return Promise.resolve(true); } } },
+    };
+    return { sent };
+  }
+
+  it("replaces the optimistic bubble instead of appending the echoed prompt", async () => {
+    stub();
+    // A turn that was aborted before it produced any message (abort during
+    // thinking) — its own message only arrives AFTER the next prompt.
+    apply([{ type: "agent_start" }]);
+    useChatStore.getState().abort(T);
+    await useChatStore.getState().sendPrompt(T, "进度如何");
+    const optimistic = useChatStore.getState().states[T]!.messages.at(-1)!;
+    expect(optimistic.id.startsWith("local-")).toBe(true);
+
+    // pi's abort fallout arrives late: it must be inserted BEFORE the prompt.
+    apply([{ type: "message_start", message: { role: "assistant", content: [] } }]);
+    let msgs = useChatStore.getState().states[T]!.messages;
+    expect(msgs.map((m) => m.role)).toEqual(["assistant", "user"]);
+    apply([{ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" } }]);
+    expect(useChatStore.getState().states[T]!.messages[0]!.interrupted).toBe(true);
+
+    // The deferral lands on settle, and pi echoes the prompt back.
+    apply([{ type: "agent_settled" }]);
+    await Promise.resolve();
+    apply([{ type: "message_start", message: { id: "real-user-1", role: "user", content: [{ type: "text", text: "进度如何" }] } }]);
+
+    msgs = useChatStore.getState().states[T]!.messages;
+    expect(msgs.filter((m) => m.role === "user")).toHaveLength(1);
+    expect(msgs.map((m) => m.role)).toEqual(["assistant", "user"]);
+    expect(msgs[1]!.id).toBe("real-user-1"); // the real entry replaced the optimistic one
+    expect(msgs[1]!.turnSeq).toBe(msgs[1]!.turnSeq); // tag survived the replacement
+  });
+
+  it("still reconciles when the optimistic bubble is the last message", async () => {
+    stub();
+    await useChatStore.getState().sendPrompt(T, "普通提问");
+    apply([{ type: "message_start", message: { id: "real-1", role: "user", content: [{ type: "text", text: "普通提问" }] } }]);
+    const msgs = useChatStore.getState().states[T]!.messages;
+    expect(msgs.filter((m) => m.role === "user")).toHaveLength(1);
+    expect(msgs.at(-1)!.id).toBe("real-1");
+  });
+});
+
+describe("chatStore: several prompts outstanding at once", () => {
+  function stub(): void {
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: { tab: { rpcSend: () => Promise.resolve(true) } },
+    };
+  }
+
+  it("matches each echoed prompt to its own bubble (no duplicate, no swap)", async () => {
+    stub();
+    await useChatStore.getState().sendPrompt(T, "第一问");
+    await useChatStore.getState().sendPrompt(T, "第二问");
+    // pi echoes them in order; the second bubble is the last one when the FIRST
+    // echo arrives, which the old "only if last" rule mistook for the target.
+    apply([{ type: "message_start", message: { id: "u-a", role: "user", content: [{ type: "text", text: "第一问" }] } }]);
+    apply([{ type: "message_start", message: { id: "u-b", role: "user", content: [{ type: "text", text: "第二问" }] } }]);
+    const users = useChatStore.getState().states[T]!.messages.filter((m) => m.role === "user");
+    expect(users.map((m) => m.id)).toEqual(["u-a", "u-b"]);
+    expect(users.map((m) => m.blocks.map((b) => (b.kind === "text" ? b.text : "")).join(""))).toEqual(["第一问", "第二问"]);
+  });
+});

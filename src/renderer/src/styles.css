@@ -2715,6 +2715,58 @@ textarea:focus-visible,
   word-break: break-word;
   color: var(--text-dim);
 }
+/* 收起后的对话框：不再遮挡正文，停靠右下角，仍可回答。 */
+.ui-dialog-overlay.minimized {
+  background: transparent;
+  pointer-events: none;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 0 16px 16px 0;
+}
+.ui-dialog.minimized {
+  pointer-events: auto;
+  width: auto;
+  max-width: 420px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+.ui-dialog.minimized .dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+}
+.dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dialog-title-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dialog-min-btn {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+}
+.dialog-min-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.ui-confirm-toggle {
+  margin-top: 6px;
+  font-size: 11px;
+}
 .ui-confirm-hint {
   margin-top: 8px;
   font-size: 11px;

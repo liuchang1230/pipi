@@ -43,6 +43,17 @@ describe("describeBashIntent (人话，而不是让人读 shell)", () => {
     expect(describeBashIntent("python build.py")).toContain("脚本");
     expect(describeBashIntent("pnpm dlx whatever")).toContain("命令"); // honest fallback
   });
+
+  it("names WHAT is being touched, not just the verb", () => {
+    expect(describeBashIntent("rm -rf build")).toContain("删除 build");
+    expect(describeBashIntent("sudo rm -rf /var/log/app")).toContain("以管理员权限删除 /var/log/app");
+    expect(describeBashIntent("npm install lodash")).toContain("lodash");
+    expect(describeBashIntent("pip uninstall requests")).toContain("卸载");
+    expect(describeBashIntent("git commit -m 'x'")).toContain("提交");
+    expect(describeBashIntent("git push origin main")).toContain("推送");
+    expect(describeBashIntent("systemctl restart nginx")).toContain("重启 nginx");
+    expect(describeBashIntent("kill -9 1234")).toContain("1234");
+  });
 });
 
 describe("summarizeBash / summarizeWrite", () => {

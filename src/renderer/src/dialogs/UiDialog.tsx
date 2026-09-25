@@ -30,10 +30,27 @@ export interface UiRequest {
  */
 function ConfirmMessage({ req, title }: { req: UiRequest; title: string }) {
   const { headline, detail } = splitConfirmMessage(req.message ?? title);
+  // 用户反馈：「用户不需要知道你执行什么命令，只需要知道你要干什么」—— so the plain
+  // sentence IS the dialog. The exact command/diff stays available, but only when
+  // the user asks to verify it.
+  const [showDetail, setShowDetail] = useState(false);
   return (
     <div className="ui-confirm-msg">
       <div className="ui-confirm-head">{headline || title}</div>
-      {detail ? <pre className="ui-confirm-detail">{detail}</pre> : null}
+      {detail ? (
+        showDetail ? (
+          <>
+            <pre className="ui-confirm-detail">{detail}</pre>
+            <button className="link-btn ui-confirm-toggle" onClick={() => setShowDetail(false)}>
+              收起具体内容
+            </button>
+          </>
+        ) : (
+          <button className="link-btn ui-confirm-toggle" onClick={() => setShowDetail(true)}>
+            查看具体命令/改动
+          </button>
+        )
+      ) : null}
       <div className="ui-confirm-hint">
         点「确定」= 允许 AI 执行；点「取消」= 这次不执行，AI 会收到「你拒绝了」并换个方案。
       </div>
@@ -43,6 +60,13 @@ function ConfirmMessage({ req, title }: { req: UiRequest; title: string }) {
 
 export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiRequest; onClose: () => void }) {
   const [text, setText] = useState(req.prefill ?? "");
+  /**
+   * 收起 (minimize): pi's dialogs are modal, and a long plan/confirm question can
+   * cover the very conversation the user needs to read before answering. The
+   * request stays pending — the body is just hidden and the overlay stops
+   * swallowing clicks, so the app behind is usable again.
+   */
+  const [minimized, setMinimized] = useState(false);
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -72,10 +96,24 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
   const title = req.title || "pi";
 
   return (
-    <div className="dialog-overlay ui-dialog-overlay" onClick={cancel}>
-      <div className="dialog ui-dialog" onClick={(e) => e.stopPropagation()} onKeyDown={onKeyDown}>
-        <div className="dialog-title">{title}</div>
-        <div className="dialog-body">
+    <div className={`dialog-overlay ui-dialog-overlay${minimized ? " minimized" : ""}`} onClick={cancel}>
+      <div
+        className={`dialog ui-dialog${minimized ? " minimized" : ""}`}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={onKeyDown}
+      >
+        <div className="dialog-title">
+          <span className="dialog-title-text">{title}</span>
+          <button
+            className="dialog-min-btn"
+            onClick={() => setMinimized((v) => !v)}
+            title={minimized ? "展开对话框" : "收起对话框，先看下面的上下文（问题仍然在等你回答）"}
+            aria-label={minimized ? "展开对话框" : "收起对话框"}
+          >
+            {minimized ? "▢" : "—"}
+          </button>
+        </div>
+        <div className="dialog-body" hidden={minimized}>
           {req.method === "select" && (
             <div className="ui-select-list">
               {(req.options ?? []).map((opt, i) => (
