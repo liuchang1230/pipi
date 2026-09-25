@@ -2692,6 +2692,86 @@ textarea:focus-visible,
   color: var(--text-dim);
 }
 
+/* --- 确认框：先一句人话，再原文供核对 --------------------------------------
+   See src/shared/confirm-detail.ts + src/main/extensions/pipi-mode-switch.ts. */
+.ui-confirm-head {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.ui-confirm-detail {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input, rgba(0, 0, 0, 0.18));
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+}
+.ui-confirm-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* --- 思维导图视图（默认） -----------------------------------------------
+   Only your messages and the AI's replies (see shared/tree-mindmap.ts). The
+   rows are the CONVERSATION, so they read as prose rather than as a log: a
+   proportional font, a speaker pill, and one ellipsised line per message.
+   The full view keeps the monospace log style. */
+.tree-dialog .tree-row-mind {
+  font-family: -apple-system, "Segoe UI", system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+  font-size: 12px;
+  gap: 6px;
+}
+.tree-row-mind .tree-entrylabel {
+  flex: 0 0 auto;
+  font-size: 10px;
+  line-height: 15px;
+  padding: 0 6px;
+  border-radius: 999px;
+  align-self: center;
+  border: 1px solid transparent;
+}
+.tree-row-mind .tree-entrylabel.user {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+}
+.tree-row-mind .tree-entrylabel.assistant {
+  background: color-mix(in srgb, var(--success, #4ade80) 16%, transparent);
+  border-color: color-mix(in srgb, var(--success, #4ade80) 40%, transparent);
+  color: color-mix(in srgb, var(--success, #4ade80) 80%, var(--text));
+}
+/* The preview is the whole point: one line, ellipsised, readable weight. */
+.tree-row-mind .tree-entrytext {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-weight: 400;
+}
+/* A user prompt is the branch point: give it a little more presence. */
+.tree-row-mind .tree-entrylabel.user ~ .tree-entrytext {
+  font-weight: 500;
+}
+.tree-row-mind .tree-time {
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+/* Connectors in the map are hierarchy, not decoration: thinner + quieter. */
+.tree-row-mind .tree-gutter {
+  opacity: 0.55;
+}
+
 /* --- Session tree dialog (aligned with /tree) --- */
 .tree-dialog {
   width: 720px;

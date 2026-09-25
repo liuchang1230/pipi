@@ -5,6 +5,7 @@
  * setWidget, setTitle, set_editor_text) are handled by the caller.
  */
 import { useEffect, useRef, useState } from "react";
+import { splitConfirmMessage } from "../../../shared/confirm-detail";
 import { useUiStore } from "../stores/uiStore";
 
 export interface UiRequest {
@@ -17,6 +18,27 @@ export interface UiRequest {
   text?: string;
   notifyType?: string;
   [key: string]: unknown;
+}
+
+/**
+ * A confirmation dialog has to answer "AI 想做什么？" in one plain sentence before
+ * it shows the raw material. The extension sends a plain sentence, then
+ *   `详情（供核对）:` and the raw command/diff on the following lines
+ * (see src/shared/confirm-detail.ts); the raw half goes into a monospace block so it
+ * is verifiable without being the first thing the user has to parse. A confirm
+ * from anywhere else has no marker and renders exactly as before.
+ */
+function ConfirmMessage({ req, title }: { req: UiRequest; title: string }) {
+  const { headline, detail } = splitConfirmMessage(req.message ?? title);
+  return (
+    <div className="ui-confirm-msg">
+      <div className="ui-confirm-head">{headline || title}</div>
+      {detail ? <pre className="ui-confirm-detail">{detail}</pre> : null}
+      <div className="ui-confirm-hint">
+        点「确定」= 允许 AI 执行；点「取消」= 这次不执行，AI 会收到「你拒绝了」并换个方案。
+      </div>
+    </div>
+  );
 }
 
 export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiRequest; onClose: () => void }) {
@@ -69,9 +91,7 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
               {!req.options?.length && <div className="ui-select-empty">（无选项）</div>}
             </div>
           )}
-          {req.method === "confirm" && (
-            <div className="ui-confirm-msg">{req.message ?? title}</div>
-          )}
+          {req.method === "confirm" && <ConfirmMessage req={req} title={title} />}
           {req.method === "input" && (
             <input
               ref={inputRef}

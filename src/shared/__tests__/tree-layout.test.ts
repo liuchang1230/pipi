@@ -3,7 +3,14 @@
 //  * "Jumping between branches is flaky" → the settle rule (target on the leaf's path)
 import { describe, expect, it } from "vitest";
 import { buildTreeFromEntries, type TreeEntry } from "../tree-build";
-import { ancestorIds, flattenTree, isAlreadyAtTarget, isNavigationSettled, isOnLeafPath } from "../tree-layout";
+import {
+  ancestorIds,
+  flattenTree,
+  isAlreadyAtTarget,
+  isNavigationSettled,
+  isOnLeafPath,
+  navigateLeafId,
+} from "../tree-layout";
 
 /** A session with a branch: r → a → b → leaf, plus a sibling branch r → x. */
 const ENTRIES: TreeEntry[] = [
@@ -111,9 +118,9 @@ describe("isAlreadyAtTarget / isNavigationSettled (what 'flaky jumping' was)", (
   it("recognises a no-op navigation so it can settle immediately", () => {
     // Clicking the node the session is already on used to run the 60s timer and
     // then toast 导航超时 with nothing actually wrong.
-    expect(isAlreadyAtTarget("leaf", "leaf")).toBe(true);
-    expect(isAlreadyAtTarget("leaf", "other")).toBe(false);
-    expect(isAlreadyAtTarget("leaf", null)).toBe(false);
+    expect(isAlreadyAtTarget(ENTRIES, "leaf", "leaf")).toBe(true);
+    expect(isAlreadyAtTarget(ENTRIES, "leaf", "other")).toBe(false);
+    expect(isAlreadyAtTarget(ENTRIES, "leaf", null)).toBe(false);
   });
 
   it("is not settled while the leaf has not moved (pi may still be working)", () => {
@@ -142,5 +149,68 @@ describe("isAlreadyAtTarget / isNavigationSettled (what 'flaky jumping' was)", (
 
   it("does not settle without a leaf (empty session)", () => {
     expect(isNavigationSettled(ENTRIES, { targetId: "r", startLeafId: null, leafId: null })).toBe(false);
+  });
+});
+
+/**
+ * Regression: 「分支导航速度太慢，基本上就是卡住」.
+ *
+ * pi's `navigateTree` does NOT put the leaf on the node you picked when that node
+ * is a USER message — it rewinds to that message's PARENT and hands the text back
+ * to the editor (TUI /tree semantics, agent-session.js). The completion rule
+ * waited for the target to appear on the leaf's path, which can never happen after
+ * a rewind: the dialog polled a 2778-entry session every second (3.0-3.4s per
+ * round trip on the user's remote) until its 60s timeout, i.e. it looked frozen.
+ */
+describe("navigateLeafId (where pi actually lands)", () => {
+  const CHAT: TreeEntry[] = [
+    { type: "message", id: "u1", parentId: null, message: { role: "user", content: [] } },
+    { type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: [] } },
+    { type: "message", id: "u2", parentId: "a1", message: { role: "user", content: [] } },
+    { type: "message", id: "a2", parentId: "u2", message: { role: "assistant", content: [] } },
+    { type: "tool", id: "t1", parentId: "a2" },
+    { type: "custom_message", id: "c1", parentId: "a2", content: [] },
+  ];
+
+  it("rewinds a user message to its parent (the common '回到这里重新提问')", () => {
+    expect(navigateLeafId(CHAT, "u2")).toBe("a1");
+    // A root user message rewinds to before the session's first message: null IS
+    // the new position, not "nothing happened".
+    expect(navigateLeafId(CHAT, "u1")).toBeNull();
+    expect(navigateLeafId(CHAT, "c1")).toBe("a2");
+  });
+
+  it("points AT every other entry", () => {
+    expect(navigateLeafId(CHAT, "a1")).toBe("a1");
+    expect(navigateLeafId(CHAT, "a2")).toBe("a2");
+    expect(navigateLeafId(CHAT, "t1")).toBe("t1");
+    expect(navigateLeafId(CHAT, "nope")).toBeUndefined();
+  });
+
+  it("settles when pi rewound to the parent of a user-message target", () => {
+    expect(isNavigationSettled(CHAT, { targetId: "u2", startLeafId: "a2", leafId: "a1" })).toBe(true);
+  });
+
+  it("settles when pi rewound before the first message (leaf null)", () => {
+    expect(isNavigationSettled(CHAT, { targetId: "u1", startLeafId: "a2", leafId: null })).toBe(true);
+  });
+
+  it("still waits while nothing has moved", () => {
+    expect(isNavigationSettled(CHAT, { targetId: "u2", startLeafId: "a2", leafId: "a2" })).toBe(false);
+    // Moving to null with a non-null expectation is not a landing either.
+    expect(isNavigationSettled(CHAT, { targetId: "a1", startLeafId: "a2", leafId: null })).toBe(false);
+  });
+
+  it("settles when a summarize appended a new entry at the rewind point", () => {
+    const summarized: TreeEntry[] = [...CHAT, { type: "message", id: "s1", parentId: "a1", message: { role: "assistant", content: [] } }];
+    expect(isNavigationSettled(summarized, { targetId: "u2", startLeafId: "a2", leafId: "s1" })).toBe(true);
+  });
+
+  it("recognises a user-message no-op before sending a command that would hang", () => {
+    // The session is already sitting where u2 would put it.
+    expect(isAlreadyAtTarget(CHAT, "u2", "a1")).toBe(true);
+    // …and pi itself no-ops when the user message IS the leaf.
+    expect(isAlreadyAtTarget(CHAT, "u2", "u2")).toBe(true);
+    expect(isAlreadyAtTarget(CHAT, "a1", "a2")).toBe(false);
   });
 });

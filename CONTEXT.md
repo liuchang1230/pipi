@@ -316,3 +316,69 @@ message_start(assistant) .551 → (abort) → message_end .775 → turn_end .775
 测试 775 passed（含：不在 `message_end` 上投递、暂态拒绝自动重发并成功、用尽次数后回收文本、
 真实拒绝（No API key）不重试）；typecheck + build + 打包 + smoke 30/30。
 反向验证：恢复 `message_end` 触发 → 失败；关掉暂态重发 → 失败。
+
+## 分支导航「卡住」的真因 + 思维导图视图 (2026-09-25)
+
+用户反馈：「分支还是不好用，导航速度太慢了，基本上就是卡住」。真实日志（用户机器 info 级）：
+
+```
+07:33:59.529 [rpc-send] tab rpc-1 prompt -> ok=true       ← /pipi-tree-nav 发出
+07:34:03.626 [rpc-slow] RESP get_entries id=tree-nav-1790321639529 3037ms
+07:34:07.541 … 3006ms   07:34:28.935 … 3391ms   07:34:43.564 … 3025ms
+07:34:47.666 … 3082ms   07:34:51.577 … 3042ms   07:34:55.637 … 3103ms
+07:34:59.935 … 3405ms    ← 同一个导航 id 轮询了 8 次、56 秒仍未"完成"
+07:35:44.639 prompt -> ok=true（第二次尝试）
+```
+
+**真因（读 pi 源码确认）**：pi 的 `navigateTree`（agent-session.js）对目标是 **user 消息**
+的情况有特殊语义 —— `newLeafId = targetEntry.parentId`（回到这条消息**之前**），并把消息文本
+交回编辑器；`custom_message` 同理；其它条目才 `newLeafId = targetId`。而我们的"导航完成"
+判据要求**目标位于新 leaf 的路径上**，user 消息目标永远不满足 → 判据永不触发 → 对话框一直
+轮询到 60s 兜底，看起来就是"卡死"。最自然的点击（点一条 user 消息＝回到这里重新提问）100% 命中。
+
+修法：
+1. `src/shared/tree-layout.ts` 新增 `navigateLeafId(entries, targetId)`：**照抄 pi 的落点规则**
+   （user / custom_message → parentId，可能是 `null`＝回到第一条消息之前；其它 → 自身）。
+   `isNavigationSettled` 用「期望落点在新 leaf 路径上（含自身）」判定；`isAlreadyAtTarget`
+   同样按落点判断，并在「目标已是 leaf」时按 pi 的 no-op 处理 —— 否则会发出一条 pi 不会响应的
+   命令，然后又等 60s。
+2. **轮询改用 `since` 游标**（pi 的 `get_entries` 支持 `{"type":"get_entries","since":"<lastId>"}`，
+   只回游标之后的条目 + `leafId`）：该会话有 **2778 条**，每次全量轮询 3.0-3.4s；改游标后
+   一次往返只有增量。响应按请求 id 关联类型（append/replace）—— 用"当前是否有游标"判断会在
+   并发下重复或丢条目；追加再按 id 去重；游标失效（会话被替换）则自动回退全量重取。
+3. **导航期间不再锁死窗口**：关闭按钮始终可用，并新增「不再等待」；提示改为
+   「已请求 pi 切换… 通常 1-2 次往返内完成，等待期间可继续浏览或直接关闭」。
+
+## 分支树改成「思维导图」视图（只显示 user / assistant）(2026-09-25)
+
+用户反馈：「树状图能不能做成思维导图那种，更加清晰，不用显示工具调用，只需要显示 user 和
+assistant 的回复」。
+
+- 新纯模块 `src/shared/tree-mindmap.ts`：`isMindMapEntry`（只保留 user 消息，以及**有文本**
+  或出错/被中断的 assistant 回复）+ `compactForMindMap`（把存活节点**重新挂到最近的存活祖先**
+  上，工具调用/工具结果/label/压缩/模型切换全部摘除）。迭代实现：线性会话 5000 层深链不爆栈。
+- 为什么必须"重新挂接"而不是只做过滤：全量树按**真实深度**缩进，被过滤掉的工具链会把存活行
+  推到很深的缩进 —— 那正是"不清晰"。压缩后缩进表达的是**对话的形状**（你的提问 → AI 的回答）。
+- 当前叶子映射到**最近的存活祖先**（会话停在某个工具结果上时，"当前"应是它上面那条回复），
+  否则「当前分支在哪」就丢了。
+- 视图切换：「导图」（默认）/「完整」；完整视图保留原有筛选 chip（回退文件等场景仍需要工具行）。
+- 行样式：`.tree-row-mind` —— 说话人药丸「你」/「AI」+ 一行省略号预览（比例字体，不再等宽日志
+  风格），`data-role` 便于真机断言。
+
+## 确认框先说人话（edit 模式写操作确认）(2026-09-25)
+
+用户反馈：「edit 请求编辑的时候，提供的是一堆代码命令，看不懂，请求的时候，可不可以告诉用户
+要做什么？通俗一点」。
+
+- `src/main/extensions/pipi-mode-switch.ts`（该扩展由 pi 直接加载为独立文件、不能 import 应用
+  代码）：`describeBashIntent` 把命令归类成人话（删除文件或目录 / 安装依赖 / Git 操作 /
+  以管理员权限…），`summarizeWrite` 说清动作与规模（把 X 的 N 行改写为 M 行 / 新增 M 行 /
+  只是空白变化 / 整份覆盖），原文放「详情（供核对）」之后。
+- `src/shared/confirm-detail.ts` + `UiDialog.tsx`：确认框渲染成「一句人话 + 等宽原文块 +
+  『确定＝允许 / 取消＝AI 收到你拒绝了并换方案』」；没有标记的第三方 confirm 一律原样显示。
+  标记字面量在两处重复（扩展无法 import），由 `src/main/__tests__/mode-confirm-plain-language.test.ts`
+  读源文件校验二者一致，并直接单测扩展导出的三个函数。
+
+测试 800 passed；typecheck + build + 打包 + 真机 smoke **32/32**（新增 2 项：导图是默认视图、
+导图行只有 user/assistant）。反向验证：恢复旧的完成判据 → 3 个导航用例失败；去掉树压缩 →
+6 个用例失败。

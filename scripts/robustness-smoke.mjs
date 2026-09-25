@@ -198,6 +198,30 @@ try {
     );
     check("tree dialog renders without a crash", await evaluate(ws, `!document.querySelector('.crash-screen')`));
     check("tree dialog body is coherent (rows or an empty-state note)", rowsInfo?.hasEmpty === true || (rowsInfo?.rows ?? 0) > 0, JSON.stringify(rowsInfo));
+    // 思维导图视图 is the default: only your messages and the AI's replies, so a
+    // rendered row must never be a tool call / bookkeeping entry.
+    const mindInfo = await evaluate(
+      ws,
+      `(() => {
+         const dialog = document.querySelector('.tree-dialog');
+         const chips = [...dialog.querySelectorAll('.tree-chip')].map((c) => c.textContent.trim());
+         const active = [...dialog.querySelectorAll('.tree-chip.active')].map((c) => c.textContent.trim());
+         const rows = [...dialog.querySelectorAll('.tree-scroll .tree-row')];
+         const roles = [...new Set(rows.map((r) => r.getAttribute('data-role')))];
+         return { chips, active, rows: rows.length, roles };
+       })()`,
+      true,
+    );
+    check(
+      "mind-map view is the default (导图 active, 完整 offered)",
+      mindInfo?.active?.includes("导图") === true && mindInfo?.chips?.includes("完整") === true,
+      JSON.stringify(mindInfo?.active),
+    );
+    check(
+      "mind-map rows are only user/assistant (no tool-call rows)",
+      (mindInfo?.rows ?? 0) === 0 || (mindInfo?.roles ?? []).every((r) => r === "user" || r === "assistant"),
+      JSON.stringify(mindInfo?.roles),
+    );
   }
   // Close it the way a user would: the 关闭 button, else the overlay.
   await evaluate(

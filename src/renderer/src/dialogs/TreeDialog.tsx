@@ -37,6 +37,7 @@ import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
 import { buildTreeFromEntries, type TreeEntry, type TreeNode } from "../../../shared/tree-build";
 import { flattenTree, isAlreadyAtTarget, isNavigationSettled, type TreeFlatRow } from "../../../shared/tree-layout";
+import { compactForMindMap } from "../../../shared/tree-mindmap";
 import { applyVisibility, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
 import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
 import { parseEditArgs } from "../components/DiffView";
@@ -107,18 +108,21 @@ function isEditToolCall(tc: { name: string; args: unknown } | undefined): { path
   return {};
 }
 
-function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; args: unknown }>): { label: string; cls: string; text: string } {
+function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; args: unknown }>, mind = false): { label: string; cls: string; text: string } {
   const e = node.entry;
   switch (e.type) {
     case "message": {
       const role = e.message?.role;
       const text = normalize(textOf(e.message?.content));
-      if (role === "user") return { label: "user:", cls: "user", text };
+      // In the mind map the label is the speaker, not the wire role: 「你」/「AI」.
+      const you = mind ? "你" : "user:";
+      const ai = mind ? "AI" : "assistant:";
+      if (role === "user") return { label: you, cls: "user", text };
       if (role === "assistant") {
-        if (text) return { label: "assistant:", cls: "assistant", text };
-        if (e.message?.stopReason === "aborted") return { label: "assistant:", cls: "assistant", text: "(aborted)" };
-        if (e.message?.errorMessage) return { label: "assistant:", cls: "assistant error", text: normalize(e.message.errorMessage).slice(0, 80) };
-        return { label: "assistant:", cls: "assistant", text: "(no content)" };
+        if (text) return { label: ai, cls: "assistant", text };
+        if (e.message?.stopReason === "aborted") return { label: ai, cls: "assistant", text: "(aborted)" };
+        if (e.message?.errorMessage) return { label: ai, cls: "assistant error", text: normalize(e.message.errorMessage).slice(0, 80) };
+        return { label: ai, cls: "assistant", text: "(no content)" };
       }
       if (role === "toolResult") {
         const m = e.message as { toolCallId?: string; toolName?: string } | undefined;
@@ -192,6 +196,7 @@ const TreeRow = memo(function TreeRow({
   leafId,
   editPoint,
   multipleRoots,
+  mind,
   onSelect,
   onToggleFold,
 }: {
@@ -203,11 +208,13 @@ const TreeRow = memo(function TreeRow({
   editPoint: { path?: string } | undefined;
   /** Tree has several roots (offset the whole gutter by one column). */
   multipleRoots: boolean;
+  /** Mind-map view: 「你」/「AI」 labels (see compactForMindMap). */
+  mind: boolean;
   onSelect: (id: string) => void;
   onToggleFold: (id: string) => void;
 }) {
   const e = row.node.entry;
-  const d = useMemo(() => entryDisplay(row.node, toolCalls), [row.node, toolCalls]);
+  const d = useMemo(() => entryDisplay(row.node, toolCalls, mind), [row.node, toolCalls, mind]);
   const prefix = useMemo(() => {
     const displayIndent = multipleRoots ? Math.max(0, row.indent - 1) : row.indent;
     const connectorPosition = row.showConnector && !row.isVirtualRootChild ? displayIndent - 1 : -1;
@@ -230,7 +237,8 @@ const TreeRow = memo(function TreeRow({
   return (
     <div
       data-row-id={e.id}
-      className={`tree-row${isSelected ? " selected" : ""}${row.onActivePath ? " on-active-path" : ""}${row.isCurrent ? " current" : ""}${leafId && !row.onActivePath ? " off-path" : ""}`}
+      data-role={mind ? (e.message?.role ?? "other") : undefined}
+      className={`tree-row${mind ? " tree-row-mind" : ""}${isSelected ? " selected" : ""}${row.onActivePath ? " on-active-path" : ""}${row.isCurrent ? " current" : ""}${leafId && !row.onActivePath ? " off-path" : ""}`}
       onClick={() => onSelect(e.id)}
       onDoubleClick={() => hasChildren && onToggleFold(e.id)}
       title={d.text || e.id}
@@ -277,6 +285,14 @@ export function TreeDialog({
   const [folded, setFolded] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [filterMode, setFilterMode] = useState<TreeFilterMode>("default");
+  /**
+   * 导图 (default) shows only your messages and the AI's replies, re-parented so
+   * the indentation describes the CONVERSATION ("不用显示工具调用，只需要显示 user
+   * 和 assistant 的回复"). 完整 is the previous every-entry tree, kept because
+   * tool calls, labels and compactions are sometimes exactly what you are looking
+   * for (and because rollback needs them).
+   */
+  const [view, setView] = useState<"mindmap" | "full">("mindmap");
   const [error, setError] = useState<string | null>(null);
   const [navPhase, setNavPhase] = useState<"idle" | "choose-summary" | "custom-instructions" | "navigating">("idle");
   const [customInstr, setCustomInstr] = useState("");
@@ -292,6 +308,29 @@ export function TreeDialog({
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /** Last applied snapshot (entries + leaf) — identical polls are dropped. */
   const lastSnapshotRef = useRef<{ entries: TreeEntry[]; leafId: string | null } | null>(null);
+  /**
+   * Cursor for incremental polling: the last entry id we have. `get_entries`
+   * with `since` returns ONLY entries after it plus the current `leafId` — the
+   * difference between a few hundred bytes and a 2778-entry payload (the user's
+   * session!). Measured on their remote: every full poll cost 3.0-3.4s, and
+   * navigation polls made it worse (the app log shows 8 polls over 56s).
+   * `null` = ask for everything (first load, or after a rejected cursor).
+   */
+  const entriesCursorRef = useRef<string | null>(null);
+  /**
+   * Which kind of answer does request `<id>` bring? A cursor response must be
+   * APPENDED, a full one REPLACES the list. Deciding from "is a cursor set right
+   * now" was wrong — the cursor can change between sending and receiving (another
+   * response lands first), which would either duplicate the whole session or drop
+   * the entries we already had. Unknown ids (other components' requests) default
+   * to "replace", which is always safe.
+   */
+  const entriesRequestKindRef = useRef(new Map<string, "replace" | "append">());
+  const nextEntriesRequestId = useRef(0);
+  /** Ids already in `lastSnapshotRef` — appended batches are de-duplicated so
+   *  two overlapping polls (the 3s refresh and the 1s navigation poll) cannot
+   *  double a row. Rebuilt on a replacing response. */
+  const knownEntryIdsRef = useRef(new Set<string>());
   // Mirrors for timers/closures that must not capture stale render values.
   const treeStatusRef = useRef(treeStatus);
   treeStatusRef.current = treeStatus;
@@ -321,9 +360,12 @@ export function TreeDialog({
       // (see entriesInFlightRef) — the poll interval is far shorter than a
       // slow remote round trip.
       if (!tryAcquireEntriesSlot()) return;
-      void window.api.tab.rpcSend(tabId, { type: "get_entries" })
+      const since = entriesCursorRef.current;
+      const id = `tree-poll-${++nextEntriesRequestId.current}`;
+      entriesRequestKindRef.current.set(id, since ? "append" : "replace");
+      void window.api.tab.rpcSend(tabId, since ? { type: "get_entries", since, id } : { type: "get_entries", id })
         .then((ok) => {
-          window.api.debug.log(`TreeDialog(${tabId}) get_entries sent ok=${ok}`, ok ? "debug" : "warn");
+          window.api.debug.log(`TreeDialog(${tabId}) get_entries sent ok=${ok} since=${since ?? "-"}`, ok ? "debug" : "warn");
           if (!ok) {
             releaseEntriesSlot();
             if (!pendingNavRequestId.current) {
@@ -339,9 +381,26 @@ export function TreeDialog({
         });
     };
     /** Apply a fetched snapshot, dropping no-op polls so nothing re-renders
-     *  while the session is unchanged (the 3s poll stays free). */
-    const applySnapshot = (entries: TreeEntry[], nextLeaf: string | null) => {
+     *  while the session is unchanged (the 3s poll stays free).
+     *
+     *  A cursor response carries only the NEW entries (append), a full one
+     *  replaces the list — the session is append-only, so appending is exact and
+     *  keeps the abandoned branches we already have. */
+    const applySnapshot = (batch: TreeEntry[], nextLeaf: string | null, mode: "replace" | "append") => {
       const prev = lastSnapshotRef.current;
+      let entries: TreeEntry[];
+      if (mode === "append" && prev) {
+        const known = knownEntryIdsRef.current;
+        const fresh = batch.filter((e) => !known.has(e.id));
+        for (const e of fresh) known.add(e.id);
+        entries = fresh.length > 0 ? [...prev.entries, ...fresh] : prev.entries;
+      } else {
+        entries = batch;
+        knownEntryIdsRef.current = new Set(batch.map((e) => e.id));
+      }
+      const lastId = entries.length ? entries[entries.length - 1]!.id : null;
+      // Advance the cursor for the next poll (never move it backwards).
+      if (lastId) entriesCursorRef.current = lastId;
       const prevLeaf = prev?.leafId ?? null;
       if (prev && prevLeaf === nextLeaf && prev.entries.length === entries.length) {
         let same = true;
@@ -503,11 +562,22 @@ export function TreeDialog({
       // current navigation early.
       if (pendingNavRequestId.current && event.id !== pendingNavRequestId.current) return;
       const data = event.data as { entries?: unknown[]; leafId?: string | null; error?: string };
+      const responseId = typeof event.id === "string" ? event.id : "";
+      const mode = entriesRequestKindRef.current.get(responseId) ?? "replace";
+      entriesRequestKindRef.current.delete(responseId);
       if (event.success && Array.isArray(data.entries)) {
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
-        window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE entries=${data.entries.length} leaf=${data.leafId ?? "null"}`, "debug");
-        applySnapshot(data.entries as TreeEntry[], data.leafId ?? null);
+        window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE mode=${mode} entries=${data.entries.length} leaf=${data.leafId ?? "null"}`, "debug");
+        applySnapshot(data.entries as TreeEntry[], data.leafId ?? null, mode);
+      } else if (entriesCursorRef.current) {
+        // The cursor no longer exists (session replaced: /new, switch, rewind
+        // rewrite). Drop it and ask for the whole list once.
+        window.api.debug.log(`TreeDialog(${tabId}) get_entries cursor rejected: ${String(event.error ?? "")}`, "warn");
+        entriesCursorRef.current = null;
+        lastSnapshotRef.current = null;
+        knownEntryIdsRef.current = new Set();
+        sendRefresh();
       } else {
         setTreeStatus("error");
         setError(friendlyTreeError(String(event.error ?? "获取会话树失败")));
@@ -551,12 +621,26 @@ export function TreeDialog({
     return map;
   }, [tree]);
 
-  const { flat } = useMemo(() => flattenTree(tree, leafId), [tree, leafId]);
+  // The mind-map projection is computed from the full tree and carries the leaf
+  // mapped to the nearest kept ancestor — that is the row that gets 「当前」.
+  const mindMap = useMemo(
+    () => (view === "mindmap" ? compactForMindMap(tree, leafId) : null),
+    [tree, leafId, view],
+  );
+  const displayTree = mindMap ? mindMap.tree : tree;
+  /** The leaf as the MAP sees it (the reply you are currently under). */
+  const displayLeafId = mindMap ? mindMap.leafId : leafId;
+
+  const { flat } = useMemo(() => flattenTree(displayTree, displayLeafId), [displayTree, displayLeafId]);
 
   // Filter/search over the flattened rows. `onActivePath`/`isCurrent` come from
   // the shared layout (src/shared/tree-layout.ts), which is unit-tested — the
   // dialog no longer keeps a second, untested copy of the ancestor walk.
-  const visible = useMemo(() => applyVisibility(flat, filterMode, query, leafId), [flat, filterMode, query, leafId]);
+  // The mind map already did its own filtering, so it only applies the search.
+  const visible = useMemo(
+    () => applyVisibility(flat, mindMap ? "all" : filterMode, query, displayLeafId),
+    [flat, mindMap, filterMode, query, displayLeafId],
+  );
 
   const filtered = useMemo(() => {
     if (folded.size === 0) return visible;
@@ -589,7 +673,7 @@ export function TreeDialog({
 
   const selectedText = selected ? normalize(textOf(selected.entry.message?.content)) : "";
   const isUserMsg = selected?.entry.type === "message" && selected.entry.message?.role === "user";
-  const isLeaf = selected?.entry.id === leafId;
+  const isLeaf = selected?.entry.id === displayLeafId;
 
   /** Stable identities: an inline arrow here would defeat TreeRow's memo and
    *  re-render all ~80 rows on every scroll event. */
@@ -780,7 +864,7 @@ export function TreeDialog({
     // Already there? pi would no-op, and the leaf would never "change" — which
     // used to leave the dialog waiting out its 60s timer and then reporting
     // 导航超时. Finish immediately instead.
-    if (isAlreadyAtTarget(targetId, leafId)) {
+    if (isAlreadyAtTarget(lastSnapshotRef.current?.entries ?? [], targetId, leafId)) {
       useUiStore.getState().showToast("已在当前位置", "ok");
       onNavigated?.(undefined);
       onClose();
@@ -833,10 +917,16 @@ export function TreeDialog({
     // slot as the refresh poll: navigation can take up to 180s (a summarize
     // model call), and 1s polling without the guard queued ~180 requests on
     // pi's serial command loop.
+    // Poll with the cursor: the navigation only needs the new `leafId`, and a
+    // 2778-entry payload every second is what made this feel frozen (3.0-3.4s per
+    // round trip in the user's log, 8 polls over 56s). The cursor is re-read on every tick
+    // so a refresh poll that already appended entries is not re-fetched.
     const timer = setInterval(() => {
       if (tryAcquireEntriesSlot()) {
+        const sinceNow = entriesCursorRef.current;
+        entriesRequestKindRef.current.set(requestId, sinceNow ? "append" : "replace");
         void window.api.tab
-          .rpcSend(tabId, { type: "get_entries", id: requestId })
+          .rpcSend(tabId, sinceNow ? { type: "get_entries", since: sinceNow, id: requestId } : { type: "get_entries", id: requestId })
           .then((ok) => {
             // Tab gone → no response will ever arrive; free the slot so the
             // poll keeps trying instead of waiting out the stall window.
@@ -861,6 +951,22 @@ export function TreeDialog({
     pendingNavTimer.current = timer;
   };
 
+  /**
+   * Give up waiting (the navigation itself keeps its pi-side effect — we only
+   * stop polling). Without this, a slow/unanswered navigation held the dialog
+   * hostage for its whole 60s backstop.
+   */
+  const stopWaitingForNav = () => {
+    if (pendingNavTimer.current) {
+      clearInterval(pendingNavTimer.current);
+      pendingNavTimer.current = null;
+    }
+    pendingNavRequestId.current = null;
+    setNavPhase("idle");
+    setNavigatingId(null);
+    useUiStore.getState().showToast("已停止等待；分支切换可能仍在 pi 中执行，可稍后用会话树确认", "ok");
+  };
+
   const pendingNavTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const pendingNavRequestId = useRef<string | null>(null);
   /** The leaf when the current navigation started (the settle rule needs it). */
@@ -870,8 +976,8 @@ export function TreeDialog({
   /** On open, centre the CURRENT conversation once — "where am I?" answered. */
   const didFocusCurrentRef = useRef(false);
   const focusCurrent = () => {
-    if (!leafId) return;
-    const idx = filtered.findIndex((f) => f.node.entry.id === leafId);
+    if (!displayLeafId) return;
+    const idx = filtered.findIndex((f) => f.node.entry.id === displayLeafId);
     if (idx < 0) return;
     ensureWindowCovers(idx);
     revealRow(idx, "center");
@@ -1085,7 +1191,23 @@ export function TreeDialog({
             title="↑↓ 选择 · Enter 导航 · Shift+Enter 导航并摘要 · Ctrl+F 搜索 · Esc 关闭"
           />
           <div className="tree-filters" role="group" aria-label="显示筛选">
-            {(Object.keys(FILTER_LABELS) as TreeFilterMode[]).map((m) => (
+            <button
+              className={`tree-chip${view === "mindmap" ? " active" : ""}`}
+              aria-pressed={view === "mindmap"}
+              title="只显示你的消息和 AI 的回复（思维导图）"
+              onClick={() => setView("mindmap")}
+            >
+              导图
+            </button>
+            <button
+              className={`tree-chip${view === "full" ? " active" : ""}`}
+              aria-pressed={view === "full"}
+              title="显示会话里的全部条目（含工具调用、压缩、标签等）"
+              onClick={() => setView("full")}
+            >
+              完整
+            </button>
+            {view === "full" && (Object.keys(FILTER_LABELS) as TreeFilterMode[]).map((m) => (
               <button
                 key={m}
                 className={`tree-chip${filterMode === m ? " active" : ""}`}
@@ -1100,7 +1222,7 @@ export function TreeDialog({
               className="tree-chip tree-chip-action"
               onClick={() => {
                 focusCurrent();
-                if (leafId) setSelectedId(leafId);
+                if (displayLeafId) setSelectedId(displayLeafId);
               }}
               title="把当前对话所在的位置滚到视图中间"
             >
@@ -1154,6 +1276,13 @@ export function TreeDialog({
                 </button>
               </div>
             )}
+            {filtered.length === 0 && treeStatus === "ready" && tree.length > 0 && mindMap !== null && (
+              <div className="tree-empty">
+                {query
+                  ? "没有匹配的对话消息（试试清空搜索，或切到「完整」看全部条目）"
+                  : "这个会话里没有可显示的对话消息（只有工具调用/簿记条目）。切到「完整」查看全部条目。"}
+              </div>
+            )}
             {filtered.length === 0 && treeStatus === "ready" && tree.length === 0 && (
               <div className="tree-empty">
                 {hasMessages ? "会话树为空，正在自动刷新…" : "空会话：尚无消息。发送第一条消息后，这里会显示分支树。"}
@@ -1183,9 +1312,10 @@ export function TreeDialog({
                         toolCalls={toolCalls}
                         selectedId={selectedId}
                         folded={folded}
-                        leafId={leafId}
+                        leafId={displayLeafId}
                         editPoint={cp}
                         multipleRoots={multipleRoots}
+                        mind={mindMap !== null}
                         onSelect={selectRow}
                         onToggleFold={toggleFold}
                       />
@@ -1198,8 +1328,9 @@ export function TreeDialog({
           </div>
           <div className="tree-status">
             ({filtered.findIndex((f) => f.node.entry.id === selectedId) + 1 || 0}/{filtered.length})
+            {mindMap && ` · 导图（已隐藏 ${mindMap.hidden} 条工具/簿记条目）`}
             {query && " · 搜索中"}
-            {filterMode !== "default" && ` · ${FILTER_LABELS[filterMode]}`}
+            {!mindMap && filterMode !== "default" && ` · ${FILTER_LABELS[filterMode]}`}
             {folded.size > 0 && " · 有折叠"} · ↑↓ 选择 · Enter 导航 · Esc 关闭
           </div>
           {fileSnapshot && (
@@ -1270,7 +1401,18 @@ export function TreeDialog({
             </div>
           )}
 
-          {navPhase === "navigating" && <div className="tree-detail">正在导航（{navigatingId === selected?.entry.id ? "等待 pi 切换分支…" : ""}）</div>}
+          {navPhase === "navigating" && (
+            <div className="tree-detail">
+              <span className="tree-detail-hint">
+                已请求 pi 切换到目标位置，正在等待它确认（远程会话每次往返约 3s，通常 1-2 次内完成）。
+                等待期间可以继续浏览、搜索或直接关闭窗口 —— 切换本身已经在 pi 里执行了。
+              </span>
+              <div className="tree-detail-actions">
+                <span />
+                <button className="btn" onClick={stopWaitingForNav}>不再等待</button>
+              </div>
+            </div>
+          )}
         </div>
         <div className="ui-dialog-actions">
           {onOpenTerminal && (
@@ -1286,7 +1428,7 @@ export function TreeDialog({
           >
             终端视图 /tree
           </button>
-          <button className="btn" onClick={onClose} disabled={!!navigatingId}>
+          <button className="btn" onClick={onClose}>
             关闭
           </button>
         </div>

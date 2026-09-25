@@ -61,9 +61,58 @@ export function isOnLeafPath(entries: readonly TreeEntry[], targetId: string, le
   return ancestorIds(entries, leafId).includes(targetId);
 }
 
-/** Is the session already sitting exactly at the target? (a no-op navigation) */
-export function isAlreadyAtTarget(targetId: string, leafId: string | null): boolean {
-  return leafId !== null && targetId === leafId;
+/**
+ * Where does pi put the leaf when you navigate to `targetId`?
+ *
+ * This mirrors pi's `navigateTree` (agent-session.js) exactly, because getting it
+ * wrong is what made "跳转分支" look frozen:
+ *
+ * ```js
+ * if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+ *   newLeafId = targetEntry.parentId;   // rewind to BEFORE the prompt…
+ *   editorText = contentText(...);      // …and hand its text back to the editor
+ * } else if (targetEntry.type === "custom_message") {
+ *   newLeafId = targetEntry.parentId;
+ * } else {
+ *   newLeafId = targetId;
+ * }
+ * ```
+ *
+ * Picking a USER message — the most natural click in a branch tree ("回到这里重新
+ * 提问") — therefore leaves the leaf at its PARENT, which is not on the target's
+ * path. The old completion rule waited for the target to sit on the leaf's path,
+ * so it never fired: the dialog spun until its 60s timeout while pi had long
+ * finished. `undefined` = target not in the snapshot (cannot tell).
+ */
+export function navigateLeafId(
+  entries: readonly TreeEntry[],
+  targetId: string,
+): string | null | undefined {
+  const entry = entries.find((e) => e.id === targetId);
+  if (!entry) return undefined;
+  const rewindsBefore =
+    entry.type === "custom_message" ||
+    (entry.type === "message" && entry.message?.role === "user");
+  return rewindsBefore ? entry.parentId ?? null : targetId;
+}
+
+/**
+ * Is the session already sitting where the target would put it?
+ * (i.e. would pi's `navigateTree` no-op?)
+ *
+ * Two cases: pi short-circuits when the target IS the current leaf, and a
+ * user-message target lands on its parent — so being AT the parent already means
+ * "there is nothing to navigate". Both must return true, otherwise the dialog
+ * sends a command pi refuses to act on and then waits for a leaf change that can
+ * never happen.
+ */
+export function isAlreadyAtTarget(
+  entries: readonly TreeEntry[],
+  targetId: string,
+  leafId: string | null,
+): boolean {
+  if (leafId !== null && targetId === leafId) return true;
+  return navigateLeafId(entries, targetId) === leafId;
 }
 
 export interface NavigationState {
@@ -92,9 +141,16 @@ export interface NavigationState {
  *    under the target".
  */
 export function isNavigationSettled(entries: readonly TreeEntry[], state: NavigationState): boolean {
-  if (state.leafId === null) return false;
+  // Nothing moved yet: pi is still working (a summarize appends its entry later).
   if (state.leafId === state.startLeafId) return false;
-  return isOnLeafPath(entries, state.targetId, state.leafId);
+  const expected = navigateLeafId(entries, state.targetId);
+  if (expected === undefined) return false; // target not in this snapshot
+  // Rewinding before the first message makes `null` the real new position.
+  if (expected === null) return state.leafId === null;
+  if (state.leafId === null) return false;
+  // `expected` itself counts (no summary) AND any descendant of it counts (a
+  // summarize appends a brand-new entry at the rewind point and makes IT the leaf).
+  return isOnLeafPath(entries, expected, state.leafId);
 }
 
 /** Pure geometry: rows to render, active branch first, with path flags set. */
