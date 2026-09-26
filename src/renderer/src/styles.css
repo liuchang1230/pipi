@@ -2700,6 +2700,33 @@ textarea:focus-visible,
   color: var(--text);
   margin-bottom: 8px;
 }
+/* 目的前置：一句人话是这个弹窗的主体，放大居中，一眼看完。 */
+.ui-confirm-purpose {
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text);
+  text-align: center;
+  padding: 10px 6px 4px;
+  font-weight: 500;
+}
+.ui-dialog-body-confirm {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.ui-dialog-actions-confirm {
+  display: flex;
+  gap: 10px;
+  justify-content: stretch;
+}
+.ui-dialog-actions-confirm .btn-lg {
+  flex: 1 1 0;
+}
+.btn-lg {
+  padding: 9px 18px;
+  font-size: 13px;
+  font-weight: 600;
+}
 .ui-confirm-detail {
   margin: 0;
   padding: 8px 10px;
@@ -2715,6 +2742,22 @@ textarea:focus-visible,
   word-break: break-word;
   color: var(--text-dim);
 }
+/* 「下一步？」这类选择：把选项做成可点的大行，一眼看清选项本身。 */
+.ui-select-list-lg .ui-select-item {
+  padding: 9px 12px;
+  font-size: 13px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+}
+.ui-select-list-lg .ui-select-item:hover,
+.ui-select-list-lg .ui-select-item.selected {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.ui-select-list-lg .ui-select-item.selected {
+  font-weight: 600;
+}
+
 /* 收起后的对话框：不再遮挡正文，停靠右下角，仍可回答。 */
 .ui-dialog-overlay.minimized {
   background: transparent;
@@ -2782,6 +2825,81 @@ textarea:focus-visible,
   font-family: -apple-system, "Segoe UI", system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
   font-size: 12px;
   gap: 6px;
+  /* Card rows: speaker line + text line. Must equal MIND_ROW_H in TreeDialog.tsx. */
+  height: 46px;
+  align-items: center;
+  padding: 3px 8px 3px 0;
+  line-height: 1.35;
+}
+/* 卡片：左侧色条说明是谁说的，正文一行，时间在右上。 */
+.tree-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-left: 3px solid color-mix(in srgb, var(--text-dim) 55%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-input, #10131a) 45%, transparent);
+}
+.tree-card.user {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.tree-card.assistant {
+  border-left-color: color-mix(in srgb, var(--success, #4ade80) 70%, transparent);
+}
+.tree-card.error {
+  border-left-color: var(--danger);
+}
+.tree-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-dim);
+}
+.tree-card-spacer {
+  flex: 1 1 auto;
+}
+.tree-card-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.tree-row-mind .tree-card.user .tree-entrylabel,
+.tree-row-mind .tree-card.assistant .tree-entrylabel {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-weight: 600;
+  font-size: 10px;
+  line-height: 14px;
+}
+.tree-row-mind .tree-card.user .tree-entrylabel {
+  color: var(--accent);
+}
+.tree-row-mind .tree-card.assistant .tree-entrylabel {
+  color: color-mix(in srgb, var(--success, #4ade80) 85%, var(--text));
+}
+/* Branch rails must line up across a two-line card. */
+.tree-row-mind .tree-gutter,
+.tree-row-mind .tree-fold,
+.tree-row-mind .tree-pathmark {
+  align-self: center;
+}
+.tree-dialog .tree-row-mind.current .tree-card {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.tree-dialog .tree-row-mind.on-active-path .tree-card {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
 }
 .tree-row-mind .tree-entrylabel {
   flex: 0 0 auto;

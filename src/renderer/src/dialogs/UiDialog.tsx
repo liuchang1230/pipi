@@ -30,31 +30,30 @@ export interface UiRequest {
  */
 function ConfirmMessage({ req, title }: { req: UiRequest; title: string }) {
   const { headline, detail } = splitConfirmMessage(req.message ?? title);
-  // 用户反馈：「用户不需要知道你执行什么命令，只需要知道你要干什么」—— so the plain
-  // sentence IS the dialog. The exact command/diff stays available, but only when
-  // the user asks to verify it.
+  // 用户反馈：「用户不需要知道你执行什么命令，只需要知道你要干什么」。So the plain
+  // sentence IS the dialog — big, centred, first. The exact command/diff stays one
+  // click away, for the times you DO want to verify before allowing.
   const [showDetail, setShowDetail] = useState(false);
+  const structured = detail !== undefined || req.message === undefined;
   return (
-    <div className="ui-confirm-msg">
-      <div className="ui-confirm-head">{headline || title}</div>
+    <>
+      <div className={structured ? "ui-confirm-purpose" : "ui-confirm-msg"}>{headline || title}</div>
       {detail ? (
         showDetail ? (
           <>
             <pre className="ui-confirm-detail">{detail}</pre>
             <button className="link-btn ui-confirm-toggle" onClick={() => setShowDetail(false)}>
-              收起具体内容
+              ▾ 收起具体内容
             </button>
           </>
         ) : (
           <button className="link-btn ui-confirm-toggle" onClick={() => setShowDetail(true)}>
-            查看具体命令/改动
+            ▸ 查看具体内容
           </button>
         )
       ) : null}
-      <div className="ui-confirm-hint">
-        点「确定」= 允许 AI 执行；点「取消」= 这次不执行，AI 会收到「你拒绝了」并换个方案。
-      </div>
-    </div>
+      <div className="ui-confirm-hint">允许 → AI 继续做；不允许 → 这次不做，它会换个办法。</div>
+    </>
   );
 }
 
@@ -94,6 +93,12 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
   };
 
   const title = req.title || "pi";
+  // A structured confirm is OUR OWN (the extension marks it, see
+  // shared/confirm-detail.ts): it gets the purpose-first layout and 允许/不允许
+  // wording. Anything else keeps 确定/取消 — "允许" would be nonsense for e.g.
+  // "Continue with the summarized branch?".
+  const structuredConfirm =
+    req.method === "confirm" && splitConfirmMessage(req.message ?? "").detail !== undefined;
 
   return (
     <div className={`dialog-overlay ui-dialog-overlay${minimized ? " minimized" : ""}`} onClick={cancel}>
@@ -113,9 +118,9 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
             {minimized ? "▢" : "—"}
           </button>
         </div>
-        <div className="dialog-body" hidden={minimized}>
+        <div className={`dialog-body${structuredConfirm ? " ui-dialog-body-confirm" : ""}`} hidden={minimized}>
           {req.method === "select" && (
-            <div className="ui-select-list">
+            <div className="ui-select-list ui-select-list-lg">
               {(req.options ?? []).map((opt, i) => (
                 <div
                   key={i}
@@ -150,26 +155,38 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
             />
           )}
         </div>
-        <div className="ui-dialog-actions">
-          <button className="btn" onClick={cancel}>
-            取消
-          </button>
-          {req.method === "select" && req.options?.length ? (
-            <button
-              className="btn btn-primary"
-              onClick={() => respond({ value: req.options![selected] })}
-            >
-              选择
-            </button>
-          ) : req.method === "confirm" ? (
-            <button className="btn btn-primary" onClick={() => respond({ confirmed: true })}>
-              确定
-            </button>
-          ) : req.method === "input" || req.method === "editor" ? (
-            <button className="btn btn-primary" onClick={() => respond({ value: text })}>
-              确定
-            </button>
-          ) : null}
+        {/* 允许 on the LEFT, 不允许 on the right — the affirmative first, which is
+            what the user reads for ("我同意继续做这件事"). */}
+        <div className={`ui-dialog-actions${structuredConfirm ? " ui-dialog-actions-confirm" : ""}`}>
+          {structuredConfirm ? (
+            <>
+              <button className="btn btn-primary btn-lg" onClick={() => respond({ confirmed: true })}>
+                允许
+              </button>
+              <button className="btn btn-lg" onClick={cancel}>
+                不允许
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn" onClick={cancel}>
+                取消
+              </button>
+              {req.method === "select" && req.options?.length ? (
+                <button className="btn btn-primary" onClick={() => respond({ value: req.options![selected] })}>
+                  选择
+                </button>
+              ) : req.method === "confirm" ? (
+                <button className="btn btn-primary" onClick={() => respond({ confirmed: true })}>
+                  确定
+                </button>
+              ) : req.method === "input" || req.method === "editor" ? (
+                <button className="btn btn-primary" onClick={() => respond({ value: text })}>
+                  确定
+                </button>
+              ) : null}
+            </>
+          )}
         </div>
       </div>
     </div>

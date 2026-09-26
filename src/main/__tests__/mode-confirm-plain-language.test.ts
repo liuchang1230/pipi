@@ -91,6 +91,16 @@ describe("summarizeBash / summarizeWrite", () => {
     expect(wrote).toContain("new.ts");
   });
 
+  it("asks with a purpose-first title, not a mode question", () => {
+    // 用户反馈：「用户不需要知道你执行什么命令，只需要知道你要干什么」—— the dialog title
+    // states the intention ("AI 想…"), the big line states the effect.
+    const source = readFileSync(join(__dirname, "..", "extensions", "pipi-mode-switch.ts"), "utf8");
+    expect(source).toContain('ctx.ui.confirm("AI 想执行一条命令"');
+    expect(source).toContain('"AI 想修改文件"');
+    expect(source).toContain('"AI 想创建或覆盖文件"');
+    expect(source).not.toContain("edit 模式：允许修改文件？");
+  });
+
   it("uses the same marker literal as the dialog", () => {
     // The extension is loaded by pi as a standalone file: it cannot import
     // shared/confirm-detail.ts, so the literal is duplicated on purpose and this

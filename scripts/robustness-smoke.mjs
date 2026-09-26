@@ -222,6 +222,49 @@ try {
       (mindInfo?.rows ?? 0) === 0 || (mindInfo?.roles ?? []).every((r) => r === "user" || r === "assistant"),
       JSON.stringify(mindInfo?.roles),
     );
+    // The card layout: a speaker line + a text line per row, and the 完整 view must
+    // switch the same dialog to the flat log rows (both are one dialog, one state).
+    const cardInfo = await evaluate(
+      ws,
+      `(() => {
+         const rows = [...document.querySelectorAll('.tree-dialog .tree-scroll .tree-row')];
+         const cards = rows.filter((r) => r.querySelector('.tree-card')).length;
+         const heads = rows.filter((r) => r.querySelector('.tree-card-head')).length;
+         const texts = rows.filter((r) => r.querySelector('.tree-card-text')).length;
+         return { rows: rows.length, cards, heads, texts };
+       })()`,
+      true,
+    );
+    check(
+      "mind-map rows use the card layout (speaker line + text line)",
+      (cardInfo?.rows ?? 0) === (cardInfo?.cards ?? 0) && (cardInfo?.rows ?? 0) === (cardInfo?.heads ?? 0) && (cardInfo?.rows ?? 0) === (cardInfo?.texts ?? 0),
+      JSON.stringify(cardInfo),
+    );
+    const fullSwitch = await evaluate(
+      ws,
+      `(() => {
+         const btn = [...document.querySelectorAll('.tree-dialog .tree-chip')].find((c) => c.textContent.trim() === '完整');
+         if (!btn) return { switched: false };
+         btn.click();
+         return { switched: true };
+       })()`,
+      true,
+    );
+    await sleep(200);
+    const afterSwitch = await evaluate(
+      ws,
+      `(() => {
+         const active = [...document.querySelectorAll('.tree-dialog .tree-chip.active')].map((c) => c.textContent.trim());
+         const cards = document.querySelectorAll('.tree-dialog .tree-card').length;
+         return { active, cards };
+       })()`,
+      true,
+    );
+    check(
+      "完整 view switches the same dialog off the card layout",
+      fullSwitch?.switched === true && afterSwitch?.active?.includes("完整") === true && (afterSwitch?.cards ?? 1) === 0,
+      JSON.stringify(afterSwitch),
+    );
   }
   // Close it the way a user would: the 关闭 button, else the overlay.
   await evaluate(

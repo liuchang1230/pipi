@@ -173,6 +173,8 @@ const WINDOW_MARGIN = 20;
 /** `.tree-row` height from styles.css. One definition, because the window math
  *  and the spacer heights must agree or the scrollbar jitters. */
 const ROW_H = 24;
+/** Height of a 导图 card row: speaker line + one line of text (styles.css). */
+const MIND_ROW_H = 46;
 
 /**
  * One tree row.
@@ -256,12 +258,30 @@ const TreeRow = memo(function TreeRow({
           ⑂{branchCount}
         </span>
       )}
-      {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
-      <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
-      <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
-      {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
-      {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
-      {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
+      {mind ? (
+        // 导图：每条消息一张小卡片（说话人 + 时间在上，正文一行在下），左侧色条
+        // 表达分支归属 —— 用户选的观感（见 CONTEXT.md 2026-09-25）。
+        <span className={`tree-card ${d.cls}`}>
+          <span className="tree-card-head">
+            <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
+            {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
+            {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}）`}>⤺</span>}
+            <span className="tree-card-spacer" />
+            {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
+            {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
+          </span>
+          <span className={`tree-card-text ${d.cls}`}>{d.text || "（无内容）"}</span>
+        </span>
+      ) : (
+        <>
+          {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
+          <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
+          <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
+          {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
+          {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
+          {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
+        </>
+      )}
     </div>
   );
 });
@@ -628,6 +648,9 @@ export function TreeDialog({
     [tree, leafId, view],
   );
   const displayTree = mindMap ? mindMap.tree : tree;
+  /** Row height of the view being rendered — the spacers and the window math
+   *  must agree with `.tree-row`/`.tree-row-mind` in styles.css. */
+  const rowH = mindMap ? MIND_ROW_H : ROW_H;
   /** The leaf as the MAP sees it (the reply you are currently under). */
   const displayLeafId = mindMap ? mindMap.leafId : leafId;
 
@@ -703,11 +726,22 @@ export function TreeDialog({
    * frame is what keeps long sessions scrollable at frame rate.
    */
   const rafRef = useRef<number | null>(null);
+  /** The active row height (card rows are taller). Read through a ref so the
+   *  windowing callbacks keep empty dependency lists instead of being rebuilt. */
+  const rowHRef = useRef(ROW_H);
+  const filteredRef = useRef<TreeFlatRow[]>([]);
+  const displayLeafIdRef = useRef<string | null>(null);
+  // Kept in sync every render, so the stable (empty-deps) callbacks and the
+  // view-change effect can read the latest list/position/row height.
+  rowHRef.current = rowH;
+  filteredRef.current = filtered;
+  displayLeafIdRef.current = displayLeafId;
   const recomputeWindow = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const start = Math.max(0, Math.floor(el.scrollTop / ROW_H) - WINDOW_MARGIN);
-    const count = Math.ceil(el.clientHeight / ROW_H) + WINDOW_MARGIN * 2;
+    const rowH = rowHRef.current;
+    const start = Math.max(0, Math.floor(el.scrollTop / rowH) - WINDOW_MARGIN);
+    const count = Math.ceil(el.clientHeight / rowH) + WINDOW_MARGIN * 2;
     setWin((w) => (w.start === start && w.end === start + count ? w : { start, end: start + count }));
   }, []);
   const onScroll = useCallback(() => {
@@ -736,11 +770,12 @@ export function TreeDialog({
       if (retry) requestAnimationFrame(() => revealRow(index, mode, false));
       return;
     }
-    const top = index * ROW_H;
-    const bottom = top + ROW_H;
+    const rowH = rowHRef.current;
+    const top = index * rowH;
+    const bottom = top + rowH;
     const view = el.clientHeight;
     if (mode === "center") {
-      el.scrollTop = Math.max(0, top - (view - ROW_H) / 2);
+      el.scrollTop = Math.max(0, top - (view - rowH) / 2);
     } else if (top < el.scrollTop) {
       el.scrollTop = top;
     } else if (bottom > el.scrollTop + view) {
@@ -754,6 +789,14 @@ export function TreeDialog({
     const start = Math.max(0, index - WINDOW_MARGIN);
     setWin({ start, end: start + WINDOW_MARGIN * 2 + 40 });
   }, []);
+  // Switching 导图/完整 changes the row height, so offsets computed for the old
+  // height are wrong: re-derive the window and keep the current position visible.
+  useEffect(() => {
+    recomputeWindow();
+    const idx = filteredRef.current.findIndex((f) => f.node.entry.id === displayLeafIdRef.current);
+    if (idx >= 0) revealRow(idx, "nearest");
+  }, [view, recomputeWindow, revealRow]);
+
   useEffect(() => {
     recomputeWindow();
     const el = scrollRef.current;
@@ -1299,7 +1342,7 @@ export function TreeDialog({
               const slice = filtered.slice(win.start, win.end);
               return (
                 <>
-                  {win.start > 0 && <div style={{ height: win.start * ROW_H }} aria-hidden="true" />}
+                  {win.start > 0 && <div style={{ height: win.start * rowH }} aria-hidden="true" />}
                   {slice.map((f: TreeFlatRow) => {
                     const e = f.node.entry;
                     const cp = e.type === "message" && e.message?.role === "toolResult"
@@ -1321,7 +1364,7 @@ export function TreeDialog({
                       />
                     );
                   })}
-                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * ROW_H }} aria-hidden="true" />}
+                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * rowH }} aria-hidden="true" />}
                 </>
               );
             })()}
