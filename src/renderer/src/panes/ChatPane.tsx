@@ -465,16 +465,6 @@ function ChatNotices() {
 // react-markdown + highlight.js freezes the UI for seconds. Render only the
 // most recent chunk and reveal older messages on scroll-up.
 const INITIAL_VISIBLE = 60;
-/**
- * Estimated pixel height of ONE rendered chat message, used by the window math.
- * Messages genuinely vary (a one-liner vs a 200-line diff), so this is an
- * ESTIMATE: the margin rows on both sides absorb the error, and the scroll
- * anchoring below corrects drift after every mount. Fixed 40px-per-row math
- * would jitter; the estimate + margin keeps the scrollbar usable instead of
- * exact.
- */
-const CHAT_ROW_FALLBACK_H = 72;
-const WINDOW_MARGIN_ROWS = 8;
 const VISIBLE_STEP = 60;
 
 // --- Stream-isolated timeline ----------------------------------------------
@@ -522,97 +512,35 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
   const revealAnchorRef = useRef<{ height: number; top: number } | null>(null);
   const revealLockedRef = useRef(false);
   const scrollFrameRef = useRef<number | null>(null);
-  // Two-sided windowing with constant total height (top + bottom spacers) — the
-  // same math the tree dialog uses. The old tail-slice mounted every revealed
-  // message forever: scrolling up grew the list, and each streamed delta made
-  // React reconcile ALL of it, which is the reported 滑动卡顿 on long sessions.
-  const [win, setWin] = useState({ start: 0, end: INITIAL_VISIBLE });
-  const winRef = useRef(win);
-  winRef.current = win;
-  const rafRef = useRef<number | null>(null);
-  const recomputeWindow = useCallback(() => {
+  /**
+   * How many of the newest messages are mounted. The list is TAIL-ANCHORED:
+   * `slice(-visibleCount)` plus an explicit "load older" step — deliberately NOT a
+   * two-sided window over estimated row heights.
+   *
+   * Why the estimate-based window was wrong (measured, twice): its spacer math is
+   * `index × estimatedRowHeight`, so the error between the estimate and the real
+   * average grows with the index (at a real ~55px vs the 72px estimate, index 1000
+   * is off by ~17k px). Once the error exceeds the mounted margin, the computed
+   * window sits outside the viewport: the user sees pure spacer (「滚着滚着就空白
+   * 了」) and scrollTop stops mapping to a new window (「滚不动了」). Variable-height
+   * content needs either measured cumulative offsets or no index math at all —
+   * this is the second option, and it is why scrolling here has no such failure
+   * mode. Growing the tail is O(1) in index space, so nothing can accumulate.
+   */
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
+  const visibleMessages = useMemo(() => messages.slice(-visibleCount), [messages, visibleCount]);
+  const hiddenCount = messages.length - visibleMessages.length;
+  /**
+   * The only scroll work per event: remember whether the user is at the bottom.
+   * Done SYNCHRONOUSLY because the layout effect below runs in the same frame and
+   * must not read a stale flag (that stale read is what yanked the viewport back
+   * to the bottom on every window flip).
+   */
+  const onScrollPosition = useCallback(() => {
     const el = scrollRef.current;
-    if (!el) return;
-    const start = Math.max(0, Math.floor(el.scrollTop / CHAT_ROW_FALLBACK_H) - WINDOW_MARGIN_ROWS);
-    const count = Math.ceil(el.clientHeight / CHAT_ROW_FALLBACK_H) + WINDOW_MARGIN_ROWS * 2;
-    setWin((w) => (w.start === start && w.end === start + count ? w : { start, end: start + count }));
-  }, []);
-  const onScrollWindowed = useCallback(() => {
-    const el = scrollRef.current;
-    // Release stick-to-bottom SYNCHRONOUSLY: the layout effect below runs in the
-    // same frame as the scroll event, and if it only saw the flag updated inside
-    // a rAF it would yank the user back to the bottom mid-gesture — the reported
-    // "滚一下又回到之前的地方".
     if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    if (rafRef.current !== null) return;
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = null;
-      recomputeWindow();
-    });
-  }, [recomputeWindow]);
-  useEffect(() => () => {
-    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
   }, []);
-  // Streaming appends at the bottom: extend the window ONLY while the user is
-  // pinned to the bottom. Overriding the window unconditionally is what let a
-  // new turn yank the view back down while the user was reading earlier
-  // messages (and turned "scroll up" into a tug-of-war).
-  useEffect(() => {
-    if (!stickToBottom.current) return;
-    setWin((w) => {
-      const end = Math.min(messages.length, Math.max(w.end, Math.min(INITIAL_VISIBLE, messages.length)));
-      const start = Math.max(0, end - Math.max(INITIAL_VISIBLE, w.end - w.start));
-      return start === w.start && end === w.end ? w : { start, end };
-    });
-  }, [messages.length]);
-  const windowed = useMemo(() => messages.slice(win.start, win.end), [messages, win]);
-  /**
-   * Spacer heights. A fixed per-row estimate fights reality: the estimate is
-   * wrong per message, so every window shift moved the content by
-   * (estimate − real) × rows and fired ANOTHER scroll event — the oscillation.
-   * Instead, measure the average REAL row height from the mounted list
-   * (content height ÷ mounted count) and drive both spacers from that. The
-   * estimate only seeds the very first paint, before anything is measurable.
-   */
-  const contentRef = useRef<HTMLDivElement>(null);
-  const rowHRef = useRef(CHAT_ROW_FALLBACK_H);
-  const topH = Math.round(win.start * rowHRef.current);
-  const bottomH = Math.round(Math.max(0, messages.length - win.end) * rowHRef.current);
-  const hiddenCount = win.start;
-  /**
-   * Calibrate the average REAL row height from what is mounted — measured ONCE
-   * per mounted-count change, clamped, and NEVER re-entrant (no recomputeWindow
-   * here: a feedback loop between spacer height and window math is exactly the
-   * runaway that made the timeline unscrollable; measured earlier at
-   * scrollHeight 2.17M px).
-   *
-   * The estimate-vs-real mismatch is what made every window shift move content
-   * and fire another scroll event (the oscillation). Clamped to [40, 600] px:
-   * a one-off tall message (a huge diff) must not define the whole scrollbar.
-   */
-  useLayoutEffect(() => {
-    const el = contentRef.current;
-    if (!el) return;
-    const count = win.end - win.start;
-    if (count <= 0) return;
-    const real = el.scrollHeight / count;
-    if (!Number.isFinite(real)) return;
-    const clamped = Math.min(600, Math.max(40, real));
-    if (Math.abs(clamped - rowHRef.current) > 1) rowHRef.current = clamped;
-  }, [win.start, win.end, messages.length]);
 
-  /**
-   * Pin to the bottom ONLY for live streaming (new content appended while the
-   * user is already at the bottom) — and decide "at the bottom" from the DOM at
-   * effect time, never from the stickiness ref: layout effects run BEFORE the
-   * scroll event's rAF callback updates that ref, so a flag latched from the
-   * previous frame made every window flip yank the viewport back to the bottom
-   * (measured: 24 set(scrollHeight) writes during a 12-step upward wheel; the
-   * reported 「滚一下又回到之前的地方」).
-   *
-   * A window flip alone must NEVER move scrollTop: the spacers keep the total
-   * height stable, so the browser keeps the viewport where it is.
-   */
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -633,7 +561,7 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       const dist = current.scrollHeight - current.scrollTop - current.clientHeight;
       if (dist < 60) current.scrollTop = current.scrollHeight;
     });
-  }, [messages, isStreaming]);
+  }, [messages, isStreaming, visibleMessages]);
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current);
   }, []);
@@ -643,15 +571,11 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
     if (!el || revealLockedRef.current || hiddenCount <= 0) return;
     revealLockedRef.current = true;
     revealAnchorRef.current = { height: el.scrollHeight, top: el.scrollTop };
-    // Extend the window UPWARD toward the folded history.
-    setWin((w) => {
-      const start = Math.max(0, w.start - VISIBLE_STEP);
-      return start === w.start ? w : { ...w, start };
-    });
+    setVisibleCount((count) => Math.min(count + VISIBLE_STEP, messages.length));
   };
 
   return (
-    <div className="chat-scroll" ref={scrollRef} onScroll={onScrollWindowed} onWheel={(e) => {
+    <div className="chat-scroll" ref={scrollRef} onScroll={onScrollPosition} onWheel={(e) => {
       if (e.deltaY < 0 && e.currentTarget.scrollTop < 80) revealOlder();
     }}>
       {!timeline.booted && !bootTimedOut && <div className="chat-placeholder">{timeline.bootStage === "connecting" ? "正在连接远程 Pi…" : "正在启动 Pi…"}</div>}
@@ -663,11 +587,7 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       )}
       {messages.length === 0 && timeline.booted && <div className="chat-placeholder">输入问题开始对话（鼠标可直接点击、选中、编辑输入内容）</div>}
       {hiddenCount > 0 && <div className="chat-load-older" onClick={revealOlder}>↑ 更早的消息已折叠（还有 {hiddenCount} 条）— 点击或滚动到顶部加载</div>}
-      <div style={{ height: topH }} aria-hidden="true" />
-      <div ref={contentRef}>
-        {windowed.map((message) => <MessageView key={message.id} message={message} />)}
-      </div>
-      <div style={{ height: bottomH }} aria-hidden="true" />
+      {visibleMessages.map((message) => <MessageView key={message.id} message={message} />)}
       {timeline.compacting && <div className="chat-retry-banner">正在压缩上下文（compaction）…</div>}
       {timeline.retryInfo && <div className="chat-retry-banner">模型错误：{timeline.retryInfo.errorMessage} — 正在重试 {timeline.retryInfo.attempt}/{timeline.retryInfo.maxAttempts}（退避等待）…</div>}
       {timeline.steeringQueue.length > 0 && <div className="chat-queue-banner">⏳ 排队（当前回合后发送）：{timeline.steeringQueue.join(" · ")}</div>}

@@ -178,7 +178,15 @@ try {
       await new Promise((r) => setTimeout(r, 30));
       const afterFrame = el.scrollTop;
       await new Promise((r) => setTimeout(r, 150));
-      steps.push({ before, dir, afterFrame, afterSettle: el.scrollTop, scrollHeight: el.scrollHeight, msgCount: document.querySelectorAll('.chat-msg').length });
+      const rows = [...document.querySelectorAll('.chat-msg')];
+      const box = el.getBoundingClientRect();
+      // Does any mounted message overlap the visible band? A spacer-only viewport
+      // (blank while "scrolled") is exactly the reported failure mode.
+      const overlapping = rows.filter((r) => {
+        const b = r.getBoundingClientRect();
+        return b.bottom > box.top && b.top < box.bottom;
+      }).length;
+      steps.push({ before, dir, afterFrame, afterSettle: el.scrollTop, scrollHeight: el.scrollHeight, msgCount: rows.length, overlapping });
     };
     // The chat opens pinned at the bottom — start there, like the user does.
     el.scrollTop = el.scrollHeight;
@@ -189,6 +197,20 @@ try {
     for (let i = 0; i < 6; i += 1) await record(-240);
     // (c) return trip down:
     for (let i = 0; i < 4; i += 1) await record(240);
+    // (d) scroll ALL the way up: this crosses the "load older" boundary, where
+    //     content is prepended — the other place a windowed list goes blank or
+    //     jumps. Each step asserts the viewport still shows messages and the
+    //     position still lands where the wheel asked.
+    for (let i = 0; i < 30; i += 1) {
+      await record(-240);
+      if (el.scrollTop <= 8) break;
+    }
+    const older = document.querySelector('.chat-load-older');
+    steps.push({ before: el.scrollTop, dir: 0, afterFrame: el.scrollTop, afterSettle: el.scrollTop, scrollHeight: el.scrollHeight, msgCount: document.querySelectorAll('.chat-msg').length, overlapping: (() => {
+      const rows = [...document.querySelectorAll('.chat-msg')];
+      const box = el.getBoundingClientRect();
+      return rows.filter((r) => { const b = r.getBoundingClientRect(); return b.bottom > box.top && b.top < box.bottom; }).length;
+    })(), note: older ? older.textContent.trim().slice(0, 40) : 'all loaded' });
     return steps;
   })()`;
   const steps = await evaluateNamed(ws, 'steps', script, true);
@@ -201,17 +223,37 @@ try {
     // within tolerance of where the wheel PUT it. "Snap" = it came back toward
     // where it was (the reported bug).
     const expected = s.before + s.dir;
-    if (Math.abs(s.afterSettle - expected) < 80) held += 1;
-    // Snap-back only means something for an UPWARD step (the reported gesture).
-    if (s.dir < 0 && s.afterSettle > s.before - 40) snaps += 1;
-    console.log(`step ${i}: before=${s.before} afterFrame=${s.afterFrame} afterSettle=${s.afterSettle} msgs=${s.msgCount}`);
+    if (s.dir !== 0) {
+      if (Math.abs(s.afterSettle - expected) < 80) held += 1;
+      // Snap-back only means something for an UPWARD step (the reported gesture).
+      if (s.dir < 0 && s.afterSettle > s.before - 40) snaps += 1;
+    }
+    console.log(`step ${i}: before=${Math.round(s.before)} after=${Math.round(s.afterSettle)} dir=${s.dir} msgs=${s.msgCount} visibleMsgs=${s.overlapping}`);
   }
   console.log(`\nheld: ${held}/12  snapped back: ${snaps}/12`);
+  const blanks = steps.filter((x) => (x.overlapping ?? 0) === 0).length;
+  const frozen = steps.filter((x) => x.dir !== 0 && Math.abs(x.afterSettle - x.before) < 4).length;
+  const olderNote = steps.filter((x) => x.note).map((x) => x.note).join("");
+  console.log(`blank viewports: ${blanks}/${steps.length}   steps that did not move: ${frozen}/${steps.length}`);
+  if (blanks > 0) console.log("FAIL: the list went blank while scrolling");
+  if (frozen > 0) console.log("FAIL: a wheel step did not move the list");
+  console.log(`after scrolling to the top: ${olderNote || "(no note)"}`);
   const writes = await evaluateNamed(ws, "writes", `window.__diagWrites.slice(-30)`, true);
   console.log("scrollTop writes during the probe (newest last):");
   for (const w of writes ?? []) console.log(`  set(${w.v}) while at ${w.at}  <-  ${w.stack}`);
   if (consoleErrors.length) console.log("renderer exceptions:", consoleErrors.slice(0, 3));
-  console.log(snaps > 3 ? "\nBUG REPRODUCED (scroll snaps back)" : "\nscroll held — no repro in this run");
+  // A real gate: `npm run test:scroll` exits non-zero when any measured
+  // invariant regresses (position holds, never blank, always scrollable).
+  const problems = [];
+  if (snaps > 1) problems.push(`${snaps} upward step(s) snapped back`);
+  if (blanks > 0) problems.push(`${blanks} blank viewport(s) while scrolling`);
+  if (frozen > 0) problems.push(`${frozen} wheel step(s) did not move the list`);
+  if (problems.length > 0) {
+    console.log(`FAIL: ${problems.join("; ")}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`PASS: ${steps.length} steps — position held, no blank viewport, always scrollable`);
+  }
 } catch (e) {
   console.log("FAIL:", e instanceof Error ? e.message : String(e));
   process.exitCode = 1;
