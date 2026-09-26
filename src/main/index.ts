@@ -2460,7 +2460,18 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
    *  transcript: the renderer falls back to `get_messages` whenever this cannot
    *  produce one, so a pi format change degrades to "slow but correct" instead
    *  of blank chat (R4). */
-  ipcMain.handle("session:transcript-from-file", async (_e, tabId: string) => {
+  /**
+   * `tail`: open-without-parsing-twice. Opening a 684-message session used to
+   * hand the renderer EVERY message across the bridge, and React then mounted
+   * (or reconciled) all of it before the first paint. The renderer now asks for
+   * the LAST `tail` messages only; the answer carries `total` so the caller can
+   * stitch the tail onto what it already has (see chatStore.initMessages).
+   * The contract stays "ok:false on anything unusable" — a tail that cannot be
+   * verified is a full dump, never a partial transcript presented as truth.
+   */
+  ipcMain.handle(
+    "session:transcript-from-file",
+    async (_e, tabId: string, opts?: { tail?: number }) => {
     const tab = getTab(tabId);
     if (!tab) return { ok: false, reason: "tab gone" };
     if (!tab.remote && !tab.wsl) return { ok: false, reason: "local tab" };
@@ -2482,14 +2493,20 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
       if (messages.length !== expected) {
         return { ok: false, reason: `file behind pi state (${messages.length} != ${expected})` };
       }
-      debugLog("transcript", `tab ${tabId} from-file OK messages=${messages.length}`);
-      return { ok: true, messages };
+      const tail = typeof opts?.tail === "number" && opts.tail > 0 ? Math.floor(opts.tail) : undefined;
+      const sliced = tail !== undefined && messages.length > tail ? messages.slice(-tail) : messages;
+      debugLog(
+        "transcript",
+        `tab ${tabId} from-file OK messages=${messages.length}${sliced.length !== messages.length ? ` tail=${sliced.length}` : ""}`,
+      );
+      return { ok: true, messages: sliced, total: messages.length };
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       debugLog("transcript", `tab ${tabId} from-file FAILED ${reason}`);
       return { ok: false, reason };
     }
-  });
+  }
+  );
 
   ipcMain.handle("tab:rpc-switch-terminal", (_e, tabId: string) => {
     // Chat → terminal: local SDK-backed chat tabs respawn the pty TUI;

@@ -444,3 +444,38 @@ assistant 的回复」。
   切换「导图/完整」时重新计算窗口并把"当前"滚回可见区（否则按旧行高算出的偏移全错）。
 - 真机 smoke 新增 2 项：导图行 100% 是卡片结构（speaker/text 行齐全）、切「完整」后
   同一弹窗不再有卡片（34/34）。
+
+## 性能：打开慢 / 对话滑动卡 / 分支树滑动导航卡（2026-09-26）
+
+用 codebase-design 的框架看，三个症状是同一个病：**接口没有"增量"这个维度，调用方被迫每次
+接住全量**。
+
+### 对话打开卡顿（接口缺增量）
+打开一条 672–684 条消息的远程会话：`session:transcript-from-file` 读全文件 → 全量解析 →
+**684 条消息整个跨桥 → `initMessages` 整体替换 → React 重新挂载/对账全部气泡**。真实日志里
+一次导航触发的 3 次连续全量快照（00:29:08 / 00:29:27 / 00:29:41）每次都是 684 条。
+- `session:transcript-from-file` 接口加 `{ tail }`：校验不变（messageCount 比对、失败一律
+  `ok:false`），但只跨桥传**尾部 N 条** + `total`。
+- `chatStore.initMessages` 加 `tailOf`：快照带 `{total}` 时**保留已渲染的更早历史**（对象
+  身份不变 → memo 直接跳过），只把尾部接上去；不带 `tailOf` 仍是整体替换（fork/导航）。
+- `TRANSCRIPT_TAIL_MESSAGES = 120`：延迟/回滚量的取舍，常量集中一处。
+
+### 对话滑动卡（浅模块把可见性成本漏给每条消息）
+`ChatTimeline` 的 `slice(-visibleCount)` 是"只增不减"的窗口：向上滚一次，全部已揭示消息永远
+挂载；流式期间每个 delta 让 React 对**整条时间线**做 reconcile。`Markdown` 的
+`remarkPlugins={[...]}` 内联数组让 memo 形同虚设（每次渲染新身份 → 兄弟消息流一个 token
+也会重跑全部已完成消息的 remark + highlight）。
+- 时间线改成**双向窗口 + 恒定总高**（顶/底 spacer，与分支树同一套数学），向上展开用
+  `revealOlder` 扩窗 + 既有 anchor 校正滚动位置。
+- `Markdown` 的插件数组提为模块常量；`a` 组件按 `currentPath` 缓存包装（身份稳定），
+  `img` 走 memo 化的 `MarkdownImage`。
+
+### 分支树滑动/导航卡（渲染路径上的重复计算）
+导航轮询每秒一次，光标轮询"无新条目"时 `entries = prev.entries` 恒等 —— 但**替换分支**每次
+都 `entries = batch`（新身份），下游 build/projection/flatten/visibility/fold 全部重算，
+2778 条 × 每秒 × 整个弹窗生命周期。
+- `applySnapshot` 增加**身份快速路径**：`prev.entries === entries` 直接返回（setError 等
+  无关状态照常）；替换分支在内容相同时保留原数组身份（`sameEntries` 逐项比对，O(n) 但无
+  分配）。真身是：**身份稳定 > 内容比较**，内容比较只是兜底。
+
+反向验证：去掉 tail 拼接 → `initMessages tail stitching` 用例失败。

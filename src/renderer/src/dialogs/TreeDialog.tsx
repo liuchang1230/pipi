@@ -406,6 +406,16 @@ export function TreeDialog({
      *  A cursor response carries only the NEW entries (append), a full one
      *  replaces the list — the session is append-only, so appending is exact and
      *  keeps the abandoned branches we already have. */
+    /** Identity-preserving compare of two entry lists (id+parent+type+time). */
+    const sameEntries = (a: TreeEntry[], b: TreeEntry[]): boolean => {
+      if (a === b) return true;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i += 1) {
+        const x = a[i]!, y = b[i]!;
+        if (x.id !== y.id || x.type !== y.type || x.parentId !== y.parentId || x.timestamp !== y.timestamp) return false;
+      }
+      return true;
+    };
     const applySnapshot = (batch: TreeEntry[], nextLeaf: string | null, mode: "replace" | "append") => {
       const prev = lastSnapshotRef.current;
       let entries: TreeEntry[];
@@ -415,13 +425,28 @@ export function TreeDialog({
         for (const e of fresh) known.add(e.id);
         entries = fresh.length > 0 ? [...prev.entries, ...fresh] : prev.entries;
       } else {
-        entries = batch;
+        // A replace whose content equals what we already render (a poll answered
+        // with the full list because the cursor was just reset) must not fork the
+        // array identity: every useMemo below keys on it.
+        entries = prev && sameEntries(prev.entries, batch) ? prev.entries : batch;
         knownEntryIdsRef.current = new Set(batch.map((e) => e.id));
       }
       const lastId = entries.length ? entries[entries.length - 1]!.id : null;
       // Advance the cursor for the next poll (never move it backwards).
       if (lastId) entriesCursorRef.current = lastId;
       const prevLeaf = prev?.leafId ?? null;
+      // Fast path FIRST: an identical array identity (the append branch reuses
+      // prev.entries when a poll found nothing new) means nothing below — the
+      // tree, the projection, the flat list, every memo — can be skipped. The
+      // navigation poll relied on the element-wise compare below for this, which
+      // still walked 2778 entries every second and, in append mode, allocated a
+      // fresh `[...prev.entries]` so the compare never saw "same" anyway.
+      if (prev && prevLeaf === nextLeaf && prev.entries === entries) {
+        setError(null);
+        setTreeStatus("ready");
+        setSlowTicks(0);
+        return;
+      }
       if (prev && prevLeaf === nextLeaf && prev.entries.length === entries.length) {
         let same = true;
         for (let i = 0; i < entries.length; i++) {

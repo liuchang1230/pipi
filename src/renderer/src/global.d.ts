@@ -288,7 +288,10 @@ declare global {
         list: (cwd?: string) => Promise<SessionListItem[]>;
         /** Attempt a transcript from the session file. `ok: false` means "fall
          *  back to get_messages", not "failed". */
-        transcriptFromFile: (tabId: string) => Promise<{ ok: true; messages: unknown[] } | { ok: false; reason: string }>;
+        transcriptFromFile: (
+          tabId: string,
+          opts?: { tail?: number },
+        ) => Promise<{ ok: true; messages: unknown[]; total: number } | { ok: false; reason: string }>;
         listProjects: () => Promise<string[]>;
         listRemote: (target: TargetRef, remoteCwd?: string) => Promise<RemoteSessionListResult>;
         delete: (path: string, target?: TargetRef) => Promise<{ ok: boolean; error?: string }>;

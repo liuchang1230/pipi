@@ -428,8 +428,11 @@ const api = {
      *  so a pi format change degrades to "slow but correct" instead of blank
      *  chat. Keeps the multi-MB history off the RPC command loop, which is what
      *  makes a remote agent look stuck. */
-    transcriptFromFile: (tabId: string): Promise<{ ok: true; messages: unknown[] } | { ok: false; reason: string }> =>
-      ipcRenderer.invoke("session:transcript-from-file", tabId),
+    transcriptFromFile: (
+      tabId: string,
+      opts?: { tail?: number },
+    ): Promise<{ ok: true; messages: unknown[]; total: number } | { ok: false; reason: string }> =>
+      ipcRenderer.invoke("session:transcript-from-file", tabId, opts),
     listProjects: (): Promise<string[]> =>
       ipcRenderer.invoke("session:list-projects"),
     listRemote: (target: IpcTargetRef, remoteCwd?: string): Promise<RemoteSessionListResult> =>

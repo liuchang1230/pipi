@@ -205,7 +205,14 @@ interface ChatStore {
    *  memory grew with every session the user ever opened. */
   retainTabs: (liveTabIds: Set<string>) => void;
   applyEvent: (tabId: string, event: Record<string, unknown>) => void;
-  initMessages: (tabId: string, messages: unknown[]) => void;
+  /**
+   * Apply a history snapshot. `tailOf` marks the snapshot as the LAST
+   * `messages.length` of `tailOf.total` messages: the already-rendered older
+   * history is kept instead of being re-created (and re-parsed, and re-mounted)
+   * from scratch — opening a big session then only costs the new tail.
+   * Omit `tailOf` for a full snapshot (first open, fork/navigation).
+   */
+  initMessages: (tabId: string, messages: unknown[], tailOf?: { total: number }) => void;
   markHistoryLoading: (tabId: string) => void;
   /** displayText is kept in the chat bubble; message is the private expanded
    * payload sent to Pi (for example @file contents). */
@@ -731,8 +738,12 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     }));
   },
 
-  initMessages: (tabId, messages) => {
+  initMessages: (tabId, messages, tailOf) => {
     get().ensure(tabId);
+    // A tail snapshot keeps the history the user is already looking at: the
+    // transcript before it is untouched (same identities → same mounted rows).
+    const keepCount = tailOf ? Math.max(0, tailOf.total - messages.length) : 0;
+    const previous = tailOf ? get().states[tabId]?.messages ?? [] : [];
     const chatMessages: ChatMessage[] = [];
     const toolResults: ToolResultLike[] = [];
     for (const raw of messages) {
@@ -769,12 +780,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       }
     }
     attachToolResults(chatMessages, toolResults);
+    const kept = keepCount > 0 ? previous.slice(0, keepCount) : [];
+    const merged = kept.length > 0 ? [...kept, ...chatMessages] : chatMessages;
     set((s) => ({
       states: {
         ...s.states,
         [tabId]: {
           ...s.states[tabId]!,
-          messages: chatMessages,
+          messages: merged,
           booted: true,
           historyLoaded: true,
           // A history reload must not clear live output that arrived after

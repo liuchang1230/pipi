@@ -6,6 +6,7 @@
  * is toggled via CSS `data-theme` so it follows the app theme.
  */
 import React, { memo, useEffect, useState } from "react";
+import type { PluggableList } from "unified";
 import ReactMarkdown from "react-markdown";
 import { openExternalSafe } from "./openExternal";
 import { useViewerStore } from "./stores/viewerStore";
@@ -93,6 +94,61 @@ const MarkdownImage = memo(function MarkdownImage({
   return <span className="markdown-img-loading"><Icon name="image" /> 图片加载中…</span>;
 });
 
+/**
+ * Plugin/config arrays are hoisted to module level: React.memo compares props
+ * shallowly, and an inline `[remarkGfm]` array was a NEW identity on every
+ * render, so every parent re-render (a streamed token on a SIBLING message is
+ * enough) re-ran remark+rehype-highlight for every already-finished message.
+ * With stable identities the memo actually stops that work.
+ */
+const REMARK_PLUGINS: PluggableList = [remarkGfm];
+/** Tilde-as-strikethrough off (see the note in Markdown below). */
+const REMARK_PLUGINS_NO_STRIKE: PluggableList = [
+  remarkGfm,
+  // remark-gfm's options object keyed by plugin — cast because Pluggable is a
+  // function union and the option-tuple form is valid at runtime.
+  [remarkGfm, { singleTilde: false }] as unknown as NonNullable<PluggableList[number]>,
+];
+const REHYPE_PLUGINS: PluggableList = [rehypeHighlight];
+const MarkdownImageComponent = (props: { src?: string; alt?: string; node?: unknown }) => (
+  <MarkdownImage src={props.src} alt={props.alt} />
+);
+
+/** Anchor needs the Markdown instance's `currentPath`, so it is bound
+ *  per-render — but cached by path, so identities stay stable while a message
+ *  is mounted and the memo keeps working. */
+type AnchorProps = React.ComponentProps<"a"> & { node?: unknown };
+const anchorCache = new Map<string, (props: AnchorProps) => React.JSX.Element>();
+function anchorFor(currentPath: string | undefined): (props: AnchorProps) => React.JSX.Element {
+  const key = currentPath ?? "";
+  let cached = anchorCache.get(key);
+  if (!cached) {
+    cached = (props) => (
+      <a
+        {...(props as React.AnchorHTMLAttributes<HTMLAnchorElement>)}
+        onClick={async (e) => {
+          e.preventDefault();
+          const href = (props as { href?: string }).href;
+          if (!href) return;
+          const resolved = await window.api.file.resolveLink({
+            currentPath,
+            href,
+            tabId: useViewerStore.getState().currentFile?.tabId,
+            rootPath: useViewerStore.getState().currentFile?.rootPath,
+          });
+          if (resolved.ok) {
+            await useViewerStore.getState().openFile(resolved.relPath, false, { tabId: resolved.tabId, rootPath: resolved.rootPath });
+          } else {
+            openExternalSafe(href);
+          }
+        }}
+      />
+    );
+    anchorCache.set(key, cached);
+  }
+  return cached;
+}
+
 const Markdown = memo(function Markdown({ content, plainCode = false, disableStrikeThrough = false, className, onContextMenu, currentPath }: MarkdownProps) {
   // Terminal/TUI transcripts frequently use tilde characters as literal
   // numeric-range decoration (for example `0.05~0.1`). GFM's default
@@ -103,34 +159,9 @@ const Markdown = memo(function Markdown({ content, plainCode = false, disableStr
   return (
     <div className={`markdown-body${className ? ` ${className}` : ""}`} onContextMenu={onContextMenu}>
       <ReactMarkdown
-        remarkPlugins={[disableStrikeThrough ? [remarkGfm, { singleTilde: false }] : remarkGfm]}
-        rehypePlugins={plainCode ? [] : [rehypeHighlight]}
-        components={{
-          // Open links externally instead of navigating inside Electron.
-          a: ({ node, ...props }) => (
-            <a
-              {...props}
-              onClick={async (e) => {
-                e.preventDefault();
-                if (!props.href) return;
-                const resolved = await window.api.file.resolveLink({
-                  currentPath,
-                  href: props.href,
-                  tabId: useViewerStore.getState().currentFile?.tabId,
-                  rootPath: useViewerStore.getState().currentFile?.rootPath,
-                });
-                if (resolved.ok) {
-                  await useViewerStore.getState().openFile(resolved.relPath, false, { tabId: resolved.tabId, rootPath: resolved.rootPath });
-                } else {
-                  openExternalSafe(props.href);
-                }
-              }}
-            />
-          ),
-          img: ({ node, ...props }) => (
-            <MarkdownImage src={props.src} alt={props.alt} currentPath={currentPath} />
-          ),
-        }}
+        remarkPlugins={disableStrikeThrough ? REMARK_PLUGINS_NO_STRIKE : REMARK_PLUGINS}
+        rehypePlugins={plainCode ? [] : REHYPE_PLUGINS}
+        components={{ a: anchorFor(currentPath), img: MarkdownImageComponent }}
       >
         {markdownContent}
       </ReactMarkdown>

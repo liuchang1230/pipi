@@ -1140,3 +1140,40 @@ describe("chatStore: several prompts outstanding at once", () => {
     expect(users.map((m) => m.blocks.map((b) => (b.kind === "text" ? b.text : "")).join(""))).toEqual(["第一问", "第二问"]);
   });
 });
+
+/**
+ * 打开速度：文件快照只跨桥传「尾部 N 条」，store 必须把尾部接续到已渲染的更早历史上，
+ * 而不是整个重建（那会让每次打开都重新挂载全部消息）。
+ */
+describe("initMessages tail stitching", () => {
+  it("keeps older history and appends the tail snapshot", () => {
+    useChatStore.getState().ensure(T);
+    useChatStore.setState((s) => ({
+      states: {
+        ...s.states,
+        [T]: { ...s.states[T]!, messages: [{ id: "old-1", role: "user" as const, status: "done" as const, blocks: [{ kind: "text" as const, contentIndex: 0, text: "早先的问题", done: true }] }] },
+      },
+    }));
+    useChatStore.getState().initMessages(
+      T,
+      [
+        { id: "mid-1", role: "assistant", content: [{ type: "text", text: "较早的回答" }] },
+        { id: "new-1", role: "user", content: [{ type: "text", text: "最新提问" }] },
+      ],
+      { total: 3 },
+    );
+    const msgs = useChatStore.getState().states[T]!.messages;
+    expect(msgs.map((m) => m.id)).toEqual(["old-1", "mid-1", "new-1"]);
+    // identities of the untouched prefix survive (same objects → memo skips them)
+    expect(useChatStore.getState().states[T]!.messages[0]!.blocks[0]).toMatchObject({ text: "早先的问题" });
+  });
+
+  it("replaces everything for a full snapshot (no tailOf)", () => {
+    useChatStore.getState().ensure(T);
+    useChatStore.setState((s) => ({
+      states: { ...s.states, [T]: { ...s.states[T]!, messages: [{ id: "stale", role: "user" as const, status: "done" as const, blocks: [{ kind: "text" as const, contentIndex: 0, text: "旧", done: true }] }] } },
+    }));
+    useChatStore.getState().initMessages(T, [{ id: "fresh", role: "user", content: [{ type: "text", text: "新会话" }] }]);
+    expect(useChatStore.getState().states[T]!.messages.map((m) => m.id)).toEqual(["fresh"]);
+  });
+});

@@ -12,6 +12,7 @@ import Markdown from "../Markdown";
 import { useChatStore, exitBannerText, type ChatBlock, type ChatMessage } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
+import { parseModeStatus, parseModeTodos, useSessionMode, MODE_RPC_ID_PREFIX, type SessionMode } from "./useSessionMode";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import {
   QuestionnaireDialog,
@@ -83,6 +84,13 @@ const HISTORY_REQUEST_TIMEOUT_MS = 120_000;
  *  single-flight gate claimed forever — so the caller bounds it too and falls
  *  back to RPC. */
 const TRANSCRIPT_FILE_TIMEOUT_MS = 60_000;
+/**
+ * How many messages a file-first open crosses the bridge with. The store keeps
+ * the already-rendered older history, so this is a latency/scrollback trade:
+ * big enough that a fresh open has real content, small enough that a reopen of
+ * a 600+ message session paints in one frame instead of mounting everything.
+ */
+const TRANSCRIPT_TAIL_MESSAGES = 120;
 import {
   commandTokenAt,
   fetchCommands,
@@ -457,6 +465,16 @@ function ChatNotices() {
 // react-markdown + highlight.js freezes the UI for seconds. Render only the
 // most recent chunk and reveal older messages on scroll-up.
 const INITIAL_VISIBLE = 60;
+/**
+ * Estimated pixel height of ONE rendered chat message, used by the window math.
+ * Messages genuinely vary (a one-liner vs a 200-line diff), so this is an
+ * ESTIMATE: the margin rows on both sides absorb the error, and the scroll
+ * anchoring below corrects drift after every mount. Fixed 40px-per-row math
+ * would jitter; the estimate + margin keeps the scrollbar usable instead of
+ * exact.
+ */
+const CHAT_ROW_FALLBACK_H = 72;
+const WINDOW_MARGIN_ROWS = 8;
 const VISIBLE_STEP = 60;
 
 // --- Stream-isolated timeline ----------------------------------------------
@@ -497,14 +515,53 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
     };
   }));
   const { messages, isStreaming } = timeline;
-  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
+  // Scroll state. Windowing (below) needs the element + stickiness refs, and the
+  // reveal-anchor machinery keeps "load older" from jumping the viewport.
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const revealAnchorRef = useRef<{ height: number; top: number } | null>(null);
   const revealLockedRef = useRef(false);
   const scrollFrameRef = useRef<number | null>(null);
-  const visibleMessages = useMemo(() => messages.slice(-visibleCount), [messages, visibleCount]);
-  const hiddenCount = messages.length - visibleMessages.length;
+  // Two-sided windowing with constant total height (top + bottom spacers) — the
+  // same math the tree dialog uses. The old tail-slice mounted every revealed
+  // message forever: scrolling up grew the list, and each streamed delta made
+  // React reconcile ALL of it, which is the reported 滑动卡顿 on long sessions.
+  const [win, setWin] = useState({ start: 0, end: INITIAL_VISIBLE });
+  const winRef = useRef(win);
+  winRef.current = win;
+  const rafRef = useRef<number | null>(null);
+  const recomputeWindow = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const start = Math.max(0, Math.floor(el.scrollTop / CHAT_ROW_FALLBACK_H) - WINDOW_MARGIN_ROWS);
+    const count = Math.ceil(el.clientHeight / CHAT_ROW_FALLBACK_H) + WINDOW_MARGIN_ROWS * 2;
+    setWin((w) => (w.start === start && w.end === start + count ? w : { start, end: start + count }));
+  }, []);
+  const onScrollWindowed = useCallback(() => {
+    if (rafRef.current !== null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      recomputeWindow();
+      const el = scrollRef.current;
+      if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    });
+  }, [recomputeWindow]);
+  useEffect(() => () => {
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+  }, []);
+  // Streaming appends at the bottom: keep the window pinned there while the user
+  // is at the bottom (the stick-to-bottom layout effect handles scrollTop).
+  useEffect(() => {
+    setWin((w) => {
+      const end = Math.min(messages.length, Math.max(w.end, Math.min(INITIAL_VISIBLE, messages.length)));
+      const start = Math.max(0, end - Math.max(INITIAL_VISIBLE, w.end - w.start));
+      return start === w.start && end === w.end ? w : { start, end };
+    });
+  }, [messages.length]);
+  const windowed = useMemo(() => messages.slice(win.start, win.end), [messages, win]);
+  const topH = win.start * CHAT_ROW_FALLBACK_H;
+  const bottomH = Math.max(0, messages.length - win.end) * CHAT_ROW_FALLBACK_H;
+  const hiddenCount = win.start;
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -522,7 +579,7 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       const current = scrollRef.current;
       if (current && stickToBottom.current) current.scrollTop = current.scrollHeight;
     });
-  }, [messages, isStreaming, visibleMessages]);
+  }, [messages, isStreaming, windowed]);
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current);
   }, []);
@@ -532,14 +589,15 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
     if (!el || revealLockedRef.current || hiddenCount <= 0) return;
     revealLockedRef.current = true;
     revealAnchorRef.current = { height: el.scrollHeight, top: el.scrollTop };
-    setVisibleCount((count) => Math.min(count + VISIBLE_STEP, messages.length));
+    // Extend the window UPWARD toward the folded history.
+    setWin((w) => {
+      const start = Math.max(0, w.start - VISIBLE_STEP);
+      return start === w.start ? w : { ...w, start };
+    });
   };
 
   return (
-    <div className="chat-scroll" ref={scrollRef} onScroll={(e) => {
-      const el = e.currentTarget;
-      stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    }} onWheel={(e) => {
+    <div className="chat-scroll" ref={scrollRef} onScroll={onScrollWindowed} onWheel={(e) => {
       if (e.deltaY < 0 && e.currentTarget.scrollTop < 80) revealOlder();
     }}>
       {!timeline.booted && !bootTimedOut && <div className="chat-placeholder">{timeline.bootStage === "connecting" ? "正在连接远程 Pi…" : "正在启动 Pi…"}</div>}
@@ -551,7 +609,9 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       )}
       {messages.length === 0 && timeline.booted && <div className="chat-placeholder">输入问题开始对话（鼠标可直接点击、选中、编辑输入内容）</div>}
       {hiddenCount > 0 && <div className="chat-load-older" onClick={revealOlder}>↑ 更早的消息已折叠（还有 {hiddenCount} 条）— 点击或滚动到顶部加载</div>}
-      {visibleMessages.map((message) => <MessageView key={message.id} message={message} />)}
+      <div style={{ height: topH }} aria-hidden="true" />
+      {windowed.map((message) => <MessageView key={message.id} message={message} />)}
+      <div style={{ height: bottomH }} aria-hidden="true" />
       {timeline.compacting && <div className="chat-retry-banner">正在压缩上下文（compaction）…</div>}
       {timeline.retryInfo && <div className="chat-retry-banner">模型错误：{timeline.retryInfo.errorMessage} — 正在重试 {timeline.retryInfo.attempt}/{timeline.retryInfo.maxAttempts}（退避等待）…</div>}
       {timeline.steeringQueue.length > 0 && <div className="chat-queue-banner">⏳ 排队（当前回合后发送）：{timeline.steeringQueue.join(" · ")}</div>}
@@ -616,6 +676,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     };
   }));
   const activeTab = useTabsStore((s) => s.activeTab);
+  const sessionMode = useSessionMode(tabId);
   const [input, setInput] = useState("");
   const [uiReq, setUiReq] = useState<UiRequest | null>(null);
   // Full multi-question UI for ask_user_question (parity with the TUI): the
@@ -777,10 +838,10 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     historyLoadedRef.current = false;
     useChatStore.getState().markHistoryLoading(tabId);
 
-    const apply = (messages: unknown[] | undefined) => {
+    const apply = (messages: unknown[] | undefined, tailOf?: { total: number }) => {
       if (seq !== historyRequestSeq.current || !messages) return;
       historyLoadedRef.current = true;
-      useChatStore.getState().initMessages(tabId, messages);
+      useChatStore.getState().initMessages(tabId, messages, tailOf);
     };
 
     void (async () => {
@@ -794,10 +855,14 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         // anything it cannot serve — that is NOT an error, it is the cue to
         // fall through to RPC, so a pi format change degrades to "slow but
         // correct" rather than blank or stale chat.
-        const file = await withTimeout(window.api.session.transcriptFromFile(tabId), TRANSCRIPT_FILE_TIMEOUT_MS);
+        // Ask for the TAIL of the transcript: the older history is already on
+        // screen (or arrives with the next full snapshot), so crossing the
+        // bridge with 600+ messages only added open latency. `total` lets the
+        // store stitch the tail onto what is rendered.
+        const file = await withTimeout(window.api.session.transcriptFromFile(tabId, { tail: TRANSCRIPT_TAIL_MESSAGES }), TRANSCRIPT_FILE_TIMEOUT_MS);
         if (seq !== historyRequestSeq.current) return;
         if (file?.ok) {
-          apply(file.messages);
+          apply(file.messages, { total: file.total });
           return;
         }
       }
@@ -928,6 +993,13 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         }
         return;
       }
+      if (event.type === "response" && typeof event.id === "string" && event.id.startsWith(MODE_RPC_ID_PREFIX)) {
+        // /mode dispatch completion: the authoritative state arrives via the
+        // extension's setStatus push (converted to mode_status in onRpcUiRequest).
+        // Consume the response frame here so the generic applyEvent never sees
+        // this foreign prompt-response shape.
+        return;
+      }
       if (event.type === "response" && event.command === "get_available_models") {
         const data = event.data as { models?: Array<{ id: string; name?: string; provider?: string }> } | undefined;
         if (data?.models) setModelList(data.models);
@@ -1046,6 +1118,27 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     const offExit = window.api.onRpcExit(tabId, (info) => useChatStore.getState().markExited(tabId, info));
     const offUi = window.api.onRpcUiRequest(tabId, (raw) => {
       const req = raw as unknown as UiRequest;
+      // Session-mode status/widget pushes from the pipi-mode-switch extension:
+      // convert the machine-readable setStatus text (and the plan-todos
+      // widget) into store events before the generic fire-and-forget swallow.
+      if (req.method === "setStatus" && req.statusKey === "pipi-mode") {
+        const parsed = parseModeStatus(String(req.statusText ?? ""));
+        if (parsed) {
+          useChatStore.getState().applyEvent(tabId, { type: "mode_status", ...parsed });
+          return;
+        }
+      }
+      if (req.method === "setWidget" && req.widgetKey === "pipi-mode-todos") {
+        // Field name differs by backend: pi RPC mode emits `widgetLines`,
+        // the SDK worker emits `widgetContent` (same payload).
+        const content = (req as { widgetContent?: unknown; widgetLines?: unknown }).widgetContent ??
+          (req as { widgetLines?: unknown }).widgetLines;
+        useChatStore.getState().applyEvent(tabId, {
+          type: "mode_status",
+          todos: Array.isArray(content) ? parseModeTodos(content as string[]) : undefined,
+        });
+        return;
+      }
       const consumed = handleFireAndForget(req, (text) => {
         setInput(text);
         requestAnimationFrame(() => {
@@ -2168,6 +2261,13 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           />
         )}
         <SkillChips skills={skillCommands} onInsert={insertSkill} />
+        {sessionMode.mode === "auto" && sessionMode.progress && sessionMode.progress.total > 0 && sessionMode.todos && (
+          <div className="chat-mode-widget" role="status">
+            {sessionMode.todos.map((t, i) => (
+              <div key={i} className={`chat-mode-todo${t.completed ? " done" : ""}`}>{t.text}</div>
+            ))}
+          </div>
+        )}
         <textarea
           ref={taRef}
           className="chat-textarea"
@@ -2205,6 +2305,35 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           spellCheck={false}
         />
         <div className="chat-input-bar">
+          {sessionMode.available !== false && (
+            <div
+              className="chat-mode-switch"
+              role="radiogroup"
+              aria-label="会话模式"
+              title="自动 = 完全自主 · 计划 = 只读出计划 · 编辑 = 写操作逐个确认"
+            >
+              {([
+                { value: "auto" as SessionMode, label: "自动" },
+                { value: "plan" as SessionMode, label: "计划" },
+                { value: "edit" as SessionMode, label: "编辑" },
+              ]).map((m) => (
+                <button
+                  key={m.value}
+                  role="radio"
+                  aria-checked={sessionMode.mode === m.value}
+                  className={
+                    "chat-mode-btn" +
+                    (sessionMode.mode === m.value ? ` active ${m.value}` : "") +
+                    (sessionMode.available === undefined || sessionMode.switching ? " pending" : "")
+                  }
+                  disabled={sessionMode.available === false || sessionMode.switching}
+                  onClick={() => sessionMode.setMode(m.value)}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          )}
           <span className="chat-input-stats" title="会话用量（输入↑ / 输出↓ / 缓存读取 / 上下文占用）">
             {stats
               ? (() => {
