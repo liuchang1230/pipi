@@ -479,3 +479,26 @@ assistant 的回复」。
   分配）。真身是：**身份稳定 > 内容比较**，内容比较只是兜底。
 
 反向验证：去掉 tail 拼接 → `initMessages tail stitching` 用例失败。
+
+## 性能度量而不是手感 (2026-09-26)
+
+用户指出（完全正确）：「打开快不快、滑动顺不顺，完全可以根据响应时间来判断，而不是手感」。
+新增 `scripts/perf-transcript.mjs`：构造与用户会话同形状的合成会话文件（684 条消息 /
+4104 条目 / 1.35 MB，含 edit 工具调用噪声），用 Vite 的 SSR 管线加载**应用的真实模块**
+（tree-from-file / transcript-from-file / chatStore / tree-build / tree-layout /
+tree-mindmap / Markdown），输出一张数字表。
+
+684 条消息（用户当前会话的形状）：
+
+| 阶段 | 全量（旧） | 尾部（新） |
+|---|---|---|
+| main 解析+解析 | 16 ms | 同左（必须整文件） |
+| 跨桥载荷 | 0.96 MB | **0.03 MB**（120 条） |
+| `initMessages` | 36 ms（重建全部） | **<1 ms**（保留旧历史，只接尾部） |
+| Markdown 每条 | 5.7 ms → 全挂载合计 **≈15.7 s** | 窗口化只挂可见行 |
+
+2000 条消息外推：全量 `initMessages` 261 ms + 跨桥 2.81 MB；尾部路径 0.03 MB 不变。
+树管线：build 4.3 ms / flatten 5.5 ms / 导图压缩+flatten 3.0 ms —— 这些正是"身份快速路径"
+每次轮询省下的东西（导航轮询每秒一次，若无变化现在为零成本）。
+
+运行方式：`node scripts/perf-transcript.mjs [messages] [entriesPerMessage]`。
