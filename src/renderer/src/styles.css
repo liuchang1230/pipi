@@ -2319,6 +2319,91 @@ textarea:focus-visible,
 }
 .chat-btn.stop {
   color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+/* --- Session mode switch (自动 / 计划 / 编辑) ---
+   Segmented control in the input bar, same visual vocabulary as
+   .viewer-modes. The active segment takes the mode's color: plan = warning
+   (read-only caution), edit = accent, auto = neutral text. */
+.chat-mode-switch {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--bg-input) 60%, transparent);
+}
+.chat-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1.5;
+  padding: 2px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.chat-mode-btn:hover:not(:disabled):not(.active) {
+  color: var(--text);
+  background: var(--hover);
+}
+.chat-mode-btn:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.chat-mode-btn.pending:not(.active) {
+  opacity: 0.6;
+}
+.chat-mode-btn.active {
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+.chat-mode-btn.active.plan {
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+}
+.chat-mode-btn.active.edit {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+/* Plan-execution progress widget (above the textarea, during exec). */
+.chat-mode-widget {
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-input) 60%, transparent);
+  padding: 5px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chat-mode-todo {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-mode-todo::before {
+  content: "☐ ";
+  color: var(--text-dim);
+}
+.chat-mode-todo.done {
+  color: var(--text-dim);
+  text-decoration: line-through;
+}
+.chat-mode-todo.done::before {
+  content: "☑ ";
+  color: var(--success);
+  text-decoration: none;
 }
 
 /* --- Chat model switch menu --- */
@@ -2807,8 +2892,9 @@ textarea:focus-visible,
   color: var(--text);
 }
 .ui-confirm-toggle {
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 11px;
+  align-self: center;
 }
 .ui-confirm-hint {
   margin-top: 8px;
@@ -2821,12 +2907,16 @@ textarea:focus-visible,
    rows are the CONVERSATION, so they read as prose rather than as a log: a
    proportional font, a speaker pill, and one ellipsised line per message.
    The full view keeps the monospace log style. */
-.tree-dialog .tree-row-mind {
+/* NOTE: the height for 导图 rows lives in the "Session tree dialog" section BELOW
+   the base `.tree-dialog .tree-row { height: 24px }` rule — an equally specific
+   rule placed above it silently lost, the cards (≈44px of content) overflowed a
+   24px row and painted over their neighbours, and the JS window math (which
+   assumes MIND_ROW_H=46) drifted by (46−24)×index. Both symptoms came from that
+   one ordering mistake; see scripts/diagnose-tree-rows.mjs. */
+.tree-dialog .tree-scroll .tree-row-mind {
   font-family: -apple-system, "Segoe UI", system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
   font-size: 12px;
   gap: 6px;
-  /* Card rows: speaker line + text line. Must equal MIND_ROW_H in TreeDialog.tsx. */
-  height: 46px;
   align-items: center;
   padding: 3px 8px 3px 0;
   line-height: 1.35;
@@ -2838,7 +2928,11 @@ textarea:focus-visible,
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding: 5px 9px;
+  /* head 14px + text line + padding + border must stay inside MIND_ROW_H (46px). */
+  padding: 4px 9px;
+  box-sizing: border-box;
+  max-height: 100%;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-left: 3px solid color-mix(in srgb, var(--text-dim) 55%, transparent);
   border-radius: 7px;
@@ -3001,6 +3095,18 @@ textarea:focus-visible,
   cursor: pointer;
   line-height: 24px;
   white-space: nowrap;
+  /* The window math in TreeDialog.tsx positions rows by ROW_H/MIND_ROW_H; a row
+     that grows past its slot paints over the next one (「会话都重叠了」). Pin the
+     height and clip, so geometry can never disagree with the math. */
+  box-sizing: border-box;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+/* 导图 rows are cards: speaker line + text line. MUST equal MIND_ROW_H. */
+.tree-dialog .tree-scroll .tree-row-mind {
+  height: 46px;
+  min-height: 46px;
+  max-height: 46px;
 }
 .tree-dialog .tree-row:hover {
   background: var(--hover);

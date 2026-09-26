@@ -561,3 +561,27 @@ held 18/18、snap 0、全程应用侧 scrollTop 写入 0 次。反向验证：�
 一路滚到顶跨过"加载更早"边界，并记录 `scrollTop` 写入者）：
 `blank viewports: 0/49`、`steps that did not move: 0/49`、`PASS`，三连跑全绿；
 全程应用侧只写一次 scrollTop（加载更早时的锚点补偿）。脚本已装成门禁（失败 exit 1）。
+
+## 分支窗口「会话都重叠了」：CSS 规则顺序 + 常量不一致 (2026-09-26)
+
+`/diagnose` 反馈环：`scripts/diagnose-tree-rows.mjs`（`npm run test:tree-rows`）——打包版真机
++ CDP，打开分支窗口后在 6 个滚动位置 + 「完整」视图测量每一行的几何：行高、相邻行是否重叠、
+是否有行落在视口内（空白判定）、**卡片内容是否超出所在行**（溢出的卡片就会盖住邻居）。
+
+**Phase 2 复现（修复前实测）**：导图行 `heights: [24]` —— 而 JS 窗口数学假设 46px。
+
+**Phase 3-4 根因（两个缺陷叠加，同一处）**：
+1. `.tree-dialog .tree-row-mind { height: 46px }` 写在了 `.tree-dialog .tree-row { height: 24px }`
+   **之前**，二者特异性相同（0,2,0）→ 后者胜出，行只有 24px；而卡片内容约 44px 且没有裁剪
+   → **卡片溢出到下一行 = 「会话都重叠了」**。
+2. 24px（实际）≠ 46px（`MIND_ROW_H`）→ 窗口 spacer 数学产生随索引增长的漂移（与聊天视图
+   空白/滚不动同一类错误）。
+
+**修复**：高度规则移到基线规则**之后**并提高特异性（`.tree-dialog .tree-scroll .tree-row-mind`），
+基线行加 `box-sizing: border-box; overflow: hidden; flex: 0 0 auto`（几何永不与数学脱节），
+卡片内距收紧到 4px 并在 46px 内自适应（head 14 + text + padding + border ≤ 46）。
+
+**Phase 5-6 验证**：`npm run test:tree-rows` → 行高 `[46, 24]` 与常量一致、重叠 0、
+空白 0、**卡片溢出 0px**、PASS。脚本带 `--self-check`：**在运行中的应用里注入修复前的几何**
+（24px + 不裁剪），门禁必须能抓到它并报 FAIL —— 这样反向验证不需要重新打包，也就永远不会
+误跑在旧产物上（这次踩过：`dist:dir` 的 asar 不一定刷新）。
