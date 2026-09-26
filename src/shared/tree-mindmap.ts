@@ -19,6 +19,7 @@
  * would blow the stack (the reason tree-build.ts is iterative too).
  */
 import type { TreeEntry, TreeNode } from "./tree-build";
+import type { TreeFlatRow } from "./tree-layout";
 
 /** Does this entry belong on the map? (only your messages and AI replies) */
 export function isMindMapEntry(entry: TreeEntry): boolean {
@@ -104,4 +105,84 @@ export function compactForMindMap(tree: TreeNode[], leafId: string | null): Mind
     cursor = entries.get(cursor)?.parentId ?? null;
   }
   return { tree: roots, leafId: mappedLeaf, kept, hidden };
+}
+
+
+/**
+ * Lay the map out: YOUR messages form the spine (one column), the AI's replies
+ * hang one column in.
+ *
+ * Why this exists instead of reusing `flattenTree`: that flattener deliberately
+ * COLLAPSES linear runs (`else childIndent = indent`), which is right for the
+ * /tree log view — and means a linear conversation renders as one flat column.
+ * Measured on a 24-node chain: every row came back with indent 0, so the map had
+ * no hierarchy to look at and every card was flush left (「同一级别没有完全对齐」).
+ *
+ * The map's shape follows the conversation instead: a prompt is a spine entry, its
+ * replies are indented under it, and the NEXT prompt starts a new spine entry. Two
+ * columns total, which is also what makes alignment structural — every row is at
+ * exactly `indent × RAIL_W`, no chain-collapsing heuristic involved.
+ */
+export function flattenMindMap(roots: TreeNode[], leafId: string | null): TreeFlatRow[] {
+  const containsActive = new Map<string, boolean>();
+  const all: TreeNode[] = [];
+  const walk: TreeNode[] = [...roots];
+  while (walk.length) {
+    const n = walk.pop()!;
+    all.push(n);
+    for (const c of n.children) walk.push(c);
+  }
+  for (let i = all.length - 1; i >= 0; i -= 1) {
+    const n = all[i]!;
+    let has = leafId !== null && n.entry.id === leafId;
+    for (const c of n.children) if (containsActive.get(c.entry.id)) has = true;
+    containsActive.set(n.entry.id, has);
+  }
+
+  const flat: TreeFlatRow[] = [];
+  const stack: Array<{ node: TreeNode; isLast: boolean; spineContinues: boolean }> = [];
+  const ordered = [...roots].sort(
+    (a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)),
+  );
+  for (let i = ordered.length - 1; i >= 0; i -= 1) {
+    stack.push({ node: ordered[i]!, isLast: i === ordered.length - 1, spineContinues: false });
+  }
+  while (stack.length) {
+    const { node, isLast, spineContinues } = stack.pop()!;
+    const isUser = node.entry.message?.role === "user";
+    flat.push({
+      node,
+      // A prompt is the spine; a reply hangs one column in. Deeper structure is not
+      // shown on purpose: it would push cards off-screen for a long conversation.
+      indent: isUser ? 0 : 1,
+      showConnector: !isUser,
+      isLast,
+      isVirtualRootChild: false,
+      gutters: [{ position: 0, show: spineContinues }], // patched below
+      onActivePath: containsActive.get(node.entry.id) === true,
+      isCurrent: leafId !== null && node.entry.id === leafId,
+    });
+    const children = node.children;
+    const orderedChildren = [...children].sort(
+      (a, b) => Number(containsActive.get(b.entry.id)) - Number(containsActive.get(a.entry.id)),
+    );
+    for (let i = orderedChildren.length - 1; i >= 0; i -= 1) {
+      stack.push({
+        node: orderedChildren[i]!,
+        isLast: i === orderedChildren.length - 1,
+        // The spine rail continues while this prompt has more siblings below it.
+        spineContinues: !isLast,
+      });
+    }
+  }
+  // The spine rail runs from the first prompt down to the last one. That is a
+  // property of the ORDER, not of the tree: in a conversation the next prompt is a
+  // descendant of the previous reply, so sibling bookkeeping can never see it.
+  let lastPrompt = -1;
+  for (let i = 0; i < flat.length; i += 1) if (flat[i]!.indent === 0) lastPrompt = i;
+  for (let i = 0; i < flat.length; i += 1) {
+    const row = flat[i]!;
+    row.gutters = [{ position: 0, show: i < lastPrompt }];
+  }
+  return flat;
 }

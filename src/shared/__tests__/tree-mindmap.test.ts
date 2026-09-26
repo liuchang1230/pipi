@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { buildTreeFromEntries, type TreeEntry } from "../tree-build";
 import { flattenTree } from "../tree-layout";
-import { compactForMindMap, isMindMapEntry } from "../tree-mindmap";
+import { compactForMindMap, flattenMindMap, isMindMapEntry } from "../tree-mindmap";
 import { applyVisibility } from "../tree-view";
 
 function mapOf(entries: TreeEntry[], leafId: string | null) {
@@ -137,15 +137,90 @@ describe("mind map pipeline (what the dialog renders)", () => {
   it("renders only user/assistant rows, with the leaf marked", () => {
     const { tree } = buildTreeFromEntries(session);
     const projection = compactForMindMap(tree, "m1");
-    const { flat } = flattenTree(projection.tree, projection.leafId);
+    const flat = flattenMindMap(projection.tree, projection.leafId);
     const visible = applyVisibility(flat, "all", "", projection.leafId);
     const roles = visible.map((r) => r.node.entry.message?.role);
     expect(roles.every((r) => r === "user" || r === "assistant")).toBe(true);
     expect(roles).toEqual(["user", "assistant", "user", "assistant"]);
-    // Indentation is the conversation's depth, not the plumbing's: 4 levels, not 10.
-    expect(Math.max(...visible.map((r) => r.indent))).toBeLessThanOrEqual(3);
+    // The map has exactly TWO columns: prompts on the spine, replies one in.
+    // (A `<= 3` assertion here passed vacuously while every row was indent 0 —
+    // see the regression test below.)
+    expect([...new Set(visible.map((r) => r.indent))].sort()).toEqual([0, 1]);
     // The real leaf is a model_change entry (hidden), so "current" is its nearest
     // kept ancestor — the prompt the session is sitting after.
     expect(visible.filter((r) => r.isCurrent).map((r) => r.node.entry.id)).toEqual(["u2"]);
+  });
+});
+
+/**
+ * Regression: 「树状图对齐…感觉同一级别没有完全对齐」.
+ *
+ * Root cause: the mind map reused `flattenTree`, whose indent rule COLLAPSES linear
+ * runs (`else childIndent = indent`) — measured on a 24-node chain, every row came
+ * back indent 0. There was no hierarchy to align, and every card sat flush left.
+ * `flattenMindMap` gives the map its own layout: prompts on the spine, replies one
+ * column in, never deeper.
+ */
+describe("flattenMindMap (the map's own layout)", () => {
+  /** u0 → a0 → u1 → a1, plus a branch: u1 also has a2. */
+  const CHAT: TreeEntry[] = [
+    { type: "message", id: "u0", parentId: null, message: { role: "user", content: [{ type: "text", text: "q0" }] } },
+    { type: "message", id: "a0", parentId: "u0", message: { role: "assistant", content: [{ type: "text", text: "r0" }] } },
+    { type: "message", id: "u1", parentId: "a0", message: { role: "user", content: [{ type: "text", text: "q1" }] } },
+    { type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: [{ type: "text", text: "r1" }] } },
+    { type: "message", id: "a2", parentId: "u1", message: { role: "assistant", content: [{ type: "text", text: "r1b" }] } },
+  ];
+
+  function rows(leafId: string) {
+    const { tree } = buildTreeFromEntries(CHAT);
+    const mind = compactForMindMap(tree, leafId);
+    return flattenMindMap(mind.tree, mind.leafId);
+  }
+
+  it("puts prompts on the spine and replies one column in", () => {
+    const out = rows("a1");
+    const indent = Object.fromEntries(out.map((r) => [r.node.entry.id, r.indent]));
+    expect(indent.u0).toBe(0);
+    expect(indent.a0).toBe(1);
+    expect(indent.u1).toBe(0); // the next prompt starts a new spine entry
+    expect(indent.a1).toBe(1);
+    expect(indent.a2).toBe(1); // a branch's reply is still one column in
+  });
+
+  it("never indents deeper than the reply column (alignment is structural)", () => {
+    const out = rows("a2");
+    expect([...new Set(out.map((r) => r.indent))].sort()).toEqual([0, 1]);
+  });
+
+  it("marks exactly one row as the current position", () => {
+    const out = rows("a2");
+    expect(out.filter((r) => r.isCurrent).map((r) => r.node.entry.id)).toEqual(["a2"]);
+  });
+
+  it("keeps the spine rail alive while a prompt has siblings below it", () => {
+    const out = rows("a1");
+    const u1 = out.find((r) => r.node.entry.id === "u1")!;
+    // u1 is the last prompt on the spine, so nothing continues below it…
+    expect(u1.gutters.find((g) => g.position === 0)?.show).toBe(false);
+    const u0 = out.find((r) => r.node.entry.id === "u0")!;
+    // …while u0 is followed by another prompt: its rail continues downward.
+    expect(u0.gutters.find((g) => g.position === 0)?.show).toBe(true);
+  });
+
+  it("keeps a long linear conversation at exactly two columns", () => {
+    const chain: TreeEntry[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 40; i += 1) {
+      const uid = `u${i}`;
+      chain.push({ type: "message", id: uid, parentId: parent, message: { role: "user", content: [{ type: "text", text: `q${i}` }] } });
+      const aid = `a${i}`;
+      chain.push({ type: "message", id: aid, parentId: uid, message: { role: "assistant", content: [{ type: "text", text: `r${i}` }] } });
+      parent = aid;
+    }
+    const { tree } = buildTreeFromEntries(chain);
+    const mind = compactForMindMap(tree, "a39");
+    const out = flattenMindMap(mind.tree, mind.leafId);
+    expect(out.length).toBe(80);
+    expect([...new Set(out.map((r) => r.indent))].sort()).toEqual([0, 1]);
   });
 });

@@ -13,7 +13,7 @@
  * Usage: node scripts/diagnose-tree-rows.mjs   (needs release/win-unpacked/pipi.exe)
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -26,6 +26,21 @@ if (!existsSync(exe)) {
   process.exit(2);
 }
 rmSync(profile, { recursive: true, force: true });
+// A stale app.asar has fooled this harness before (dist:dir does not always
+// refresh it): refuse to measure an older bundle than the one just built.
+{
+  const asar = join("release", "win-unpacked", "resources", "app.asar");
+  const assetsDir = join("out", "renderer", "assets");
+  if (existsSync(asar) && existsSync(assetsDir)) {
+    const asarTime = statSync(asar).mtimeMs;
+    const newestAsset = Math.max(...readdirSync(assetsDir).map((f) => statSync(join(assetsDir, f)).mtimeMs));
+    if (newestAsset > asarTime + 1000) {
+      console.log(`FAIL: app.asar is STALE (${new Date(asarTime).toISOString()}) vs out/ (${new Date(newestAsset).toISOString()}) — run npm run dist:dir again`);
+      process.exit(2);
+    }
+  }
+}
+
 const workDir = mkdtempSync(join(tmpdir(), "pipi-diag-"));
 const sessionsDir = join(workDir, "sessions-test");
 mkdirSync(sessionsDir, { recursive: true });
@@ -153,7 +168,13 @@ try {
       // overflow = the card needs more vertical space than its row gives it,
       // which is what paints the next row's card over its neighbour.
       const overflow = card ? Math.round(card.scrollHeight - b.height) : 0;
-      return { id: r.getAttribute('data-row-id'), top: Math.round(b.top), bottom: Math.round(b.bottom), h: Math.round(b.height), mind: r.className.includes('tree-row-mind'), overflow };
+      const content = card ?? r.querySelector('.tree-entrylabel') ?? r;
+      // Rail geometry: every rail element's x position, per level. Levels must
+      // line up vertically across ALL rows — that is the user's "感觉同一级别没有
+      // 完全对齐" turned into a number.
+      const railEls = [...r.querySelectorAll('.tree-rail')];
+      const rails = railEls.map((el, i) => ({ level: i, x: Math.round(el.getBoundingClientRect().left * 10) / 10 }));
+      return { id: r.getAttribute('data-row-id'), top: Math.round(b.top), bottom: Math.round(b.bottom), h: Math.round(b.height), mind: r.className.includes('tree-row-mind'), overflow, indent: Number(r.getAttribute('data-indent') ?? -1), contentLeft: content.getBoundingClientRect().left, rails, selected: r.getAttribute('data-selected') === '1' };
     });
     let overlaps = 0;
     let worst = 0;
@@ -162,6 +183,40 @@ try {
       if (gap < 0) { overlaps += 1; worst = Math.min(worst, gap); }
     }
     const heights = rows.map((r) => r.h);
+    // Same-level alignment: every row with the same indent must place its CONTENT
+    // at exactly the same x. (Measured: the ASCII gutter was rendered in a
+    // proportional font for card rows, so levels drifted.)
+    // A missing data-indent would collapse every row into one group and make this
+    // check pass vacuously (that is exactly how a stale bundle fooled an earlier
+    // run). Refuse to measure instead.
+    const missingIndent = rows.filter((r) => r.indent === -1).length;
+    if (rows.length > 0 && missingIndent === rows.length) {
+      return { error: 'rows carry no data-indent — stale bundle? (alignment unmeasurable)' };
+    }
+    const byIndent = {};
+    for (const r of rows) {
+      const key = String(r.indent);
+      if (!byIndent[key]) byIndent[key] = new Set();
+      byIndent[key].add(Math.round(r.contentLeft * 10) / 10);
+    }
+    const misaligned = Object.entries(byIndent)
+      .filter(([, set]) => set.size > 1)
+      .map(([indent, set]) => ({ indent, offsets: [...set] }));
+    // Rail x per level across all mounted rows: one distinct value per level means
+    // the vertical guides line up exactly.
+    const railPositions = {};
+    let railCount = 0;
+    for (const r of rows) {
+      for (const rail of r.rails ?? []) {
+        railCount += 1;
+        const key = String(rail.level);
+        if (!railPositions[key]) railPositions[key] = new Set();
+        railPositions[key].add(rail.x);
+      }
+    }
+    const railDrift = Object.entries(railPositions)
+      .filter(([, set]) => set.size > 1)
+      .map(([level, set]) => ({ level, xs: [...set] }));
     const box = el.getBoundingClientRect();
     const visible = rows.filter((r) => r.bottom > box.top && r.top < box.bottom).length;
     return {
@@ -171,6 +226,10 @@ try {
       worstGap: worst,
       visible,
       maxCardOverflow: rows.reduce((m, r) => Math.max(m, r.overflow || 0), 0),
+      misaligned,
+      railDrift,
+      railCount,
+      indentCounts: rows.reduce((m, r) => { m[r.indent] = (m[r.indent] || 0) + 1; return m; }, {}),
       scrollTop: Math.round(el.scrollTop),
       scrollHeight: Math.round(el.scrollHeight),
       clientHeight: Math.round(el.clientHeight),
@@ -195,6 +254,7 @@ try {
   const report = [];
   const first = await evaluateNamed(ws, "measure-top", measure, true);
   console.log("at top:", JSON.stringify(first));
+  console.log("indents:", JSON.stringify(first.indentCounts ?? "n/a"));
   report.push(first);
 
   // Scroll through the list and re-measure at each position.
@@ -212,6 +272,42 @@ try {
     console.log(`at ${frac}:`, JSON.stringify(m));
     report.push(m);
   }
+
+  // --- selection highlight: click a row, then compare the SELECTED row's paint
+  // against a neighbour's. Identical computed styles = the click is invisible.
+  const selBefore = await evaluateNamed(ws, "select", `(() => {
+    const rows = [...document.querySelectorAll('.tree-dialog .tree-scroll .tree-row')];
+    const target = rows[Math.floor(rows.length / 2)];
+    if (!target) return { error: 'no rows' };
+    target.click();
+    return target.getAttribute('data-row-id');
+  })()`, true);
+  await sleep(400);
+  const selInfo = await evaluateNamed(ws, "selection-style", `(() => {
+    const rows = [...document.querySelectorAll('.tree-dialog .tree-scroll .tree-row')];
+    const sel = rows.find((r) => r.getAttribute('data-selected') === '1');
+    if (!sel) {
+      return {
+        error: 'nothing marked selected in the DOM',
+        byClass: rows.filter((r) => r.className.includes('selected')).length,
+        badges: rows.map((r) => (r.getAttribute('data-selected') || r.className.includes('selected') ? 'S' : '.')).join(''),
+      };
+    }
+    const other = rows.find((r) => r.getAttribute('data-selected') !== '1');
+    const paint = (row) => {
+      const el = row.querySelector('.tree-card') || row;
+      const cs = getComputedStyle(el);
+      return [cs.backgroundColor, cs.borderTopColor, cs.borderLeftColor, cs.boxShadow, cs.outlineColor].join('|');
+    };
+    return { selectedId: sel.getAttribute('data-row-id'), selectedPaint: paint(sel), otherPaint: other ? paint(other) : null };
+  })()`, true);
+  console.log("selection:", JSON.stringify(selInfo));
+  const selectionVisible = selInfo && !selInfo.error && selInfo.otherPaint !== null && selInfo.selectedPaint !== selInfo.otherPaint;
+  if (!selectionVisible) {
+    console.log("FAIL: clicking a node produces no visible difference");
+    process.exitCode = 1;
+  }
+  void selBefore;
 
   // Also check the 完整 view (fixed 24px log rows).
   const toFull = await evaluateNamed(ws, "full-view", `(() => {
@@ -238,6 +334,16 @@ measurements: ${report.length}   total overlapping row pairs: ${overlaps}   blan
   const mindHeights = [...new Set(report.filter((r) => r.mind === true).flatMap((r) => r.heights ?? []))];
   const fullHeights = [...new Set(report.filter((r) => r.mind === false).flatMap((r) => r.heights ?? []))];
   const maxOverflow = report.reduce((m, r) => Math.max(m, r.maxCardOverflow ?? 0), 0);
+  const railTotal = report.reduce((n, r) => n + (r.railCount ?? 0), 0);
+  const railDrifts = report.reduce((n, r) => n + (r.railDrift?.length ?? 0), 0);
+  console.log(`rails measured: ${railTotal}   levels with drift: ${railDrifts}`);
+  if (railTotal === 0) {
+    console.log("FAIL: no rail elements found — alignment unmeasurable (stale bundle?)");
+    process.exitCode = 1;
+  } else if (railDrifts > 0) {
+    console.log(`FAIL: rails at the same level sit at different x: ${JSON.stringify(report.flatMap((r) => r.railDrift ?? []).slice(0, 4))}`);
+    process.exitCode = 1;
+  }
   console.log(`max card content overflow past its row: ${maxOverflow}px (0 = nothing can paint over a neighbour)`);
   if (maxOverflow > 0) {
     console.log("FAIL: card content is taller than its row slot → rows paint over each other");

@@ -2982,11 +2982,17 @@ textarea:focus-visible,
 .tree-row-mind .tree-card.assistant .tree-entrylabel {
   color: color-mix(in srgb, var(--success, #4ade80) 85%, var(--text));
 }
-/* Branch rails must line up across a two-line card. */
-.tree-row-mind .tree-gutter,
+/* Fold/path marks sit on the card's vertical centre; the rails span the full row. */
 .tree-row-mind .tree-fold,
 .tree-row-mind .tree-pathmark {
   align-self: center;
+}
+.tree-row-mind .tree-rails {
+  margin-right: 5px;
+}
+/* The 时间/badge row must not compete with the message text. */
+.tree-row-mind .tree-card-head .tree-time {
+  opacity: 0.75;
 }
 .tree-dialog .tree-row-mind.current .tree-card {
   border-color: var(--accent);
@@ -3032,8 +3038,10 @@ textarea:focus-visible,
   font-size: 10px;
 }
 /* Connectors in the map are hierarchy, not decoration: thinner + quieter. */
-.tree-row-mind .tree-gutter {
-  opacity: 0.55;
+.tree-row-mind .tree-rail.on::before,
+.tree-row-mind .tree-rail.elbow::before,
+.tree-row-mind .tree-rail.elbow::after {
+  background: color-mix(in srgb, var(--text-dim) 32%, transparent);
 }
 
 /* --- Session tree dialog (aligned with /tree) --- */
@@ -3105,6 +3113,7 @@ textarea:focus-visible,
 /* 导图 rows are cards: speaker line + text line. MUST equal MIND_ROW_H. */
 .tree-dialog .tree-scroll .tree-row-mind {
   height: 46px;
+  padding-left: 2px;
   min-height: 46px;
   max-height: 46px;
 }
@@ -3112,17 +3121,82 @@ textarea:focus-visible,
   background: var(--hover);
 }
 .tree-dialog .tree-row.selected {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+/* Card rows: the card is opaque, so the row's background never showed — clicking a
+   node produced NO visible change (measured: selected and unselected cards had
+   identical computed paint). Paint the selection on the card itself, and keep it
+   distinct from 「当前」 (a ring + badge). */
+.tree-dialog .tree-row.selected .tree-card {
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.tree-dialog .tree-row.selected .tree-card .tree-card-text {
+  color: var(--text);
+  font-weight: 500;
+}
+.tree-dialog .tree-row-mind:hover .tree-card {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+/* 当前 outranks 选中 visually: a solid accent ring + the badge. */
+.tree-dialog .tree-row.current .tree-card {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
 }
 .tree-dialog .tree-row.current .tree-entrylabel,
 .tree-dialog .tree-row.current .tree-entrytext {
   color: var(--accent);
   font-weight: 600;
 }
-.tree-gutter {
-  color: var(--text-dim);
+/* Hierarchy rails: one fixed-width column per level (see RAIL_W in
+   TreeDialog.tsx). Alignment is geometric, not typographic. */
+.tree-rails {
   flex: 0 0 auto;
-  opacity: 0.7;
+  display: flex;
+  align-self: stretch;
+}
+.tree-rail {
+  position: relative;
+  width: 14px;
+  align-self: stretch;
+}
+.tree-rail.on::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
+}
+/* Elbow into the node: vertical stops at the midline, then a horizontal stub. */
+.tree-rail.elbow::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 50%;
+  width: 1px;
+  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
+}
+.tree-rail.elbow:not(.last)::before {
+  bottom: 0; /* ├ — the rail continues to the next sibling */
+}
+.tree-rail.elbow::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: calc(50% - 0.5px);
+  width: 8px;
+  height: 1px;
+  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
+}
+/* The active branch's rails are tinted, so "where am I" reads at a glance. */
+.tree-dialog .tree-row.on-active-path .tree-rail.on::before,
+.tree-dialog .tree-row.on-active-path .tree-rail.elbow::before,
+.tree-dialog .tree-row.on-active-path .tree-rail.elbow::after {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .tree-fold {
   flex: 0 0 auto;
@@ -3186,9 +3260,8 @@ textarea:focus-visible,
   align-self: center;
 }
 /* Connectors carry the hierarchy — make them readable, not decorative. */
-.tree-dialog .tree-gutter {
-  color: color-mix(in srgb, var(--text-dim) 85%, transparent);
-  opacity: 0.9;
+.tree-dialog .tree-rails {
+  margin-right: 2px;
 }
 .tree-entrylabel {
   flex: 0 0 auto;

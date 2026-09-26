@@ -37,7 +37,7 @@ import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
 import { buildTreeFromEntries, type TreeEntry, type TreeNode } from "../../../shared/tree-build";
 import { flattenTree, isAlreadyAtTarget, isNavigationSettled, type TreeFlatRow } from "../../../shared/tree-layout";
-import { compactForMindMap } from "../../../shared/tree-mindmap";
+import { compactForMindMap, flattenMindMap } from "../../../shared/tree-mindmap";
 import { applyVisibility, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
 import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
 import { parseEditArgs } from "../components/DiffView";
@@ -170,6 +170,9 @@ const FILTER_LABELS: Record<TreeFilterMode, string> = {
 
 /** Row window around the viewport — long sessions mount ~2×40 rows, not all. */
 const WINDOW_MARGIN = 20;
+/** Width of one hierarchy level. MUST equal `.tree-rail { width }` in styles.css:
+ *  the rail x position is `level × this`, which is what keeps levels aligned. */
+const RAIL_W = 14;
 /** `.tree-row` height from styles.css. One definition, because the window math
  *  and the spacer heights must agree or the scrollbar jitters. */
 const ROW_H = 24;
@@ -217,15 +220,24 @@ const TreeRow = memo(function TreeRow({
 }) {
   const e = row.node.entry;
   const d = useMemo(() => entryDisplay(row.node, toolCalls, mind), [row.node, toolCalls, mind]);
-  const prefix = useMemo(() => {
+  /**
+   * Hierarchy rails as ELEMENTS, not as ASCII text.
+   *
+   * The old prefix was a string (`│  ` / `   ` / `├─ `), i.e. three characters per
+   * level — but the card rows use a proportional font, where `│  ` and `├─ ` have
+   * different pixel widths, so the vertical lines did not line up between rows:
+   * 「同一级别没有完全对齐」. One element per level, each exactly `RAIL_W` wide, puts
+   * every rail at `level × RAIL_W` by construction — no font, no glyph, no drift.
+   */
+  const rails = useMemo(() => {
     const displayIndent = multipleRoots ? Math.max(0, row.indent - 1) : row.indent;
     const connectorPosition = row.showConnector && !row.isVirtualRootChild ? displayIndent - 1 : -1;
-    let out = "";
+    const out: Array<{ on: boolean; elbow: boolean; last: boolean }> = [];
     for (let level = 0; level < displayIndent; level++) {
       const g = row.gutters.find((x) => x.position === level);
-      if (g) out += g.show ? "│  " : "   ";
-      else if (level === connectorPosition) out += (row.isLast ? "└" : "├") + "─ ";
-      else out += "   ";
+      if (g) out.push({ on: g.show, elbow: false, last: false });
+      else if (level === connectorPosition) out.push({ on: true, elbow: true, last: row.isLast });
+      else out.push({ on: false, elbow: false, last: false });
     }
     return out;
   }, [row, multipleRoots]);
@@ -240,12 +252,23 @@ const TreeRow = memo(function TreeRow({
     <div
       data-row-id={e.id}
       data-role={mind ? (e.message?.role ?? "other") : undefined}
+      // Measured by scripts/diagnose-tree-rows.mjs: same-level rows must share one
+      // left offset, and a click must be visibly distinguishable.
+      data-indent={row.indent}
+      data-selected={isSelected ? "1" : undefined}
       className={`tree-row${mind ? " tree-row-mind" : ""}${isSelected ? " selected" : ""}${row.onActivePath ? " on-active-path" : ""}${row.isCurrent ? " current" : ""}${leafId && !row.onActivePath ? " off-path" : ""}`}
       onClick={() => onSelect(e.id)}
       onDoubleClick={() => hasChildren && onToggleFold(e.id)}
       title={d.text || e.id}
     >
-      <span className="tree-gutter">{prefix}</span>
+      <span className="tree-rails" aria-hidden="true">
+        {rails.map((rail, i) => (
+          <i
+            key={i}
+            className={`tree-rail${rail.on ? " on" : ""}${rail.elbow ? " elbow" : ""}${rail.elbow && rail.last ? " last" : ""}`}
+          />
+        ))}
+      </span>
       <span
         className="tree-fold"
         onClick={(ev) => { ev.stopPropagation(); hasChildren && onToggleFold(e.id); }}
@@ -679,7 +702,12 @@ export function TreeDialog({
   /** The leaf as the MAP sees it (the reply you are currently under). */
   const displayLeafId = mindMap ? mindMap.leafId : leafId;
 
-  const { flat } = useMemo(() => flattenTree(displayTree, displayLeafId), [displayTree, displayLeafId]);
+  // The map has its own layout (spine + replies); the log view keeps the /tree
+  // flattening (which collapses linear runs — correct there, useless here).
+  const flat = useMemo(
+    () => (mindMap ? flattenMindMap(displayTree, displayLeafId) : flattenTree(displayTree, displayLeafId).flat),
+    [displayTree, displayLeafId, mindMap],
+  );
 
   // Filter/search over the flattened rows. `onActivePath`/`isCurrent` come from
   // the shared layout (src/shared/tree-layout.ts), which is unit-tested — the
