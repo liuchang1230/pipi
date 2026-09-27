@@ -334,3 +334,89 @@ describe("scout→planner hint", () => {
     expect(content).toContain("## Risks"); // the plan brief itself is still there
   });
 });
+
+/**
+ * 模式 × 子代理：委托不能绕过只读/授权。
+ *
+ * 事实（读代码确认）：subagent 是独立的 `pi --mode json -p` 进程，scout 扩展用
+ * `spawn(...)` 且未传 env ⇒ 继承父进程环境。我们的模式状态原本只活在父进程里，子进程一律
+ * 以 auto 起步 —— 于是 plan 模式的"只读"和 edit 模式的"逐个确认"都能被一次委托绕过。
+ * 现在把模式写进 process.env.PIPI_MODE，子进程在 session_start 采用它，于是子进程自己的
+ * 守卫生效：plan → 写工具被摘除/拦截；edit → 无 UI ⇒ fail-closed 拦截（并说明怎么办）。
+ */
+describe("mode propagates to subagents (no bypass by delegation)", () => {
+  function drive(activeTools = ["read", "edit", "write", "bash"], hasUI = true) {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const pi = {
+      registerFlag: () => undefined,
+      registerCommand: (name: string, def: { handler: (a: string, c: unknown) => unknown }) => commands.set(name, def.handler),
+      registerShortcut: () => undefined,
+      on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+      getFlag: () => undefined,
+      getActiveTools: () => activeTools,
+      setActiveTools: () => undefined,
+      appendEntry: () => undefined,
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    };
+    pipiModeSwitch(pi as never);
+    const ctx = {
+      hasUI,
+      ui: {
+        notify: async () => undefined,
+        setStatus: () => undefined,
+        setWidget: () => undefined,
+        confirm: async () => true,
+        select: async () => undefined,
+        editor: async () => "",
+        theme: { fg: (_c: string, t: string) => t, strikethrough: (t: string) => t },
+      },
+      sessionManager: { getEntries: () => [] },
+    };
+    return { handlers, commands, ctx };
+  }
+
+  it("publishes the mode in the environment so children inherit it", async () => {
+    const { commands, ctx } = drive();
+    await commands.get("mode")!("edit", ctx);
+    expect(process.env.PIPI_MODE).toBe("edit");
+    await commands.get("mode")!("auto", ctx);
+    expect(process.env.PIPI_MODE).toBe("auto");
+  });
+
+  it("a child pi adopts the inherited plan mode (delegation cannot write)", async () => {
+    process.env.PIPI_MODE = "plan";
+    try {
+      const { handlers, ctx } = drive();
+      await handlers.get("session_start")!({}, ctx);
+      const brief = ((await handlers.get("before_agent_start")!({}, ctx)) as { message?: { content?: string } })
+        ?.message?.content;
+      expect(brief).toContain("plan mode");
+      // …and its own guard blocks a file modification outright.
+      const verdict = (await handlers.get("tool_call")!({ toolName: "edit", input: { path: "a.ts" } }, ctx)) as
+        | { block?: boolean; reason?: string }
+        | undefined;
+      expect(verdict?.block).toBe(true);
+      expect(verdict?.reason).toContain("Plan 模式为只读");
+    } finally {
+      delete process.env.PIPI_MODE;
+    }
+  });
+
+  it("a child in edit mode with no UI fails CLOSED and says how to proceed", async () => {
+    process.env.PIPI_MODE = "edit";
+    try {
+      const { handlers, ctx } = drive(["read", "edit", "write", "bash"], false);
+      await handlers.get("session_start")!({}, ctx);
+      const verdict = (await handlers.get("tool_call")!({ toolName: "edit", input: { path: "a.ts" } }, ctx)) as
+        | { block?: boolean; reason?: string }
+        | undefined;
+      expect(verdict?.block).toBe(true);
+      expect(verdict?.reason).toContain("无 UI");
+      expect(verdict?.reason).toContain("auto 模式");
+    } finally {
+      delete process.env.PIPI_MODE;
+    }
+  });
+});

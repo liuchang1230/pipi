@@ -750,3 +750,38 @@ Ctrl+Alt+M、`--pipi-mode`、同样的计划提取 + `[DONE:n]` + todos widget�
 验证：扩展分发测试覆盖三类目录 + 远程三目录 + idempotent（12 例）；真机 smoke 启动后
 `~/.pi/agent/agents/planner.md`（1762B）与 `~/.pi/agent/prompts/scout-and-plan.md`（812B）
 确实落地 ✓。
+
+## 分析：三模式 × 子代理（scout→planner）的联动，以及必须补的漏洞 (2026-09-26)
+
+用户要求分析「这种模式和软件的三个模式联动效果如何，是否需要进一步优化」。读代码得到的事实：
+
+**联动现状（修复前）**
+- subagent 是**独立进程**：`spawn(invocation.command, invocation.args, { cwd, shell:false, stdio })`
+  —— **没有传 env**，所以子进程继承父进程环境（scout 扩展 index.ts:358）。
+- 我们的模式状态只活在**父进程**里（内存 `mode` + `appendEntry` 持久化），既不写环境，子进程
+  也不读任何模式标记 ⇒ **子进程一律以 auto 起步**。
+- 后果（真漏洞，不是理论）：
+  1. **plan 模式的"只读"可被一次委托绕过**：父进程把 `edit/write` 摘掉、拦 bash 写命令，但只要
+     模型把写操作交给一个 subagent，子进程是 auto ⇒ 照写不误。我们随 app 分发的 planner 自身是
+     只读工具（安全），但 worker 之类的通用代理不是。
+  2. **edit 模式的"逐个授权"同样被绕过**：子进程里的写操作根本不会弹确认框 —— 而这正是用户最
+     在意的那条契约。
+- 另外一种可见的摩擦：模型不知道子代理会继承模式，可能白花几轮去委托一个注定被拦的写操作。
+
+**修复（小，且复用已验证的通道）**
+- `applyModeEnv(mode)`：切换模式时写 `process.env.PIPI_MODE`（与 `pipi-subagent-model.ts` 钉模型
+  同一条通道：env → 子进程）。
+- 子进程 `session_start`：**没有显式 flag 时**采用 `process.env.PIPI_MODE`（`--pipi-mode` /
+  `--plan` 仍然优先），并把当前模式再导出一次；plan 子进程顺手 `enablePlanTools()`。
+- 于是子进程**自己的守卫**生效：
+  - plan 子进程 → 写工具被摘除，bash 写命令被拦：「Plan 模式为只读…」；
+  - edit 子进程 → `ctx.hasUI === false` ⇒ **fail-closed 拦截**，且提示里写清怎么办
+    （"主对话切到 auto 后重试，或在主对话里直接改（那里会弹确认框）"）。
+- auto 模式不受影响（子代理照常干活）。
+
+**测试（3 例，扩展接口层）**：切换模式会写 `PIPI_MODE`；设 `PIPI_MODE=plan` 的子进程会进入 plan
+（plan 简报出现）且 `edit` 工具调用被 block；设 `PIPI_MODE=edit` 且 `hasUI=false` 的子进程写操作
+fail-closed 且提示含"auto 模式"。
+
+**仍然存在（有意保留）**：子代理的**读操作**在 plan/edit 下不受限（本来就该允许）；
+`executing`（执行计划期）不导出——执行期是父进程的 auto 模式，子代理 auto 即可。

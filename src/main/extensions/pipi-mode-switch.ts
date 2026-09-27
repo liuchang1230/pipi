@@ -698,6 +698,25 @@ function enablePlanTools(): void {
 		}
 	}
 
+	/**
+	 * 把模式写进环境变量，让**子进程**也遵守它。
+	 *
+	 * 为什么必须这么做：subagent 是独立的 `pi --mode json -p` 进程（scout 扩展用
+	 * `spawn(...)`，未传 env ⇒ 继承父进程环境）。我们的模式状态原本只活在父进程里
+	 * （内存 + appendEntry），子进程一律以 auto 起步 —— 于是：
+	 *   · plan 模式（只读）下，模型只要把写操作委托给一个 subagent 就能绕过只读；
+	 *   · edit 模式（逐个确认）下，子进程里的写操作根本不会弹确认框 —— 本用户最在意的
+	 *     「每次写操作都要授权」被委托悄悄绕过。
+	 * 与 pipi-subagent-model.ts 钉模型用的是同一条通道（process.env → 子进程）。
+	 */
+	function applyModeEnv(next: Mode): void {
+		try {
+			process.env.PIPI_MODE = next;
+		} catch {
+			/* 环境不可写就算了：这只是加固，不是唯一防线 */
+		}
+	}
+
 	async function setMode(next: Mode, ctx: ExtensionContext): Promise<void> {
 		if (next === mode && !executing) {
 			await ctx.ui.notify(`当前已是 ${next} 模式`, "info");
@@ -707,6 +726,7 @@ function enablePlanTools(): void {
 		executing = false;
 		todos = [];
 		mode = next;
+		applyModeEnv(next);
 
 		if (mode === "plan") {
 			enablePlanTools();
@@ -820,7 +840,12 @@ function enablePlanTools(): void {
 				return { block: true, reason: "Plan 模式为只读：文件修改已拦截" };
 			}
 			if (!ctx.hasUI) {
-				return { block: true, reason: "edit 模式需要确认，但当前无 UI，按 fail-closed 拦截" };
+				return {
+					block: true,
+					reason:
+						"edit 模式需要确认，但当前无 UI（子代理/无界面会话），按 fail-closed 拦截。" +
+						"需要写文件请在主对话切到 auto 模式后重试，或在主对话里直接修改（那里会弹确认框）。",
+				};
 			}
 			const ok = await ctx.ui.confirm(
 				event.toolName === "write" ? "AI 想创建或覆盖文件" : "AI 想修改文件",
@@ -1037,6 +1062,15 @@ ${remainingList}
 		if (flag === "plan" || flag === "edit") mode = flag;
 		// `--plan` is boolean (the official extension's flag shape), so presence wins.
 		if (pi.getFlag("plan") === true) mode = "plan";
+		// Inherited mode (this process is most likely a SUBAGENT of a session that was in
+		// plan/edit): without this, delegation bypasses read-only and write-confirmation.
+		// An explicit flag always wins.
+		if (flag === undefined && pi.getFlag("plan") !== true) {
+			const inherited = process.env.PIPI_MODE;
+			if (inherited === "plan" || inherited === "edit") mode = inherited;
+		}
+		applyModeEnv(mode);
+		if (mode === "plan") enablePlanTools();
 
 		const entries = ctx.sessionManager.getEntries() as Array<{
 			type: string;
