@@ -679,3 +679,18 @@ Ctrl+Alt+M、`--pipi-mode`、同样的计划提取 + `[DONE:n]` + todos widget�
 排版：`AI 说：…`（左侧细色条引用块）→ 目的行（加粗）→ `· 要点` 列表 → 「▸ 查看具体内容」
 折叠的原始 diff。测试 14 例（含 4 个新纯函数：数值/函数/文案/行数、符号定位、自述提取、
 "没说不编造"）。
+
+## edit 模式强制"先说要做什么" (2026-09-26)
+
+用户要求：模型不主动说明目的时，也要让它说 —— 因为弹窗的「AI 说：…」直接取自那段话。
+
+`before_agent_start` 在 edit 模式注入的上下文里加了一条硬性要求（隐藏消息，不进聊天记录）：
+
+> ALWAYS say what you are about to do in ONE short sentence immediately BEFORE each write
+> operation — in the user's language. That sentence is shown verbatim in the confirmation
+> dialog as 「AI 说：…」… Say the intent, not the mechanics: "把登录失败的重试次数从 3 提到 5"
+> — not "editing src/auth.ts". Name the effect when it is destructive: "删除 build 目录下的全部产物".
+
+代价：每个回合多几十个 token；换取"每次授权都有目的句"。测试用**扩展自己的接口**驱动
+（假的 ExtensionAPI：捕获 `on`/`registerCommand` → 切到 edit → 调 `before_agent_start`），
+断言注入了该要求且 `display: false`；auto 模式不注入。共 16 例。

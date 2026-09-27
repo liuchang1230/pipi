@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import { CONFIRM_DETAIL_MARKER, splitConfirmMessage } from "../../shared/confirm-detail";
 // The extension is a plain module with a default export; importing it here gives
 // the tests the REAL human-language functions it uses at runtime.
-import {
+import pipiModeSwitch, {
   describeBashIntent,
   findEnclosingSymbol,
   lastAssistantIntent,
@@ -159,5 +159,68 @@ describe("purpose-first helpers", () => {
     expect(
       lastAssistantIntent([{ type: "message", message: { role: "assistant", content: [{ type: "toolCall" }] } }]),
     ).toBeUndefined();
+  });
+});
+
+/**
+ * Driving the real extension through its own interface: the edit-mode context it
+ * injects must REQUIRE a one-sentence intent before every write, because that
+ * sentence is what the confirmation dialog shows as 「AI 说：…」. Without it the
+ * dialog falls back to "path + line counts", which the user cannot authorize.
+ */
+describe("edit-mode context requires a stated intent", () => {
+  /** Minimal ExtensionAPI double: capture handlers/commands, ignore the rest. */
+  function drive() {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const flags = new Map<string, unknown>();
+    const pi = {
+      registerFlag: (name: string, opts: { default?: unknown }) => flags.set(name, opts?.default),
+      registerCommand: (name: string, def: { handler: (a: string, c: unknown) => unknown }) => commands.set(name, def.handler),
+      registerShortcut: () => undefined,
+      on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+      getFlag: (name: string) => flags.get(name),
+      getActiveTools: () => ["read", "edit", "write", "bash"],
+      setActiveTools: () => undefined,
+      appendEntry: () => undefined,
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    };
+    pipiModeSwitch(pi as never);
+    return { handlers, commands };
+  }
+
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: async () => undefined,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+      confirm: async () => true,
+      select: async () => undefined,
+      editor: async () => "",
+      theme: { fg: (_c: string, t: string) => t, strikethrough: (t: string) => t },
+    },
+    sessionManager: { getEntries: () => [] },
+  };
+
+  it("injects the instruction once the session is in edit mode", async () => {
+    const { handlers, commands } = drive();
+    await commands.get("mode")!("edit", ctx);
+    const result = (await handlers.get("before_agent_start")!({}, ctx)) as {
+      message?: { content?: string; display?: boolean };
+    };
+    const content = result?.message?.content ?? "";
+    expect(content).toContain("ONE short sentence immediately BEFORE each write operation");
+    expect(content).toContain("AI 说");
+    // Hidden from the transcript: it is a behavioural constraint, not a chat message.
+    expect(result?.message?.display).toBe(false);
+  });
+
+  it("does not inject it in auto mode", async () => {
+    const { handlers, commands } = drive();
+    await commands.get("mode")!("auto", ctx);
+    const result = await handlers.get("before_agent_start")!({}, ctx);
+    expect(result).toBeUndefined();
   });
 });

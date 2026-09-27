@@ -832,6 +832,10 @@ export default function pipiModeSwitch(pi: ExtensionAPI): void {
 					content: `${EDIT_MARKER}
 The user has enabled edit mode: every write operation (edit/write tools, or bash commands that modify files) is shown to the user for confirmation before it runs.
 
+ALWAYS say what you are about to do in ONE short sentence immediately BEFORE each write operation — in the user's language (Chinese if they write Chinese). That sentence is shown verbatim in the confirmation dialog as 「AI 说：…」, and without it the user cannot tell what they are being asked to authorize.
+- Say the intent, not the mechanics: "把登录失败的重试次数从 3 提到 5" — not "editing src/auth.ts".
+- Name the effect when it is destructive: "删除 build 目录下的全部产物".
+
 To keep confirmations to a minimum:
 - Batch related changes into as few edit/write calls as possible instead of many small ones.
 - If the user rejects a change, do NOT retry the same change — ask what they would prefer instead.
