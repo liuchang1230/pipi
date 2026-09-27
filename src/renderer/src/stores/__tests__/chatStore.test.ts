@@ -1177,3 +1177,61 @@ describe("initMessages tail stitching", () => {
     expect(useChatStore.getState().states[T]!.messages.map((m) => m.id)).toEqual(["fresh"]);
   });
 });
+
+/**
+ * 「/compact 长时间压缩，不确定是真实需要这么长时间，还是卡住了」.
+ *
+ * The UI said only 「正在压缩上下文」 for the whole run, identical whether pi was
+ * summarizing, retrying a transient failure, or wedged. Now the store records WHEN
+ * it started, WHY it is slow (manual/threshold/overflow + context size), and pi's
+ * own summarization retries — so the banner can show an honest elapsed time and the
+ * user can decide to wait or press 停止 (which cancels the compaction).
+ */
+describe("compaction progress", () => {
+  it("records start time, reason and context size", () => {
+    useChatStore.getState().ensure(T);
+    useChatStore.setState((s) => ({
+      states: { ...s.states, [T]: { ...s.states[T]!, contextTokens: 120_000 } },
+    }));
+    apply([{ type: "compaction_start", reason: "manual" }]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.compacting).toBe(true);
+    expect(st.compactionStartedAt).toBeGreaterThan(0);
+    expect(st.compactionNote).toContain("手动");
+    expect(st.compactionNote).toContain("120k tokens");
+  });
+
+  it("explains a retry instead of looking frozen", () => {
+    apply([
+      { type: "compaction_start", reason: "threshold" },
+      { type: "summarization_retry_scheduled", attempt: 2, maxAttempts: 3, delayMs: 4000, errorMessage: "terminated" },
+    ]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.compactionNote).toContain("第 2/3 次");
+    expect(st.compactionNote).toContain("4s");
+    expect(st.compactionNote).toContain("terminated");
+    expect(st.compacting).toBe(true); // still running, NOT failed
+  });
+
+  it("clears the progress state and keeps the result", () => {
+    apply([
+      { type: "compaction_start", reason: "manual" },
+      { type: "compaction_end", reason: "manual", result: { summary: "s", tokensBefore: 150000, estimatedTokensAfter: 32000 } },
+    ]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.compacting).toBe(false);
+    expect(st.compactionStartedAt).toBeUndefined();
+    expect(st.compactionNote).toBeUndefined();
+    expect(st.lastCompactionSummary).toEqual({ before: 150000, after: 32000 });
+  });
+
+  it("a cancelled compaction is not a failure", () => {
+    apply([
+      { type: "compaction_start", reason: "manual" },
+      { type: "compaction_end", reason: "manual", aborted: true },
+    ]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.compacting).toBe(false);
+    expect(st.lastError).toBeUndefined();
+  });
+});

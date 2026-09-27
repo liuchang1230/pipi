@@ -11,9 +11,20 @@ declare module "@earendil-works/pi-coding-agent" {
   }
 
   export interface ExtensionContext {
+    hasUI: boolean;
     ui: {
       setWorkingIndicator(options?: WorkingIndicatorOptions): void;
       notify(message: string, type?: "info" | "warning" | "error"): Promise<void>;
+      /** Dialogs resolve via the extension_ui sub-protocol (rpc.md). */
+      select(title: string, options: string[]): Promise<string | undefined>;
+      confirm(title: string, message: string): Promise<boolean>;
+      editor(title: string, prefill?: string): Promise<string | undefined>;
+      setStatus(key: string, text: string | undefined): void;
+      setWidget(key: string, content: string[] | undefined): void;
+      theme: {
+        fg(color: string, text: string): string;
+        strikethrough(text: string): string;
+      };
     };
     /** Model registry facade: ctx.modelRegistry.refresh() re-reads
      *  models.json/auth.json into the RUNNING session (used by
@@ -34,16 +45,18 @@ declare module "@earendil-works/pi-coding-agent" {
         label?: string;
       }
     ): Promise<{ cancelled: boolean }>;
-  }
-
-  export interface ExtensionCommandContext extends ExtensionContext {
-    // full context surface (ui etc. covered by ExtensionContext)
+    /** Session store (used by pipi-mode-switch to scan persisted entries on resume). */
+    sessionManager: {
+      getEntries(): Array<Record<string, unknown>>;
+    };
   }
 
   export interface ExtensionAPI {
-    on(
+    /* Events may return control objects (tool_call block, context/before_agent
+       start message overrides) — pi reads the awaited result. */
+    on<TEvent = any>(
       event: string,
-      handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>
+      handler: (event: TEvent, ctx: ExtensionContext) => unknown
     ): void;
     registerCommand(
       name: string,
@@ -51,6 +64,32 @@ declare module "@earendil-works/pi-coding-agent" {
         description?: string;
         handler: (args: string, ctx: ExtensionCommandContext) => void | Promise<void>;
       }
+    ): void;
+    registerShortcut(
+      shortcut: string,
+      options: {
+        description?: string;
+        handler: (ctx: ExtensionContext) => void | Promise<void>;
+      }
+    ): void;
+    /** pi supports string flags (`--x value`) and boolean flags (`--x`). */
+    registerFlag(
+      name: string,
+      options:
+        | { description?: string; type: "string"; default?: string }
+        | { description?: string; type: "boolean"; default?: boolean }
+    ): void;
+    getFlag(name: string): boolean | string | undefined;
+    getActiveTools(): string[];
+    setActiveTools(toolNames: string[]): void;
+    appendEntry(customType: string, data?: unknown): void;
+    sendMessage(
+      message: { customType: string; content: string; display: boolean },
+      options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }
+    ): void;
+    sendUserMessage(
+      content: string,
+      options?: { deliverAs?: "steer" | "followUp" }
     ): void;
   }
 }

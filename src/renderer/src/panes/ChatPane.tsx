@@ -478,6 +478,8 @@ const HIDDEN_TIMELINE = {
   booted: false,
   bootStage: undefined as "connecting" | "starting" | "ready" | undefined,
   compacting: false,
+  compactionNote: undefined as string | undefined,
+  compactionStartedAt: undefined as number | undefined,
   retryInfo: null,
   steeringQueue: [] as string[],
   followUpQueue: [] as string[],
@@ -498,6 +500,8 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       booted: st.booted,
       bootStage: st.bootStage,
       compacting: !!st.compacting,
+      compactionNote: st.compactionNote,
+      compactionStartedAt: st.compactionStartedAt,
       retryInfo: st.retryInfo ?? null,
       steeringQueue: st.steeringQueue ?? HIDDEN_TIMELINE.steeringQueue,
       followUpQueue: st.followUpQueue ?? HIDDEN_TIMELINE.followUpQueue,
@@ -566,6 +570,25 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
     if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current);
   }, []);
 
+  /**
+   * Compaction's own clock, started from pi's compaction_start. The generic turn
+   * clock resets on phase changes and cannot answer "how long has this been
+   * summarizing?" — which is exactly the question behind 「不确定是真实需要这么长
+   * 时间，还是卡住了」.
+   */
+  const [compactionElapsed, setCompactionElapsed] = useState(0);
+  useEffect(() => {
+    const startedAt = timeline.compactionStartedAt;
+    if (!startedAt) {
+      setCompactionElapsed(0);
+      return;
+    }
+    const tick = () => setCompactionElapsed(Math.max(0, Math.round((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [timeline.compactionStartedAt]);
+
   const revealOlder = () => {
     const el = scrollRef.current;
     if (!el || revealLockedRef.current || hiddenCount <= 0) return;
@@ -588,7 +611,15 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       {messages.length === 0 && timeline.booted && <div className="chat-placeholder">输入问题开始对话（鼠标可直接点击、选中、编辑输入内容）</div>}
       {hiddenCount > 0 && <div className="chat-load-older" onClick={revealOlder}>↑ 更早的消息已折叠（还有 {hiddenCount} 条）— 点击或滚动到顶部加载</div>}
       {visibleMessages.map((message) => <MessageView key={message.id} message={message} />)}
-      {timeline.compacting && <div className="chat-retry-banner">正在压缩上下文（compaction）…</div>}
+      {timeline.compacting && (
+        <div className="chat-retry-banner">
+          正在压缩上下文（compaction）…已 {fmtElapsed(compactionElapsed)}s
+          {timeline.compactionNote ? <div className="chat-error-detail">{timeline.compactionNote}</div> : null}
+          <div className="chat-error-detail">
+            这一步是 pi 用模型把早期对话总结成摘要（一次模型调用，上下文越大越久）。需要中止就点「停止」，压缩会被取消。
+          </div>
+        </div>
+      )}
       {timeline.retryInfo && <div className="chat-retry-banner">模型错误：{timeline.retryInfo.errorMessage} — 正在重试 {timeline.retryInfo.attempt}/{timeline.retryInfo.maxAttempts}（退避等待）…</div>}
       {timeline.steeringQueue.length > 0 && <div className="chat-queue-banner">⏳ 排队（当前回合后发送）：{timeline.steeringQueue.join(" · ")}</div>}
       {timeline.followUpQueue.length > 0 && <div className="chat-queue-banner">⏳ 排队（agent 完成后发送）：{timeline.followUpQueue.join(" · ")}</div>}
@@ -1061,6 +1092,16 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         const data = event.data as { tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }; cost?: number; contextUsage?: { tokens?: number | null; percent?: number | null; contextWindow?: number } } | undefined;
         if (data) {
           setStats({ tokens: data.tokens, cost: data.cost, context: data.contextUsage });
+          // The store keeps the number too: the compaction banner explains a long
+          // wait with it ("上下文约 120k tokens").
+          const tokens = data.contextUsage?.tokens;
+          if (typeof tokens === "number") {
+            useChatStore.setState((s2) => {
+              const cur = s2.states[tabId];
+              if (!cur) return {};
+              return { states: { ...s2.states, [tabId]: { ...cur, contextTokens: tokens } } };
+            });
+          }
         }
         return;
       }

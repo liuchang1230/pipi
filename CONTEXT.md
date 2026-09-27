@@ -613,3 +613,45 @@ held 18/18、snap 0、全程应用侧 scrollTop 写入 0 次。反向验证：�
 - `dist:dir` 不保证刷新 `app.asar`：现在脚本启动前比对 `out/` 最新产物与 asar 的 mtime，
   **旧产物直接 exit 2**。`--self-check` 会在运行中的应用里注入修复前的几何，要求门禁必须
   抓到（`SELF-CHECK PASS`），因此反向验证不再依赖重新打包。
+
+## /compact 长时间压缩：让"慢"与"卡住"可区分 (2026-09-26)
+
+用户：「输入 /compact 会执行压缩，但长时间压缩，不确定是真实需要这么长时间，还是卡住了」。
+
+事实（读 pi 源码/文档确认，不是猜）：`/compact` 触发**一次模型调用**把早期对话总结成摘要；
+`compaction_start.reason` 是 `manual|threshold|overflow`；`compaction_end` 带回
+`tokensBefore`/`estimatedTokensAfter`/`usage`；pi 还会在摘要失败时发
+`summarization_retry_scheduled`（含 attempt/maxAttempts/delayMs/errorMessage）与
+`summarization_retry_attempt_start/finished`。而我们的 UI 全程只有一句「正在压缩上下文」——
+工作、重试、卡死三种状态长得一模一样，**用户无法判断正是因为这个**。
+
+修法（把可判断的信息显示出来）：
+- 记录 `compactionStartedAt` → 横幅显示**已 Xs**（独立的压缩计时器，回合计时器做不到这件事）；
+- 记录 `compactionNote`：由什么触发（手动/接近上限/溢出）+ 当前上下文规模（`get_session_stats`
+  的 contextUsage.tokens，例如「上下文约 120k tokens」）+ 「pi 正在调用模型生成摘要」；
+- 处理 `summarization_retry_scheduled` → 「摘要生成失败，正在重试（第 2/3 次，4s 后）：terminated」
+  —— 长等待有了真实解释；`summarization_retry_finished` → 恢复「正在继续生成摘要」；
+- `compaction_end` 记录 `lastCompactionSummary {before, after}` 并清空进度状态；
+- 横幅明确写出**出口**：需要中止就点「停止」（pi 的 abort 会取消压缩）。
+
+测试：4 个用例（起止状态/上下文规模、重试文案而非"卡住"、结束清理并保留结果、取消不算失败）。
+
+## plan 模式：pi 官方扩展 vs 我们的实现 (2026-09-26)
+
+用户问「pi extension 是否有比较好的扩展，可不可以直接用」。
+
+pi **自带官方 plan-mode 扩展**（`examples/extensions/plan-mode/`，index 390 行 + utils 168 行）：
+`/plan` 切换、`/todos`、`Ctrl+Alt+P`、`--plan` 布尔标志、`Plan:` 段落提取、`[DONE:n]` 进度、
+`plan-todos` widget、bash 只读白名单、读写工具摘除。
+
+本仓库已有的 `pipi-mode-switch.ts` 是它的**超集**（auto/plan/edit 三模式、`/mode`、
+Ctrl+Alt+M、`--pipi-mode`、同样的计划提取 + `[DONE:n]` + todos widget，另外多了**edit 模式
+写操作逐个确认**），并且注释里就写着源自官方 plan-mode/utils.ts。
+
+**结论：不要并列安装官方扩展** —— 两者会注册同一个 `plan-mode` status key、同一个
+`plan-todos` widget、都拦截 `tool_call`，必然互相打架（状态被覆盖、拦截规则叠乘）。
+正确做法是**对齐官方对外接口**，让 pi 文档里的用法在这里也能用：
+- 新增 `/plan`（切换 plan，等价 `/mode plan`）与 `--plan` 布尔标志（存在即进入 plan）；
+- 新增 `Ctrl+Alt+P` 快捷键别名（官方 README 里写的就是它），保留我们的 Ctrl+Alt+M；
+- `/todos`、`[DONE:n]` 本来就有 ✓。
+- `pi-api-stub.d.ts` 的 `registerFlag` 类型补上 boolean 形式（官方扩展就是这么注册的）。

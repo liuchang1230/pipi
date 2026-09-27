@@ -159,6 +159,21 @@ export interface ChatTabState {
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage: string } | null;
   /** Context compaction running (auto/manual). */
   compacting?: boolean;
+  /**
+   * Why the compaction is taking a while, in the user's terms. `/compact` runs a
+   * MODEL CALL over the whole context (one call, minutes on a big session), and
+   * pi retries transient failures — none of that was visible, so "正在压缩上下文"
+   * sat there looking identical whether it was working or wedged.
+   */
+  compactionNote?: string;
+  /** When this compaction started (drives the elapsed timer in the banner). */
+  compactionStartedAt?: number;
+  /** Current context-window estimate from the last get_session_stats. Shown
+   *  WHILE compacting, because "which context am I summarizing" is the honest
+   *  explanation for a long-running compaction. */
+  contextTokens?: number;
+  /** Result of the last compaction (for the "压缩完成" toast/banner). */
+  lastCompactionSummary?: { before: number; after: number | null };
   /** Monotonic turn counter. A prompt that STARTS a turn increments it; a steer
    *  into the running turn keeps it. Assistant messages are tagged with it so a
    *  late event cannot mutate a newer turn's bubble. */
@@ -972,12 +987,41 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "compaction_start") {
-      patch({ compacting: true, lastError: undefined, turn: { phase: "compacting", lastActivityAt: Date.now(), detail: "正在压缩上下文" } });
+      const reason = event.reason === "manual" ? "手动" : event.reason === "overflow" ? "上下文溢出" : "接近上限";
+      const tokens = st.contextTokens;
+      patch({
+        compacting: true,
+        lastError: undefined,
+        compactionStartedAt: Date.now(),
+        compactionNote: `${reason}触发${typeof tokens === "number" && tokens > 0 ? `，上下文约 ${Math.round(tokens / 1000)}k tokens` : ""}：pi 正在调用模型把早期对话总结成摘要`,
+        turn: { phase: "compacting", lastActivityAt: Date.now(), detail: "正在压缩上下文" },
+      });
+      return;
+    }
+    if (type === "summarization_retry_scheduled") {
+      const attempt = event.attempt as number | undefined;
+      const maxAttempts = event.maxAttempts as number | undefined;
+      const delayMs = event.delayMs as number | undefined;
+      patch({
+        compactionNote: `摘要生成失败，正在重试（第 ${attempt ?? "?"}/${maxAttempts ?? "?"} 次${delayMs ? `，${Math.round(delayMs / 1000)}s 后` : ""}）：${String(event.errorMessage ?? "").slice(0, 120)}`,
+        turn: st.turn.phase === "compacting" ? { phase: "compacting", lastActivityAt: Date.now(), detail: "压缩重试中" } : st.turn,
+      });
+      return;
+    }
+    if (type === "summarization_retry_finished") {
+      patch({ compactionNote: st.turn.phase === "compacting" ? "正在继续生成摘要（重试成功）" : st.compactionNote });
       return;
     }
     if (type === "compaction_end") {
+      const result = event.result as { tokensBefore?: number; estimatedTokensAfter?: number } | null | undefined;
       patch({
         compacting: false,
+        compactionNote: undefined,
+        compactionStartedAt: undefined,
+        lastCompactionSummary:
+          result && typeof result.tokensBefore === "number"
+            ? { before: result.tokensBefore, after: result.estimatedTokensAfter ?? null }
+            : undefined,
         // Failed compaction is the terminal state for this turn.
         lastError: event.errorMessage && !event.aborted ? (event.errorMessage as string) : undefined,
         turn: event.errorMessage && !event.aborted
