@@ -10,6 +10,7 @@ import { CONFIRM_DETAIL_MARKER, splitConfirmMessage } from "../../shared/confirm
 // the tests the REAL human-language functions it uses at runtime.
 import pipiModeSwitch, {
   describeBashIntent,
+  extractTodoItems,
   findEnclosingSymbol,
   lastAssistantIntent,
   summarizeBash,
@@ -222,5 +223,59 @@ describe("edit-mode context requires a stated intent", () => {
     await commands.get("mode")!("auto", ctx);
     const result = await handlers.get("before_agent_start")!({}, ctx);
     expect(result).toBeUndefined();
+  });
+});
+
+/**
+ * The plan-mode brief adopts pi's own planner-subagent output shape (Goal / Plan /
+ * Files to Modify / New Files / Risks) while KEEPING the machine-tracked numbered
+ * list: the `Plan:` header + numbers are what our todo extractor and `[DONE:n]`
+ * progress tracking consume, so they must survive any wording change.
+ */
+describe("plan-mode brief", () => {
+  function drive() {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const pi = {
+      registerFlag: () => undefined,
+      registerCommand: (name: string, def: { handler: (a: string, c: unknown) => unknown }) => commands.set(name, def.handler),
+      registerShortcut: () => undefined,
+      on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+      getFlag: () => undefined,
+      getActiveTools: () => ["read", "edit", "write", "bash"],
+      setActiveTools: () => undefined,
+      appendEntry: () => undefined,
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    };
+    pipiModeSwitch(pi as never);
+    return { handlers, commands };
+  }
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: async () => undefined,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+      confirm: async () => true,
+      select: async () => undefined,
+      editor: async () => "",
+      theme: { fg: (_c: string, t: string) => t, strikethrough: (t: string) => t },
+    },
+    sessionManager: { getEntries: () => [] },
+  };
+
+  it("asks for the structured plan AND keeps the trackable numbered list", async () => {
+    const { handlers, commands } = drive();
+    await commands.get("plan")!("", ctx);
+    const result = (await handlers.get("before_agent_start")!({}, ctx)) as { message?: { content?: string } };
+    const content = result?.message?.content ?? "";
+    expect(content).toContain("## Goal");
+    expect(content).toContain("## Plan");
+    expect(content).toContain("## Files to Modify");
+    expect(content).toContain("## Risks");
+    // The machine contract: our extractor needs the header + numbers.
+    expect(content).toContain('Plan:');
+    expect(extractTodoItems("Plan:\n1. 修改 src/a.ts 的 login()\n2. 补一个测试")).toHaveLength(2);
   });
 });

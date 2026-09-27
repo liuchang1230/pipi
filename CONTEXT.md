@@ -694,3 +694,33 @@ Ctrl+Alt+M、`--pipi-mode`、同样的计划提取 + `[DONE:n]` + todos widget�
 代价：每个回合多几十个 token；换取"每次授权都有目的句"。测试用**扩展自己的接口**驱动
 （假的 ExtensionAPI：捕获 `on`/`registerCommand` → 切到 edit → 调 `before_agent_start`），
 断言注入了该要求且 `display: false`；auto 模式不注入。共 16 例。
+
+## plan 模式：pi 官方扩展的调查结论与采纳 (2026-09-26)
+
+用户提示「可以去 pi extension 了解下 plan 相关扩展，如果更好也是可以的」。调查结果：
+
+- **pi 没有内置 plan 模式**，而且是明确的设计选择：`docs/usage.md`
+  「It intentionally does not include built-in MCP, sub-agents, permission popups, **plan mode**,
+  **to-dos**, or background bash. You can build or install those workflows as extensions」。
+  所以"官方 plan-mode 扩展"就是 sanctioned 路径。
+- 官方 `examples/extensions/plan-mode/`（390+168 行）功能清单：`/plan`、`/todos`、
+  `Ctrl+Alt+P`、`--plan` 布尔标志、`Plan:` 编号提取、`[DONE:n]`、`plan-todos` widget、
+  只读 bash 白名单、`edit/write` 摘除、状态持久化 + resume 重扫。
+- **我们的 `pipi-mode-switch.ts` 是它的超集**（同样的提取/标记/widget/白名单/持久化/resume，
+  外加三模式 auto/plan/edit、`/mode`、Ctrl+Alt+M、以及 edit 模式逐个写操作确认）。
+  官方那份**没有**任何我们没有的能力 —— 所以"直接用官方那份"会**降级**（丢 edit 授权）。
+
+**仍然值得采纳的两点（已做）**：
+1. **计划的结构**：官方 `planner` 子代理的输出契约是
+   Goal / Plan / Files to Modify / New Files / Risks —— 比只有编号列表好审查得多。
+   已把它写进 plan 模式的注入（`## Goal` / `Plan:` 编号 / `## Files to Modify` /
+   `## New Files` / `## Risks`），**同时保留 `Plan:` 标题与编号**（我们的 todo 提取与
+   `[DONE:n]` 进度依赖这个机器契约，测试同时钉住两者）。
+2. **中文步骤不被丢弃**：官方 utils 的 `text.length > 5` 门槛是英文调优的，「补一个测试」
+   只有 5 个字会被丢掉 → 改为按信息量折算（CJK 每字 2 分，阈值 8），英文残片
+   （"Use" / "1." 之类）仍然过滤。
+
+**未采纳（附理由）**：官方 `subagent` 例子里的 **planner 子代理 + scout→planner 工作流**
+确实是好东西（规划在独立上下文窗口里做，不污染主对话），但它依赖 pi-subagent 扩展；
+要做的话应该由 app 一并分发 agent 定义与 workflow 提示词，而不是假设用户装过 —— 已记录为
+后续项，不与本次改动混在一起。

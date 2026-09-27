@@ -210,7 +210,14 @@ function cleanStepText(text: string): string {
 	return cleaned;
 }
 
-function extractTodoItems(message: string): TodoItem[] {
+/** 「信息量」权重：CJK 每字按 2，其余按 1（阈值沿用官方语义但适配中文）。 */
+function stepWeight(text: string): number {
+	let weight = 0;
+	for (const ch of text) weight += /[㐀-鿿＀-￯]/.test(ch) ? 2 : 1;
+	return weight;
+}
+
+export function extractTodoItems(message: string): TodoItem[] {
 	const items: TodoItem[] = [];
 	const headerMatch = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
 	if (!headerMatch) return items;
@@ -221,7 +228,9 @@ function extractTodoItems(message: string): TodoItem[] {
 			.trim()
 			.replace(/\*{1,2}$/, "")
 			.trim();
-		if (text.length > 5 && !text.startsWith("`") && !text.startsWith("/") && !text.startsWith("-")) {
+		// 门槛按"信息量"而不是字符数：官方 utils 用 >5 字符（英文调优），但中文步骤
+		// 「补一个测试」只有 5 个字却完全可用，被丢掉就等于计划少了一步。CJK 字符按 2 计。
+		if (stepWeight(text) >= 8 && !text.startsWith("`") && !text.startsWith("/") && !text.startsWith("-")) {
 			const cleaned = cleanStepText(text);
 			if (cleaned.length > 3) items.push({ step: items.length + 1, text: cleaned, completed: false });
 		}
@@ -858,12 +867,28 @@ Restrictions:
 
 Ask clarifying questions when requirements are ambiguous.
 
-Analyze the code and produce a detailed numbered plan under a "Plan:" header:
+Analyze the code and produce a plan with this shape (it mirrors pi's own planner
+subagent output, which we adopt because it is markedly easier to review):
+
+## Goal
+One sentence: what the user gets when this is done.
+
+## Plan
+A NUMBERED list under a "Plan:" header — these numbers are tracked, and each step
+must be small and actionable (name the file/function, not "improve the code"):
 
 Plan:
 1. First step description
 2. Second step description
-...
+
+## Files to Modify
+- path/to/file.ts — what changes there
+
+## New Files (if any)
+- path/to/new.ts — its purpose
+
+## Risks
+Anything that could break, plus the check that would catch it.
 
 Do NOT attempt to make changes - just describe what you would do.`,
 					display: false,
