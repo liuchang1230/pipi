@@ -612,7 +612,31 @@ export default function pipiModeSwitch(pi: ExtensionAPI): void {
 
 	// --- 工具开关 -----------------------------------------------------------
 
-	function enablePlanTools(): void {
+	/**
+ * 「先侦察再规划」的提示：只有当 subagent 能力真的在时才对模型说 —— 否则它会照着提示去调用
+ * 一个不存在的工具（我们自己也踩过"提示了不存在的命令"这一类坑）。
+ * 判据：活动工具里有 subagent（pi-subagent 扩展注册的名字），或 scout/planner 之一。
+ */
+function subagentHint(): string {
+	const tools = (() => {
+		try {
+			return pi.getActiveTools();
+		} catch {
+			return [] as string[];
+		}
+	})();
+	const hasSubagent = tools.includes("subagent") || tools.some((t) => t.startsWith("scout") || t.startsWith("planner"));
+	if (!hasSubagent) return "";
+	return `
+
+Before writing the plan for a non-trivial task, consider delegating the legwork so this
+conversation keeps its context for the work itself:
+- use the "scout" agent to gather the relevant code, then
+- use the "planner" agent with that context to produce the plan.
+The app ships both agent definitions plus a /scout-and-plan prompt template that chains them.`;
+}
+
+function enablePlanTools(): void {
 		if (savedTools === undefined) savedTools = pi.getActiveTools();
 		pi.setActiveTools([
 			...new Set([...(savedTools ?? []).filter((n) => !PLAN_DISABLED_TOOLS.has(n)), ...PLAN_READ_TOOLS]),
@@ -890,7 +914,7 @@ Plan:
 ## Risks
 Anything that could break, plus the check that would catch it.
 
-Do NOT attempt to make changes - just describe what you would do.`,
+Do NOT attempt to make changes - just describe what you would do.${subagentHint()}`,
 					display: false,
 				},
 			};

@@ -20,12 +20,33 @@ import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
 import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
+import modeSwitchSource from "./extensions/pipi-mode-switch.ts?raw";
+import plannerAgentSource from "./agents/planner.md?raw";
+import scoutAndPlanPromptSource from "./prompts/scout-and-plan.md?raw";
 
-const EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
+const AGENT_HOME = join(homedir(), ".pi", "agent");
+const EXTENSIONS_DIR = join(AGENT_HOME, "extensions");
 
 export interface ShippedExtension {
   fileName: string;
   content: string;
+}
+
+/**
+ * A file the app provisions into pi's agent home. Three kinds, all discovered by
+ * pi from the SAME home dir:
+ *   extensions/ — code (commands, hooks, UI)
+ *   agents/      — subagent definitions (`~/.pi/agent/agents/*.md`)
+ *   prompts/     — prompt templates (`~/.pi/agent/prompts/*.md`, typed as /name)
+ *
+ * Shipping the agent + prompt from the app (rather than assuming the user
+ * installed pi's subagent example) is what makes 「先侦察再规划」 available on a
+ * fresh machine and on every remote server we provision.
+ */
+export type ShippedDir = "extensions" | "agents" | "prompts";
+
+export interface ShippedFile extends ShippedExtension {
+  dir: ShippedDir;
 }
 
 export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
@@ -33,6 +54,16 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
   { fileName: "pipi-model-sync.ts", content: modelSyncSource },
   { fileName: "pipi-subagent-model.ts", content: subagentModelSource },
+  { fileName: "pipi-mode-switch.ts", content: modeSwitchSource },
+];
+
+export const SHIPPED_FILES: ShippedFile[] = [
+  ...SHIPPED_EXTENSIONS.map((f) => ({ ...f, dir: "extensions" as const })),
+  // Planner subagent: `model:` is deliberately ABSENT so the app's pinned session
+  // model applies (pipi-subagent-model.ts) — a hardcoded model here would silently
+  // override the user's choice.
+  { dir: "agents", fileName: "planner.md", content: plannerAgentSource },
+  { dir: "prompts", fileName: "scout-and-plan.md", content: scoutAndPlanPromptSource },
 ];
 
 /**
@@ -45,10 +76,16 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
  */
 export function ensureShippedExtensions(dir = EXTENSIONS_DIR): string[] {
   const updated: string[] = [];
-  for (const { fileName, content } of SHIPPED_EXTENSIONS) {
+  // `dir` may be given explicitly (tests, custom installs): keep the historical
+  // behaviour of writing the EXTENSIONS there, and derive the sibling dirs from it
+  // so agents/prompts land next to them instead of in the real home.
+  const explicit = dir !== EXTENSIONS_DIR;
+  const root = explicit ? dir.replace(/[\/]extensions$/, "") : AGENT_HOME;
+  for (const { fileName, content, dir: kind } of SHIPPED_FILES) {
     try {
-      mkdirSync(dir, { recursive: true });
-      const target = join(dir, fileName);
+      const targetDir = explicit ? (kind === "extensions" ? dir : join(root, kind)) : join(root, kind);
+      mkdirSync(targetDir, { recursive: true });
+      const target = join(targetDir, fileName);
       const current = existsSync(target) ? readFileSync(target, "utf8") : null;
       if (current !== content) {
         writeFileSync(target, content, "utf8");
@@ -86,15 +123,17 @@ export function buildSshCatCommand(remotePath: string): string {
  * app has no SFTP credentials, so provisioning goes over ssh.exe with
  * BatchMode instead (see syncKeyAuthExtensions in index.ts).
  */
-export function buildSshInstallCommand(extensions: ShippedExtension[] = SHIPPED_EXTENSIONS): string {
-  const base = "$HOME/.pi/agent/extensions";
-  const writes = extensions
-    .map(({ fileName, content }) => {
+export function buildSshInstallCommand(files: Array<ShippedExtension & { dir?: ShippedDir }> = SHIPPED_FILES): string {
+  // $HOME expands in the remote shell (the agent path has no spaces, and avoiding
+  // quotes is what keeps the command safe through ssh.exe → bash layers).
+  const dirs = ["extensions", "agents", "prompts"];
+  const writes = files
+    .map(({ fileName, content, dir }) => {
       const b64 = Buffer.from(content, "utf8").toString("base64");
-      return `echo ${b64} | base64 -d > ${base}/${fileName}`;
+      return `echo ${b64} | base64 -d > $HOME/.pi/agent/${dir ?? "extensions"}/${fileName}`;
     })
     .join(" && ");
-  return `mkdir -p ${base} && ${writes}`;
+  return `mkdir -p ${dirs.map((d) => `$HOME/.pi/agent/${d}`).join(" ")} && ${writes}`;
 }
 
 /**
@@ -114,11 +153,11 @@ export async function syncExtensionsViaSftp(
 ): Promise<RemoteExtensionsSyncResult> {
   const uploaded: string[] = [];
   const base = remoteAgentDir({ agentDir: agentDirRemote }, homeDir);
-  const extDir = `${base}/extensions`;
   try {
-    await client.mkdir(extDir, true);
-    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-      const remotePath = `${extDir}/${fileName}`;
+    for (const { fileName, content, dir } of SHIPPED_FILES) {
+      const remoteDir = `${base}/${dir}`;
+      await client.mkdir(remoteDir, true);
+      const remotePath = `${remoteDir}/${fileName}`;
       let current: string | Buffer | undefined;
       try {
         current = (await client.get(remotePath)) as string | Buffer | undefined;

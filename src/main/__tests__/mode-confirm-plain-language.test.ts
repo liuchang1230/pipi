@@ -233,7 +233,7 @@ describe("edit-mode context requires a stated intent", () => {
  * progress tracking consume, so they must survive any wording change.
  */
 describe("plan-mode brief", () => {
-  function drive() {
+  function drive(activeTools: string[] = ["read", "edit", "write", "bash"]) {
     const handlers = new Map<string, (...args: unknown[]) => unknown>();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const pi = {
@@ -277,5 +277,60 @@ describe("plan-mode brief", () => {
     // The machine contract: our extractor needs the header + numbers.
     expect(content).toContain('Plan:');
     expect(extractTodoItems("Plan:\n1. 修改 src/a.ts 的 login()\n2. 补一个测试")).toHaveLength(2);
+  });
+});
+
+/**
+ * 「先侦察再规划」只在 subagent 能力真的存在时提示 —— 否则等于让模型去调用一个不存在的工具
+ * （我们之前踩过"提示了不存在的命令"这一类坑）。
+ */
+describe("scout→planner hint", () => {
+  function drive(activeTools: string[]) {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const pi = {
+      registerFlag: () => undefined,
+      registerCommand: (name: string, def: { handler: (a: string, c: unknown) => unknown }) => commands.set(name, def.handler),
+      registerShortcut: () => undefined,
+      on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+      getFlag: () => undefined,
+      getActiveTools: () => activeTools,
+      setActiveTools: () => undefined,
+      appendEntry: () => undefined,
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    };
+    pipiModeSwitch(pi as never);
+    return { handlers, commands };
+  }
+  const ctx = {
+    hasUI: true,
+    ui: {
+      notify: async () => undefined,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+      confirm: async () => true,
+      select: async () => undefined,
+      editor: async () => "",
+      theme: { fg: (_c: string, t: string) => t, strikethrough: (t: string) => t },
+    },
+    sessionManager: { getEntries: () => [] },
+  };
+
+  it("suggests scout→planner when a subagent tool is present", async () => {
+    const { handlers, commands } = drive(["read", "edit", "write", "bash", "subagent"]);
+    await commands.get("plan")!("", ctx);
+    const content = ((await handlers.get("before_agent_start")!({}, ctx)) as { message?: { content?: string } })?.message?.content ?? "";
+    expect(content).toContain("scout");
+    expect(content).toContain("planner");
+    expect(content).toContain("/scout-and-plan");
+  });
+
+  it("stays silent when no subagent tool exists", async () => {
+    const { handlers, commands } = drive(["read", "edit", "write", "bash"]);
+    await commands.get("plan")!("", ctx);
+    const content = ((await handlers.get("before_agent_start")!({}, ctx)) as { message?: { content?: string } })?.message?.content ?? "";
+    expect(content).not.toContain("scout");
+    expect(content).toContain("## Risks"); // the plan brief itself is still there
   });
 });

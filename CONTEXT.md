@@ -724,3 +724,29 @@ Ctrl+Alt+M、`--pipi-mode`、同样的计划提取 + `[DONE:n]` + todos widget�
 确实是好东西（规划在独立上下文窗口里做，不污染主对话），但它依赖 pi-subagent 扩展；
 要做的话应该由 app 一并分发 agent 定义与 workflow 提示词，而不是假设用户装过 —— 已记录为
 后续项，不与本次改动混在一起。
+
+## 采纳官方「先侦察再规划」：app 分发 planner agent + workflow 提示词 (2026-09-26)
+
+上一轮记为后续项、用户已同意：pi 官方 subagent 例子的 scout→planner 工作流值得要 ——
+**规划在独立上下文窗口里做，不污染主对话**。已实现（不再假设用户装过 pi-subagent）：
+
+1. **分发机制从"只发扩展"扩到三类文件**：`ShippedFile { dir: "extensions"|"agents"|"prompts" }`。
+   pi 从同一个 agent 家目录自动发现三者（`docs/prompt-templates.md`：全局
+   `~/.pi/agent/prompts/*.md`；scout 扩展的 `agents.ts`：`~/.pi/agent/agents/*.md`）：
+   - `ensureShippedExtensions()` 现在按 `dir` 建目录写文件（显式 dir 时 agents/prompts 落在
+     它的兄弟目录，测试不会污染真实家目录）；
+   - **远程同步一并覆盖**：`syncExtensionsViaSftp` 逐类 mkdir，`buildSshInstallCommand` 里
+     `mkdir -p $HOME/.pi/agent/{extensions,agents,prompts}` —— 否则远程会话（本用户的主场景）
+     用不了这个工作流。
+2. **`agents/planner.md`**：Goal / `Plan:` 编号 / Files to Modify / New Files / Risks /
+   Open Questions，只读工具（read/grep/find/ls）。**故意不写 `model:`** —— app 会为子代理
+   钉住当前会话模型（`pipi-subagent-model.ts`），写死模型会静默覆盖用户的选择（有测试钉住）。
+3. **`prompts/scout-and-plan.md`**：`/scout-and-plan <任务>` = scout 侦察 → planner 出计划，
+   通过 `{previous}` 串链，明确"不要实现"。
+4. **plan 模式的提示是有条件的**：只有 `pi.getActiveTools()` 里真的存在 subagent/scout/planner
+   时才写给模型（否则等于让它调用不存在的工具 —— 我们踩过"提示了不存在的命令"这类坑）。
+5. plan 模式的工作简报同时采纳官方 planner 的段落结构（见上一条记录）。
+
+验证：扩展分发测试覆盖三类目录 + 远程三目录 + idempotent（12 例）；真机 smoke 启动后
+`~/.pi/agent/agents/planner.md`（1762B）与 `~/.pi/agent/prompts/scout-and-plan.md`（812B）
+确实落地 ✓。

@@ -5,7 +5,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ensureShippedExtensions, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand, SHIPPED_EXTENSIONS } from "../extension-sync";
+import {
+  ensureShippedExtensions,
+  syncExtensionsViaSftp,
+  buildSshInstallCommand,
+  buildSshCatCommand,
+  SHIPPED_EXTENSIONS,
+  SHIPPED_FILES,
+} from "../extension-sync";
 
 let dirs: string[] = [];
 
@@ -21,13 +28,23 @@ afterEach(() => {
 });
 
 describe("ensureShippedExtensions", () => {
-  it("writes all shipped extensions on first run and returns their names", () => {
+  it("writes every shipped file on first run — extensions, agents AND prompts", () => {
     const dir = tempDir();
     const updated = ensureShippedExtensions(dir);
-    expect(updated.length).toBeGreaterThan(0);
-    for (const name of updated) {
-      expect(existsSync(join(dir, name))).toBe(true);
+    expect(updated.length).toBe(SHIPPED_FILES.length);
+    for (const f of SHIPPED_FILES) {
+      // extensions land in the given dir; agents/prompts in its siblings, so pi's
+      // auto-discovery finds all three next to each other.
+      const root = dir.replace(/[/\\]extensions$/, "");
+      const base = f.dir === "extensions" ? dir : join(root, f.dir);
+      expect(existsSync(join(base, f.fileName))).toBe(true);
     }
+    // The planner agent must NOT pin a model: the app pins the SESSION model for
+    // subagents (pipi-subagent-model.ts) and a model: line here would win.
+    const planner = SHIPPED_FILES.find((f) => f.fileName === "planner.md")!;
+    expect(planner.content).toContain("name: planner");
+    expect(/^model:/m.test(planner.content)).toBe(false);
+    expect(planner.content).toContain("Plan:");
   });
 
   it("returns an empty list when nothing changed on the second run", () => {
@@ -51,12 +68,12 @@ describe("ensureShippedExtensions", () => {
 describe("buildSshInstallCommand", () => {
   it("produces a quote-free install command covering every shipped extension", () => {
     const cmd = buildSshInstallCommand();
-    expect(cmd.startsWith("mkdir -p $HOME/.pi/agent/extensions && ")).toBe(true);
+    expect(cmd.startsWith("mkdir -p $HOME/.pi/agent/extensions $HOME/.pi/agent/agents $HOME/.pi/agent/prompts && ")).toBe(true);
     // The command crosses Windows spawn → ssh.exe → remote bash: any quote
     // would need escaping, so the command must be entirely quote-free.
     expect(cmd).not.toMatch(/['"]/);
-    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-      expect(cmd).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/extensions/${fileName}`);
+    for (const { fileName, content, dir } of SHIPPED_FILES) {
+      expect(cmd).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/${dir}/${fileName}`);
     }
   });
 });
@@ -107,32 +124,34 @@ describe("syncExtensionsViaSftp", () => {
     const { client, puts, mkdirs } = mockClient(new Map());
     const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
     expect(result.ok).toBe(true);
-    expect(puts.length).toBe(SHIPPED_EXTENSIONS.length);
+    expect(puts.length).toBe(SHIPPED_FILES.length);
     for (const p of puts) {
-      expect(p.path.startsWith("/home/user/.pi/agent/extensions/")).toBe(true);
+      expect(/^\/home\/user\/\.pi\/agent\/(extensions|agents|prompts)\//.test(p.path)).toBe(true);
       expect(p.content.toString("utf8").length).toBeGreaterThan(0);
     }
     expect(mkdirs).toContain("/home/user/.pi/agent/extensions");
+    expect(mkdirs).toContain("/home/user/.pi/agent/agents");
+    expect(mkdirs).toContain("/home/user/.pi/agent/prompts");
   });
 
   it("honors an absolute agentDir override when computing the remote base", async () => {
     const { client, puts } = mockClient(new Map());
     const result = await syncExtensionsViaSftp(client as never, "/home/user", "/srv/shared-pi");
     expect(result.ok).toBe(true);
-    for (const p of puts) expect(p.path.startsWith("/srv/shared-pi/extensions/")).toBe(true);
+    for (const p of puts) expect(/^\/srv\/shared-pi\/(extensions|agents|prompts)\//.test(p.path)).toBe(true);
   });
 
   it("expands a ~/ agentDir override against the remote home", async () => {
     const { client, puts } = mockClient(new Map());
     const result = await syncExtensionsViaSftp(client as never, "/home/user", "~/shared-pi");
     expect(result.ok).toBe(true);
-    for (const p of puts) expect(p.path.startsWith("/home/user/shared-pi/extensions/")).toBe(true);
+    for (const p of puts) expect(/^\/home\/user\/shared-pi\/(extensions|agents|prompts)\//.test(p.path)).toBe(true);
   });
 
   it("skips files whose remote content already matches (string or Buffer)", async () => {
     const existing = new Map<string, string | Buffer>();
-    SHIPPED_EXTENSIONS.forEach(({ fileName, content }, i) => {
-      const path = `/home/user/.pi/agent/extensions/${fileName}`;
+    SHIPPED_FILES.forEach(({ fileName, content, dir }, i) => {
+      const path = `/home/user/.pi/agent/${dir}/${fileName}`;
       existing.set(path, i % 2 === 0 ? Buffer.from(content, "utf8") : content);
     });
     const { client, puts } = mockClient(existing);
@@ -143,9 +162,9 @@ describe("syncExtensionsViaSftp", () => {
   });
 
   it("re-uploads a file that drifted from the shipped content", async () => {
-    const file = SHIPPED_EXTENSIONS[0]!;
+    const file = SHIPPED_FILES[0]!;
     const existing = new Map<string, string | Buffer>([
-      [`/home/user/.pi/agent/extensions/${file.fileName}`, "// tampered\n"],
+      [`/home/user/.pi/agent/${file.dir}/${file.fileName}`, "// tampered\n"],
     ]);
     const { client, puts } = mockClient(existing);
     const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
