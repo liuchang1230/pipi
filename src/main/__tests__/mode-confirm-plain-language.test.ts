@@ -8,7 +8,14 @@ import { describe, expect, it } from "vitest";
 import { CONFIRM_DETAIL_MARKER, splitConfirmMessage } from "../../shared/confirm-detail";
 // The extension is a plain module with a default export; importing it here gives
 // the tests the REAL human-language functions it uses at runtime.
-import { describeBashIntent, summarizeBash, summarizeWrite } from "../extensions/pipi-mode-switch";
+import {
+  describeBashIntent,
+  findEnclosingSymbol,
+  lastAssistantIntent,
+  summarizeBash,
+  summarizeTextChange,
+  summarizeWrite,
+} from "../extensions/pipi-mode-switch";
 
 describe("splitConfirmMessage", () => {
   it("splits a human sentence from the raw detail", () => {
@@ -67,38 +74,40 @@ describe("summarizeBash / summarizeWrite", () => {
     expect(splitConfirmMessage(text).headline).toBe(headline);
   });
 
-  it("describes a file edit by scale instead of dumping the first line", () => {
+  it("says WHAT the edit does, not just how many lines", () => {
     const text = summarizeWrite("edit", {
       path: "src/a.ts",
-      oldText: "const a = 1;\nconst b = 2;",
-      newText: "const a = 42;\nconst b = 2;\nconst c = 3;",
+      oldText: "const retries = 3;",
+      newText: "const retries = 5;",
     });
-    expect(text).toContain("改写为 3 行");
-    expect(text).toContain("src/a.ts");
-    expect(splitConfirmMessage(text).detail).toContain("删掉: const a = 1;");
-    expect(splitConfirmMessage(text).detail).toContain("换成: const a = 42;");
+    // 「授权来做什么」的答案：具体到值的变化。
+    expect(text).toContain("把 3 改为 5");
+    expect(text).toContain("删除 1 行 / 新增 1 行");
+    expect(splitConfirmMessage(text).detail).toContain("删掉: const retries = 3;");
+    expect(splitConfirmMessage(text).detail).toContain("换成: const retries = 5;");
   });
 
-  it("calls out a whitespace-only change", () => {
-    const text = summarizeWrite("edit", { path: "a.ts", oldText: "a  b", newText: "a b" });
-    expect(text).toContain("空白");
+  it("puts the model's own statement of intent first when available", () => {
+    const text = summarizeWrite(
+      "edit",
+      { path: "src/a.ts", oldText: "a", newText: "b" },
+      "把登录失败的重试次数从 3 提到 5，避免网络抖动直接报错",
+    );
+    expect(text.split("\n")[0]).toContain("AI 说：把登录失败的重试次数从 3 提到 5");
   });
 
-  it("describes an insert and a whole-file write", () => {
-    expect(summarizeWrite("edit", { path: "a.ts", oldText: "", newText: "x\ny" })).toContain("新增 2 行");
-    const wrote = summarizeWrite("write", { path: "new.ts", content: "line1\nline2\n" });
-    expect(wrote).toContain("整份覆盖");
-    expect(wrote).toContain("new.ts");
-  });
+  it("tells a new file from an overwrite (the risky one) and shows the opening line", () => {
+    const fresh = summarizeWrite("write", {
+      path: "src/definitely-missing-file-xyz.ts",
+      content: "export function foo() {}\nconst a = 1;",
+    });
+    expect(fresh).toContain("新建文件");
+    expect(fresh).toContain("将写入 2 行内容");
+    expect(fresh).toContain("开头是：export function foo");
 
-  it("asks with a purpose-first title, not a mode question", () => {
-    // 用户反馈：「用户不需要知道你执行什么命令，只需要知道你要干什么」—— the dialog title
-    // states the intention ("AI 想…"), the big line states the effect.
-    const source = readFileSync(join(__dirname, "..", "extensions", "pipi-mode-switch.ts"), "utf8");
-    expect(source).toContain('ctx.ui.confirm("AI 想执行一条命令"');
-    expect(source).toContain('"AI 想修改文件"');
-    expect(source).toContain('"AI 想创建或覆盖文件"');
-    expect(source).not.toContain("edit 模式：允许修改文件？");
+    const overwrite = summarizeWrite("write", { path: __filename, content: "a\nb\n" });
+    expect(overwrite).toContain("覆盖已有文件");
+    expect(overwrite).toContain("原文件会被整份替换");
   });
 
   it("uses the same marker literal as the dialog", () => {
@@ -108,5 +117,47 @@ describe("summarizeBash / summarizeWrite", () => {
     const source = readFileSync(join(__dirname, "..", "extensions", "pipi-mode-switch.ts"), "utf8");
     expect(source).toContain(`const CONFIRM_DETAIL_MARKER = "${CONFIRM_DETAIL_MARKER}"`);
     expect(source).not.toContain("`${path}\\n替换:");
+  });
+});
+
+describe("purpose-first helpers", () => {
+  it("summarizeTextChange reports what actually changed", () => {
+    expect(summarizeTextChange("const n = 3;", "const n = 5;")).toContain("把 3 改为 5");
+    expect(summarizeTextChange("", "export function foo() {}")).toEqual(["新增 foo()", "删除 0 行 / 新增 1 行"]);
+    expect(summarizeTextChange("log('old')", "log('new')")).toContain("新增文案「new」");
+  });
+
+  it("findEnclosingSymbol locates the function being edited", () => {
+    const file = [
+      "import x from 'x';",
+      "",
+      "export function login(user) {",
+      "  const retries = 3;",
+      "  return user;",
+      "}",
+      "",
+      "export function logout() {}",
+    ].join("\n");
+    const found = findEnclosingSymbol(file, "const retries = 3;");
+    expect(found?.symbol).toBe("login");
+    expect(found?.line).toBe(4);
+    expect(findEnclosingSymbol(file, "not in the file")).toBeUndefined();
+  });
+
+  it("lastAssistantIntent reads the model's own last words", () => {
+    const entries = [
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "帮我改重试次数" }] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "text", text: "我先看一下。\n\n把 3 次改成 5 次更稳。" }] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "edit" }] } },
+    ];
+    // The whole statement is kept when it is short — it IS the purpose.
+    expect(lastAssistantIntent(entries)).toBe("我先看一下。 把 3 次改成 5 次更稳。");
+  });
+
+  it("never invents a purpose when the model said nothing", () => {
+    expect(lastAssistantIntent([])).toBeUndefined();
+    expect(
+      lastAssistantIntent([{ type: "message", message: { role: "assistant", content: [{ type: "toolCall" }] } }]),
+    ).toBeUndefined();
   });
 });

@@ -35,9 +35,36 @@ function ConfirmMessage({ req, title }: { req: UiRequest; title: string }) {
   // click away, for the times you DO want to verify before allowing.
   const [showDetail, setShowDetail] = useState(false);
   const structured = detail !== undefined || req.message === undefined;
+  /**
+   * The headline is now a small block: 「AI 说：…」 (the model's own stated purpose)
+   * + what/where + 「· 要点」 bullets. 用户反馈：「只有写什么、覆盖什么，然后就是一堆代码…根本
+   * 不知道要授权来做什么」 — so 目的 first, 要点 next, code last (and collapsed).
+   */
+  const lines = (headline || title).split("\n").map((l) => l.trim()).filter(Boolean);
+  const purpose = lines.filter((l) => l.startsWith("AI 说："));
+  const heading = lines.filter((l) => !l.startsWith("AI 说：") && !l.startsWith("· "));
+  const bullets = lines.filter((l) => l.startsWith("· ")).map((l) => l.slice(2));
   return (
     <>
-      <div className={structured ? "ui-confirm-purpose" : "ui-confirm-msg"}>{headline || title}</div>
+      {structured ? (
+        <div className="ui-confirm-msg">
+          {purpose.map((p, i) => (
+            <div key={`p${i}`} className="ui-confirm-purpose-line">{p}</div>
+          ))}
+          {heading.map((h, i) => (
+            <div key={`h${i}`} className="ui-confirm-head">{h}</div>
+          ))}
+          {bullets.length > 0 ? (
+            <ul className="ui-confirm-bullets">
+              {bullets.map((b, i) => (
+                <li key={i}>{b}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : (
+        <div className="ui-confirm-msg">{headline || title}</div>
+      )}
       {detail ? (
         showDetail ? (
           <>

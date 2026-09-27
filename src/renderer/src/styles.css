@@ -2794,6 +2794,31 @@ textarea:focus-visible,
   padding: 10px 6px 4px;
   font-weight: 500;
 }
+/* 目的（模型自述）单独一行、带引号观感 —— the answer to 「授权来做什么」. */
+.ui-confirm-purpose-line {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  padding: 2px 0 2px 8px;
+  margin-bottom: 6px;
+}
+.ui-confirm-head {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--text);
+}
+.ui-confirm-bullets {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+.ui-confirm-bullets li {
+  margin: 2px 0;
+}
 .ui-dialog-body-confirm {
   display: flex;
   flex-direction: column;

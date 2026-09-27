@@ -655,3 +655,27 @@ Ctrl+Alt+M、`--pipi-mode`、同样的计划提取 + `[DONE:n]` + todos widget�
 - 新增 `Ctrl+Alt+P` 快捷键别名（官方 README 里写的就是它），保留我们的 Ctrl+Alt+M；
 - `/todos`、`[DONE:n]` 本来就有 ✓。
 - `pi-api-stub.d.ts` 的 `registerFlag` 类型补上 boolean 形式（官方扩展就是这么注册的）。
+
+## 授权弹窗回答"要授权来做什么" (2026-09-26)
+
+用户反馈（关键）：edit 模式弹窗「描述非常不具体，只有写什么、覆盖什么，然后就是一堆代码…
+我用过别的 agent 可不是这样，用户根本不知道要授权来做什么」。
+
+**别的 agent 的做法**：先说目的（"修改 login 里的重试次数"），再说要点，代码放最后且可展开。
+我们之前只有"路径 + 行数"——因为**目的信息我们手上其实有，只是没显示**。
+
+三块拼图（都在 pi 侧可得，零猜测）：
+
+1. **模型自述目的**：`ctx.sessionManager.getEntries()` 里上一条 assistant 的文本就是它请求这次
+   编辑前说的话 → `lastAssistantIntent(entries)`（剥 markdown、压空白、取第一句、限 160 字；
+   取不到返回 undefined，**绝不编造**）。
+2. **改哪里**：读目标文件、定位 `oldText` 的位置 → `findEnclosingSymbol(fileText, snippet)`
+   回溯最近的 `function|class|const|interface|type|…` 声明，给出**符号名 + 近似行号**
+   （扩展运行在工具所在的机器上，本地/WSL/远程读到的都是同一份文件）。
+3. **改了什么**：`summarizeTextChange(old, new)` 抽可读要点 —— 数值变化（「把 3 改为 5」）、
+   新增函数（「新增 foo()」）、新增文案、以及行数增减。`write` 还区分**新建** vs
+   **覆盖已有文件（整份重写）**（`statSync` 实测），并给出开头一行。
+
+排版：`AI 说：…`（左侧细色条引用块）→ 目的行（加粗）→ `· 要点` 列表 → 「▸ 查看具体内容」
+折叠的原始 diff。测试 14 例（含 4 个新纯函数：数值/函数/文案/行数、符号定位、自述提取、
+"没说不编造"）。

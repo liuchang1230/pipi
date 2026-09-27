@@ -1,3 +1,5 @@
+import { readFileSync, statSync } from "node:fs";
+import { relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /**
@@ -371,13 +373,106 @@ export function describeBashIntent(command: string): string {
 
 /** 与 src/shared/confirm-detail.ts 的 CONFIRM_DETAIL_MARKER 必须一致（扩展是独立
  *  文件、由 pi 直接加载，无法 import 应用代码；有测试读本文件校验二者一致）。 */
+/**
+ * 人话摘要：回答用户真正的问题——「**授权来做什么**」。
+ *
+ * 用户反馈：「弹窗描述非常不具体，只有写什么、覆盖什么，然后就是一堆代码，用户根本不知道
+ * 要授权来做什么」。别的 agent 会先说目的（"修改 login 函数里的重试次数"）再说细节。
+ * 这里把三样东西凑齐：
+ *   1. 模型自己的话（它请求这次编辑前说的那句，来自会话里的上一条 assistant 文本）；
+ *   2. 改哪里（读文件、定位被替换片段，回溯到最近的函数/类声明，给出符号名与行号）；
+ *   3. 改了什么（从 old/new 文本抽出可读要点：数字/字符串变化、新增函数、增删行数）。
+ * 原始 diff 仍然附在「详情（供核对）」之后，但不再作为主要信息。
+ */
+
+/** 纯函数：从 old→new 抽出可读要点。可单测（无 fs）。 */
+export function summarizeTextChange(oldText: string, newText: string): string[] {
+	const out: string[] = [];
+	const oldLines = oldText ? oldText.split("\n") : [];
+	const newLines = newText ? newText.split("\n") : [];
+	// Numbers that changed (retry counts, timeouts, versions…): the single most
+	// useful fact in a config-ish edit.
+	const oldNums = [...new Set((oldText.match(/\b\d+(?:\.\d+)?\b/g) ?? []))];
+	const newNums = [...new Set((newText.match(/\b\d+(?:\.\d+)?\b/g) ?? []))];
+	const removedNums = oldNums.filter((n) => !newNums.includes(n));
+	const addedNums = newNums.filter((n) => !oldNums.includes(n));
+	if (removedNums.length === 1 && addedNums.length === 1) out.push(`把 ${removedNums[0]} 改为 ${addedNums[0]}`);
+	else if (addedNums.length > 0 && removedNums.length === 0) out.push(`新增数值 ${addedNums.slice(0, 3).join("、")}`);
+	// Newly declared functions/classes/methods — "what is being introduced".
+	const declRe = /(?:^|\n)\s*(?:export\s+)?(?:async\s+)?(?:function|class|def|fn|func)\s+([A-Za-z_$][\w$]*)/g;
+	const decls = (text: string) => [...text.matchAll(declRe)].map((m) => m[1]!);
+	const newDecls = decls(newText).filter((d) => !decls(oldText).includes(d));
+	if (newDecls.length > 0) out.push(`新增 ${newDecls.slice(0, 3).map((d) => `${d}()`).join("、")}`);
+	// Changed string literals.
+	const strs = (text: string) =>
+		[...text.matchAll(/["'`]([^"'`\n]{2,60})["'`]/g)].map((m) => m[1]!);
+	const oldStrs = strs(oldText);
+	const addedStrs = strs(newText).filter((x) => !oldStrs.includes(x));
+	if (addedStrs.length > 0) out.push(`新增文案「${addedStrs[0]}」`);
+	// Size, always: the reader wants to know how big this is.
+	if (oldLines.length > 0 || newLines.length > 0) {
+		out.push(`删除 ${oldLines.filter((l) => l.trim()).length} 行 / 新增 ${newLines.filter((l) => l.trim()).length} 行`);
+	}
+	return out;
+}
+
+/**
+ * 纯函数：在被改动的文件里找到这段旧代码属于哪个函数/类，以及它大概在第几行。
+ * 返回 undefined 表示定位不到（片段不在文件里 / 文件读不到）——调用方就不要编造符号名。
+ */
+export function findEnclosingSymbol(
+	fileText: string,
+	snippet: string,
+): { symbol: string; line: number } | undefined {
+	if (!fileText || !snippet) return undefined;
+	const at = fileText.indexOf(snippet);
+	if (at < 0) return undefined;
+	const upTo = fileText.slice(0, at);
+	const line = upTo.split("\n").length;
+	const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|def|fn|func|interface|type|enum)\s+([A-Za-z_$][\w$]*)/;
+	const lines = upTo.split("\n");
+	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		const m = lines[i]!.match(declRe);
+		if (m) return { symbol: m[1]!, line };
+	}
+	return { symbol: "", line };
+}
+
+/** 模型自己刚说过的话：这次编辑的"为什么"。取不到就返回 undefined（不编造）。 */
+export function lastAssistantIntent(
+	entries: Array<Record<string, unknown>>,
+	limit = 40,
+): string | undefined {
+	const tail = entries.slice(-limit);
+	for (let i = tail.length - 1; i >= 0; i -= 1) {
+		const e = tail[i]!;
+		const msg = e.message as { role?: string; content?: unknown } | undefined;
+		if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const text = msg.content
+			.map((b) => (b as { type?: string; text?: string }).type === "text" ? ((b as { text?: string }).text ?? "") : "")
+			.join(" ")
+			.replace(/```[\s\S]*?```/g, " ")
+			.replace(/[#*`>]/g, "")
+			.replace(/\s+/g, " ")
+			.trim();
+		if (!text) continue;
+		// First sentence reads best; cap the length so the dialog stays scannable.
+		const firstSentence = text.split(/(?<=[。.!?])\s*/)[0] ?? text;
+		const picked = firstSentence.length >= 8 ? firstSentence : text;
+		return picked.length > 160 ? `${picked.slice(0, 157)}...` : picked;
+	}
+	return undefined;
+}
+
 const CONFIRM_DETAIL_MARKER = "详情（供核对）";
 
 /** 一句人话 + 原文照附（用户要能核对具体内容）。 */
-export function summarizeBash(command: string): string {
+export function summarizeBash(command: string, intent?: string): string {
 	const oneLine = command.replace(/\s+/g, " ").trim();
 	const shown = oneLine.length > 400 ? `${oneLine.slice(0, 397)}...` : oneLine;
-	return `${describeBashIntent(command)}\n\n${CONFIRM_DETAIL_MARKER}:\n${shown}`;
+	// 目的（模型自述）在前，命令原文在「详情（供核对）」之后。
+	const head = intent ? `${describeBashIntent(command)}\nAI 说：${intent}` : describeBashIntent(command);
+	return `${head}\n\n${CONFIRM_DETAIL_MARKER}:\n${shown}`;
 }
 
 function firstLine(text: string, max = 90): string {
@@ -392,33 +487,90 @@ function firstLine(text: string, max = 90): string {
  * 这里先说清动作与规模（改写 N 行 → M 行 / 新增 M 行 / 整份覆盖 / 只是空白变化），
  * 再把改动前后各一行作为可核对详情。
  */
-export function summarizeWrite(toolName: string, input: unknown): string {
+/**
+ * 文件修改的确认文案：先说**要做什么**，再说规模，最后附可核对的原文。
+ *
+ * 用户反馈的原话：「根本弹窗中描述非常不具体，只有写什么，覆盖什么，然后就是一堆代码…
+ * 用户根本不知道要授权来做什么」。所以顺序是：
+ *   目的（模型自述 + 符号名 + 行号）→ 要点（数值/新增符号/文案变化 + 行数）→ 原文。
+ *
+ * `intent` 由调用方从会话里取（模型请求编辑前说的那句话）；取不到就不编造。
+ * 这里会读文件：判断"新建还是覆盖"、把被替换的片段定位到所在函数/类。扩展运行在工具所在的
+ * 那台机器上，所以本地 / WSL / 远程读到的都是同一份文件。
+ */
+/**
+ * 文件修改的确认文案：先说**要做什么**，再说规模，最后附可核对的原文。
+ *
+ * 用户反馈的原话：「根本弹窗中描述非常不具体，只有写什么，覆盖什么，然后就是一堆代码…
+ * 用户根本不知道要授权来做什么」。所以顺序是：
+ *   目的（模型自述 + 符号名 + 行号）→ 要点（数值/新增符号/文案变化 + 行数）→ 原文。
+ *
+ * `intent` 由调用方从会话里取（模型请求编辑前说的那句话）；取不到就不编造。
+ * 这里会读文件：判断"新建还是覆盖"、把被替换的片段定位到所在函数/类。扩展运行在工具所在的
+ * 那台机器上，所以本地 / WSL / 远程读到的都是同一份文件。
+ */
+export function summarizeWrite(toolName: string, input: unknown, intent?: string): string {
 	const i = (input ?? {}) as { path?: unknown; file_path?: unknown; oldText?: unknown; newText?: unknown; content?: unknown };
-	const path = String(i.path ?? i.file_path ?? "(未知路径)");
+	const rawPath = String(i.path ?? i.file_path ?? "(未知路径)");
+	const rel = (() => {
+		try {
+			return relative(process.cwd(), rawPath) || rawPath;
+		} catch {
+			return rawPath;
+		}
+	})();
+	const head: string[] = [];
+	const bullets: string[] = [];
+	if (intent) head.push(`AI 说：${intent}`);
+
 	if (toolName === "edit") {
 		const oldText = String(i.oldText ?? "");
 		const newText = String(i.newText ?? "");
-		const removed = oldText.length > 0 ? oldText.split("\n").length : 0;
-		const added = newText.length > 0 ? newText.split("\n").length : 0;
-		const whitespaceOnly = oldText.replace(/\s+/g, "") === newText.replace(/\s+/g, "") && oldText !== newText;
-		const headline = whitespaceOnly
-			? `只调整 ${path} 的空白或换行（内容不变）`
-			: removed === 0
-				? `在 ${path} 里新增 ${added} 行内容`
-				: added === 0
-					? `删除 ${path} 里的 ${removed} 行内容`
-					: `把 ${path} 里的 ${removed} 行内容改写为 ${added} 行`;
+		let where = rel;
+		try {
+			const found = findEnclosingSymbol(readFileSync(rawPath, "utf8"), oldText);
+			if (found) {
+				where = found.symbol ? `${rel} 的 ${found.symbol}()（约第 ${found.line} 行）` : `${rel}（约第 ${found.line} 行）`;
+			}
+		} catch {
+			/* 读不到就不编造位置 */
+		}
+		head.push(`修改 ${where}`);
+		bullets.push(...summarizeTextChange(oldText, newText));
 		const detail = [
 			oldText ? `删掉: ${firstLine(oldText)}` : "",
 			newText ? `换成: ${firstLine(newText)}` : "",
 		].filter(Boolean).join("\n");
-		return `${headline}\n\n${CONFIRM_DETAIL_MARKER}:\n${detail}`;
+		return composeConfirm(head, bullets, detail);
 	}
+
 	const content = String(i.content ?? "");
-	const count = content.length > 0 ? content.split("\n").length : 0;
-	const preview = content.split("\n").slice(0, 8).map((l) => l.trim()).filter(Boolean).join("\n");
-	return `新建或整份覆盖 ${path}（${count} 行，${content.length} 字符）\n\n${CONFIRM_DETAIL_MARKER}:\n${preview || "（空文件）"}`;
+	const lineCount = content.length > 0 ? content.split("\n").length : 0;
+	// 新建还是覆盖：真实存在的文件被整份重写，风险高得多，必须说清楚。
+	let exists = false;
+	try {
+		exists = statSync(rawPath).isFile();
+	} catch {
+		exists = false;
+	}
+	head.push(exists ? `覆盖已有文件 ${rel}（整份重写）` : `新建文件 ${rel}`);
+	if (exists) bullets.push(`原文件会被整份替换：${lineCount} 行新内容将成为文件全部内容`);
+	else bullets.push(`将写入 ${lineCount} 行内容`);
+	const firstMeaningful = content.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+	if (firstMeaningful) bullets.push(`开头是：${firstMeaningful.slice(0, 80)}`);
+	return composeConfirm(
+		head,
+		bullets,
+		content.split("\n").slice(0, 8).map((l) => l.trim()).filter(Boolean).join("\n"),
+	);
 }
+
+/** 目的 + 要点 + 原文（原文放在「详情（供核对）」之后，供核对而非首要信息）。 */
+function composeConfirm(head: string[], bullets: string[], detail: string): string {
+	const lines = [head.join("\n"), ...bullets.map((b) => `· ${b}`)];
+	return `${lines.join("\n")}\n\n${CONFIRM_DETAIL_MARKER}:\n${detail || "（无改动内容）"}`;
+}
+
 
 // ---------------------------------------------------------------------------
 // 主扩展
@@ -619,7 +771,12 @@ export default function pipiModeSwitch(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) {
 				return { block: true, reason: `edit 模式需要确认，但当前无 UI，按 fail-closed 拦截。\n命令: ${command}` };
 			}
-			const ok = await ctx.ui.confirm("AI 想执行一条命令", summarizeBash(command));
+			const ok = await ctx.ui.confirm(
+				"AI 想执行一条命令",
+				// 目的来自模型自己刚说的话（会话里上一条 assistant 文本）——
+				// 「用户根本不知道要授权来做什么」的答案在这里，不在 diff 里。
+				summarizeBash(command, lastAssistantIntent(ctx.sessionManager.getEntries())),
+			);
 			if (!ok) return { block: true, reason: "用户在 edit 模式下拒绝了该命令" };
 			return undefined;
 		}
@@ -634,7 +791,7 @@ export default function pipiModeSwitch(pi: ExtensionAPI): void {
 			}
 			const ok = await ctx.ui.confirm(
 				event.toolName === "write" ? "AI 想创建或覆盖文件" : "AI 想修改文件",
-				summarizeWrite(event.toolName, event.input),
+				summarizeWrite(event.toolName, event.input, lastAssistantIntent(ctx.sessionManager.getEntries())),
 			);
 			if (!ok) return { block: true, reason: "用户在 edit 模式下拒绝了本次文件修改" };
 		}
