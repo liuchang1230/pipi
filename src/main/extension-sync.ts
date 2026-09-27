@@ -11,18 +11,16 @@
  * Source of truth: the files in src/main/extensions/, embedded at build time
  * via Vite `?raw` imports (no packaging/asar concerns).
  */
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type SftpClient from "ssh2-sftp-client";
 import { remoteAgentDir } from "./pty";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
 import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
-import modeSwitchSource from "./extensions/pipi-mode-switch.ts?raw";
-import plannerAgentSource from "./agents/planner.md?raw";
-import scoutAndPlanPromptSource from "./prompts/scout-and-plan.md?raw";
 
 const AGENT_HOME = join(homedir(), ".pi", "agent");
 const EXTENSIONS_DIR = join(AGENT_HOME, "extensions");
@@ -32,39 +30,84 @@ export interface ShippedExtension {
   content: string;
 }
 
-/**
- * A file the app provisions into pi's agent home. Three kinds, all discovered by
- * pi from the SAME home dir:
- *   extensions/ — code (commands, hooks, UI)
- *   agents/      — subagent definitions (`~/.pi/agent/agents/*.md`)
- *   prompts/     — prompt templates (`~/.pi/agent/prompts/*.md`, typed as /name)
- *
- * Shipping the agent + prompt from the app (rather than assuming the user
- * installed pi's subagent example) is what makes 「先侦察再规划」 available on a
- * fresh machine and on every remote server we provision.
- */
-export type ShippedDir = "extensions" | "agents" | "prompts";
-
-export interface ShippedFile extends ShippedExtension {
-  dir: ShippedDir;
-}
-
 export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-static-indicator.ts", content: staticIndicatorSource },
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
   { fileName: "pipi-model-sync.ts", content: modelSyncSource },
   { fileName: "pipi-subagent-model.ts", content: subagentModelSource },
-  { fileName: "pipi-mode-switch.ts", content: modeSwitchSource },
 ];
 
-export const SHIPPED_FILES: ShippedFile[] = [
-  ...SHIPPED_EXTENSIONS.map((f) => ({ ...f, dir: "extensions" as const })),
-  // Planner subagent: `model:` is deliberately ABSENT so the app's pinned session
-  // model applies (pipi-subagent-model.ts) — a hardcoded model here would silently
-  // override the user's choice.
-  { dir: "agents", fileName: "planner.md", content: plannerAgentSource },
-  { dir: "prompts", fileName: "scout-and-plan.md", content: scoutAndPlanPromptSource },
+/**
+ * Files that EARLIER app versions shipped and that we no longer ship. They must be
+ * DELETED on upgrade, not merely ignored: pi auto-loads every .ts under extensions/,
+ * so a retired extension left on disk keeps running (the app would just stop
+ * rendering its UI — the prompts, briefs and tool guards would still fire). Same for
+ * an agent definition or prompt template nobody references any more.
+ *
+ * A file is removed ONLY when we recognize it as ours: its bytes are the ones we
+ * shipped (`sha256`), or it carries EVERY marker (`markers`). Anything else — a file
+ * the user wrote or edited — is left alone and logged. Markers are space-free so the
+ * remote one-liner can pass them through `base64 -d` unquoted.
+ */
+export interface RetiredFile {
+  dir: "extensions" | "agents" | "prompts";
+  fileName: string;
+  sha256: string;
+  markers: string[];
+}
+
+export const RETIRED_FILES: RetiredFile[] = [
+  {
+    dir: "extensions",
+    fileName: "pipi-mode-switch.ts",
+    sha256: "a3244720443fa75b0dbe88413b94d50876ae4fb42badd60ef24bc366c5177c8e",
+    markers: ["pipi-mode-switch", "pipi-mode"],
+  },
+  {
+    dir: "agents",
+    fileName: "planner.md",
+    sha256: "cf304fd6a3b42fbba08e61b45af37d7d4228d848004895008b43a2b4958ac64c",
+    markers: ["READ-ONLY", "specialist"],
+  },
+  {
+    dir: "prompts",
+    fileName: "scout-and-plan.md",
+    sha256: "eaed55dbd1e23f3b66fd703e01bd6aaf16d8c8cbec2b98105b9ece78aa805353",
+    markers: ["先侦察再规划"],
+  },
 ];
+
+/** Is this file one we shipped and have since retired? */
+export function shouldRetire(content: string, spec: RetiredFile): boolean {
+  if (createHash("sha256").update(content, "utf8").digest("hex") === spec.sha256) return true;
+  return spec.markers.every((m) => content.includes(m));
+}
+
+/**
+ * Delete files we no longer ship. Best-effort like the sync itself: a failure is
+ * logged, never fatal (the app must still start). `agentHome` is overridable for
+ * tests. Returns the paths actually deleted.
+ */
+export function retireShippedFiles(agentHome = AGENT_HOME): string[] {
+  const removed: string[] = [];
+  for (const spec of RETIRED_FILES) {
+    const target = join(agentHome, spec.dir, spec.fileName);
+    try {
+      if (!existsSync(target)) continue;
+      const content = readFileSync(target, "utf8");
+      if (!shouldRetire(content, spec)) {
+        console.log(`[extensions] keeping ${target}: not a file we shipped`);
+        continue;
+      }
+      rmSync(target, { force: true });
+      removed.push(target);
+      console.log(`[extensions] retired ${target}`);
+    } catch (e) {
+      console.error(`[extensions] failed to retire ${spec.fileName}:`, e instanceof Error ? e.message : String(e));
+    }
+  }
+  return removed;
+}
 
 /**
  * Best-effort sync of shipped extensions. Runs at app startup, before any
@@ -76,16 +119,10 @@ export const SHIPPED_FILES: ShippedFile[] = [
  */
 export function ensureShippedExtensions(dir = EXTENSIONS_DIR): string[] {
   const updated: string[] = [];
-  // `dir` may be given explicitly (tests, custom installs): keep the historical
-  // behaviour of writing the EXTENSIONS there, and derive the sibling dirs from it
-  // so agents/prompts land next to them instead of in the real home.
-  const explicit = dir !== EXTENSIONS_DIR;
-  const root = explicit ? dir.replace(/[\/]extensions$/, "") : AGENT_HOME;
-  for (const { fileName, content, dir: kind } of SHIPPED_FILES) {
+  for (const { fileName, content } of SHIPPED_EXTENSIONS) {
     try {
-      const targetDir = explicit ? (kind === "extensions" ? dir : join(root, kind)) : join(root, kind);
-      mkdirSync(targetDir, { recursive: true });
-      const target = join(targetDir, fileName);
+      mkdirSync(dir, { recursive: true });
+      const target = join(dir, fileName);
       const current = existsSync(target) ? readFileSync(target, "utf8") : null;
       if (current !== content) {
         writeFileSync(target, content, "utf8");
@@ -103,6 +140,8 @@ export interface RemoteExtensionsSyncResult {
   ok: boolean;
   error?: string;
   uploaded: string[];
+  /** Paths removed because we no longer ship them (see RETIRED_FILES). */
+  retired?: string[];
 }
 
 /** Build the remote-shell command that cats a file whose path is
@@ -123,17 +162,31 @@ export function buildSshCatCommand(remotePath: string): string {
  * app has no SFTP credentials, so provisioning goes over ssh.exe with
  * BatchMode instead (see syncKeyAuthExtensions in index.ts).
  */
-export function buildSshInstallCommand(files: Array<ShippedExtension & { dir?: ShippedDir }> = SHIPPED_FILES): string {
-  // $HOME expands in the remote shell (the agent path has no spaces, and avoiding
-  // quotes is what keeps the command safe through ssh.exe → bash layers).
-  const dirs = ["extensions", "agents", "prompts"];
-  const writes = files
-    .map(({ fileName, content, dir }) => {
+export function buildSshInstallCommand(extensions: ShippedExtension[] = SHIPPED_EXTENSIONS): string {
+  const base = "$HOME/.pi/agent/extensions";
+  const writes = extensions
+    .map(({ fileName, content }) => {
       const b64 = Buffer.from(content, "utf8").toString("base64");
-      return `echo ${b64} | base64 -d > $HOME/.pi/agent/${dir ?? "extensions"}/${fileName}`;
+      return `echo ${b64} | base64 -d > ${base}/${fileName}`;
     })
     .join(" && ");
-  return `mkdir -p ${dirs.map((d) => `$HOME/.pi/agent/${d}`).join(" ")} && ${writes}`;
+  return `mkdir -p ${base} && ${writes}${buildSshRetireSuffix()}`;
+}
+
+/**
+ * The remote half of retirement: `rm -f` only when our markers are all present.
+ * Quote-free (markers travel base64-encoded, and they contain no spaces) and
+ * wrapped in a subshell that always succeeds, so a retire miss can never fail the
+ * install command itself.
+ */
+function buildSshRetireSuffix(): string {
+  return RETIRED_FILES.map(({ dir, fileName, markers }) => {
+    const path = `$HOME/.pi/agent/${dir}/${fileName}`;
+    const probes = markers
+      .map((m) => `grep -q $(echo ${Buffer.from(m, "utf8").toString("base64")} | base64 -d) ${path}`)
+      .join(" && ");
+    return ` && ( test -f ${path} && ${probes} && rm -f ${path} && echo retired ${path} || true )`;
+  }).join("");
 }
 
 /**
@@ -153,11 +206,32 @@ export async function syncExtensionsViaSftp(
 ): Promise<RemoteExtensionsSyncResult> {
   const uploaded: string[] = [];
   const base = remoteAgentDir({ agentDir: agentDirRemote }, homeDir);
+  const extDir = `${base}/extensions`;
+  const retired: string[] = [];
   try {
-    for (const { fileName, content, dir } of SHIPPED_FILES) {
-      const remoteDir = `${base}/${dir}`;
-      await client.mkdir(remoteDir, true);
-      const remotePath = `${remoteDir}/${fileName}`;
+    await client.mkdir(extDir, true);
+    // Retire first: a retired extension must not survive the sync that stops
+    // shipping it (pi loads it from disk regardless of what the app renders).
+    for (const spec of RETIRED_FILES) {
+      const remotePath = `${base}/${spec.dir}/${spec.fileName}`;
+      let current: string | Buffer | undefined;
+      try {
+        current = (await client.get(remotePath)) as string | Buffer | undefined;
+      } catch {
+        continue; // not present → nothing to retire
+      }
+      const text = Buffer.isBuffer(current) ? current.toString("utf8") : String(current ?? "");
+      if (!shouldRetire(text, spec)) continue;
+      try {
+        // noErrorOK: a concurrent delete must not fail the whole sync.
+        await client.delete(remotePath, true);
+        retired.push(remotePath);
+      } catch (error) {
+        console.error(`[extensions] failed to retire ${remotePath}:`, error instanceof Error ? error.message : String(error));
+      }
+    }
+    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
+      const remotePath = `${extDir}/${fileName}`;
       let current: string | Buffer | undefined;
       try {
         current = (await client.get(remotePath)) as string | Buffer | undefined;
@@ -175,7 +249,8 @@ export async function syncExtensionsViaSftp(
       ok: false,
       error: error instanceof Error ? error.message : String(error),
       uploaded,
+      retired,
     };
   }
-  return { ok: true, uploaded };
+  return { ok: true, uploaded, retired };
 }

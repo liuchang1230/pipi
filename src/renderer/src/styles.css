@@ -2326,85 +2326,8 @@ textarea:focus-visible,
    Segmented control in the input bar, same visual vocabulary as
    .viewer-modes. The active segment takes the mode's color: plan = warning
    (read-only caution), edit = accent, auto = neutral text. */
-.chat-mode-switch {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
-  flex-shrink: 0;
-  background: color-mix(in srgb, var(--bg-input) 60%, transparent);
-}
-.chat-mode-btn {
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 11px;
-  font-family: inherit;
-  line-height: 1.5;
-  padding: 2px 9px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
-}
-.chat-mode-btn:hover:not(:disabled):not(.active) {
-  color: var(--text);
-  background: var(--hover);
-}
-.chat-mode-btn:disabled {
-  cursor: default;
-  opacity: 0.5;
-}
-.chat-mode-btn.pending:not(.active) {
-  opacity: 0.6;
-}
-.chat-mode-btn.active {
-  font-weight: 600;
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-  color: var(--accent);
-}
-.chat-mode-btn.active.plan {
-  background: color-mix(in srgb, var(--warning) 16%, transparent);
-  color: var(--warning);
-}
-.chat-mode-btn.active.edit {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-  color: var(--accent);
-}
 
 /* Plan-execution progress widget (above the textarea, during exec). */
-.chat-mode-widget {
-  margin-bottom: 6px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--bg-input) 60%, transparent);
-  padding: 5px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.chat-mode-todo {
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.chat-mode-todo::before {
-  content: "☐ ";
-  color: var(--text-dim);
-}
-.chat-mode-todo.done {
-  color: var(--text-dim);
-  text-decoration: line-through;
-}
-.chat-mode-todo.done::before {
-  content: "☑ ";
-  color: var(--success);
-  text-decoration: none;
-}
 
 /* --- Chat model switch menu --- */
 .chat-header-left,

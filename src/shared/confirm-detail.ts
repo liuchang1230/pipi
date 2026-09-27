@@ -2,24 +2,23 @@
  * confirm-detail.ts — how a confirmation dialog tells the user WHAT is about to
  * happen.
  *
- * The user's report: 「edit 请求编辑的时候，提供的是一堆代码命令，看不懂，请求的时候，
- * 可不可以告诉用户要做什么？通俗一点」. The dialog was printing the extension's
- * message verbatim: for edit mode that message is a shell command or a
- * path + first replaced line, i.e. exactly the pile of code they could not read.
- *
- * The fix is a two-part message, and this module is the seam that keeps both
- * halves honest:
+ * A `ctx.ui.confirm(...)` request from any pi extension arrives as one string.
+ * Extensions that care can split it into a plain-language headline (what the AI
+ * wants to do) plus a literal marker followed by the raw detail to verify:
  *
  *   <一句人话：AI 想做什么>
  *
  *   详情（供核对）:
  *   <原始命令 / 改动前后，等宽字体，供核对>
  *
- * The extension (src/main/extensions/pipi-mode-switch.ts, which pi loads as a
- * standalone file and therefore cannot import from here) writes the literal
- * marker; `CONFIRM_DETAIL_MARKER` must match it — a test reads that file and
- * fails if the two ever drift. Everything else about the message stays free
- * prose, so a foreign extension's confirm is rendered verbatim as before.
+ * `splitConfirmMessage` is the seam: the headline gets the purpose-first
+ * layout, the detail goes into a monospace block. A message written by a
+ * foreign extension without the marker is returned verbatim as the headline,
+ * so nothing is lost and nothing is invented.
+ *
+ * The app no longer ships any extension that requests confirmation (the
+ * plan/edit modes were removed — the app is vanilla pi now), so this module
+ * today only formats requests coming from user-installed extensions.
  */
 
 /** Literal marker separating the plain sentence from the raw detail. */

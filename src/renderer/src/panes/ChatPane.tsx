@@ -12,7 +12,6 @@ import Markdown from "../Markdown";
 import { useChatStore, exitBannerText, type ChatBlock, type ChatMessage } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
-import { parseModeStatus, parseModeTodos, useSessionMode, MODE_RPC_ID_PREFIX, type SessionMode } from "./useSessionMode";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import {
   QuestionnaireDialog,
@@ -683,7 +682,6 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     };
   }));
   const activeTab = useTabsStore((s) => s.activeTab);
-  const sessionMode = useSessionMode(tabId);
   const [input, setInput] = useState("");
   const [uiReq, setUiReq] = useState<UiRequest | null>(null);
   // Full multi-question UI for ask_user_question (parity with the TUI): the
@@ -1000,13 +998,6 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         }
         return;
       }
-      if (event.type === "response" && typeof event.id === "string" && event.id.startsWith(MODE_RPC_ID_PREFIX)) {
-        // /mode dispatch completion: the authoritative state arrives via the
-        // extension's setStatus push (converted to mode_status in onRpcUiRequest).
-        // Consume the response frame here so the generic applyEvent never sees
-        // this foreign prompt-response shape.
-        return;
-      }
       if (event.type === "response" && event.command === "get_available_models") {
         const data = event.data as { models?: Array<{ id: string; name?: string; provider?: string }> } | undefined;
         if (data?.models) setModelList(data.models);
@@ -1135,27 +1126,6 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     const offExit = window.api.onRpcExit(tabId, (info) => useChatStore.getState().markExited(tabId, info));
     const offUi = window.api.onRpcUiRequest(tabId, (raw) => {
       const req = raw as unknown as UiRequest;
-      // Session-mode status/widget pushes from the pipi-mode-switch extension:
-      // convert the machine-readable setStatus text (and the plan-todos
-      // widget) into store events before the generic fire-and-forget swallow.
-      if (req.method === "setStatus" && req.statusKey === "pipi-mode") {
-        const parsed = parseModeStatus(String(req.statusText ?? ""));
-        if (parsed) {
-          useChatStore.getState().applyEvent(tabId, { type: "mode_status", ...parsed });
-          return;
-        }
-      }
-      if (req.method === "setWidget" && req.widgetKey === "pipi-mode-todos") {
-        // Field name differs by backend: pi RPC mode emits `widgetLines`,
-        // the SDK worker emits `widgetContent` (same payload).
-        const content = (req as { widgetContent?: unknown; widgetLines?: unknown }).widgetContent ??
-          (req as { widgetLines?: unknown }).widgetLines;
-        useChatStore.getState().applyEvent(tabId, {
-          type: "mode_status",
-          todos: Array.isArray(content) ? parseModeTodos(content as string[]) : undefined,
-        });
-        return;
-      }
       const consumed = handleFireAndForget(req, (text) => {
         setInput(text);
         requestAnimationFrame(() => {
@@ -2278,13 +2248,6 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           />
         )}
         <SkillChips skills={skillCommands} onInsert={insertSkill} />
-        {sessionMode.mode === "auto" && sessionMode.progress && sessionMode.progress.total > 0 && sessionMode.todos && (
-          <div className="chat-mode-widget" role="status">
-            {sessionMode.todos.map((t, i) => (
-              <div key={i} className={`chat-mode-todo${t.completed ? " done" : ""}`}>{t.text}</div>
-            ))}
-          </div>
-        )}
         <textarea
           ref={taRef}
           className="chat-textarea"
@@ -2322,35 +2285,6 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           spellCheck={false}
         />
         <div className="chat-input-bar">
-          {sessionMode.available !== false && (
-            <div
-              className="chat-mode-switch"
-              role="radiogroup"
-              aria-label="会话模式"
-              title="自动 = 完全自主 · 计划 = 只读出计划 · 编辑 = 写操作逐个确认"
-            >
-              {([
-                { value: "auto" as SessionMode, label: "自动" },
-                { value: "plan" as SessionMode, label: "计划" },
-                { value: "edit" as SessionMode, label: "编辑" },
-              ]).map((m) => (
-                <button
-                  key={m.value}
-                  role="radio"
-                  aria-checked={sessionMode.mode === m.value}
-                  className={
-                    "chat-mode-btn" +
-                    (sessionMode.mode === m.value ? ` active ${m.value}` : "") +
-                    (sessionMode.available === undefined || sessionMode.switching ? " pending" : "")
-                  }
-                  disabled={sessionMode.available === false || sessionMode.switching}
-                  onClick={() => sessionMode.setMode(m.value)}
-                >
-                  {m.label}
-                </button>
-              ))}
-            </div>
-          )}
           <span className="chat-input-stats" title="会话用量（输入↑ / 输出↓ / 缓存读取 / 上下文占用）">
             {stats
               ? (() => {

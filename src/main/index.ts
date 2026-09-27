@@ -29,7 +29,7 @@ import { sameSessionPaths } from "../shared/session-paths";
 import { pickWslEventTab } from "./wsl-event-tab";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
-import { ensureShippedExtensions, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
+import { ensureShippedExtensions, retireShippedFiles, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
 import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
 import { trackIpcHandlersOn } from "./in-flight";
 import { drainCorruptReports, onCorruptReport, type CorruptFileReport } from "./json-store";
@@ -1121,6 +1121,12 @@ if (gotSingleInstanceLock) {
   // tab can spawn pi, so every pi process auto-discovers them. The returned
   // list of actually-written files feeds the chat-page update notice.
   pendingExtensionSync = ensureShippedExtensions();
+  // Delete files we no longer ship: pi auto-loads every .ts under extensions/, so a
+  // retired extension left on disk keeps running (we would only stop rendering its UI).
+  const retiredAtStartup = retireShippedFiles();
+  if (retiredAtStartup.length > 0) {
+    console.log(`[extensions] retired: ${retiredAtStartup.join(", ")}`);
+  }
   if (pendingExtensionSync.length > 0) {
     console.log(`[extensions] updated: ${pendingExtensionSync.join(", ")}`);
   }
@@ -1173,7 +1179,7 @@ if (gotSingleInstanceLock) {
       if (!tab) return;
       // Dedup per (distro, cwd): two projects of one distro poll
       // independently; mtime drift on one must not suppress the other.
-      const dedupKey = `${target.distro} ${cwd}`;
+      const dedupKey = `${target.distro}\x00${cwd}`;
       const prev = wslLastEmittedSessions.get(dedupKey);
       if (prev && sameSessionPaths(prev, sessions)) {
         syncRemoteTabTitles(tab.id, cwd, sessions);
@@ -1348,7 +1354,9 @@ if (gotSingleInstanceLock) {
             const extResult = await syncExtensionsViaSftp(lease.client, lease.homeDir, remote.agentDir);
             if (extResult.ok) {
               remoteKeyExtSyncHash.set(syncKey, extDigest);
-              console.log(`[extensions] remote synced ${extResult.uploaded.length} file(s) -> ${syncKey}`);
+              console.log(
+                `[extensions] remote synced ${extResult.uploaded.length} file(s)${extResult.retired?.length ? `, retired ${extResult.retired.length}` : ""} -> ${syncKey}`,
+              );
             } else {
               console.error(`[extensions] remote sync partial/failed (${syncKey}):`, extResult.error ?? "unknown");
             }

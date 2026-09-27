@@ -198,16 +198,6 @@ export interface ChatTabState {
   steeringMode?: string;
   followUpMode?: string;
   autoCompactionEnabled?: boolean;
-  /** Session mode (auto/plan/edit) reported by the shipped pipi-mode-switch
-   *  extension: parse from its setStatus("pipi-mode:…") push. Undefined =
-   *  extension not present / not yet reported. */
-  sessionMode?: "auto" | "plan" | "edit";
-  /** Plan execution progress (done/total) while executing a plan. */
-  sessionModeProgress?: { done: number; total: number };
-  /** Numbered plan steps while a plan exists/ executes (widget rendering). */
-  sessionModeTodos?: Array<{ text: string; completed: boolean }>;
-  /** True while a /mode switch command is in flight (button spinner). */
-  sessionModeSwitching?: boolean;
 }
 
 interface ChatStore {
@@ -869,13 +859,6 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         steeringMode: (event.steeringMode as string | undefined) ?? st.steeringMode,
         followUpMode: (event.followUpMode as string | undefined) ?? st.followUpMode,
         autoCompactionEnabled: (event.autoCompactionEnabled as boolean | undefined) ?? st.autoCompactionEnabled,
-        // Optimistic /mode switch: sessionModeSwitching is cleared when the
-        // authoritative setStatus push arrives (parseModeStatus in ChatPane).
-        sessionMode: (event.sessionMode as ChatTabState["sessionMode"] | undefined) ?? st.sessionMode,
-        sessionModeSwitching:
-          event.sessionModeSwitching !== undefined
-            ? Boolean(event.sessionModeSwitching)
-            : st.sessionModeSwitching,
         booted: true,
         bootStage: "ready",
         // A pending prompt (written, not yet answered by pi) is in-flight
@@ -884,21 +867,6 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         // "已就绪" and hide that the message is still unanswered.
         turn: st.isStreaming || pendingTurnPhases.has(st.turn.phase) ? st.turn : { phase: "ready", lastActivityAt: Date.now() },
       });
-      return;
-    }
-    if (type === "mode_status") {
-      // Authoritative session mode from the pipi-mode-switch extension,
-      // forwarded by ChatPane after parsing its setStatus("pipi-mode:…") text.
-      // An undefined mode (extension absent/cleared) keeps the last value —
-      // the extension pushes on every transition, so absence is not a signal.
-      const patchMode: Partial<ChatTabState> = {};
-      if (typeof event.mode === "string") patchMode.sessionMode = event.mode as ChatTabState["sessionMode"];
-      patchMode.sessionModeProgress =
-        (event.progress as ChatTabState["sessionModeProgress"] | undefined) ?? undefined;
-      patchMode.sessionModeTodos = (event.todos as ChatTabState["sessionModeTodos"] | undefined) ?? undefined;
-      // The authoritative push always concludes an optimistic switch.
-      patchMode.sessionModeSwitching = false;
-      patch(patchMode);
       return;
     }
     if (type === "agent_start") {

@@ -45,7 +45,7 @@ declare module "@earendil-works/pi-coding-agent" {
         label?: string;
       }
     ): Promise<{ cancelled: boolean }>;
-    /** Session store (used by pipi-mode-switch to scan persisted entries on resume). */
+    /** Session store: persisted entries of the current session. */
     sessionManager: {
       getEntries(): Array<Record<string, unknown>>;
     };

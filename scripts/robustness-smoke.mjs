@@ -11,7 +11,7 @@
 //
 // Usage: node scripts/robustness-smoke.mjs   (needs release/win-unpacked/pipi.exe)
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -27,6 +27,24 @@ if (!existsSync(exe)) {
   process.exit(2);
 }
 rmSync(profile, { recursive: true, force: true });
+// A stale app.asar has fooled this harness before: `npm run dist:dir` can leave the
+// previous package in place (it also fails outright on a network error), and then a
+// green smoke run says nothing about the code just written. Refuse to run rather than
+// report a pass from an older bundle.
+{
+  const asar = join("release", "win-unpacked", "resources", "app.asar");
+  const assetsDir = join("out", "renderer", "assets");
+  if (existsSync(asar) && existsSync(assetsDir)) {
+    const asarTime = statSync(asar).mtimeMs;
+    const newestAsset = Math.max(...readdirSync(assetsDir).map((f) => statSync(join(assetsDir, f)).mtimeMs));
+    if (newestAsset > asarTime + 1000) {
+      console.log(
+        `FAIL: app.asar is STALE (${new Date(asarTime).toISOString()}) vs out/ (${new Date(newestAsset).toISOString()}) — run npm run dist:dir again`,
+      );
+      process.exit(2);
+    }
+  }
+}
 const workDir = mkdtempSync(join(tmpdir(), "pipi-smoke-"));
 
 const mainLines = [];
