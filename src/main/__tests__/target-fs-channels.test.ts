@@ -13,11 +13,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RemoteOpts } from "../pty";
 import { FileTreeIndex } from "../file-tree-index";
-import { createTargetFs, localTarget, sftpTarget, wslTarget, type Binding, type Channel, type Target, type TargetFsDeps } from "../target-fs";
+import { TargetFsError, createTargetFs, localTarget, sftpTarget, wslTarget, type Binding, type Channel, type Target, type TargetFsDeps } from "../target-fs";
 import {
   createTargetFsFactory,
   isWindowsPath,
   localBinding,
+  mutationErrorText,
   sftpBinding,
   sshBinding,
   targetFromTab,
@@ -551,5 +552,56 @@ describe("isWindowsPath", () => {
     expect(target.kind).toBe("sftp");
     expect(isWindowsPath("C:\\Users\\me\\a.txt")).toBe(true);
     await expect(fs.readPreview("C:\\Users\\me\\a.txt")).rejects.toMatchObject({ kind: "not-found" });
+  });
+});
+
+describe("mutationErrorText", () => {
+  // These strings are the UI (toasts and the tree's inline error row) and
+  // predate the seam, so they are pinned verbatim: the module's classified
+  // English errors must not leak into Chinese surfaces.
+  it("keeps the wording of a name the tree refuses", () => {
+    const e = new TargetFsError("invalid-name", "invalid name: a/b");
+    expect(mutationErrorText(e, "a/b", "a/b")).toBe("名称不合法（不能包含 / 或 \\）");
+  });
+
+  it("reads one `exists` kind two ways: a file in the way vs a taken name", () => {
+    const e = new TargetFsError("exists", "file occupies path: x");
+    expect(mutationErrorText(e, "x")).toBe("已存在同名文件: x");
+    expect(mutationErrorText(e, "dir/x", "x")).toBe("目标已存在: x");
+  });
+
+  it("turns the module's miss wording into the surface's", () => {
+    // The module says "No such file or directory: x" so local reads keep the
+    // renderer's retry predicate working; mutations need the Chinese wording.
+    const e = new TargetFsError("not-found", "No such file or directory: x");
+    expect(mutationErrorText(e, "x")).toBe("路径不存在: x");
+  });
+
+  it("reports a containment refusal without leaking the absolute path algebra", () => {
+    expect(mutationErrorText(new TargetFsError("escape", "escapes root: /etc/passwd"), "/etc/passwd")).toBe(
+      "路径越界: /etc/passwd"
+    );
+  });
+
+  it("passes transport failures through with their own detail", () => {
+    expect(mutationErrorText(new TargetFsError("transport", "w: connection reset"), "w")).toBe("w: connection reset");
+    expect(mutationErrorText(new Error("boom"), "w")).toBe("boom");
+  });
+
+  it("joins a REAL module failure to the surface wording", async () => {
+    // The two halves were tested apart (the module's kinds, this table); this
+    // pins that they compose: whatever kind the module picks for a failing
+    // mutation must land on the wording that surface has always shown.
+    const fs = localFs(dir);
+    await fs.writeText("taken.txt", "x");
+    await fs.writeText("a.txt", "a");
+    const mkdirErr = await fs.mkdir("taken.txt").catch((e: unknown) => e);
+    expect(mutationErrorText(mkdirErr, "taken.txt")).toBe("已存在同名文件: taken.txt");
+    const renameErr = await fs.rename("a.txt", "taken.txt").catch((e: unknown) => e);
+    expect(mutationErrorText(renameErr, "a.txt", "taken.txt")).toBe("目标已存在: taken.txt");
+    const goneErr = await fs.remove("gone.txt").catch((e: unknown) => e);
+    expect(mutationErrorText(goneErr, "gone.txt")).toBe("路径不存在: gone.txt");
+    const nameErr = await fs.rename("a.txt", "a/b").catch((e: unknown) => e);
+    expect(mutationErrorText(nameErr, "a.txt", "a/b")).toBe("名称不合法（不能包含 / 或 \\）");
   });
 });

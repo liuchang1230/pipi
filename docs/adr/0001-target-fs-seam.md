@@ -14,7 +14,10 @@ Status: accepted（2026-09-29）
 - **路径校验看解析结果。** `readPreview` / `writeText` / `mkdir` / `remove` / `rename` 只判「解析后是否仍在根内」：`src/../readme.md` 合法，`../x` 与 `/etc/passwd` 被拒，对根自身操作也拒。代价是远程 markdown 里指向项目外的 `../` 链接不再可读（旧 `remoteReadFile` 对非 mention 读取是 `requireWithinBase=false`）。
 - **「目录不存在」在树边界退化为空。** 模块抛 `not-found`，`file:list` / `file:list-dir` 转成 `[]`；权限与传输错误照旧上抛。旧行为把两者都当空列表，于是不可达的远程项目看起来就是空项目（CONTEXT：那个「远程文件刷新中…」事故）。
 - **not-found 文案带 `No such file`。** 渲染层（`viewerStore` 的自动跟随重试、`FileViewer` 的「文件不存在」分支）按这个字样判别。模块自造的错误文案若只剩自己的措辞，等于静默砍掉那条重试路径。
-- **未连线前的失效必须改道。** 写入/改名/删除本轮仍用旧实现，但它们失效的是旧缓存；读路径已改看模块缓存，所以 `mutateFile` 现在同时调模块的 `invalidate`（用与读路径同一个 target，否则键不同、等于没失效）。
+- **写路径（③）：失败文案是边界的事。** 模块抛分类错误（`invalid-name` / `exists` / `not-found` / `escape`），中文文案表（`mutationErrorText`）放在边界并逐字沿用旧串：`已存在同名文件: x` / `目标已存在: x` / `路径不存在: x` / `名称不合法（不能包含 / 或 \）。同一个 `exists` 有两种读法（mkdir 被文件占位 vs 改名撞名），用 `newName` 是否存在区分——这不是措辞细节，是避免每通道各写一张文案表。
+- **写路径（③）也走模块，失败文案留在边界。** `file:write` / `file:mkdir` / `file:delete` / `file:rename` 现在同样经 `resolveFileTarget` + 模块的 `writeText` / `mkdir` / `remove` / `rename`（`rootPath` 与 tab 两条 payload 读法从此合流）。模块抛分类错误（`invalid-name` / `exists` / `not-found` / `escape`），中文文案表（`mutationErrorText`）放在边界并逐字沿用旧串：`已存在同名文件: x` / `目标已存在: x` / `路径不存在: x` / `名称不合法（不能包含 / 或 \）。同一个 `exists` 有两种读法（mkdir 被文件占位 vs 改名撞名），用 `newName` 是否存在区分——这不是措辞细节，是避免每通道各写一张文案表。后果：写入的缓存失效不再由 handler 负责（模块自己失效，含祖先链与两个 filter 变体），而远程/WSL 的 mkdir / remove / rename 会多一次 `stat`（这是分类错误与“路径不存在”判定的代价）。
+- **未连线前的过渡（仅 slice ②）。** ② 落地时写入/改名/删除还是旧实现，但它们失效的是旧缓存；读路径已改看模块缓存，所以当时的 `mutateFile` 额外调了模块的 `invalidate`（用与读路径同一个 target，否则键不同、等于没失效）。③ 收编这四个 handler 后这层手动失效就删了。
+- **无 cwd 的 tab 不再回落到 `process.cwd()`（②③ 共同的行为变化）。** 旧码在 tab 没有 cwd 时把文件操作落到 app 自己的进程目录，也就是把用户的文件写到安装目录里；现在报错。读路径与写路径一致；同理，根不是绝对路径的远程档案（`path` 写成相对路径）现在直接报错，而不是“先半成功后失败”。
 
 ## Considered Options
 
@@ -28,4 +31,4 @@ Status: accepted（2026-09-29）
 - 过渡期内 `resolveTarget` 仍在为 session / model / remote handler 物化伪造 `TabInfo`。规矩是**新代码不得再读伪造字段**，这些 handler 迁移完成后一并删除。
 - git 通道（`diff-session.ts` 自有 `GitCtx`）与 exec 通道（`sshExec` / `sshCatRemoteFile` / `file:diagnose-mentions` 自建 `SshClient`）不在本 seam 内。若将来把 `Target` 扩成它们的共同表示，那是另一个决策。
 - 「目录不存在」的语义（空列表而非错误）从 `sftp-errors.ts` 的字符串匹配变为判别错误分类，`isSftpMissingPathError` 随之退役。
-- 重建只做到读路径（slice ②）。写入 / 改名 / 删除仍走旧实现，因此旧的那套失效接口（`invalidateRemoteFileTree` / `invalidateWslFileTree` / `invalidateLocalParent`）已经没人写、也没人真失效到东西：看着像失效、实际作用于废缓存。它们与 `remoteReadFile` / `wslListFiles` / `remoteListFiles` / `remoteFileTreeCache` 一律留给 slice ④ 删除；在删除前，新代码不得调用它们（调用读路径的 `invalidate`，否则键不同、等于没失效）。
+- 重建只做到读路径（slice ②）与写/改/删（slice ③）。列表侧的旧实现已经没人调用：`remoteReadFile` / `wslListFiles` / `remoteListFiles` / `remoteFileTreeCache` 及 `invalidateRemoteFileTree` / `invalidateWslFileTree`（看着像失效、实际作用于废缓存）、`session-file-reader.ts` 与 `file-tree.ts` 的本地写/改/删函数，一律留给 slice ④ 删除；在删除前，新代码不得调用它们（写入的失效由模块自己做）。

@@ -505,7 +505,7 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
 
     async rename(relPath: string, newName: string): Promise<void> {
       const name = newName.trim();
-      if (!isValidName(name)) throw new TargetFsError("invalid-name", `invalid name: ${newName}`);
+      if (!isValidName(name, binding.dialect)) throw new TargetFsError("invalid-name", `invalid name: ${newName}`);
       const abs = await resolveContained(relPath);
       const native = binding.toNative(abs);
       // Source first: renaming a missing path to its own name must not look
@@ -542,11 +542,16 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
  *  it is applied to every channel on purpose: one naming rule in the module is
  *  worth more than a POSIX server accepting a name that cannot be round-tripped
  *  to Windows, and the whole app must name files identically on both sides. */
-export function isValidName(name: string): boolean {
+/** A bare name for `rename`. The trailing dot/space rule is WINDOWS-only: a
+ *  Windows API silently strips them, so `x.` would land on `x` (a different file
+ *  than the user typed). A POSIX target can hold both spellings, and refusing
+ *  them there would reject legal renames on a Linux remote. */
+export function isValidName(name: string, dialect: PathDialect = "posix"): boolean {
   if (!name || name !== name.trim()) return false;
   if (name === "." || name === "..") return false;
   if (/[\/\\]/.test(name)) return false;
-  return !/[. ]$/.test(name);
+  if (dialect === "win" && /[. ]$/.test(name)) return false;
+  return true;
 }
 
 /** Directory noise that never earns a tree row. Opt-in per call site

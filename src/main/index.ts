@@ -1,12 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog, powerMonitor, Menu, shell, type MenuItemConstructorOptions } from "electron";
 import { spawn } from "node:child_process";
-import { isAbsolute, relative, sep, join, dirname, posix as posixPath, win32 as win32Path } from "node:path";
+import { isAbsolute, relative, sep, join, posix as posixPath, win32 as win32Path } from "node:path";
 import { unlinkSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
-import { readFile, writeFile, mkdir, rm, rename, access, readdir, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
-import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, imagePayloadOf, listDirChildren, readPreviewFromAbs, rasterImageMimeOf, isBinaryBuffer, resolveWithin, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES, IMAGE_PREVIEW_MAX_BYTES, type FileOpResult, type FileNode } from "./file-tree";
+import { imagePayloadOf, rasterImageMimeOf, isBinaryBuffer, resolveWithin, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES, IMAGE_PREVIEW_MAX_BYTES, type FileNode } from "./file-tree";
 import { specForModel } from "../shared/model-specs";
 import { lookupModelSpecs } from "./specs-lookup";
 import {
@@ -48,6 +48,7 @@ import {
 import {
   createTargetFsFactory,
   isWindowsPath,
+  mutationErrorText,
   localBinding,
   sftpBinding,
   sshBinding,
@@ -1844,19 +1845,6 @@ if (gotSingleInstanceLock) {
     return null;
   }
 
-  function remoteFullPath(relPath: string, baseDir: string, homeDir: string): string {
-    const base = resolveRemotePath(baseDir, homeDir);
-    const full = relPath.startsWith("/")
-      ? posixPath.normalize(relPath)
-      : resolveRemotePath(posixPath.join(baseDir, relPath), homeDir);
-    // Mutations stay inside the browse dir (tree paths are children of it;
-    // the synthetic ".." entry would otherwise be deletable/renamable).
-    if (full !== base && !full.startsWith(base === "/" ? "/" : base + "/")) {
-      throw new Error(`路径越界: ${relPath}`);
-    }
-    return full;
-  }
-
   function wslBaseDirFor(t: TabInfo): Promise<string> {
     return resolveWslPath(t.wsl!.distro, t.wsl!.path || "~");
   }
@@ -1875,200 +1863,62 @@ if (gotSingleInstanceLock) {
     return win;
   }
 
-  async function remoteWrite(client: SftpClient, full: string, content: string): Promise<void> {
-    await client.mkdir(posixPath.dirname(full), true);
-    // put() treats a string as a LOCAL file path → must pass a Buffer for raw content.
-    await client.put(Buffer.from(content, "utf8"), full);
-  }
-
-  async function remoteDelete(client: SftpClient, full: string): Promise<void> {
-    const kind = await client.exists(full);
-    if (!kind) throw new Error(`路径不存在: ${full}`);
-    if (kind === "d") await client.rmdir(full, true);
-    else await client.delete(full);
-  }
-
-  async function remoteRename(client: SftpClient, full: string, newName: string): Promise<void> {
-    if (!isValidName(newName)) throw new Error("名称不合法（不能包含 / 或 \\）");
-    const target = `${posixPath.dirname(full)}/${newName}`;
-    if (target !== full && (await client.exists(target))) {
-      throw new Error(`目标已存在: ${newName}`);
-    }
-    if (target === full) return; // same name → no-op
-    await client.rename(full, target);
-  }
-
-  async function wslWrite(t: TabInfo, relPath: string, content: string): Promise<void> {
-    const win = await wslFullPath(t, relPath);
-    const dir = win.substring(0, win.lastIndexOf("\\"));
-    return mkdir(dir, { recursive: true }).then(() => writeFile(win, content, "utf8"));
-  }
-
-  async function wslDelete(t: TabInfo, relPath: string): Promise<void> {
-    const win = await wslFullPath(t, relPath);
-    try {
-      await access(win);
-    } catch {
-      throw new Error(`路径不存在: ${relPath}`);
-    }
-    await rm(win, { recursive: true, force: false });
-  }
-
-  async function wslRename(t: TabInfo, relPath: string, newName: string): Promise<void> {
-    if (!isValidName(newName)) throw new Error("名称不合法（不能包含 / 或 \\）");
-    const win = await wslFullPath(t, relPath);
-    const target = `${win.substring(0, win.lastIndexOf("\\"))}\\${newName}`;
-    if (target !== win) {
-      let exists = false;
-      try {
-        await access(target);
-        exists = true;
-      } catch {
-        /* target free */
-      }
-      if (exists) throw new Error(`目标已存在: ${newName}`);
-    }
-    if (target === win) return; // same name → no-op
-    await rename(win, target);
-  }
-
-  /** Shared dispatch for the four mutation handlers. */
-  /** Drop the cached listings a mutation just changed. Must use the SAME target
-   *  the read path used: the cache key is built from the target's kind, root and
-   *  filter, so a differently rooted target would invalidate nothing. */
-  async function invalidateAfterMutation(
-    ref: (TargetRef & { rootPath?: string; dirPath?: string }) | undefined,
-    relPath: string
-  ): Promise<void> {
-    const resolved = resolveFileTarget(ref);
-    if (resolved) await resolved.fs.invalidate([relPath]);
-  }
-
-  async function mutateFile(
-    ref: TargetRef | undefined,
+  /** Shared dispatch for the four mutation handlers: one target resolution, one
+   *  error-wording table, one containment law. Cache invalidation is the module's
+   *  own business — its mutations drop the listings they changed, ancestors
+   *  included (the pre-seam code had to do that itself, per channel, and the
+   *  remote/WSL copies were invalidating a cache nothing read any more). */
+  async function mutateThrough(
+    payload: TargetRef & { rootPath?: string; dirPath?: string },
     relPath: string,
-    fn: (t: TabInfo) => Promise<void> | void
+    newName: string | undefined,
+    fn: (fs: TargetFs) => Promise<void>
   ): Promise<FileMutationResult> {
     const bad = validateRel(relPath);
     if (bad) return { ok: false, error: bad };
-    const t = resolveTarget(ref);
-    if (!t) return { ok: false, error: "找不到终端会话" };
+    // Resolution inside the try: a target whose root is not absolute (a remote
+    // profile with a relative `path`) throws synchronously from `createTargetFs`,
+    // and these four handlers must answer `{ok:false,error}` — never a rejected
+    // IPC promise (the renderer shows a toast in both cases, but only one of
+    // them is this handler's contract).
     try {
-      await fn(t);
-      await invalidateAfterMutation(ref, relPath);
+      const resolved = resolveFileTarget(payload);
+      if (!resolved) return { ok: false, error: "找不到终端会话" };
+      await fn(resolved.fs);
       return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    } catch (e) {
+      return { ok: false, error: mutationErrorText(e, relPath, newName) };
     }
   }
 
-  /** Invalidate the cached listings that a mutation can have changed.
-   *  With lazy per-dir caching, the DIRECTORY holding `relPath` changed — plus
-   *  its ancestor chain (recursive mkdir/write creates intermediates, so the
-   *  root and every level in between may have gained an entry). */
-  function invalidateLocalParent(root: string, relPath: string): void {
-    let cur = dirname(relPath);
-    while (cur !== ".") {
-      fileTreeIndex.invalidate(localTreeKey(root, cur));
-      cur = dirname(cur);
-    }
-    fileTreeIndex.invalidate(localTreeKey(root, "."));
-  }
-
-  /** Cache key for a local dir listing: ROOT-aware — listings carry paths
-   *  relative to their root, so keying by the absolute dir alone would let
-   *  the same dir browsed under two roots serve wrong-relative paths. */
-  function localTreeKey(root: string, relDir: string): string {
-    return `${root}\u0000${relDir}`;
-  }
-
-  /** Local mutations in preview mode resolve against rootPath, not the tab cwd. */
+  /** Local mutations in preview mode resolve against rootPath, not the tab cwd —
+   *  both readings are handled by `resolveFileTarget`, which is why the four
+   *  handlers below no longer branch on the payload shape at all. */
 
   ipcMain.handle("file:write", async (_e, payload: TargetRef & { rootPath?: string; relPath: string; content: string }) => {
     const relPath = payload.relPath;
     const content = payload.content ?? "";
-    // Local preview root is authoritative; needs no tab at all.
-    if (payload.rootPath) {
-      const r = await writeFileContent(payload.rootPath, relPath, content);
-      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
-      return r;
-    }
-    return mutateFile(payload, relPath, async (t) => {
-      if (t.wsl) {
-        await wslWrite(t, relPath, content);
-      } else if (t.remote) {
-        await withSftp(t.remote, async (client, homeDir) => {
-          await remoteWrite(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), content);
-        });
-      } else {
-        const r = await writeFileContent(t.cwd ?? process.cwd(), relPath, content);
-        if (!r.ok) throw new Error(r.error);
-      }
-    });
+    // Both readings of the payload end up on the same channel seam: an explicit
+    // `rootPath` is a local target whose root IS that path, a tab target is
+    // resolved from the tab/profile. The old split (local helpers vs remote/WSL
+    // helpers) no longer exists, so neither does the risk of the two drifting.
+    return mutateThrough(payload, relPath, undefined, (fs) => fs.writeText(relPath, content));
   });
 
   ipcMain.handle("file:mkdir", async (_e, payload: TargetRef & { rootPath?: string; relPath: string }) => {
     const relPath = payload.relPath;
-    if (payload.rootPath) {
-      const r = await createDirectory(payload.rootPath, relPath);
-      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
-      return r;
-    }
-    return mutateFile(payload, relPath, async (t) => {
-      if (t.wsl) {
-        await mkdir(await wslFullPath(t, relPath), { recursive: true });
-      } else if (t.remote) {
-        await withSftp(t.remote, async (client, homeDir) => {
-          await client.mkdir(remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), true);
-        });
-      } else {
-        const r = await createDirectory(t.cwd ?? process.cwd(), relPath);
-        if (!r.ok) throw new Error(r.error);
-      }
-    });
+    return mutateThrough(payload, relPath, undefined, (fs) => fs.mkdir(relPath));
   });
 
   ipcMain.handle("file:delete", async (_e, payload: TargetRef & { rootPath?: string; relPath: string }) => {
     const relPath = payload.relPath;
-    if (payload.rootPath) {
-      const r = await deletePath(payload.rootPath, relPath);
-      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
-      return r;
-    }
-    return mutateFile(payload, relPath, async (t) => {
-      if (t.wsl) {
-        await wslDelete(t, relPath);
-      } else if (t.remote) {
-        await withSftp(t.remote, async (client, homeDir) => {
-          await remoteDelete(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir));
-        });
-      } else {
-        const r = await deletePath(t.cwd ?? process.cwd(), relPath);
-        if (!r.ok) throw new Error(r.error);
-      }
-    });
+    return mutateThrough(payload, relPath, undefined, (fs) => fs.remove(relPath));
   });
 
   ipcMain.handle("file:rename", async (_e, payload: TargetRef & { rootPath?: string; relPath: string; newName: string }) => {
     const relPath = payload.relPath;
     const newName = (payload.newName ?? "").trim();
-    if (payload.rootPath) {
-      const r = await renamePath(payload.rootPath, relPath, newName);
-      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
-      return r;
-    }
-    return mutateFile(payload, relPath, async (t) => {
-      if (t.wsl) {
-        await wslRename(t, relPath, newName);
-      } else if (t.remote) {
-        await withSftp(t.remote, async (client, homeDir) => {
-          await remoteRename(client, remoteFullPath(relPath, t.remoteBrowsePath ?? t.remote!.path ?? "~", homeDir), newName);
-        });
-      } else {
-        const r = await renamePath(t.cwd ?? process.cwd(), relPath, newName);
-        if (!r.ok) throw new Error(r.error);
-      }
-    });
+    return mutateThrough(payload, relPath, newName, (fs) => fs.rename(relPath, newName));
   });
 
   /** Reveal a file/folder in the OS file explorer (tree right-click →

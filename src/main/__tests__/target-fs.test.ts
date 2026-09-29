@@ -274,6 +274,35 @@ describe("TargetFs · list", () => {
     expect(store.size).toBe(0);
   });
 
+  it("drops both the source's and the target's ancestors on a rename", async () => {
+    // A rename changes two directories, and a handler no longer has to remember
+    // that: the module invalidates the moved-from path AND the new one. Both
+    // filters of each ancestor go too, or a picker would keep showing the old
+    // name while the tree already shows the new one.
+    const { channel, calls } = memChannel({ "/p/src/a.ts": "a", "/p/keep.ts": "k" });
+    const store = new Map<string, FileNode[]>();
+    const cache: TreeCache = {
+      cached: (k) => store.get(k),
+      refresh: async (k, walk) => {
+        const nodes = await walk();
+        store.set(k, nodes);
+        return nodes;
+      },
+      invalidate: (k) => {
+        store.delete(k);
+      },
+    };
+    const fs = posixFs("/p", channel, { cache });
+    await fs.list("src", { filter: "tree" });
+    await fs.list("src", { filter: "all" });
+    await fs.list(".", { filter: "tree" });
+    expect(store.size).toBe(3);
+
+    await fs.rename("src/a.ts", "moved.ts");
+    expect(calls).toContain("rename:/p/src/a.ts->/p/src/moved.ts");
+    expect(store.size).toBe(0); // /p/src (×2 filters) and /p (the target's ancestor)
+  });
+
   it("invalidates through aliases of the same directory, and leaves unrelated entries alone", async () => {
     const { channel } = memChannel({ "/home/u/p/src/a.ts": "a", "/other/x.ts": "x" });
     const store = new Map<string, FileNode[]>();
@@ -604,7 +633,6 @@ describe("TargetFs · mutations", () => {
     const fs = posixFs("/p", channel);
     await expect(fs.rename("a.txt", "x/y")).rejects.toMatchObject({ kind: "invalid-name" });
     await expect(fs.rename("a.txt", "..")).rejects.toMatchObject({ kind: "invalid-name" });
-    await expect(fs.rename("a.txt", "x.")).rejects.toMatchObject({ kind: "invalid-name" });
     await expect(fs.rename("a.txt", "taken.txt")).rejects.toMatchObject({ kind: "exists" });
     await expect(fs.rename("gone.txt", "x.txt")).rejects.toMatchObject({ kind: "not-found" });
     // A missing source renamed to its own name must not look like success.
@@ -614,6 +642,13 @@ describe("TargetFs · mutations", () => {
     await fs.rename("a.txt", "b.txt");
     expect(calls).toContain("rename:/p/a.txt->/p/b.txt");
     expect(isValidName("my file.txt")).toBe(true);
+    // A trailing dot/space is a WINDOWS-only rule: that API strips them, so
+    // `x.` would silently land on `x`. A posix target takes it as written, and
+    // refusing it there would reject a legal rename on a Linux remote.
+    await fs.rename("b.txt", "x.");
+    expect(calls).toContain("rename:/p/b.txt->/p/x.");
+    expect(isValidName("x.", "posix")).toBe(true);
+    expect(isValidName("x.", "win")).toBe(false);
   });
 });
 

@@ -18,7 +18,7 @@ import { wslToWinPath } from "./wsl";
 import type SftpClient from "ssh2-sftp-client";
 import type { RemoteOpts, TabInfo } from "./pty";
 import { isSftpMissingPathError } from "./sftp-errors";
-import { TargetFsError, createTargetFs, localTarget, sftpTarget, sshTarget, targetKey, wslTarget } from "./target-fs";
+import { TargetFsError, createTargetFs, isTargetFsError, localTarget, sftpTarget, sshTarget, targetKey, wslTarget } from "./target-fs";
 import type { Binding, Channel, PathDialect, Target, TargetFs, TargetFsDeps } from "./target-fs";
 
 function toBuffer(raw: string | Buffer | NodeJS.WritableStream): Buffer {
@@ -243,4 +243,30 @@ export function createTargetFsFactory(deps: TargetFsDeps): (target: Target) => T
 /** Remote guard: a Windows-local path must never reach a POSIX channel. */
 export function isWindowsPath(p: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(p);
+}
+
+/**
+ * The other half of the boundary: the module reports CLASSIFIED errors, while
+ * this app shows Chinese wording per surface (these strings predate the seam and
+ * are part of the UI, not of the module). One `exists` kind has two readings —
+ * "a file already occupies that name" (mkdir) and "the new name is taken"
+ * (rename) — which is what `newName` distinguishes, so the table stays in one
+ * place instead of one per channel.
+ */
+export function mutationErrorText(e: unknown, relPath: string, newName?: string): string {
+  if (isTargetFsError(e)) {
+    switch (e.kind) {
+      case "invalid-name":
+        return "名称不合法（不能包含 / 或 \\）";
+      case "exists":
+        return newName ? `目标已存在: ${newName}` : `已存在同名文件: ${relPath}`;
+      case "not-found":
+        return `路径不存在: ${relPath}`;
+      case "escape":
+        return `路径越界: ${relPath}`;
+      default:
+        return e.message;
+    }
+  }
+  return e instanceof Error ? e.message : String(e);
 }
