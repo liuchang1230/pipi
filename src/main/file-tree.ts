@@ -38,6 +38,17 @@ export interface ImagePayload {
   base64: string;
 }
 
+/** Viewer payload for a file preview (IPC shape). `error` is filled in by the
+ *  handler, never by the reader — reads throw. */
+export type PreviewPayload = {
+  content: string;
+  bytes: number;
+  isBinary: boolean;
+  image?: ImagePayload;
+  truncated?: boolean;
+  error?: string;
+};
+
 /** Raster images larger than this are NOT base64-encoded for preview. */
 export const IMAGE_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
 
@@ -147,7 +158,7 @@ export function resolveWithin(rootDir: string, relPath: string): string {
 export async function readFileContent(
   rootDir: string,
   relPath: string
-): Promise<{ content: string; bytes: number; isBinary: boolean; image?: ImagePayload; truncated?: boolean; error?: string }> {
+): Promise<PreviewPayload> {
   const abs = resolveWithin(rootDir, relPath);
   return readPreviewFromAbs(abs, relPath);
 }
@@ -175,7 +186,7 @@ async function readSlice(abs: string, start: number, len: number): Promise<Buffe
 export async function readPreviewFromAbs(
   abs: string,
   relPath: string
-): Promise<{ content: string; bytes: number; isBinary: boolean; image?: ImagePayload; truncated?: boolean; error?: string }> {
+): Promise<PreviewPayload> {
   const st = await stat(abs);
   if (st.size <= TEXT_PREVIEW_MAX_BYTES) {
     const buf = await readFile(abs);
