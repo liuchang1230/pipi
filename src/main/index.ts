@@ -6,7 +6,7 @@ import { readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
-import { imagePayloadOf, rasterImageMimeOf, isBinaryBuffer, resolveWithin, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES, IMAGE_PREVIEW_MAX_BYTES, type FileNode } from "./file-tree";
+import { resolveWithin, type FileNode } from "./file-tree";
 import { specForModel } from "../shared/model-specs";
 import { lookupModelSpecs } from "./specs-lookup";
 import {
@@ -35,7 +35,6 @@ import { trackIpcHandlersOn } from "./in-flight";
 import { drainCorruptReports, onCorruptReport, type CorruptFileReport } from "./json-store";
 import { withOpGuard } from "./op-guard";
 import { createLagMonitor, type LagMonitor } from "./perf";
-import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
 import {
   localTarget as localFsTarget,
   isTargetFsError,
@@ -186,18 +185,6 @@ type RemoteSessionCacheEntry = {
   lastRequestedAt: number;
 };
 
-type RemoteFileNode = {
-  name: string;
-  path: string;
-  type: "file" | "directory";
-  children?: RemoteFileNode[];
-};
-
-type RemoteFileTreeCacheEntry = {
-  expiresAt: number;
-  nodes: RemoteFileNode[];
-};
-
 type SftpLease = {
   key: string;
   client: SftpClient;
@@ -225,7 +212,7 @@ const POLL_RPC_COMMANDS = new Set<string>([
   "get_messages",
 ]);
 
-const REMOTE_SESSION_CACHE_TTL_MS = 12_000;const REMOTE_FILE_TREE_CACHE_TTL_MS = 5_000;
+const REMOTE_SESSION_CACHE_TTL_MS = 12_000;
 // Idle TTL for the shared SFTP lease. 20s was too aggressive: every lease
 // expiry destroys the connection (client-side clean close → sshd logs
 // "Received disconnect :11"), and the next poll re-creates it — a fresh
@@ -251,7 +238,6 @@ const REMOTE_SESSION_READ_BYTE_LIMIT = 128 * 1024;
  *  entries to the END of the JSONL — mirror pty.ts's local head+tail read. */
 const REMOTE_SESSION_TAIL_READ_BYTES = 64 * 1024;
 const remoteSessionCache = new Map<string, RemoteSessionCacheEntry>();
-const remoteFileTreeCache = new Map<string, RemoteFileTreeCacheEntry>();
 const sftpLeases = new Map<string, SftpLease>();
 /** Latest connection profile seen per remoteKey. Background session
  *  hydration is keyed by remoteKey, so it needs the profile even when no tab
@@ -403,10 +389,6 @@ function remoteSessionCacheKey(remote: RemoteOpts, remoteCwd: string): string {
   return `${stableRemoteKey(remote)}::sessions::${remoteCwd}`;
 }
 
-function remoteFileTreeCacheKey(remote: RemoteOpts, dirPath: string): string {
-  return `${stableRemoteKey(remote)}::tree::${dirPath}`;
-}
-
 function getCachedRemoteSessions(key: string): RemoteSessionCacheEntry | null {
   const hit = remoteSessionCache.get(key);
   if (!hit) return null;
@@ -438,44 +420,10 @@ function setCachedRemoteSessions(
   return sessions;
 }
 
-function getCachedRemoteFileTree(key: string): RemoteFileNode[] | null {
-  const hit = remoteFileTreeCache.get(key);
-  if (!hit) return null;
-  if (hit.expiresAt <= Date.now()) {
-    remoteFileTreeCache.delete(key);
-    return null;
-  }
-  return hit.nodes;
-}
-
-function setCachedRemoteFileTree(key: string, nodes: RemoteFileNode[]): RemoteFileNode[] {
-  remoteFileTreeCache.set(key, { expiresAt: Date.now() + REMOTE_FILE_TREE_CACHE_TTL_MS, nodes });
-  return nodes;
-}
-
 function invalidateRemoteCaches(remote: RemoteOpts): void {
   const prefix = stableRemoteKey(remote);
   for (const key of [...remoteSessionCache.keys()]) {
     if (key.startsWith(prefix)) remoteSessionCache.delete(key);
-  }
-  for (const key of [...remoteFileTreeCache.keys()]) {
-    if (key.startsWith(prefix)) remoteFileTreeCache.delete(key);
-  }
-}
-
-/** Drop only the file-tree cache entries for a remote (keeps session cache). */
-function invalidateRemoteFileTree(remote: RemoteOpts): void {
-  const prefix = stableRemoteKey(remote) + "::tree::";
-  for (const key of [...remoteFileTreeCache.keys()]) {
-    if (key.startsWith(prefix)) remoteFileTreeCache.delete(key);
-  }
-}
-
-/** Drop the file-tree cache entries for a WSL distro. */
-function invalidateWslFileTree(distro: string): void {
-  const prefix = `wsl:${distro}:`;
-  for (const key of [...remoteFileTreeCache.keys()]) {
-    if (key.startsWith(prefix)) remoteFileTreeCache.delete(key);
   }
 }
 
@@ -2252,10 +2200,10 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     }
     debugLog("tree", `tab ${tabId} from-file start (${pathSource}) path=${sessionPath}`);
     try {
-      // Channel selection (WSL UNC / SFTP-or-ssh / local) lives in
-      // session-file-reader.ts, not here: the tree dialog, the chat transcript
-      // and future readers must not each re-derive it. Throws on failure →
-      // caught below, so a key-auth read failure still reports exactly
+      // Channel selection (WSL UNC / SFTP-or-ssh / local) lives behind the
+      // TargetFs seam, not here: the tree dialog, the chat transcript and any
+      // future reader must not each re-derive it. Throws on failure → caught
+      // below, so a key-auth read failure still reports exactly
       // "key-auth remote read failed".
       const content = await readSessionFileText(tab, sessionPath);
       const { entries, leafId } = await parseTreeFileAsync(content);
@@ -3138,54 +3086,6 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     return posixPath.normalize(posixPath.join(homeDir, raw));
   }
 
-  /** Single-level WSL directory listing (mirrors remoteListFiles: fast, lazy).
-   *  Returns Linux-style paths so the renderer can browse with the same
-   *  navigation logic as SSH remotes. Cached by the caller (5s TTL). */
-  async function wslListFiles(distro: string, linuxPath: string) {
-    try {
-      const winPath = wslToWinPath(distro, linuxPath);
-      const items = await import("node:fs/promises").then((m) => m.readdir(winPath, { withFileTypes: true }));
-      const entries = items.map((item) => ({
-        name: item.name,
-        path: posixPath.join(linuxPath, item.name),
-        type: (item.isDirectory() ? "directory" : "file") as "directory" | "file",
-        children: undefined,
-      }));
-      entries.sort((a, b) => {
-        if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-      return entries;
-    } catch (e) {
-      // A failure must stay a failure. This used to return ONE fake "file" row
-      // (`（WSL 浏览失败: …）`) so the tree rendered a nonsense entry instead of an
-      // error state — and an error that is disguised as data is one the user
-      // cannot act on (docs/robustness-plan.md B5). Throwing lets the tree show
-      // its error state with a retry.
-      throw new Error(`无法列出 WSL 目录 ${linuxPath}：${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  async function remoteListFiles(remote: RemoteOpts, dirPath?: string) {    try {
-      return await withSftp(remote, async (client, homeDir) => {
-        const dir = resolveRemotePath(dirPath ?? remote.path, homeDir);
-        const items = await client.list(dir);
-        const entries = items.map((item: { name: string; type: string }) => ({
-          name: item.name,
-          path: posixPath.join(dir, item.name),
-          type: (item.type === "d" ? "directory" : "file") as "directory" | "file",
-          children: undefined,
-        }));
-        return entries;
-      });
-    } catch (e) {
-      // See wslListFiles: an error returned as a tree row is data-shaped
-      // garbage that hides the failure. Throw instead — the tree has an error
-      // state, and an empty directory is already handled as an empty list.
-      throw new Error(`无法列出远程目录 ${dirPath ?? remote.path ?? "~"}：${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
   async function hydrateRemoteSessionsInBackground(
     remoteKey: string,
     remote: RemoteOpts,
@@ -3442,72 +3342,6 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
       firstMessage: "",
       name: null,
     };
-  }
-
-  async function remoteReadFile(remote: RemoteOpts, filePath: string, baseDir: string, requireWithinBase = false) {
-    try {
-      if (/^[A-Za-z]:[\\/]/.test(filePath)) {
-        throw new Error(`remote tab cannot open local path: ${filePath}`);
-      }
-      return await withSftp(remote, async (client, homeDir) => {
-        const base = resolveRemotePath(baseDir, homeDir);
-        const full = filePath.startsWith("/")
-          ? posixPath.normalize(filePath)
-          : posixPath.normalize(posixPath.join(base, filePath));
-        if (requireWithinBase && full !== base && !full.startsWith(`${base}/`)) {
-          throw new Error("引用文件不能位于项目目录之外");
-        }
-        const st = await client.stat(full);
-        const bytes = st.size;
-        if (bytes <= TEXT_PREVIEW_MAX_BYTES) {
-          const content = await client.get(full);
-          const buffer = Buffer.isBuffer(content) ? content : Buffer.from(String(content));
-          const isBinary = isBinaryBuffer(buffer);
-          return {
-            content: isBinary ? "(二进制文件，无法以文本显示)" : buffer.toString("utf8"),
-            bytes,
-            isBinary,
-            image: imagePayloadOf(buffer, filePath),
-            error: undefined as string | undefined,
-          };
-        }
-        // Oversize: pull only the head+tail ranges over the wire (no full
-        // transfer). readStreamOptions start/end are byte offsets — the
-        // @types/ssh2-sftp-client declarations are stale, but v12 passes the
-        // options straight to ssh2's createReadStream, which honors ranges.
-        const half = TEXT_PREVIEW_HALF_BYTES;
-        const rangeOpts = { readStreamOptions: { start: 0, end: half - 1 } } as unknown as Parameters<typeof client.get>[2];
-        const headRaw = await client.get(full, undefined, rangeOpts);
-        const tailRaw = await client.get(full, undefined, {
-          readStreamOptions: { start: bytes - half, end: bytes - 1 },
-        } as unknown as Parameters<typeof client.get>[2]);
-        const head = Buffer.isBuffer(headRaw) ? headRaw : Buffer.from(String(headRaw));
-        const tail = Buffer.isBuffer(tailRaw) ? tailRaw : Buffer.from(String(tailRaw));
-        if (isBinaryBuffer(head)) {
-          let image;
-          if (rasterImageMimeOf(filePath) && bytes <= IMAGE_PREVIEW_MAX_BYTES) {
-            const fullBuf = await client.get(full);
-            image = imagePayloadOf(Buffer.isBuffer(fullBuf) ? fullBuf : Buffer.from(String(fullBuf)), filePath);
-          }
-          return {
-            content: "(二进制文件，无法以文本显示)",
-            bytes,
-            isBinary: true,
-            image,
-            error: undefined as string | undefined,
-          };
-        }
-        return {
-          content: `${head.toString("utf8")}\n\n……\n\n${tail.toString("utf8")}`,
-          bytes,
-          isBinary: false,
-          truncated: true,
-          error: undefined as string | undefined,
-        };
-      });
-    } catch (e) {
-      return { content: "", bytes: 0, isBinary: false, error: e instanceof Error ? e.message : String(e) };
-    }
   }
 
   // Provision the app-controlled theme file into pi's config BEFORE the window

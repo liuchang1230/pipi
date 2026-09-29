@@ -54,9 +54,10 @@ if (TEXT_PREVIEW_HALF_BYTES * 2 > TEXT_PREVIEW_MAX_BYTES + 1) {
 // Target
 // ---------------------------------------------------------------------------
 
-/** Where a file operation happens. The one true representation — the bridges
- *  (`targetFromTab` / `resolveTargetRef` in index.ts) build it, and nothing
- *  else interrogates a tab to work out what kind of target it is. */
+/** Where a file operation happens. The one true representation — the two
+ *  bridges (`targetFromTab` in this app's adapters, and `resolveFileTarget` in
+ *  index.ts) build it, and nothing else interrogates a tab to work out what
+ *  kind of target it is. */
 export type Target =
   | { kind: "local"; root: string }
   | { kind: "wsl"; distro: string; root: string }

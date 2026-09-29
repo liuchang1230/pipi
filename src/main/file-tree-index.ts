@@ -5,9 +5,9 @@
  * refreshes after auto-follow writes, and the mutation invalidation all cross
  * the same cached/refresh/invalidate surface. Cache entries are PER-DIRECTORY
  * shallow listings (the tree is lazy — expanded directories are fetched on
- * demand), keyed by the directory's absolute path. The remote/WSL backends
- * keep their own 5s TTL adapters (they read via SFTP / \\wsl$); this index
- * serves the LOCAL path.
+ * demand), keyed by the directory's absolute path. Since the TargetFs seam this
+ * index is the ONE tree cache for every channel (local / WSL / SFTP — the
+ * module hands it a channel-specific walker), not just the local path.
  *
  *   cached(dirPath)     — sync peek (TTL-guarded), used by the click path
  *   refresh(dirPath)    — async listing + cache; concurrent calls for the

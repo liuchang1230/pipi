@@ -503,9 +503,34 @@ describe("targetFromTab", () => {
 
   it("maps a remote tab to sftp when it has a password and ssh otherwise", () => {
     const remote: RemoteOpts = { host: "h", user: "u", password: "p", path: "/srv/app" };
-    expect(targetFromTab({ remote, cwd: "" })).toEqual({ kind: "sftp", remote, root: "/srv/app" });
+    const target = targetFromTab({ remote, cwd: "" });
+    expect(target).toEqual({ kind: "sftp", remote, root: "/srv/app" });
+    // Same REFERENCE, not just the same fields: `stableRemoteKey` hashes
+    // host|user|port|path|agentDir into the lease key, so a caller that
+    // rebuilds the object literal would split one server into two leases and
+    // two caches (CONTEXT: 那个「间歇性变慢」地雷).
+    expect((target as { remote: RemoteOpts }).remote).toBe(remote);
     const keyAuth: RemoteOpts = { host: "h", user: "u" };
     expect(targetFromTab({ remote: keyAuth, cwd: "" })).toMatchObject({ kind: "ssh", root: "~" });
+    // An EMPTY password is not a password: those profiles are key-auth, and
+    // choosing sftp for them would take a lease that then fails to
+    // authenticate (the old suite pinned this; now for `targetFromTab`).
+    expect(targetFromTab({ remote: { ...keyAuth, password: "" }, cwd: "" })).toMatchObject({ kind: "ssh" });
+  });
+
+  it("prefers wsl when a tab somehow carries both", () => {
+    // Non-empty wsl wins over remote: the field order is the rule the tab
+    // model has always used, and a tab that carries both must not depend on
+    // which one the reader looks at second.
+    const remote: RemoteOpts = { host: "h", user: "u", password: "p" };
+    expect(targetFromTab({ wsl: { distro: "Ubuntu", path: "/srv" }, remote, cwd: "/tmp/p" })).toEqual({
+      kind: "wsl",
+      distro: "Ubuntu",
+      root: "/srv",
+    });
+    // ...and remote wins over a cwd, which is what makes a remote tab's
+    // separate local cwd harmless for file IO.
+    expect(targetFromTab({ remote, cwd: "/tmp/p" })).toMatchObject({ kind: "sftp" });
   });
 
   it("maps a local tab to its cwd, and refuses an empty one", () => {
