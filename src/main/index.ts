@@ -6,7 +6,7 @@ import { readFile, writeFile, mkdir, rm, rename, access, readdir, stat } from "n
 import { createHash } from "node:crypto";
 import SftpClient from "ssh2-sftp-client";
 import { Client as SshClient } from "ssh2";
-import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, imagePayloadOf, listDirChildren, readPreviewFromAbs, rasterImageMimeOf, isBinaryBuffer, resolveWithin, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES, IMAGE_PREVIEW_MAX_BYTES, type FileOpResult } from "./file-tree";
+import { readFileContent, writeFileContent, createDirectory, deletePath, renamePath, isValidName, imagePayloadOf, listDirChildren, readPreviewFromAbs, rasterImageMimeOf, isBinaryBuffer, resolveWithin, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_HALF_BYTES, IMAGE_PREVIEW_MAX_BYTES, type FileOpResult, type FileNode } from "./file-tree";
 import { specForModel } from "../shared/model-specs";
 import { lookupModelSpecs } from "./specs-lookup";
 import {
@@ -36,6 +36,24 @@ import { drainCorruptReports, onCorruptReport, type CorruptFileReport } from "./
 import { withOpGuard } from "./op-guard";
 import { createLagMonitor, type LagMonitor } from "./perf";
 import { createSessionFileReader, type SessionFileTarget } from "./session-file-reader";
+import {
+  localTarget as localFsTarget,
+  isTargetFsError,
+  sftpTarget,
+  wslTarget as wslFsTarget,
+  type Target,
+  type TargetFs,
+  type TargetFsDeps,
+} from "./target-fs";
+import {
+  createTargetFsFactory,
+  isWindowsPath,
+  localBinding,
+  sftpBinding,
+  sshBinding,
+  targetFromTab,
+  wslBinding,
+} from "./target-fs-channels";
 import { INTERNAL_RPC_ID_PREFIX } from "../shared/transcript";
 import { isSftpMissingPathError } from "./sftp-errors";
 import { describeConnectFailure, isSftpPathError, isSshAuthError } from "./sftp-failure";
@@ -1486,47 +1504,34 @@ if (gotSingleInstanceLock) {
 
   // --- File tree + viewer (left/right panels) ---
   ipcMain.handle("file:list", async (_e, payload?: TargetRef & { dirPath?: string; rootPath?: string; noCache?: boolean }) => {
-    const t = resolveTarget(payload);
-    const dirPath = payload?.dirPath;
-    // rootPath = explicit LOCAL preview root (sidebar project click). It is
-    // authoritative: never route it through a remote/WSL tab even if one is
-    // active — previews browse the local filesystem, period.
-    if (!payload?.rootPath) {
-      if (t?.wsl) {
-        const targetDir = dirPath ?? payload?.rootPath ?? t.wsl.path ?? "~";
-        const resolved = await resolveWslPath(t.wsl.distro, targetDir);
-        const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
-        if (!payload?.noCache) {
-          const cached = getCachedRemoteFileTree(cacheKey);
-          if (cached) return cached;
-        }
-        return setCachedRemoteFileTree(cacheKey, await wslListFiles(t.wsl.distro, resolved));
-      }
-      if (t?.remote) {
-        const targetDir = dirPath ?? payload?.rootPath ?? t.remoteBrowsePath ?? t.remote.path ?? "~";
-        const cacheKey = remoteFileTreeCacheKey(t.remote, targetDir);
-        if (!payload?.noCache) {
-          const cached = getCachedRemoteFileTree(cacheKey);
-          if (cached) return cached;
-        }
-        return setCachedRemoteFileTree(cacheKey, await remoteListFiles(t.remote, targetDir));
-      }
-    }
+    const resolved = resolveFileTarget(payload);
     // No resolvable root (no tab / no explicit root): return an empty tree
     // instead of silently falling back to the app's own directory — that
     // fallback made the tree show the software's files under a wrong header.
-    const root = payload?.rootPath ?? dirPath ?? t?.cwd;
-    if (!root) return [];
+    if (!resolved) return [];
     // noCache = force-fresh listing (auto-follow tree sync): pi writes do NOT
     // go through our mutation handlers, so the TTL cache would hide files pi
     // just created. Click-path listings (tab switch / preview) stay cached.
-    // Local-only by construction: the renderer skips auto-follow tree
-    // refreshes for remote/WSL/preview origins, so the flag never fires here
-    // for those (their 5s TTL adapters keep serving as before).
-    if (payload?.noCache) return fileTreeIndex.refresh(localTreeKey(root, "."), () => listDirChildren(root, "."));
-    const cachedTree = fileTreeIndex.cached(localTreeKey(root, "."));
-    if (cachedTree) return cachedTree;
-    return fileTreeIndex.refresh(localTreeKey(root, "."), () => listDirChildren(root, "."));
+    //
+    // filter: this one handler serves BOTH the project tree and the directory
+    // picker (`RemoteDirPicker` browses through it), and the wire payload has
+    // no filter field by design (see the ADR: the payload shape does not
+    // change). So each channel keeps its pre-seam filter: local listings were
+    // always noise-filtered, remote/WSL listings never were — and the picker,
+    // which is remote/WSL-only, exists precisely to reach the directories a
+    // noise filter hides (`.worktrees`, `build`, `node_modules`). Unifying the
+    // two needs a caller-supplied filter on the wire, which is its own change.
+    const filter = resolved.target.kind === "local" ? "tree" : "all";
+    try {
+      return await resolved.fs.list(resolved.dir, { filter, fresh: !!payload?.noCache });
+    } catch (e) {
+      // "Nothing there" is an empty tree. A permission or transport failure is
+      // NOT: reporting it as an empty listing is how a remote project looked
+      // empty while it was merely unreachable (CONTEXT: the "远程文件刷新中…"
+      // incident), and an error shaped like data is one the user cannot act on.
+      if (isTargetFsError(e) && e.kind === "not-found") return [];
+      throw e;
+    }
   });
 
   /** List one directory's children for the shared lazy file tree. Local paths
@@ -1534,32 +1539,18 @@ if (gotSingleInstanceLock) {
    *  adapter returns directories with `children: undefined`, meaning they can
    *  be expanded in place instead of replacing the current tree root. */
   ipcMain.handle("file:list-dir", async (_e, payload?: TargetRef & { rootPath?: string; relDir: string; noCache?: boolean }) => {
-    const t = resolveTarget(payload);
-    if (!payload?.rootPath && t?.wsl && payload?.relDir) {
-      const resolved = await resolveWslPath(t.wsl.distro, payload.relDir);
-      const cacheKey = `wsl:${t.wsl.distro}:${resolved}`;
-      if (!payload?.noCache) {
-        const cached = getCachedRemoteFileTree(cacheKey);
-        if (cached) return cached;
-      }
-      return setCachedRemoteFileTree(cacheKey, await wslListFiles(t.wsl.distro, resolved));
+    if (!payload?.relDir) return [];
+    const resolved = resolveFileTarget(payload);
+    if (!resolved) return [];
+    // Same filter reasoning as `file:list` above: the picker expands
+    // directories through this handler too.
+    const filter = resolved.target.kind === "local" ? "tree" : "all";
+    try {
+      return await resolved.fs.list(payload.relDir, { filter, fresh: !!payload?.noCache });
+    } catch (e) {
+      if (isTargetFsError(e) && e.kind === "not-found") return [];
+      throw e;
     }
-    if (!payload?.rootPath && t?.remote && payload?.relDir) {
-      const cacheKey = remoteFileTreeCacheKey(t.remote, payload.relDir);
-      if (!payload?.noCache) {
-        const cached = getCachedRemoteFileTree(cacheKey);
-        if (cached) return cached;
-      }
-      return setCachedRemoteFileTree(cacheKey, await remoteListFiles(t.remote, payload?.relDir));
-    }
-    const root = payload?.rootPath ?? t?.cwd;
-    if (!root || !payload?.relDir) return [];
-    const key = localTreeKey(root, payload.relDir);
-    if (!payload.noCache) {
-      const cached = fileTreeIndex.cached(key);
-      if (cached) return cached;
-    }
-    return fileTreeIndex.refresh(key, () => listDirChildren(root, payload.relDir));
   });
 
   ipcMain.handle("file:resolve-link", (_e, payload: { tabId?: string; rootPath?: string; currentPath?: string; href: string }) => {
@@ -1687,23 +1678,24 @@ if (gotSingleInstanceLock) {
     const shell = `if command -v fd >/dev/null 2>&1; then fd --hidden --follow --exclude .git --max-results 100 --type f --type d ${query ? sq(query) : ""}; else find . -path './.git' -prune -o -path './.git/*' -prune -o -mindepth 1 \( -type d -printf '%P/\\n' -o -type f -printf '%P\\n' \) | ${query ? `grep -i -F -- ${sq(query)}` : "cat"} | head -n 100; fi`;
     // Windows-local projects use Windows cwd paths. Running `bash -lc cd
     // D:\\...` is invalid and previously made their result set always empty.
-    const localSearch = async () => {
+    // One channel-agnostic walk: the three per-channel `walk`s that used to
+    // live here differed only in their listing primitive.
+    const walkFrom = async (fs: TargetFs): Promise<Array<{ path: string; type: "file" | "directory" }>> => {
       const needle = query.toLocaleLowerCase();
       const files: Array<{ path: string; type: "file" | "directory" }> = [];
-      const walk = async (dir: string, rel: string): Promise<void> => {
+      const walk = async (dir: string): Promise<void> => {
         if (files.length >= 100) return;
-        let entries;
-        try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+        let entries: FileNode[];
+        try { entries = await fs.list(dir, { filter: "all", fresh: true }); } catch { return; }
         for (const entry of entries) {
           if (files.length >= 100 || entry.name === ".git") continue;
-          if (!entry.isDirectory() && !entry.isFile()) continue;
-          const path = rel ? `${rel}/${entry.name}` : entry.name;
-          const type = entry.isDirectory() ? "directory" as const : "file" as const;
-          if (!needle || path.toLocaleLowerCase().includes(needle)) files.push({ path, type });
-          if (entry.isDirectory()) await walk(join(dir, entry.name), path);
+          if (!needle || entry.path.toLocaleLowerCase().includes(needle)) {
+            files.push({ path: entry.path, type: entry.type });
+          }
+          if (entry.type === "directory") await walk(entry.path);
         }
       };
-      await walk(t.cwd, "");
+      await walk(".");
       return files;
     };
     try {
@@ -1715,31 +1707,30 @@ if (gotSingleInstanceLock) {
         // Search through SFTP, but fan out each directory level in parallel.
         // The old depth-first walk made an SSH round-trip per directory, so a
         // match in a second-level directory waited behind every sibling.
-        const remote = t.remote;
+        const fs = targetFsFor(sftpTarget(t.remote, t.remote.path || "~"));
         const needle = query.toLocaleLowerCase();
         const files: Array<{ path: string; type: "file" | "directory" }> = [];
-        await withSftp(remote, async (client, homeDir) => {
-          const root = resolveRemotePath(remote.path || "~", homeDir);
-          let pending: Array<{ abs: string; rel: string }> = [{ abs: root, rel: "" }];
-          const maxDepth = 32;
-          while (pending.length && files.length < 100) {
-            const level = pending;
-            pending = [];
-            const listings = await Promise.all(level.map(async (dir) => {
-              try { return { dir, entries: await client.list(dir.abs) }; } catch { return { dir, entries: [] as Awaited<ReturnType<typeof client.list>> }; }
-            }));
-            for (const { dir, entries } of listings) {
-              const depth = dir.rel ? dir.rel.split("/").length : 0;
-              for (const entry of entries) {
-                if (files.length >= 100 || entry.name === "." || entry.name === ".." || entry.name === ".git") continue;
-                const path = dir.rel ? `${dir.rel}/${entry.name}` : entry.name;
-                const type = entry.type === "d" ? "directory" as const : "file" as const;
-                if (!needle || path.toLocaleLowerCase().includes(needle)) files.push({ path, type });
-                if (entry.type === "d" && depth < maxDepth) pending.push({ abs: posixPath.join(dir.abs, entry.name), rel: path });
+        let pending: string[] = ["."];
+        const maxDepth = 32;
+        while (pending.length && files.length < 100) {
+          const level = pending;
+          pending = [];
+          const listings = await Promise.all(level.map(async (dir) => {
+            // Best effort per directory: one unreadable subdir must not turn a
+            // completion list into an error.
+            try { return { dir, entries: await fs.list(dir, { filter: "all", fresh: true }) }; } catch { return { dir, entries: [] as FileNode[] }; }
+          }));
+          for (const { dir, entries } of listings) {
+            const depth = dir === "." ? 0 : dir.split("/").length;
+            for (const entry of entries) {
+              if (files.length >= 100 || entry.name === ".git") continue;
+              if (!needle || entry.path.toLocaleLowerCase().includes(needle)) {
+                files.push({ path: entry.path, type: entry.type });
               }
+              if (entry.type === "directory" && depth < maxDepth) pending.push(entry.path);
             }
           }
-        });
+        }
         return { files };
       } else if (t.wsl) {
         // Bounded: this spawn had NO timeout, so a wedged `wsl.exe` (or a find
@@ -1771,7 +1762,11 @@ if (gotSingleInstanceLock) {
           });
         });
       } else {
-        return { files: await localSearch() };
+        // Local: no shell, no `bash -lc` — the same channel-agnostic walk the
+        // remote branch uses.
+        const resolved = resolveFileTarget({ tabId: payload?.tabId });
+        if (!resolved) return { files: [], error: "tab unavailable" };
+        return { files: await walkFrom(resolved.fs) };
       }
       return { files: parse(stdout) };
     } catch (e) {
@@ -1781,43 +1776,33 @@ if (gotSingleInstanceLock) {
 
   /** Legacy bounded project index used by the file tree. */
   ipcMain.handle("file:list-mentions", async (_e, payload: { tabId?: string }) => {
-    const t = payload?.tabId ? getTab(payload.tabId) : getActiveTab();
-    if (!t) return { files: [], error: "tab unavailable" };
+    const resolved = resolveFileTarget({ tabId: payload?.tabId });
+    if (!resolved) return { files: [], error: "tab unavailable" };
     const files: Array<{ path: string; type: "file" | "directory" }> = [];
     const ignored = new Set([".git", "node_modules", "dist", "build", ".next", ".cache"]);
     const limit = 2_000;
-    const walk = async (dir: string, rel: string, list: (p: string) => Promise<Array<{ name: string; type: "file" | "directory" }>>) => {
+    // ONE walk for every channel: local, WSL and SFTP differed only in how
+    // they listed a directory, which is what the channel seam now owns. Paths
+    // stay root-relative because the walk asks for relative directories.
+    // `fresh` because this index is a live view of the project (it fed a live
+    // readdir/client.list per directory before the seam): a file pi created
+    // seconds ago must be offered. Note `fresh` also evicts the cached listings
+    // of every directory it touches (that is what keeps the answer from being
+    // stale), so a search can cost the tree one re-walk — correctness wins over
+    // one cached listing.
+    const walk = async (dir: string): Promise<void> => {
       if (files.length >= limit) return;
-      let entries: Array<{ name: string; type: "file" | "directory" }>;
-      try { entries = await list(dir); } catch { return; }
+      let entries: FileNode[];
+      try { entries = await resolved.fs.list(dir, { filter: "all", fresh: true }); } catch { return; }
       for (const entry of entries) {
         if (files.length >= limit || ignored.has(entry.name)) continue;
         if (entry.name.startsWith(".") && entry.name !== ".env" && entry.name !== ".gitignore") continue;
-        const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-        files.push({ path: childRel, type: entry.type });
-        if (entry.type === "directory" && childRel.split("/").length < 9) await walk(`${dir}/${entry.name}`, childRel, list);
+        files.push({ path: entry.path, type: entry.type });
+        if (entry.type === "directory" && entry.path.split("/").length < 9) await walk(entry.path);
       }
     };
     try {
-      if (t.remote) {
-        const remote = t.remote;
-        await withSftp(remote, async (client, homeDir) => {
-          const root = resolveRemotePath(remote.path ?? "~", homeDir);
-          await walk(root, "", async (dir) => (await client.list(dir)).flatMap((item: { name: string; type: string }) =>
-            item.name === "." || item.name === ".." ? [] : [{ name: item.name, type: item.type === "d" ? "directory" as const : "file" as const }],
-          ));
-        });
-      } else if (t.wsl) {
-        const wsl = t.wsl;
-        const root = await resolveWslPath(wsl.distro, wsl.path || "~");
-        await walk(root, "", async (dir): Promise<Array<{ name: string; type: "file" | "directory" }>> =>
-          (await readdir(wslToWinPath(wsl.distro, dir), { withFileTypes: true }))
-            .flatMap((item): Array<{ name: string; type: "file" | "directory" }> => item.isDirectory() ? [{ name: item.name, type: "directory" }] : item.isFile() ? [{ name: item.name, type: "file" }] : []));
-      } else {
-        await walk(t.cwd, "", async (dir): Promise<Array<{ name: string; type: "file" | "directory" }>> =>
-          (await readdir(dir, { withFileTypes: true }))
-            .flatMap((item): Array<{ name: string; type: "file" | "directory" }> => item.isDirectory() ? [{ name: item.name, type: "directory" }] : item.isFile() ? [{ name: item.name, type: "file" }] : []));
-      }
+      await walk(".");
       files.sort((a, b) => a.path.localeCompare(b.path));
       return { files, ...(files.length >= limit ? { error: `仅显示前 ${limit} 个文件` } : {}) };
     } catch (e) {
@@ -1826,32 +1811,24 @@ if (gotSingleInstanceLock) {
   });
 
   ipcMain.handle("file:read", async (_e, payload: TargetRef & { rootPath?: string; relPath: string; mention?: boolean }) => {
-    const t = resolveTarget(payload);
     const relPath = payload.relPath;
-    // Local preview root is authoritative (see file:list).
-    if (!payload.rootPath) {
-      if (t?.wsl) {
-        try {
-          return await readPreviewFromAbs(await wslFullPath(t, relPath), relPath);
-        } catch (err) {
-          // `content` stays empty: the failure lives in `error`. Returning the
-          // message as content meant a future consumer that forgets to check
-          // `error` would send "⚠️ 读取失败…" to the model or save it to disk.
-          return { content: "", bytes: 0, isBinary: false, error: err instanceof Error ? err.message : String(err) };
-        }
-      }
-      if (t?.remote) {
-        // @-mentions always address the tab's project cwd, never the mutable
-        // file-browser directory. This also enforces a project-root boundary.
-        return remoteReadFile(t.remote, relPath, t.remote.path ?? "~", !!payload.mention);
-      }
+    const target = resolveFileTarget(payload)?.target ?? localFsTarget(payload.rootPath ?? process.cwd());
+    // A remote/WSL tab cannot open a Windows-local path: say so instead of
+    // letting the POSIX channel report it as a missing file.
+    if (target.kind !== "local" && isWindowsPath(relPath)) {
+      return { content: "", bytes: 0, isBinary: false, error: `remote tab cannot open local path: ${relPath}` };
     }
-    return readFileContent(payload.rootPath ?? t?.cwd ?? process.cwd(), relPath).catch((err) => ({
-      content: "",
-      bytes: 0,
-      isBinary: false,
-      error: err instanceof Error ? err.message : String(err),
-    }));
+    // A failed read stays a FAILURE: `content` is empty and the message lives in
+    // `error`. Returning the message as content meant a consumer that forgot to
+    // check `error` would send "⚠️ 读取失败…" to the model or write it to disk.
+    return targetFsFor(target)
+      .readPreview(relPath)
+      .catch((err) => ({
+        content: "",
+        bytes: 0,
+        isBinary: false,
+        error: err instanceof Error ? err.message : String(err),
+      }));
   });
 
   // --- File mutations (write / mkdir / delete / rename) — local / WSL / SFTP ---
@@ -1956,6 +1933,17 @@ if (gotSingleInstanceLock) {
   }
 
   /** Shared dispatch for the four mutation handlers. */
+  /** Drop the cached listings a mutation just changed. Must use the SAME target
+   *  the read path used: the cache key is built from the target's kind, root and
+   *  filter, so a differently rooted target would invalidate nothing. */
+  async function invalidateAfterMutation(
+    ref: (TargetRef & { rootPath?: string; dirPath?: string }) | undefined,
+    relPath: string
+  ): Promise<void> {
+    const resolved = resolveFileTarget(ref);
+    if (resolved) await resolved.fs.invalidate([relPath]);
+  }
+
   async function mutateFile(
     ref: TargetRef | undefined,
     relPath: string,
@@ -1967,9 +1955,7 @@ if (gotSingleInstanceLock) {
     if (!t) return { ok: false, error: "找不到终端会话" };
     try {
       await fn(t);
-      if (t.remote) invalidateRemoteFileTree(t.remote);
-      else if (t.wsl) invalidateWslFileTree(t.wsl.distro);
-      else invalidateLocalParent(t.cwd ?? process.cwd(), relPath);
+      await invalidateAfterMutation(ref, relPath);
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -2004,7 +1990,7 @@ if (gotSingleInstanceLock) {
     // Local preview root is authoritative; needs no tab at all.
     if (payload.rootPath) {
       const r = await writeFileContent(payload.rootPath, relPath, content);
-      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
+      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
       return r;
     }
     return mutateFile(payload, relPath, async (t) => {
@@ -2025,7 +2011,7 @@ if (gotSingleInstanceLock) {
     const relPath = payload.relPath;
     if (payload.rootPath) {
       const r = await createDirectory(payload.rootPath, relPath);
-      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
+      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
       return r;
     }
     return mutateFile(payload, relPath, async (t) => {
@@ -2046,7 +2032,7 @@ if (gotSingleInstanceLock) {
     const relPath = payload.relPath;
     if (payload.rootPath) {
       const r = await deletePath(payload.rootPath, relPath);
-      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
+      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
       return r;
     }
     return mutateFile(payload, relPath, async (t) => {
@@ -2068,7 +2054,7 @@ if (gotSingleInstanceLock) {
     const newName = (payload.newName ?? "").trim();
     if (payload.rootPath) {
       const r = await renamePath(payload.rootPath, relPath, newName);
-      if (r.ok) invalidateLocalParent(payload.rootPath, relPath);
+      if (r.ok) await invalidateAfterMutation({ rootPath: payload.rootPath }, relPath);
       return r;
     }
     return mutateFile(payload, relPath, async (t) => {
@@ -2383,32 +2369,20 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   }
 }
 
-/** The session-file location for a tab — the ONE place a tab's fields are
- *  mapped onto the reader's channel rule (see session-file-reader.ts). */
-function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
-  return { wslDistro: tab.wsl ? tab.wsl.distro : undefined, remote: tab.remote };
-}
+/** The session-file location for a tab — superseded by `targetFromTab` in
+ *  target-fs-channels.ts: the tab's fields map onto a Target, and the module
+ *  owns the channel rule (see docs/adr/0001-target-fs-seam.md). */
 
   /** Session-file channel adapters. Declared inside the ready closure (not at
    *  module level) because the SFTP adapter needs `withSftp`, whose
    *  refCount/destroy-on-error discipline the previous hand-rolled lease call
-   *  was missing. */
-  const readSessionFile = createSessionFileReader({
-    readLocal: (p) => readFile(p, "utf8"),
-    readWsl: (distro, p) => readFile(wslToWinPath(distro, p), "utf8"),
-    readSftp: (remote, p) =>
-      withSftp(remote, async (client) => {
-        const buf = (await client.get(p)) as string | Buffer;
-        return Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
-      }),
-    readSsh: async (remote, p) => {
-      const content = await sshCatRemoteFile(remote, p);
-      // The helper signals failure with an empty string; the reader's contract
-      // is "resolve text or throw", so callers fall back to the RPC path.
-      if (!content) throw new Error("key-auth remote read failed");
-      return content;
-    },
-  });
+   *  was missing: reading a session file is a TargetFs READ (channel selection
+   *  + `readText`), not a fourth implementation of the channel rule. */
+  const readSessionFileText = (tab: TabInfo, sessionPath: string): Promise<string> => {
+    const target = targetFromTab(tab);
+    if (!target) throw new Error("no session file target");
+    return targetFsFor(target).readText(sessionPath);
+  };
 
   ipcMain.handle("tree:from-file", async (_e, tabId: string) => {
     const tab = getTab(tabId);
@@ -2433,7 +2407,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
       // and future readers must not each re-derive it. Throws on failure →
       // caught below, so a key-auth read failure still reports exactly
       // "key-auth remote read failed".
-      const content = await readSessionFile(sessionFileTargetOf(tab), sessionPath);
+      const content = await readSessionFileText(tab, sessionPath);
       const { entries, leafId } = await parseTreeFileAsync(content);
       debugLog("tree", `tab ${tabId} from-file OK entries=${entries.length}`);
       // Flat entries (not a nested tree): a long linear session nests deeper
@@ -2495,7 +2469,7 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
     const sessionPath = state.data?.sessionFile || tab.sessionPath || (await findRecentSessionFile(tab));
     if (!sessionPath) return { ok: false, reason: "no session file" };
     try {
-      const content = await readSessionFile(sessionFileTargetOf(tab), sessionPath);
+      const content = await readSessionFileText(tab, sessionPath);
       const messages = await transcriptFromContent(content);
       if (!messages) return { ok: false, reason: "empty transcript" };
       if (messages.length !== expected) {
@@ -3242,6 +3216,68 @@ function sessionFileTargetOf(tab: TabInfo): SessionFileTarget {
   /** `session:*`-family ref: legacy tabId string, or a TargetRef object. */
   function toTargetRef(ref: string | TargetRef | undefined): TargetRef | undefined {
     return typeof ref === "string" ? { tabId: ref } : ref;
+  }
+
+  /** The TargetFs deps: the three production channels bound to this process's
+   *  connections. Assembled here (not in target-fs-channels.ts) because
+   *  `withSftp` below is closure state — the module must not know how a lease
+   *  is pooled. */
+  const targetFsDeps: TargetFsDeps = {
+    local: localBinding(),
+    wsl: (distro) => wslBinding(distro, () => getWslHomeAsync(distro)),
+    sftp: (remote) => sftpBinding(remote, withSftp),
+    ssh: (remote) => sshBinding(remote, (r, absPath) => sshCatRemoteFile(r, absPath)),
+    cache: fileTreeIndex,
+    // One rule for every channel: `all` by default (the directory picker and
+    // the mention index must be able to enter node_modules); tree call sites
+    // pass `filter: "tree"` explicitly.
+    filter: "all",
+  };
+  const targetFsFor = createTargetFsFactory(targetFsDeps);
+
+  /** Renderer ref → the TargetFs that owns this file operation.
+   *
+   *  `rootPath` is an explicit LOCAL preview root and stays authoritative —
+   *  never routed through an active remote/WSL tab, because previews browse the
+   *  local filesystem period. Otherwise the target tab (or explicit profile)
+   *  decides the root, and on a local target a `dirPath` IS the root (the
+   *  pre-seam reading of that field) while on a remote/WSL one it is a browse
+   *  path — hence the returned `dir` callers list. */
+  function resolveFileTarget(
+    ref: (TargetRef & { dirPath?: string; rootPath?: string; mention?: boolean }) | undefined,
+    fallbackToActive = true,
+  ): { fs: TargetFs; target: Target; dir: string } | undefined {
+    if (ref?.rootPath) {
+      const target = localFsTarget(ref.rootPath);
+      return { fs: targetFsFor(target), target, dir: ref.dirPath ?? "." };
+    }
+    const t = resolveTarget(ref, fallbackToActive);
+    if (t?.wsl) {
+      const target = wslFsTarget(t.wsl.distro, t.wsl.path || "~");
+      return { fs: targetFsFor(target), target, dir: ref?.dirPath ?? t.wsl.path ?? "~" };
+    }
+    if (t?.remote) {
+      // A remote tab has TWO roots and the payload says which one:
+      //  - `mention` (an `@file` reference) addresses the PROJECT dir, which is
+      //    what the mention index walked and what `..` containment must use;
+      //  - a tree click addresses the BROWSE dir, whose absolute rows are not
+      //    contained by the project dir once the user navigated away.
+      const root = ref?.mention
+        ? t.remote.path || "~"
+        : t.remoteBrowsePath ?? t.remote.path ?? "~";
+      const target = sftpTarget(t.remote, root);
+      // `dir` follows the same choice as `root`: a `mention` caller addresses
+      // the project dir, and the two must not disagree (a listing of `dir` has
+      // to be a listing of `root`).
+      const dir = ref?.mention
+        ? root
+        : ref?.dirPath ?? t.remoteBrowsePath ?? t.remote.path ?? "~";
+      return { fs: targetFsFor(target), target, dir };
+    }
+    const root = ref?.dirPath ?? t?.cwd;
+    if (!root) return undefined;
+    const target = localFsTarget(root);
+    return { fs: targetFsFor(target), target, dir: "." };
   }
 
   function resolveRemotePath(inputPath: string | undefined, homeDir: string): string {

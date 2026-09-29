@@ -71,10 +71,20 @@ export function wslTarget(distro: string, root: string): Target {
   return { kind: "wsl", distro, root };
 }
 
-/** Password ⇒ SFTP (a pooled lease); no password ⇒ plain ssh (key auth, no
- *  SFTP channel). This is the single place that rule is decided. */
-export function remoteTarget(remote: RemoteOpts, root: string): Target {
-  return remote.password ? { kind: "sftp", remote, root } : { kind: "ssh", remote, root };
+/** Browsing/IO over a pooled SFTP lease. Used for EVERY remote file operation
+ *  a user addresses through the tree or the viewer — a password is auth
+ *  material, not a channel choice (`remoteAuthOptions` also accepts agent and
+ *  default keys, which is what the pre-seam `remoteReadFile` relied on). */
+export function sftpTarget(remote: RemoteOpts, root: string): Target {
+  return { kind: "sftp", remote, root };
+}
+
+/** Plain `ssh cat`, no SFTP lease. This is the SESSION-FILE fast path for
+ *  key-auth remotes (it also works while the remote pi is dead, which is when
+ *  that path matters) — not a general “passwordless ⇒ ssh” rule: it must not
+ *  be used for tree browsing or previews. */
+export function sshTarget(remote: RemoteOpts, root: string): Target {
+  return { kind: "ssh", remote, root };
 }
 
 /** Stable cache/dedup key. Includes the root: two tabs on the same server but
@@ -142,24 +152,29 @@ export function classifyError(e: unknown, what: string): TargetFsError {
   // swallowed.
   const rawMsg = (e as { message?: unknown } | null)?.message;
   const msg = typeof rawMsg === "string" ? rawMsg : "";
+  // The raw cause stays in the message: consumers match the English spelling
+  // (`viewerStore` retries a just-created file while the error says ENOENT or
+  // "No such file"), so replacing it with module-speak would silently drop a
+  // retry path. `what` is the absolute path the operation was attempted on.
+  const detail = (fallback: string) => `${what}: ${msg || fallback}`;
   // ssh2 SFTP statuses: 2 = NO_SUCH_FILE, 3 = PERMISSION_DENIED (the client
   // surfaces either as a number or as its string form).
   if (code === 2 || code === "2" || code === "ENOENT") {
-    return new TargetFsError("not-found", `${what}: not found`, e);
+    return new TargetFsError("not-found", detail("not found"), e);
   }
   if (typeof code === "string" && /NO_SUCH_FILE/i.test(code)) {
-    return new TargetFsError("not-found", `${what}: not found`, e);
+    return new TargetFsError("not-found", detail("not found"), e);
   }
   // ENOTDIR means a *file* was listed or read as a directory: from the tree's
   // point of view that is still "nothing to list", and the local adapter used
   // to answer an empty listing for it.
-  if (code === "ENOTDIR" || code === 20) return new TargetFsError("not-found", `${what}: not a directory`, e);
+  if (code === "ENOTDIR" || code === 20) return new TargetFsError("not-found", detail("not a directory"), e);
   if (code === "EACCES" || code === "EPERM" || code === 3 || code === "3") {
-    return new TargetFsError("denied", `${what}: permission denied`, e);
+    return new TargetFsError("denied", detail("permission denied"), e);
   }
   // Message-only fallback, kept narrow so a network error containing the same
   // words is not swallowed.
-  if (/(^|:\s*)No such file(\b|$)/i.test(msg)) return new TargetFsError("not-found", `${what}: not found`, e);
+  if (/(^|:\s*)No such file(\b|$)/i.test(msg)) return new TargetFsError("not-found", detail("not found"), e);
   return new TargetFsError("transport", `${what}: ${msg || String(e)}`, e);
 }
 
@@ -327,11 +342,15 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
   if (!target.root || !dialect.isAbsolute(target.root)) {
     throw new TargetFsError("escape", `target root must be absolute: ${JSON.stringify(target.root)}`);
   }
-  /** Canonical, separator-insensitive cache key: one directory has ONE key, no
-   *  matter whether the caller spelled it `src`, `src/`, `/p/src` or `~` first. */
-  const keyOf = (abs: string) => {
+  /** Canonical, separator- and filter-insensitive-enough cache key: one
+   *  directory has ONE key per filter, no matter whether the caller spelled it
+   *  `src`, `src/`, `/p/src` or `~` first. The filter is part of the key because
+   *  the SAME directory is listed with `"tree"` by the tree and `"all"` by the
+   *  picker and the mention index: sharing an entry would hide `node_modules`
+   *  from the picker for the TTL, or leak it into the tree. */
+  const keyOf = (abs: string, filter: ListFilter) => {
     const n = dialect.normalize(abs);
-    return `${targetKey(target)}\0${n.replace(/[\\/]+$/, "") || n}`;
+    return `${targetKey(target)}\0${filter}\0${n.replace(/[\\/]+$/, "") || n}`;
   };
 
   /** Promises that are cleared on failure: a transient home lookup must not
@@ -389,15 +408,16 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
     return abs;
   }
 
-  /** The resolved path and every ancestor, for cache invalidation. */
+  /** The resolved path and every ancestor, for cache invalidation. Every
+   *  filter variant is dropped: we do not track which filter a caller cached,
+   *  and one stale tree row is worse than one extra walk. */
   async function invalidateAbs(abs: string): Promise<void> {
     if (!deps.cache) return;
     let cur = dialect.normalize(abs);
-    deps.cache.invalidate(keyOf(cur));
     for (;;) {
+      for (const filter of FILTERS) deps.cache.invalidate(keyOf(cur, filter));
       const parent = dialect.parent(cur);
       if (!parent || parent === cur) break;
-      deps.cache.invalidate(keyOf(parent));
       cur = parent;
     }
   }
@@ -408,7 +428,8 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
     async list(dir: string, opts?: { fresh?: boolean; filter?: ListFilter }): Promise<FileNode[]> {
       const input = dir || ".";
       const absDir = await absOf(input);
-      const key = keyOf(absDir);
+      const filter: ListFilter = opts?.filter ?? deps.filter ?? "all";
+      const key = keyOf(absDir, filter);
       if (!opts?.fresh && deps.cache) {
         const hit = deps.cache.cached(key);
         if (hit) return hit;
@@ -416,7 +437,7 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
       const walk = async (): Promise<FileNode[]> => {
         try {
           const entries = await binding.channel.list(binding.toNative(absDir));
-          return project(input, absDir, entries, dialect, opts?.filter ?? deps.filter);
+          return project(input, absDir, entries, dialect, filter);
         } catch (e) {
           // Classified, not swallowed: a missing directory used to be reported
           // as an empty listing from here, which is how a permission or
@@ -477,7 +498,7 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
       const abs = await resolveContained(relPath);
       const native = binding.toNative(abs);
       const st = await statOrNull(binding.channel, native);
-      if (!st) throw new TargetFsError("not-found", `path does not exist: ${relPath}`);
+      if (!st) throw notFound(relPath);
       await viaChannel(abs, () => binding.channel.remove(native, st.type));
       await invalidateAbs(abs);
     },
@@ -490,7 +511,7 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
       // Source first: renaming a missing path to its own name must not look
       // like a silent success.
       if (!(await statOrNull(binding.channel, native))) {
-        throw new TargetFsError("not-found", `path does not exist: ${relPath}`);
+        throw notFound(relPath);
       }
       const targetAbs = dialect.join(dialect.parent(abs), name);
       if (targetAbs === abs) return; // same name → no-op
@@ -558,10 +579,15 @@ const VISIBLE_DOTFILES = new Set([
   ".pi",
 ]);
 
-/** What a listing should hide. `"tree"` reproduces the local project tree's
- *  filter; `"all"` is what the remote adapter and the directory picker do
- *  today (default, so nothing changes silently). */
+/** What a listing should hide. `"tree"` is the project tree's filter, applied
+ *  to EVERY channel on purpose (a tree that hides `node_modules` locally but
+ *  shows it over SFTP would be two products); `"all"` is for surfaces that must
+ *  reach everything — the directory picker and the mention index. The module's
+ *  default is `"all"`; the tree call sites pass `"tree"`. */
 export type ListFilter = "tree" | "all";
+
+/** Every filter a caller may have cached for one directory. */
+const FILTERS: readonly ListFilter[] = ["tree", "all"];
 
 function isVisibleEntry(name: string): boolean {
   if (TREE_NOISE.has(name)) return false;
@@ -616,6 +642,14 @@ async function statOrNull(channel: Channel, absPath: string): Promise<{ type: "f
   }
 }
 
+/** A missing path. The wording keeps the POSIX spelling the renderer already
+ *  matches on (`viewerStore` auto-follows a file the write tool just created by
+ *  retrying while the error says it does not exist yet) — replacing it with
+ *  module-speak silently dropped that retry. */
+function notFound(relPath: string): TargetFsError {
+  return new TargetFsError("not-found", `No such file or directory: ${relPath}`);
+}
+
 /** Every channel call leaves the module classified — a raw ENOENT or SSH
  *  status must never reach an IPC handler that only knows `kind`. */
 async function viaChannel<T>(absPath: string, run: () => Promise<T>): Promise<T> {
@@ -632,7 +666,7 @@ async function viaChannel<T>(absPath: string, run: () => Promise<T>): Promise<T>
  *  two windows from overlapping; the module asserts it at load time.) */
 async function preview(relPath: string, native: string, channel: Channel): Promise<PreviewPayload> {
   const st = await statOrNull(channel, native);
-  if (!st) throw new TargetFsError("not-found", `path does not exist: ${relPath}`);
+  if (!st) throw notFound(relPath);
   const size = st.size;
   if (size <= TEXT_PREVIEW_MAX_BYTES) {
     return payloadOf(await viaChannel(native, () => channel.readAll(native)), relPath);

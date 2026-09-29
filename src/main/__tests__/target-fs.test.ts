@@ -20,7 +20,8 @@ import {
   isTargetFsError,
   isValidName,
   localTarget,
-  remoteTarget,
+  sftpTarget,
+  sshTarget,
   targetKey,
   TEXT_PREVIEW_HALF_BYTES,
   TEXT_PREVIEW_MAX_BYTES,
@@ -142,15 +143,18 @@ function posixFs(root: string, channel: Channel, overrides: Partial<TargetFsDeps
 const REMOTE: RemoteOpts = { host: "h", user: "u", path: "~" } as RemoteOpts;
 
 describe("TargetFs · target kinds", () => {
-  it("picks SFTP when a password exists and ssh otherwise", () => {
-    expect(remoteTarget({ ...REMOTE, password: "pw" }, "~").kind).toBe("sftp");
-    expect(remoteTarget(REMOTE, "~").kind).toBe("ssh");
+  it("has one constructor per channel: auth is not a channel choice", () => {
+    expect(sftpTarget({ ...REMOTE, password: "pw" }, "~").kind).toBe("sftp");
+    // A key-auth server browses over SFTP too (agent/default keys) — the ssh
+    // channel is only the session-file fast path, never the browse channel.
+    expect(sftpTarget(REMOTE, "~").kind).toBe("sftp");
+    expect(sshTarget(REMOTE, "~").kind).toBe("ssh");
   });
 
   it("keys the cache by target AND root, so two roots never share", () => {
     expect(targetKey(localTarget("C:\\a"))).not.toBe(targetKey(localTarget("C:\\b")));
     expect(targetKey(wslTarget("Ubuntu", "/p"))).toContain("wsl:Ubuntu");
-    expect(targetKey(remoteTarget({ ...REMOTE, password: "pw", port: 2222, agentDir: "~/d" }, "~"))).toBe(
+    expect(targetKey(sftpTarget({ ...REMOTE, password: "pw", port: 2222, agentDir: "~/d" }, "~"))).toBe(
       "sftp:u@h:2222[~/d]\0~"
     );
   });
@@ -163,7 +167,7 @@ describe("TargetFs · target kinds", () => {
 
   it("exports a default dialect helper that follows the host for local targets", () => {
     expect(dialectOf(wslTarget("Ubuntu", "/p"))).toBe("posix");
-    expect(dialectOf(remoteTarget(REMOTE, "~"))).toBe("posix");
+    expect(dialectOf(sftpTarget(REMOTE, "~"))).toBe("posix");
     expect(dialectOf(localTarget("C:\\p"))).toBe(process.platform === "win32" ? "win" : "posix");
   });
 });
@@ -295,6 +299,59 @@ describe("TargetFs · list", () => {
     expect(store.size).toBe(1); // …but not the sibling root `/other`
   });
 
+  it("keeps one directory's tree and picker listings apart in the cache", async () => {
+    const { channel, calls } = memChannel({ "/p/node_modules/x": "x", "/p/a.ts": "a" });
+    const store = new Map<string, FileNode[]>();
+    const cache: TreeCache = {
+      cached: (k) => store.get(k),
+      refresh: async (k, walk) => {
+        const nodes = await walk();
+        store.set(k, nodes);
+        return nodes;
+      },
+      invalidate: (k) => {
+        store.delete(k);
+      },
+    };
+    const fs = posixFs("/p", channel, { cache });
+    // One instance, one directory, two filters: whichever ran first must not
+    // answer for the other (a shared entry hides node_modules from the picker,
+    // or leaks it into the project tree).
+    expect((await fs.list(".", { filter: "tree" })).map((n) => n.name)).toEqual(["a.ts"]);
+    expect((await fs.list(".", { filter: "all" })).map((n) => n.name)).toEqual(["node_modules", "a.ts"]);
+    expect((await fs.list(".", { filter: "tree" })).map((n) => n.name)).toEqual(["a.ts"]);
+    expect(calls.filter((c) => c === "list:/p")).toHaveLength(2); // two walks, not three
+  });
+
+  it("drops EVERY filter variant of an ancestor when a path is invalidated", async () => {
+    const { channel, calls } = memChannel({ "/p/src/a.ts": "a" });
+    const store = new Map<string, FileNode[]>();
+    const cache: TreeCache = {
+      cached: (k) => store.get(k),
+      refresh: async (k, walk) => {
+        const nodes = await walk();
+        store.set(k, nodes);
+        return nodes;
+      },
+      invalidate: (k) => {
+        store.delete(k);
+      },
+    };
+    const fs = posixFs("/p", channel, { cache });
+    await fs.list(".", { filter: "tree" });
+    await fs.list("src", { filter: "tree" });
+    await fs.list("src", { filter: "all" });
+    const walks = calls.filter((c) => c === "list:/p/src").length;
+    // A mutation inside `src` invalidates `src`; if only the filter that
+    // happens to be asked for were dropped, the OTHER variant would keep
+    // answering from cache and the picker would miss the new file.
+    await fs.invalidate(["src/a.ts"]);
+    await fs.list("src", { filter: "tree" });
+    await fs.list("src", { filter: "all" });
+    await fs.list("src", { filter: "tree" }); // cached again
+    expect(calls.filter((c) => c === "list:/p/src").length).toBe(walks + 2);
+  });
+
   it("refreshes a stale listing after its own mutations", async () => {
     const { channel } = memChannel({ "/p/src/a.ts": "a" });
     const store = new Map<string, FileNode[]>();
@@ -313,6 +370,31 @@ describe("TargetFs · list", () => {
     expect((await fs.list("src")).map((n) => n.name)).toEqual(["a.ts"]);
     await fs.writeText("src/b.ts", "b");
     expect((await fs.list("src")).map((n) => n.name)).toEqual(["a.ts", "b.ts"]);
+  });
+});
+
+describe("TargetFs · error contract", () => {
+  it("phrases a missing file the way the renderer's retry predicate expects", async () => {
+    const { channel } = memChannel({ "/p/a.ts": "a" });
+    const fs = posixFs("/p", channel);
+    // `viewerStore` auto-follows a file the write tool just created by retrying
+    // while the error still reads as "not found yet" — the wording is part of
+    // the interface, not cosmetics.
+    for (const run of [() => fs.readPreview("gone.ts"), () => fs.remove("gone.ts"), () => fs.rename("gone.ts", "b.ts")]) {
+      const err = await run().then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(isTargetFsError(err)).toBe(true);
+      expect((err as Error).message).toMatch(/ENOENT|No such file/);
+      expect((err as { kind: string }).kind).toBe("not-found");
+    }
+  });
+
+  it("classifies a channel's own error and keeps its raw text", () => {
+    const err = classifyError(Object.assign(new Error("ENOENT: no such file or directory, stat '/p/x'"), { code: "ENOENT" }), "/p/x");
+    expect(err.kind).toBe("not-found");
+    expect(err.message).toContain("/p/x");
   });
 });
 
@@ -352,7 +434,7 @@ describe("TargetFs · containment", () => {
 
   it("accepts an absolute path INSIDE the root (the remote wire shape)", async () => {
     const { channel } = memChannel({ "/p/src/a.ts": "hello" });
-    const fs = createTargetFs(remoteTarget({ ...REMOTE, password: "pw" }, "/p"), depsWith(channel));
+    const fs = createTargetFs(sftpTarget({ ...REMOTE, password: "pw" }, "/p"), depsWith(channel));
     expect(await fs.readPreview("/p/src/a.ts")).toEqual({ content: "hello", bytes: 5, isBinary: false });
   });
 
