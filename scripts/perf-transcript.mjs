@@ -118,7 +118,6 @@ console.log(`renderer init (tail) : ${applyTailMs.toFixed(0)} ms  (${useChatStor
 // --- 4) tree: full get_entries parse vs incremental cursor poll --------------
 const { buildTreeFromEntries } = await load("src/shared/tree-build.ts");
 const { flattenTree } = await load("src/shared/tree-layout.ts");
-const { compactForMindMap } = await load("src/shared/tree-mindmap.ts");
 const entries = (await parseTreeFileAsync(content)).entries;
 
 t0 = performance.now();
@@ -127,15 +126,8 @@ const buildMs = performance.now() - t0;
 t0 = performance.now();
 const { flat } = flattenTree(tree, entries[entries.length - 1].id);
 const flatMs = performance.now() - t0;
-t0 = performance.now();
-const mind = compactForMindMap(tree, entries[entries.length - 1].id);
-const mindMs = performance.now() - t0;
-t0 = performance.now();
-const { flat: mindFlat } = flattenTree(mind.tree, mind.leafId);
-const mindFlatMs = performance.now() - t0;
 console.log(`tree build           : ${buildMs.toFixed(1)} ms`);
-console.log(`tree flatten (full)  : ${flatMs.toFixed(1)} ms  (${flat.length} rows)`);
-console.log(`mind compact+flatten : ${(mindMs + mindFlatMs).toFixed(1)} ms  (${mindFlat.length} rows)`);
+console.log(`tree flatten         : ${flatMs.toFixed(1)} ms  (${flat.length} rows)`);
 
 // --- 5) the real per-message paint cost: Markdown parse --------------------
 try {

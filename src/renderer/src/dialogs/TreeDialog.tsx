@@ -1,20 +1,31 @@
 /**
  * Session tree dialog — aligned with pi's TUI /tree (TreeSelectorComponent):
- *  - connector gutter (│/├/└), fold markers (⊞/⊟ inside the gutter, like the
- *    TUI), active-path dots, branch labels, per-row timestamps (HH:MM today,
- *    M/D otherwise)
- *  - per-type entry labels (user:/assistant:/[tool]/[model]/[compaction]/…)
+ *  - branch marks (│/├/└), drawn in a fixed-width marker column of their own
+ *    (_not_ inside the indentation — see TreeRowMarker in tree-layout.ts), plus
+ *    fold markers (⊞/⊟, like the TUI), active-path stripes, branch labels and
+ *    per-row timestamps (HH:MM today, M/D otherwise)
+ *  - per-type entry labels (你/AI for messages, [tool]/[model]/[compaction]/… for
+ *    the rest)
  *  - default view hides bookkeeping entries (label/model_change/…) and
  *    tool-call-only assistant rows — same visibility rules as the TUI's
- *    applyFilter; quick filter chips (标准/用户/无工具/全部) + multi-token search
+ *    applyFilter; quick filter chips (标准/用户/无工具/标签/全部) + multi-token search
  *  - folding hides descendants (a child whose parent is folded collapses
- *    into it, like the TUI's fold handling; gutter shapes are computed on
- *    the full tree, so a folded tail row keeps its elbow — cosmetic only)
+ *    into it, like the TUI's fold handling; the hidden set is resolved over the
+ *    FULL flat list by `foldedAwayIds` in shared/tree-view.ts, because a row's
+ *    immediate parent is often filtered out of the rendered list. Marks still come
+ *    from `flattenTree` over the full tree, before the visibility filter, so a folded
+ *    or filtered-away sibling can leave a ├ standing alone — cosmetic only)
  *  - windowed rendering: only the rows around the viewport mount, so a
  *    thousand-entry session renders ~30 rows regardless of size
+ *  - ONE view (导图/完整 merged 2026-09-28). The mind map hid tool rows, which
+ *    also hid the entries rollback needs; the two-column shape it aimed for now
+ *    comes from the layout itself: indentation is the entry's CONVERSATION level
+ *    (你 = 第 0 列, AI 回复 = 第 1 列, 工具/结果 = 第 2 列 — see conversationLevel in
+ *    src/shared/tree-layout.ts), so every row at the same level lines up. The
+ *    user: 「分支按钮的窗口还是回到之前吧，同一层一定要对齐」.
  *  - keyboard: ↑/↓ move, Home/End jump, Enter navigates, Shift+Enter offers
  *    the summary choice, Ctrl+F focuses search, Esc backs out / closes
- *  - active-branch-first ordering, single-child chains rendered flat
+ *  - active-branch-first ordering
  *  - current leaf pre-selected, fold/unfold
  *  - navigate to a point (SDK tabs: native `navigate_tree` RPC — a silent
  *    session operation, nothing enters the prompt channel; RPC-backed
@@ -36,11 +47,11 @@ import { useUiStore } from "../stores/uiStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
 import { buildTreeFromEntries, type TreeEntry, type TreeNode } from "../../../shared/tree-build";
-import { flattenTree, isAlreadyAtTarget, isNavigationSettled, type TreeFlatRow } from "../../../shared/tree-layout";
-import { compactForMindMap, flattenMindMap } from "../../../shared/tree-mindmap";
-import { applyVisibility, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
+import { flattenTree, isAlreadyAtTarget, isNavigationSettled, type TreeFlatRow, type TreeRowMarker } from "../../../shared/tree-layout";
+import { activeFolds, applyVisibility, foldedAwayIds, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
 import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
 import { parseEditArgs } from "../components/DiffView";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 import { fetchCommands } from "../commands";
 
 interface TreeResponse {
@@ -108,15 +119,16 @@ function isEditToolCall(tc: { name: string; args: unknown } | undefined): { path
   return {};
 }
 
-function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; args: unknown }>, mind = false): { label: string; cls: string; text: string } {
+function entryDisplay(node: TreeNode, toolCalls: Map<string, { name: string; args: unknown }>): { label: string; cls: string; text: string } {
   const e = node.entry;
   switch (e.type) {
     case "message": {
       const role = e.message?.role;
       const text = normalize(textOf(e.message?.content));
-      // In the mind map the label is the speaker, not the wire role: 「你」/「AI」.
-      const you = mind ? "你" : "user:";
-      const ai = mind ? "AI" : "assistant:";
+      // The label is the SPEAKER, not the wire role: 「你」/「AI」 reads at a glance
+      // and the two are easy to tell apart by colour (see .tree-entrylabel).
+      const you = "你";
+      const ai = "AI";
       if (role === "user") return { label: you, cls: "user", text };
       if (role === "assistant") {
         if (text) return { label: ai, cls: "assistant", text };
@@ -170,26 +182,36 @@ const FILTER_LABELS: Record<TreeFilterMode, string> = {
 
 /** Row window around the viewport — long sessions mount ~2×40 rows, not all. */
 const WINDOW_MARGIN = 20;
-/** Width of one hierarchy level. MUST equal `.tree-rail { width }` in styles.css:
- *  the rail x position is `level × this`, which is what keeps levels aligned. */
-const RAIL_W = 14;
+/** The glyph per branch mark — see TreeRowMarker in tree-layout.ts. Drawn in the
+ *  fixed-width `.tree-marker` column, never inside the indentation.
+ *  (The one-level step is `.tree-rail { width }` in styles.css — scripts/diagnose-tree-rows.mjs
+ *  measures the real slope against that element, so there is no constant here to drift.) */
+const MARKER_GLYPH: Record<TreeRowMarker, string> = {
+  none: "",
+  "branch-mid": "├",
+  "branch-last": "└",
+  continuation: "│",
+};
 /** `.tree-row` height from styles.css. One definition, because the window math
  *  and the spacer heights must agree or the scrollbar jitters. */
 const ROW_H = 24;
-/** Height of a 导图 card row: speaker line + one line of text (styles.css). */
-const MIND_ROW_H = 46;
+/** One delayed re-probe after the first command-list read failed. A cold remote
+ *  pi answers get_commands in 10-21s (see GET_COMMANDS_TIMEOUT_MS); by the time
+ *  we retry it is warm and answers in ~3s, so the guard gets a real answer
+ *  instead of staying "unknown" for the rest of the dialog's life. */
+const TREE_NAV_PROBE_RETRY_MS = 1500;
 
 /**
  * One tree row.
  *
  * Extracted + memoized because the windowed list re-renders on EVERY scroll
  * event: without memo each wheel tick reconciled all ~80 rows (each rebuilding
- * its gutter prefix and re-normalizing its entry text — `entryDisplay` walks the
+ * its MARKER glyph and re-normalizing its entry text — `entryDisplay` walks the
  * message content), which is what made scrolling feel sticky on long sessions.
  * With memo, a scroll only mounts/unmounts the rows entering and leaving the
  * window; the ~70 rows that stay are skipped entirely.
  *
- * All per-row derived values (gutter prefix, display label/text) are computed
+ * All per-row derived values (marker glyph, display label/text) are computed
  * HERE, from props that are stable between renders, so the parent does not have
  * to hand down freshly-allocated objects (which would defeat the memo).
  */
@@ -200,8 +222,6 @@ const TreeRow = memo(function TreeRow({
   folded,
   leafId,
   editPoint,
-  multipleRoots,
-  mind,
   onSelect,
   onToggleFold,
 }: {
@@ -211,37 +231,11 @@ const TreeRow = memo(function TreeRow({
   folded: Set<string>;
   leafId: string | null;
   editPoint: { path?: string } | undefined;
-  /** Tree has several roots (offset the whole gutter by one column). */
-  multipleRoots: boolean;
-  /** Mind-map view: 「你」/「AI」 labels (see compactForMindMap). */
-  mind: boolean;
   onSelect: (id: string) => void;
   onToggleFold: (id: string) => void;
 }) {
   const e = row.node.entry;
-  const d = useMemo(() => entryDisplay(row.node, toolCalls, mind), [row.node, toolCalls, mind]);
-  /**
-   * Hierarchy rails as ELEMENTS, not as ASCII text.
-   *
-   * The old prefix was a string (`│  ` / `   ` / `├─ `), i.e. three characters per
-   * level — but the card rows use a proportional font, where `│  ` and `├─ ` have
-   * different pixel widths, so the vertical lines did not line up between rows:
-   * 「同一级别没有完全对齐」. One element per level, each exactly `RAIL_W` wide, puts
-   * every rail at `level × RAIL_W` by construction — no font, no glyph, no drift.
-   */
-  const rails = useMemo(() => {
-    const displayIndent = multipleRoots ? Math.max(0, row.indent - 1) : row.indent;
-    const connectorPosition = row.showConnector && !row.isVirtualRootChild ? displayIndent - 1 : -1;
-    const out: Array<{ on: boolean; elbow: boolean; last: boolean }> = [];
-    for (let level = 0; level < displayIndent; level++) {
-      const g = row.gutters.find((x) => x.position === level);
-      if (g) out.push({ on: g.show, elbow: false, last: false });
-      else if (level === connectorPosition) out.push({ on: true, elbow: true, last: row.isLast });
-      else out.push({ on: false, elbow: false, last: false });
-    }
-    return out;
-  }, [row, multipleRoots]);
-
+  const d = useMemo(() => entryDisplay(row.node, toolCalls), [row.node, toolCalls]);
   const isSelected = e.id === selectedId;
   const hasChildren = row.node.children.length > 0;
   const branchCount = row.node.children.length;
@@ -251,22 +245,30 @@ const TreeRow = memo(function TreeRow({
   return (
     <div
       data-row-id={e.id}
-      data-role={mind ? (e.message?.role ?? "other") : undefined}
+      data-role={e.message?.role ?? "other"}
       // Measured by scripts/diagnose-tree-rows.mjs: same-level rows must share one
       // left offset, and a click must be visibly distinguishable.
       data-indent={row.indent}
+      data-marker={row.marker === "none" ? undefined : row.marker}
       data-selected={isSelected ? "1" : undefined}
-      className={`tree-row${mind ? " tree-row-mind" : ""}${isSelected ? " selected" : ""}${row.onActivePath ? " on-active-path" : ""}${row.isCurrent ? " current" : ""}${leafId && !row.onActivePath ? " off-path" : ""}`}
+      className={`tree-row${isSelected ? " selected" : ""}${row.onActivePath ? " on-active-path" : ""}${row.isCurrent ? " current" : ""}${leafId && !row.onActivePath ? " off-path" : ""}`}
       onClick={() => onSelect(e.id)}
       onDoubleClick={() => hasChildren && onToggleFold(e.id)}
       title={d.text || e.id}
     >
+      {/* Branch mark, in a column of its own that every row has, so drawing it
+          never shifts the text column (「同一层一定要对齐」). */}
+      <span className="tree-marker" aria-hidden="true">
+        {MARKER_GLYPH[row.marker]}
+      </span>
+      {/* Indentation: one element per conversation level, each exactly one
+          `.tree-rail` wide (14 px in styles.css), so a row's content starts at
+          `level × 14px` by construction —
+          no glyph metric can drift it (the old ASCII `│  `/`├─ ` prefix did not
+          line up in a proportional font). */}
       <span className="tree-rails" aria-hidden="true">
-        {rails.map((rail, i) => (
-          <i
-            key={i}
-            className={`tree-rail${rail.on ? " on" : ""}${rail.elbow ? " elbow" : ""}${rail.elbow && rail.last ? " last" : ""}`}
-          />
+        {Array.from({ length: row.indent }, (_, i) => (
+          <i key={i} className="tree-rail" />
         ))}
       </span>
       <span
@@ -281,30 +283,12 @@ const TreeRow = memo(function TreeRow({
           ⑂{branchCount}
         </span>
       )}
-      {mind ? (
-        // 导图：每条消息一张小卡片（说话人 + 时间在上，正文一行在下），左侧色条
-        // 表达分支归属 —— 用户选的观感（见 CONTEXT.md 2026-09-25）。
-        <span className={`tree-card ${d.cls}`}>
-          <span className="tree-card-head">
-            <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
-            {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
-            {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}）`}>⤺</span>}
-            <span className="tree-card-spacer" />
-            {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
-            {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
-          </span>
-          <span className={`tree-card-text ${d.cls}`}>{d.text || "（无内容）"}</span>
-        </span>
-      ) : (
-        <>
-          {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
-          <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
-          <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
-          {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
-          {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
-          {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
-        </>
-      )}
+      {row.node.label && <span className="tree-branch-tag">[{row.node.label}]</span>}
+      <span className={`tree-entrylabel ${d.cls}`}>{d.label}</span>
+      <span className={`tree-entrytext ${d.cls}`}>{d.text}</span>
+      {editPoint && <span className="tree-cp-tag" title={`回退点：此节点后文件已变更（${editPoint.path ?? "未知路径"}），可回退到此状态`}>⤺ 回退点</span>}
+      {ts && <span className="tree-time" title={e.timestamp}>{ts}</span>}
+      {row.isCurrent && <span className="tree-leaf-tag">当前</span>}
     </div>
   );
 });
@@ -323,26 +307,24 @@ export function TreeDialog({
   onNavigated?: (editorText?: string) => void;
 }) {
   const [tree, setTree] = useState<TreeNode[]>([]);
+  // Backdrop dismissal needs a press AND a release on the backdrop; with a plain
+  // onClick a text selection dragged past the edge closed the dialog mid-edit
+  // (overlay-dismiss.ts).
+  const overlayDismiss = useOverlayDismiss(onClose);
   const [leafId, setLeafId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [folded, setFolded] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [filterMode, setFilterMode] = useState<TreeFilterMode>("default");
-  /**
-   * 导图 (default) shows only your messages and the AI's replies, re-parented so
-   * the indentation describes the CONVERSATION ("不用显示工具调用，只需要显示 user
-   * 和 assistant 的回复"). 完整 is the previous every-entry tree, kept because
-   * tool calls, labels and compactions are sometimes exactly what you are looking
-   * for (and because rollback needs them).
-   */
-  const [view, setView] = useState<"mindmap" | "full">("mindmap");
   const [error, setError] = useState<string | null>(null);
   const [navPhase, setNavPhase] = useState<"idle" | "choose-summary" | "custom-instructions" | "navigating">("idle");
   const [customInstr, setCustomInstr] = useState("");
   const [navigatingId, setNavigatingId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   // Tree fetch state machine: "loading" until the first get_tree response
-  // (remote/WSL pi takes 15-20s to boot, so this can be a long wait),
+  // (remote/WSL pi boot is p50 3.5s and can reach ~20s when a startup extension
+  // blocks on the worktree — see docs/adr/0002-remote-rpc-process-pool.md §结案 —
+  // so this can be a long wait),
   // "error" on an explicit failure, "ready" after any successful snapshot.
   // The dialog re-asks on an interval (below) so a slow boot or a dropped
   // first request heals itself instead of sitting on an empty tree.
@@ -689,44 +671,32 @@ export function TreeDialog({
     return map;
   }, [tree]);
 
-  // The mind-map projection is computed from the full tree and carries the leaf
-  // mapped to the nearest kept ancestor — that is the row that gets 「当前」.
-  const mindMap = useMemo(
-    () => (view === "mindmap" ? compactForMindMap(tree, leafId) : null),
-    [tree, leafId, view],
-  );
-  const displayTree = mindMap ? mindMap.tree : tree;
-  /** Row height of the view being rendered — the spacers and the window math
-   *  must agree with `.tree-row`/`.tree-row-mind` in styles.css. */
-  const rowH = mindMap ? MIND_ROW_H : ROW_H;
-  /** The leaf as the MAP sees it (the reply you are currently under). */
-  const displayLeafId = mindMap ? mindMap.leafId : leafId;
-
-  // The map has its own layout (spine + replies); the log view keeps the /tree
-  // flattening (which collapses linear runs — correct there, useless here).
-  const flat = useMemo(
-    () => (mindMap ? flattenMindMap(displayTree, displayLeafId) : flattenTree(displayTree, displayLeafId).flat),
-    [displayTree, displayLeafId, mindMap],
-  );
+  // ONE layout: the full entry tree, laid out by CONVERSATION level (prompt /
+  // reply / plumbing — see conversationLevel in src/shared/tree-layout.ts), so
+  // every row at the same level sits in the same column.
+  const flat = useMemo(() => flattenTree(tree, leafId).flat, [tree, leafId]);
 
   // Filter/search over the flattened rows. `onActivePath`/`isCurrent` come from
   // the shared layout (src/shared/tree-layout.ts), which is unit-tested — the
   // dialog no longer keeps a second, untested copy of the ancestor walk.
-  // The mind map already did its own filtering, so it only applies the search.
   const visible = useMemo(
-    () => applyVisibility(flat, mindMap ? "all" : filterMode, query, displayLeafId),
-    [flat, mindMap, filterMode, query, displayLeafId],
+    () => applyVisibility(flat, filterMode, query, leafId),
+    [flat, filterMode, query, leafId],
   );
 
+  // A fold only hides rows while its own row is rendered — see activeFolds.
+  const folds = useMemo(() => activeFolds(visible, folded), [visible, folded]);
+
   const filtered = useMemo(() => {
-    if (folded.size === 0) return visible;
-    const skip = new Set<string>();
-    for (const f of visible) {
-      const { id, parentId } = f.node.entry;
-      if (parentId != null && (folded.has(parentId) || skip.has(parentId))) skip.add(id);
-    }
-    return visible.filter((f) => !skip.has(f.node.entry.id));
-  }, [visible, folded]);
+    // Hidden set comes from the shared helper, which walks parentId chains over the
+    // FULL flat list: an entry whose parent was filtered out of `visible` still
+    // collapses together with its folded ancestor. A left-to-right pass over
+    // `visible` missed exactly those rows — 「点折叠只折叠下面一条」. `folds` (not
+    // `folded`) is what hides: a ⊟ the user cannot see must not hide anything, or
+    // 「（无匹配）」 would lie and nothing on screen could unfold it.
+    const hidden = foldedAwayIds(flat, folds);
+    return hidden.size === 0 ? visible : visible.filter((f) => !hidden.has(f.node.entry.id));
+  }, [flat, visible, folds]);
 
   const selected = useMemo(() => {
     for (const f of flat) if (f.node.entry.id === selectedId) return f.node;
@@ -749,7 +719,7 @@ export function TreeDialog({
 
   const selectedText = selected ? normalize(textOf(selected.entry.message?.content)) : "";
   const isUserMsg = selected?.entry.type === "message" && selected.entry.message?.role === "user";
-  const isLeaf = selected?.entry.id === displayLeafId;
+  const isLeaf = selected?.entry.id === leafId;
 
   /** Stable identities: an inline arrow here would defeat TreeRow's memo and
    *  re-render all ~80 rows on every scroll event. */
@@ -779,22 +749,11 @@ export function TreeDialog({
    * frame is what keeps long sessions scrollable at frame rate.
    */
   const rafRef = useRef<number | null>(null);
-  /** The active row height (card rows are taller). Read through a ref so the
-   *  windowing callbacks keep empty dependency lists instead of being rebuilt. */
-  const rowHRef = useRef(ROW_H);
-  const filteredRef = useRef<TreeFlatRow[]>([]);
-  const displayLeafIdRef = useRef<string | null>(null);
-  // Kept in sync every render, so the stable (empty-deps) callbacks and the
-  // view-change effect can read the latest list/position/row height.
-  rowHRef.current = rowH;
-  filteredRef.current = filtered;
-  displayLeafIdRef.current = displayLeafId;
   const recomputeWindow = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const rowH = rowHRef.current;
-    const start = Math.max(0, Math.floor(el.scrollTop / rowH) - WINDOW_MARGIN);
-    const count = Math.ceil(el.clientHeight / rowH) + WINDOW_MARGIN * 2;
+    const start = Math.max(0, Math.floor(el.scrollTop / ROW_H) - WINDOW_MARGIN);
+    const count = Math.ceil(el.clientHeight / ROW_H) + WINDOW_MARGIN * 2;
     setWin((w) => (w.start === start && w.end === start + count ? w : { start, end: start + count }));
   }, []);
   const onScroll = useCallback(() => {
@@ -823,7 +782,7 @@ export function TreeDialog({
       if (retry) requestAnimationFrame(() => revealRow(index, mode, false));
       return;
     }
-    const rowH = rowHRef.current;
+    const rowH = ROW_H;
     const top = index * rowH;
     const bottom = top + rowH;
     const view = el.clientHeight;
@@ -842,14 +801,8 @@ export function TreeDialog({
     const start = Math.max(0, index - WINDOW_MARGIN);
     setWin({ start, end: start + WINDOW_MARGIN * 2 + 40 });
   }, []);
-  // Switching 导图/完整 changes the row height, so offsets computed for the old
-  // height are wrong: re-derive the window and keep the current position visible.
-  useEffect(() => {
-    recomputeWindow();
-    const idx = filteredRef.current.findIndex((f) => f.node.entry.id === displayLeafIdRef.current);
-    if (idx >= 0) revealRow(idx, "nearest");
-  }, [view, recomputeWindow, revealRow]);
-
+  /** Listen for scroll (rAF-throttled through `onScroll`) and derive the window
+   *  from the real layout once the dialog is mounted. */
   useEffect(() => {
     recomputeWindow();
     const el = scrollRef.current;
@@ -979,15 +932,18 @@ export function TreeDialog({
     // that extension is not loaded on this target, sending the prompt would be
     // taken as an ordinary user message: the agent replies, the tree moves to an
     // unrelated place and a bogus message lands in the transcript. So refuse
-    // when we already KNOW it is missing (probed on mount, cached per tab).
-    if (tab?.mode !== "sdk" && treeNavAvailableRef.current === false) {
+    // when we KNOW — from a command list we actually read — that it is missing.
+    // A probe that merely failed must NOT land here (it used to, and blamed the
+    // extension sync on a host where the extension was present all along).
+    if (tab?.mode !== "sdk" && treeNavAvailableRef.current?.available === false) {
+      const probed = treeNavAvailableRef.current;
       setNavPhase("idle");
       setNavigatingId(null);
       useUiStore
         .getState()
         .showToast("该会话未加载 pipi-tree-nav 扩展，无法跳转（可切到终端视图用 /tree）", "err", {
           failure: true,
-          cause: "get_commands 未返回 pipi-tree-nav：扩展未同步到该主机（远程/WSL）或 pi 版本不支持扩展命令",
+          cause: `get_commands 已成功返回 ${probed.commandCount} 条命令（tab ${tabId}），其中没有 pipi-tree-nav：该扩展没有加载进这个 pi 进程 —— 未同步到该主机、扩展自身加载报错，或 pi 版本不支持扩展命令`,
         });
       return;
     }
@@ -1067,13 +1023,16 @@ export function TreeDialog({
   const pendingNavRequestId = useRef<string | null>(null);
   /** The leaf when the current navigation started (the settle rule needs it). */
   const navStartLeafRef = useRef<string | null>(null);
-  /** Does the RPC bridge command exist? null = not probed yet. */
-  const treeNavAvailableRef = useRef<boolean | null>(null);
+  /** Does the RPC bridge command exist? null = still unknown — either not
+   *  probed yet, or the probe could not READ the list (a failed read is not
+   *  evidence of absence; see the probe effect). `commandCount` is kept so a
+   *  real "missing" verdict can quote what was actually returned. */
+  const treeNavAvailableRef = useRef<{ available: boolean; commandCount: number } | null>(null);
   /** On open, centre the CURRENT conversation once — "where am I?" answered. */
   const didFocusCurrentRef = useRef(false);
   const focusCurrent = () => {
-    if (!displayLeafId) return;
-    const idx = filtered.findIndex((f) => f.node.entry.id === displayLeafId);
+    if (!leafId) return;
+    const idx = filtered.findIndex((f) => f.node.entry.id === leafId);
     if (idx < 0) return;
     ensureWindowCovers(idx);
     revealRow(idx, "center");
@@ -1150,23 +1109,58 @@ export function TreeDialog({
   // Probe the RPC bridge command in the background: by the time the user presses
   // Enter it is usually known, and a missing extension is reported instead of
   // silently turning the jump into a user message.
+  //
+  // ONLY a successfully read command list counts as evidence. `rpcRequest`
+  // RESOLVES `{success:false}` when it times out instead of throwing, and a
+  // failed read returns just the mirrored built-ins — indistinguishable from
+  // "this session has no extension commands". Treating that as `false` refused
+  // jumps on a slow remote host (get_commands there takes 10-21s against the 20s
+  // budget) and blamed the extension sync, which had actually succeeded. So a
+  // failed probe stays `null` (= unknown → doNavigate still sends the bridge
+  // prompt, the previous behaviour), is written to the log, and is retried once.
   useEffect(() => {
     const tab = useTabsStore.getState().tabs.find((t) => t.id === tabId);
     if (tab?.mode === "sdk") {
-      treeNavAvailableRef.current = true;
+      // SDK tabs never use the bridge (native navigate_tree); nothing to probe.
+      treeNavAvailableRef.current = { available: true, commandCount: 0 };
       return;
     }
     let cancelled = false;
-    void fetchCommands(tabId)
-      .then((r) => {
-        if (cancelled) return;
-        treeNavAvailableRef.current = r.commands.some((c) => c.name === "pipi-tree-nav");
-      })
-      .catch(() => {
-        /* unknown — keep sending the prompt (previous behavior) */
-      });
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const probe = (force: boolean): void => {
+      void fetchCommands(tabId, force)
+        .then((r) => {
+          if (cancelled) return;
+          if (r.error) {
+            window.api.debug.log(
+              `[tree-nav] tab ${tabId}: get_commands 读取失败（${r.error}）—— 扩展有无仍未知，不拦截跳转`,
+              "warn",
+            );
+            if (!force) retry = setTimeout(() => probe(true), TREE_NAV_PROBE_RETRY_MS);
+            return;
+          }
+          const available = r.commands.some((c) => c.name === "pipi-tree-nav");
+          treeNavAvailableRef.current = { available, commandCount: r.commands.length };
+          // No log on the happy path (it would be noise); the forced re-probe and
+          // every "missing" verdict are worth a line in the diagnostics file.
+          if (!available || force) {
+            window.api.debug.log(
+              `[tree-nav] tab ${tabId}: pipi-tree-nav ${available ? "available" : "MISSING"}（成功读到 ${r.commands.length} 条命令）`,
+              available ? "info" : "warn",
+            );
+          }
+        })
+        .catch((e: unknown) => {
+          // fetchCommands does not reject today; anything thrown in the chain
+          // still must not be mistaken for "the extension is missing".
+          treeNavAvailableRef.current = null;
+          window.api.debug.log(`[tree-nav] tab ${tabId}: probe threw (${e instanceof Error ? e.message : String(e)})`, "warn");
+        });
+    };
+    probe(false);
     return () => {
       cancelled = true;
+      if (retry !== undefined) clearTimeout(retry);
     };
   }, [tabId]);
 
@@ -1273,7 +1267,7 @@ export function TreeDialog({
   const selectedIsCurrent = selectedId === leafId;
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog tree-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">会话树（/tree）</div>
         <div className="dialog-body">
@@ -1287,23 +1281,7 @@ export function TreeDialog({
             title="↑↓ 选择 · Enter 导航 · Shift+Enter 导航并摘要 · Ctrl+F 搜索 · Esc 关闭"
           />
           <div className="tree-filters" role="group" aria-label="显示筛选">
-            <button
-              className={`tree-chip${view === "mindmap" ? " active" : ""}`}
-              aria-pressed={view === "mindmap"}
-              title="只显示你的消息和 AI 的回复（思维导图）"
-              onClick={() => setView("mindmap")}
-            >
-              导图
-            </button>
-            <button
-              className={`tree-chip${view === "full" ? " active" : ""}`}
-              aria-pressed={view === "full"}
-              title="显示会话里的全部条目（含工具调用、压缩、标签等）"
-              onClick={() => setView("full")}
-            >
-              完整
-            </button>
-            {view === "full" && (Object.keys(FILTER_LABELS) as TreeFilterMode[]).map((m) => (
+            {(Object.keys(FILTER_LABELS) as TreeFilterMode[]).map((m) => (
               <button
                 key={m}
                 className={`tree-chip${filterMode === m ? " active" : ""}`}
@@ -1318,15 +1296,15 @@ export function TreeDialog({
               className="tree-chip tree-chip-action"
               onClick={() => {
                 focusCurrent();
-                if (displayLeafId) setSelectedId(displayLeafId);
+                if (leafId) setSelectedId(leafId);
               }}
               title="把当前对话所在的位置滚到视图中间"
             >
               定位到当前
             </button>
-            {folded.size > 0 && (
+            {folds.size > 0 && (
               <button className="tree-chip tree-chip-action" onClick={() => setFolded(new Set())} title="展开所有折叠的分支">
-                展开全部({folded.size})
+                展开全部({folds.size})
               </button>
             )}
           </div>
@@ -1372,13 +1350,6 @@ export function TreeDialog({
                 </button>
               </div>
             )}
-            {filtered.length === 0 && treeStatus === "ready" && tree.length > 0 && mindMap !== null && (
-              <div className="tree-empty">
-                {query
-                  ? "没有匹配的对话消息（试试清空搜索，或切到「完整」看全部条目）"
-                  : "这个会话里没有可显示的对话消息（只有工具调用/簿记条目）。切到「完整」查看全部条目。"}
-              </div>
-            )}
             {filtered.length === 0 && treeStatus === "ready" && tree.length === 0 && (
               <div className="tree-empty">
                 {hasMessages ? "会话树为空，正在自动刷新…" : "空会话：尚无消息。发送第一条消息后，这里会显示分支树。"}
@@ -1391,11 +1362,10 @@ export function TreeDialog({
               // and bottom spacers keep the scrolled height CONSTANT, so moving
               // the window never changes the scrollbar range (a changing range
               // is what makes a virtualized list stutter while scrolling).
-              const multipleRoots = tree.length > 1;
               const slice = filtered.slice(win.start, win.end);
               return (
                 <>
-                  {win.start > 0 && <div style={{ height: win.start * rowH }} aria-hidden="true" />}
+                  {win.start > 0 && <div style={{ height: win.start * ROW_H }} aria-hidden="true" />}
                   {slice.map((f: TreeFlatRow) => {
                     const e = f.node.entry;
                     const cp = e.type === "message" && e.message?.role === "toolResult"
@@ -1408,26 +1378,23 @@ export function TreeDialog({
                         toolCalls={toolCalls}
                         selectedId={selectedId}
                         folded={folded}
-                        leafId={displayLeafId}
+                        leafId={leafId}
                         editPoint={cp}
-                        multipleRoots={multipleRoots}
-                        mind={mindMap !== null}
                         onSelect={selectRow}
                         onToggleFold={toggleFold}
                       />
                     );
                   })}
-                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * rowH }} aria-hidden="true" />}
+                  {win.end < filtered.length && <div style={{ height: (filtered.length - win.end) * ROW_H }} aria-hidden="true" />}
                 </>
               );
             })()}
           </div>
           <div className="tree-status">
             ({filtered.findIndex((f) => f.node.entry.id === selectedId) + 1 || 0}/{filtered.length})
-            {mindMap && ` · 导图（已隐藏 ${mindMap.hidden} 条工具/簿记条目）`}
             {query && " · 搜索中"}
-            {!mindMap && filterMode !== "default" && ` · ${FILTER_LABELS[filterMode]}`}
-            {folded.size > 0 && " · 有折叠"} · ↑↓ 选择 · Enter 导航 · Esc 关闭
+            {filterMode !== "default" && ` · ${FILTER_LABELS[filterMode]}`}
+            {folds.size > 0 && " · 有折叠"} · ↑↓ 选择 · Enter 导航 · Esc 关闭
           </div>
           {fileSnapshot && (
             <div className="tree-snapshot-note">树来自会话文件快照 · 正在同步实时状态（远程 pi 未就绪时先显示存档数据）</div>

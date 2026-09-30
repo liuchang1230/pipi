@@ -2,7 +2,7 @@
 // visibility rules (mirroring pi TUI's applyFilter), search text extraction
 // and compact timestamps. No React / Electron runtime.
 import { describe, expect, it } from "vitest";
-import { applyVisibility, formatEntryTime, searchableText } from "../tree-view";
+import { activeFolds, applyVisibility, foldedAwayIds, formatEntryTime, searchableText } from "../tree-view";
 import { buildTreeFromEntries, type TreeEntry } from "../tree-build";
 import type { TreeNode } from "../tree-build";
 
@@ -109,6 +109,112 @@ describe("applyVisibility", () => {
     // "compaction" keyword surfaces bookkeeping rows via search
     expect(applyVisibility(flat, "default", "compaction", null).map((f) => f.node.entry.id)).toEqual(["c1"]);
     expect(applyVisibility(flat, "default", "login theme", null)).toEqual([]);
+  });
+});
+
+/** One conversation turn: user / assistant text / tool-call-only reply / toolResult,
+ *  i.e. three VISIBLE rows deep (the tool-call-only reply is dropped by the default
+ *  filter) — the shape that used to break the fold walk. */
+const turn = (n: number) => [
+  user(`u${n}`, `问题 ${n}`, { id: `u${n}`, parentId: n === 0 ? null : `c${n - 1}` }),
+  { id: `a${n}`, parentId: `u${n}`, message: { role: "assistant", content: `回答 ${n}` } },
+  { id: `k${n}`, parentId: `a${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `t${n}`, name: "read", arguments: {} }] } },
+  { id: `c${n}`, parentId: `k${n}`, message: { role: "toolResult", content: "ok" } },
+];
+
+describe("foldedAwayIds", () => {
+  it("collapses descendants even when their direct parent is filtered away", () => {
+    // `k0` (tool-call-only assistant) is dropped by the default filter, so `c0`'s
+    // parent is NOT in the rendered list. A pass that only looks at the direct
+    // parent leaves `c0` and every later turn on screen — the bug.
+    const flat = flatFrom(entries(...turn(0), ...turn(1), ...turn(2)));
+    const visible = applyVisibility(flat, "default", "", null);
+    expect(visible.map((f) => f.node.entry.id)).toEqual(["u0", "a0", "c0", "u1", "a1", "c1", "u2", "a2", "c2"]);
+    // The FULL list is what gets folded (see the contract in foldedAwayIds).
+    const hidden = foldedAwayIds(flat, new Set(["u0"]));
+    expect(visible.filter((f) => !hidden.has(f.node.entry.id)).map((f) => f.node.entry.id)).toEqual(["u0"]);
+  });
+
+  it("keeps the folded row itself and its ancestors", () => {
+    const flat = flatFrom(entries(...turn(0), ...turn(1)));
+    const hidden = foldedAwayIds(flat, new Set(["a0"]));
+    expect(hidden.has("a0")).toBe(false);
+    expect(hidden.has("c0")).toBe(true);
+    expect(hidden.has("u1")).toBe(true);
+    expect(hidden.has("u0")).toBe(false);
+  });
+
+  it("is order-independent", () => {
+    const flat = flatFrom(entries(...turn(0), ...turn(1)));
+    const shuffled = [...flat].reverse();
+    const hidden = foldedAwayIds(shuffled, new Set(["u0"]));
+    // The verdict covers every row of the input (the dialog then filters its own
+    // already-filtered list by this set).
+    expect([...hidden].sort()).toEqual(["a0", "a1", "c0", "c1", "k0", "k1", "u1"]);
+  });
+
+  it("nests folds and stops at the first unfolded ancestor", () => {
+    const flat = flatFrom(entries(...turn(0), ...turn(1), ...turn(2)));
+    const hidden = foldedAwayIds(flat, new Set(["u0", "a1"]));
+    expect(hidden.has("c1")).toBe(true);
+    expect(hidden.has("u2")).toBe(true);
+    expect(hidden.has("a0")).toBe(true); // only reachable through folded u0
+    expect(hidden.has("u0")).toBe(false);
+  });
+
+  it("returns an empty set when nothing is folded", () => {
+    const flat = flatFrom(entries(...turn(0)));
+    expect(foldedAwayIds(flat, new Set()).size).toBe(0);
+  });
+
+  it("terminates on a parentId ring and never hides the folded row itself", () => {
+    // A ring cannot occur in a pi session (buildTreeFromEntries promotes ring
+    // members to roots) — this only pins the two properties that keep the dialog
+    // alive: no infinite walk, and the folded row stays on screen so it can be
+    // unfolded again. Other ring members have no consistent verdict.
+    const rows = [
+      { node: { entry: { id: "x", type: "message", parentId: "y" } } },
+      { node: { entry: { id: "y", type: "message", parentId: "x" } } },
+    ];
+    const hidden = foldedAwayIds(rows as never, new Set(["x"]));
+    expect(hidden.has("x")).toBe(false);
+  });
+
+  it("under-hides when handed a list with the parent filtered away (why the contract says FULL list)", () => {
+    // Guard for the exact regression: the call site used to pass the FILTERED list.
+    // This pins the wake-up call — the deeper rows survive because the chain has a
+    // hole (c0's parent k0 is dropped by the default filter), which is the reported
+    // 「只折叠下面一条」. If this ever fails because the helper got smarter, the call
+    // site may no longer need `flat` — until then, passing `visible` is the bug.
+    const flat = flatFrom(entries(...turn(0), ...turn(1)));
+    const visible = applyVisibility(flat, "default", "", null);
+    const hidden = foldedAwayIds(visible, new Set(["u0"]));
+    expect(hidden.has("c0")).toBe(false);
+    expect(hidden.has("u1")).toBe(false);
+  });
+});
+
+describe("activeFolds", () => {
+  it("keeps only folds whose own row is rendered", () => {
+    const flat = flatFrom(entries(...turn(0), ...turn(1)));
+    const visible = applyVisibility(flat, "user-only", "", null);
+    expect(visible.map((f) => f.node.entry.id)).toEqual(["u0", "u1"]);
+    expect([...activeFolds(visible, new Set(["u0", "a0"]))]).toEqual(["u0"]);
+  });
+
+  it("switching the filter therefore stops a hidden fold from hiding rows", () => {
+    // Fold the reply, then switch to 用户: the reply row is gone, so the prompt below
+    // it must come back — otherwise the list could read 「（无匹配）」 while it matched.
+    const flat = flatFrom(entries(...turn(0), ...turn(1)));
+    const standard = applyVisibility(flat, "default", "", null);
+    const usersOnly = applyVisibility(flat, "user-only", "", null);
+    expect(foldedAwayIds(flat, activeFolds(standard, new Set(["a0"]))).has("u1")).toBe(true);
+    expect(foldedAwayIds(flat, activeFolds(usersOnly, new Set(["a0"]))).has("u1")).toBe(false);
+  });
+
+  it("returns the very same set when nothing is folded (no allocation per render)", () => {
+    const folded = new Set<string>();
+    expect(activeFolds([], folded)).toBe(folded);
   });
 });
 

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { buildTreeFromEntries, type TreeEntry } from "../tree-build";
 import {
   ancestorIds,
+  conversationLevel,
   flattenTree,
   isAlreadyAtTarget,
   isNavigationSettled,
@@ -63,6 +64,159 @@ describe("flattenTree", () => {
     expect(() => flattenTree(tree, "p")).not.toThrow();
     // The contract is termination within a bounded walk, not a specific length.
     expect(ancestorIds(cyclic, "p").length).toBeLessThanOrEqual(cyclic.length + 1);
+  });
+});
+
+/**
+ * 「同一层一定要对齐」 (2026-09-28) — the user's report was not about a missing
+ * indent but about an INCONSISTENT one: the old rule collapsed single-child runs
+ * (else every session would march off to the right), so whether a row moved right
+ * depended on whether some ancestor happened to branch, and two entries at the
+ * same level landed in different columns. Indentation is now the entry's own
+ * conversation level, i.e. a pure function of the entry.
+ */
+describe("conversationLevel (the column a row belongs in)", () => {
+  it("is the speaker, not the depth of the parentId chain", () => {
+    expect(conversationLevel({ type: "message", id: "u", parentId: null, message: { role: "user" } })).toBe(0);
+    expect(conversationLevel({ type: "message", id: "a", parentId: "u", message: { role: "assistant" } })).toBe(1);
+    expect(conversationLevel({ type: "message", id: "t", parentId: "a", message: { role: "toolResult" } })).toBe(2);
+    // A replayed prompt reads like a prompt (pi rewinds to before it).
+    expect(conversationLevel({ type: "custom_message", id: "c", parentId: "t" })).toBe(0);
+    // Bookkeeping is plumbing, never a level of its own.
+    for (const type of ["compaction", "branch_summary", "model_change", "label", "session_info"]) {
+      expect(conversationLevel({ type, id: `x-${type}`, parentId: "a" })).toBe(2);
+    }
+  });
+
+  it("puts prompt / reply / plumbing in columns 0 / 1 / 2 on a linear session", () => {
+    // pi chains every entry onto the previous one, so real depth here is 0..5.
+    const linear: TreeEntry[] = [
+      { type: "message", id: "u1", parentId: null, message: { role: "user" } },
+      { type: "message", id: "a1", parentId: "u1", message: { role: "assistant" } },
+      { type: "message", id: "t1", parentId: "a1", message: { role: "toolResult" } },
+      { type: "message", id: "a2", parentId: "t1", message: { role: "assistant" } },
+      { type: "model_change", id: "m1", parentId: "a2" },
+      { type: "message", id: "u2", parentId: "m1", message: { role: "user" } },
+    ];
+    const { tree } = buildTreeFromEntries(linear);
+    const rows = flattenTree(tree, "u2").flat;
+    expect(rows.map((r) => [r.node.entry.id, r.indent])).toEqual([
+      ["u1", 0],
+      ["a1", 1],
+      ["t1", 2],
+      ["a2", 1],
+      ["m1", 2],
+      ["u2", 0], // the next prompt starts a new spine entry, not a deeper one
+    ]);
+  });
+
+  it("never puts two rows of the same level in different columns (long session)", () => {
+    // 600 entries: without the level rule this would indent 600 columns deep.
+    const entries: TreeEntry[] = [];
+    let parentId: string | null = null;
+    for (let turn = 0; turn < 100; turn += 1) {
+      for (const role of ["user", "assistant", "toolResult"] as const) {
+        const id = `${role}-${turn}`;
+        entries.push({ type: "message", id, parentId, message: { role } });
+        parentId = id;
+      }
+    }
+    const { tree } = buildTreeFromEntries(entries);
+    const rows = flattenTree(tree, parentId).flat;
+    expect(rows).toHaveLength(300);
+    const columnsByLevel = new Map<number, Set<number>>();
+    for (const row of rows) {
+      const level = conversationLevel(row.node.entry);
+      const seen = columnsByLevel.get(level) ?? new Set<number>();
+      seen.add(row.indent);
+      columnsByLevel.set(level, seen);
+    }
+    // Exactly one column per level, and no drift: the deepest column is 2.
+    expect([...columnsByLevel.keys()].sort()).toEqual([0, 1, 2]);
+    for (const [level, columns] of columnsByLevel) {
+      expect([...columns], `level ${level}`).toEqual([level]);
+    }
+  });
+
+  it("keeps both sides of a branch in the same column", () => {
+    // Two replies to one prompt: they are the same level, so they must line up.
+    const branched: TreeEntry[] = [
+      { type: "message", id: "u", parentId: null, message: { role: "user" } },
+      { type: "message", id: "a", parentId: "u", message: { role: "assistant" } },
+      { type: "message", id: "b", parentId: "u", message: { role: "assistant" } },
+      { type: "message", id: "a-tool", parentId: "a", message: { role: "toolResult" } },
+      { type: "message", id: "b-tool", parentId: "b", message: { role: "toolResult" } },
+    ];
+    const { tree } = buildTreeFromEntries(branched);
+    const rows = flattenTree(tree, "a-tool").flat;
+    expect(rows.find((r) => r.node.entry.id === "a")?.indent).toBe(1);
+    expect(rows.find((r) => r.node.entry.id === "b")?.indent).toBe(1);
+    expect(rows.find((r) => r.node.entry.id === "a-tool")?.indent).toBe(2);
+    expect(rows.find((r) => r.node.entry.id === "b-tool")?.indent).toBe(2);
+    // The branch itself is drawn in the marker column: a is not the last sibling.
+    expect(rows.find((r) => r.node.entry.id === "a")?.marker).toBe("branch-mid");
+    expect(rows.find((r) => r.node.entry.id === "b")?.marker).toBe("branch-last");
+    // …and the first branch stays open for its own descendants.
+    expect(rows.find((r) => r.node.entry.id === "a-tool")?.marker).toBe("continuation");
+    expect(rows.find((r) => r.node.entry.id === "b-tool")?.marker).toBe("none");
+  });
+
+  it("marks a fork at a PROMPT without moving the prompt out of column 0", () => {
+    // The level-0 case the old elbow scheme silently dropped: the parent sits in
+    // column 2, the two prompts it forked into stay in column 0 (that IS the
+    // alignment the user asked for) and carry the ├/└ themselves.
+    const forked: TreeEntry[] = [
+      { type: "message", id: "u1", parentId: null, message: { role: "user" } },
+      { type: "message", id: "t1", parentId: "u1", message: { role: "toolResult" } },
+      { type: "message", id: "u2", parentId: "t1", message: { role: "user" } },
+      { type: "message", id: "u3", parentId: "t1", message: { role: "user" } },
+      { type: "message", id: "a3", parentId: "u3", message: { role: "assistant" } },
+    ];
+    const { tree } = buildTreeFromEntries(forked);
+    const rows = flattenTree(tree, "a3").flat;
+    expect(rows.find((r) => r.node.entry.id === "u2")?.indent).toBe(0);
+    expect(rows.find((r) => r.node.entry.id === "u3")?.indent).toBe(0);
+    // The active branch is listed first, so u3 (which holds the leaf) is the
+    // non-last sibling here.
+    expect(rows.find((r) => r.node.entry.id === "u3")?.marker).toBe("branch-mid");
+    expect(rows.find((r) => r.node.entry.id === "u2")?.marker).toBe("branch-last");
+    // u3 is an open branch, so its reply keeps the │ alive.
+    expect(rows.find((r) => r.node.entry.id === "a3")?.marker).toBe("continuation");
+  });
+
+  it("gives every row at one level the same indent, mark or no mark", () => {
+    // Guards the regression the old gutter did: a branch child at column 0 used
+    // to leave a phantom │ on its descendants while drawing no elbow of its own.
+    const forked: TreeEntry[] = [
+      { type: "message", id: "r", parentId: null, message: { role: "toolResult" } },
+      { type: "message", id: "u1", parentId: "r", message: { role: "user" } },
+      { type: "message", id: "u2", parentId: "r", message: { role: "user" } },
+      { type: "message", id: "a2", parentId: "u2", message: { role: "assistant" } },
+    ];
+    const { tree } = buildTreeFromEntries(forked);
+    const rows = flattenTree(tree, "a2").flat;
+    expect(rows.map((r) => [r.node.entry.id, r.indent])).toEqual([
+      ["r", 2],
+      ["u2", 0], // active branch first
+      ["a2", 1],
+      ["u1", 0],
+    ]);
+    // u2 is an open branch (u1 follows it), so its reply continues the │ — and
+    // nothing inherits a line from u1, which has no children.
+    expect(rows.find((r) => r.node.entry.id === "a2")?.marker).toBe("continuation");
+  });
+
+  it("lets several roots sit in their own level (no virtual offset column)", () => {
+    const roots: TreeEntry[] = [
+      { type: "message", id: "u", parentId: null, message: { role: "user" } },
+      { type: "message", id: "orphan", parentId: "missing", message: { role: "assistant" } },
+    ];
+    const { tree } = buildTreeFromEntries(roots);
+    const rows = flattenTree(tree, null).flat;
+    expect(rows.find((r) => r.node.entry.id === "u")?.indent).toBe(0);
+    expect(rows.find((r) => r.node.entry.id === "orphan")?.indent).toBe(1);
+    // A root is nobody's sibling child, so it is never marked as a branch.
+    expect(rows.every((r) => r.marker === "none")).toBe(true);
   });
 });
 

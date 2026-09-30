@@ -127,6 +127,93 @@ export function applyVisibility<T extends TreeFlatLike>(
   return out;
 }
 
+/**
+ * Ids hidden because an ANCESTOR is folded (`folded` holds the folded node ids).
+ *
+ * Pass the FULL flat row list, **not** the filtered/visible one: the rendered list
+ * has holes (the visibility filter drops bookkeeping rows, tool-call-only replies…),
+ * so a descendant's immediate parent is often not in it, and the chain up to the
+ * folded node cannot be walked. That hole is exactly the reported
+ * 「点折叠只折叠下面一条」 (2026-09-28): a left-to-right pass that only looked at each
+ * row's DIRECT parent lost the folded state at the first filtered-away row, so only
+ * the row straight below the folded node collapsed and everything deeper stayed.
+ *
+ * Order-independent (a chain is walked, never assumed to appear parent-first),
+ * O(rows) amortised: each chain is resolved once and memoised, because
+ * hidden(node) ⟺ a parent is folded or a parent is hidden. A parentId RING cannot
+ * happen in a pi session (buildTreeFromEntries promotes ring members to roots), so
+ * the walk merely guarantees termination there and that a row is never hidden by its
+ * OWN fold — it has to stay on screen to be unfoldable again.
+ */
+export function foldedAwayIds<T extends TreeFlatLike>(
+  allRows: readonly T[],
+  folded: ReadonlySet<string>,
+): Set<string> {
+  const hidden = new Set<string>();
+  if (folded.size === 0 || allRows.length === 0) return hidden;
+  const parentOf = new Map<string, string | null>();
+  for (const r of allRows) parentOf.set(r.node.entry.id, r.node.entry.parentId ?? null);
+  /** id → hidden verdict, filled as chains are resolved. */
+  const memo = new Map<string, boolean>();
+  for (const r of allRows) {
+    const id = r.node.entry.id;
+    const resolved = memo.get(id);
+    if (resolved !== undefined) {
+      // Already resolved as part of another (later or earlier) row's chain.
+      if (resolved) hidden.add(id);
+      continue;
+    }
+    // Walk up until a verdict is known: a folded parent, an already-resolved node,
+    // the root, or a ring back to this row.
+    const chain: string[] = [];
+    const onChain = new Set<string>();
+    let cur = id;
+    let verdict = false;
+    for (;;) {
+      const known = memo.get(cur);
+      if (known !== undefined) { verdict = known; break; }
+      if (onChain.has(cur)) break; // a ring not through `id`: treat as rooted
+      onChain.add(cur);
+      chain.push(cur);
+      const parent = parentOf.get(cur) ?? null;
+      if (parent == null) break;
+      if (parent === id) break; // a ring through this row: never hide it by its own fold
+      if (folded.has(parent)) { verdict = true; break; }
+      cur = parent;
+    }
+    // Fold the verdict back down the chain: a node is hidden iff its parent is.
+    memo.set(chain[chain.length - 1]!, verdict);
+    for (let i = chain.length - 2; i >= 0; i -= 1) {
+      verdict = folded.has(chain[i + 1]!) || verdict;
+      memo.set(chain[i]!, verdict);
+    }
+    if (memo.get(id)) hidden.add(id);
+  }
+  return hidden;
+}
+
+/**
+ * The subset of `folded` whose own row is currently rendered.
+ *
+ * A fold must only hide rows while its own row is still on screen: if the folded row
+ * is filtered out (search, 用户/无工具 chips…), hiding its descendants would make rows
+ * vanish with no ⊟ to explain them and no way to unfold locally — and a search could
+ * report 「（无匹配）」 while matches exist. The fold STATE is kept, so clearing the
+ * filter brings the fold back exactly as it was.
+ */
+export function activeFolds<T extends TreeFlatLike>(
+  renderedRows: readonly T[],
+  folded: ReadonlySet<string>,
+): ReadonlySet<string> {
+  if (folded.size === 0) return folded;
+  const out = new Set<string>();
+  for (const r of renderedRows) {
+    const id = r.node.entry.id;
+    if (folded.has(id)) out.add(id);
+  }
+  return out;
+}
+
 /** Compact per-row timestamp: HH:MM today, M/D HH:MM this year, else yy/M/D. */
 export function formatEntryTime(ts: string | undefined): string {
   if (!ts) return "";

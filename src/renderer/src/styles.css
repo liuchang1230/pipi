@@ -2850,148 +2850,6 @@ textarea:focus-visible,
   color: var(--text-dim);
 }
 
-/* --- 思维导图视图（默认） -----------------------------------------------
-   Only your messages and the AI's replies (see shared/tree-mindmap.ts). The
-   rows are the CONVERSATION, so they read as prose rather than as a log: a
-   proportional font, a speaker pill, and one ellipsised line per message.
-   The full view keeps the monospace log style. */
-/* NOTE: the height for 导图 rows lives in the "Session tree dialog" section BELOW
-   the base `.tree-dialog .tree-row { height: 24px }` rule — an equally specific
-   rule placed above it silently lost, the cards (≈44px of content) overflowed a
-   24px row and painted over their neighbours, and the JS window math (which
-   assumes MIND_ROW_H=46) drifted by (46−24)×index. Both symptoms came from that
-   one ordering mistake; see scripts/diagnose-tree-rows.mjs. */
-.tree-dialog .tree-scroll .tree-row-mind {
-  font-family: -apple-system, "Segoe UI", system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
-  font-size: 12px;
-  gap: 6px;
-  align-items: center;
-  padding: 3px 8px 3px 0;
-  line-height: 1.35;
-}
-/* 卡片：左侧色条说明是谁说的，正文一行，时间在右上。 */
-.tree-card {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  /* head 14px + text line + padding + border must stay inside MIND_ROW_H (46px). */
-  padding: 4px 9px;
-  box-sizing: border-box;
-  max-height: 100%;
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-left: 3px solid color-mix(in srgb, var(--text-dim) 55%, transparent);
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--bg-input, #10131a) 45%, transparent);
-}
-.tree-card.user {
-  border-left-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-}
-.tree-card.assistant {
-  border-left-color: color-mix(in srgb, var(--success, #4ade80) 70%, transparent);
-}
-.tree-card.error {
-  border-left-color: var(--danger);
-}
-.tree-card-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10px;
-  line-height: 14px;
-  color: var(--text-dim);
-}
-.tree-card-spacer {
-  flex: 1 1 auto;
-}
-.tree-card-text {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text);
-}
-.tree-row-mind .tree-card.user .tree-entrylabel,
-.tree-row-mind .tree-card.assistant .tree-entrylabel {
-  border: none;
-  background: transparent;
-  padding: 0;
-  font-weight: 600;
-  font-size: 10px;
-  line-height: 14px;
-}
-.tree-row-mind .tree-card.user .tree-entrylabel {
-  color: var(--accent);
-}
-.tree-row-mind .tree-card.assistant .tree-entrylabel {
-  color: color-mix(in srgb, var(--success, #4ade80) 85%, var(--text));
-}
-/* Fold/path marks sit on the card's vertical centre; the rails span the full row. */
-.tree-row-mind .tree-fold,
-.tree-row-mind .tree-pathmark {
-  align-self: center;
-}
-.tree-row-mind .tree-rails {
-  margin-right: 5px;
-}
-/* The 时间/badge row must not compete with the message text. */
-.tree-row-mind .tree-card-head .tree-time {
-  opacity: 0.75;
-}
-.tree-dialog .tree-row-mind.current .tree-card {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
-}
-.tree-dialog .tree-row-mind.on-active-path .tree-card {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-}
-.tree-row-mind .tree-entrylabel {
-  flex: 0 0 auto;
-  font-size: 10px;
-  line-height: 15px;
-  padding: 0 6px;
-  border-radius: 999px;
-  align-self: center;
-  border: 1px solid transparent;
-}
-.tree-row-mind .tree-entrylabel.user {
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  color: var(--accent);
-}
-.tree-row-mind .tree-entrylabel.assistant {
-  background: color-mix(in srgb, var(--success, #4ade80) 16%, transparent);
-  border-color: color-mix(in srgb, var(--success, #4ade80) 40%, transparent);
-  color: color-mix(in srgb, var(--success, #4ade80) 80%, var(--text));
-}
-/* The preview is the whole point: one line, ellipsised, readable weight. */
-.tree-row-mind .tree-entrytext {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--text);
-  font-weight: 400;
-}
-/* A user prompt is the branch point: give it a little more presence. */
-.tree-row-mind .tree-entrylabel.user ~ .tree-entrytext {
-  font-weight: 500;
-}
-.tree-row-mind .tree-time {
-  flex: 0 0 auto;
-  font-size: 10px;
-}
-/* Connectors in the map are hierarchy, not decoration: thinner + quieter. */
-.tree-row-mind .tree-rail.on::before,
-.tree-row-mind .tree-rail.elbow::before,
-.tree-row-mind .tree-rail.elbow::after {
-  background: color-mix(in srgb, var(--text-dim) 32%, transparent);
-}
-
 /* --- Session tree dialog (aligned with /tree) --- */
 .tree-dialog {
   width: 720px;
@@ -3051,54 +2909,49 @@ textarea:focus-visible,
   cursor: pointer;
   line-height: 24px;
   white-space: nowrap;
-  /* The window math in TreeDialog.tsx positions rows by ROW_H/MIND_ROW_H; a row
-     that grows past its slot paints over the next one (「会话都重叠了」). Pin the
-     height and clip, so geometry can never disagree with the math. */
+  /* The window math in TreeDialog.tsx positions rows by ROW_H; a row that grows
+     past its slot paints over the next one (「会话都重叠了」). Pin the height and
+     clip, so geometry can never disagree with the math. */
   box-sizing: border-box;
   overflow: hidden;
   flex: 0 0 auto;
 }
-/* 导图 rows are cards: speaker line + text line. MUST equal MIND_ROW_H. */
-.tree-dialog .tree-scroll .tree-row-mind {
-  height: 46px;
-  padding-left: 2px;
-  min-height: 46px;
-  max-height: 46px;
-}
+/* These must not use the `background` SHORTHAND: it resets background-image, and
+   `.on-active-path` below (which draws the accent stripe as a gradient) comes
+   LATER in the file at the same specificity — so its shorthand wiped the selected
+   row's colour and clicking an active-path row produced NO visible change (the
+   gradient is transparent). `.current` below had the same shorthand and wiped it
+   too. Measured by scripts/diagnose-tree-rows.mjs > "selection". Colour and stripe
+   are now separate properties and compose. */
 .tree-dialog .tree-row:hover {
-  background: var(--hover);
+  background-color: var(--hover);
 }
 .tree-dialog .tree-row.selected {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  background-color: color-mix(in srgb, var(--accent) 10%, transparent);
 }
-/* Card rows: the card is opaque, so the row's background never showed — clicking a
-   node produced NO visible change (measured: selected and unselected cards had
-   identical computed paint). Paint the selection on the card itself, and keep it
-   distinct from 「当前」 (a ring + badge). */
-.tree-dialog .tree-row.selected .tree-card {
-  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
-  background: color-mix(in srgb, var(--accent) 20%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+/* Hovering the row you just selected must not hide the fact that it is selected. */
+.tree-dialog .tree-row.selected:hover {
+  background-color: color-mix(in srgb, var(--accent) 18%, transparent);
 }
-.tree-dialog .tree-row.selected .tree-card .tree-card-text {
-  color: var(--text);
-  font-weight: 500;
-}
-.tree-dialog .tree-row-mind:hover .tree-card {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-}
-/* 当前 outranks 选中 visually: a solid accent ring + the badge. */
-.tree-dialog .tree-row.current .tree-card {
-  border-color: var(--accent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
-}
+/* 当前 outranks 选中 visually: solid accent text + the badge. */
 .tree-dialog .tree-row.current .tree-entrylabel,
 .tree-dialog .tree-row.current .tree-entrytext {
   color: var(--accent);
   font-weight: 600;
 }
-/* Hierarchy rails: one fixed-width column per level (see RAIL_W in
-   TreeDialog.tsx). Alignment is geometric, not typographic. */
+/* Branch mark: its OWN fixed-width column, present on every row (blank when the
+   row has no mark). Keeping it out of the indentation is what lets a marked row
+   start at the same x as any other row of its level. */
+.tree-marker {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  color: color-mix(in srgb, var(--text-dim) 75%, transparent);
+}
+/* Indentation: one fixed-width column per conversation level (one `.tree-rail`
+   per level, 14px — the step scripts/diagnose-tree-rows.mjs measures). Alignment is
+   geometric, not typographic — the columns carry no lines, because a "level" is a
+   speaker, not a nesting depth. */
 .tree-rails {
   flex: 0 0 auto;
   display: flex;
@@ -3108,43 +2961,6 @@ textarea:focus-visible,
   position: relative;
   width: 14px;
   align-self: stretch;
-}
-.tree-rail.on::before {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
-}
-/* Elbow into the node: vertical stops at the midline, then a horizontal stub. */
-.tree-rail.elbow::before {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 0;
-  bottom: 50%;
-  width: 1px;
-  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
-}
-.tree-rail.elbow:not(.last)::before {
-  bottom: 0; /* ├ — the rail continues to the next sibling */
-}
-.tree-rail.elbow::after {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: calc(50% - 0.5px);
-  width: 8px;
-  height: 1px;
-  background: color-mix(in srgb, var(--text-dim) 45%, transparent);
-}
-/* The active branch's rails are tinted, so "where am I" reads at a glance. */
-.tree-dialog .tree-row.on-active-path .tree-rail.on::before,
-.tree-dialog .tree-row.on-active-path .tree-rail.elbow::before,
-.tree-dialog .tree-row.on-active-path .tree-rail.elbow::after {
-  background: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .tree-fold {
   flex: 0 0 auto;
@@ -3168,7 +2984,7 @@ textarea:focus-visible,
    The active path is what a reader needs to follow; dimming everything else is
    what makes it obvious at a glance (a lone • marker was not). */
 .tree-dialog .tree-row.on-active-path {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 18%, transparent) 0 3px, transparent 3px);
+  background-image: linear-gradient(90deg, color-mix(in srgb, var(--accent) 18%, transparent) 0 3px, transparent 3px);
 }
 .tree-dialog .tree-row.on-active-path .tree-entrytext {
   color: var(--text);
@@ -3179,9 +2995,10 @@ textarea:focus-visible,
 .tree-dialog .tree-row.off-path:hover {
   opacity: 1;
 }
-/* The current node is the answer to the question — strongest treatment. */
+/* The current node is the answer to the question — strongest treatment.
+   `background-color`, not the shorthand: see the note on `.selected` above. */
 .tree-dialog .tree-row.current {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  background-color: color-mix(in srgb, var(--accent) 22%, transparent);
   box-shadow: inset 3px 0 0 var(--accent);
 }
 .tree-leaf-tag {

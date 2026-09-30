@@ -46,6 +46,41 @@ rmSync(profile, { recursive: true, force: true });
   }
 }
 const workDir = mkdtempSync(join(tmpdir(), "pipi-smoke-"));
+// A SEEDED session for the tree-dialog checks below: on an empty session every
+// alignment/branch assertion passes vacuously (rows = 0), which is how a broken
+// layout could hide behind a green smoke run. Two forks + a tool chain.
+const smokeSession = (() => {
+  const dir = join(workDir, "sessions-test");
+  mkdirSync(dir, { recursive: true });
+  // `version: 3` keeps pi's SessionManager from migrating the file as v1, which
+  // linearizes it (every entry re-chained onto the previous one) and would make
+  // the fork checks below pass on a chain.
+  const lines = [JSON.stringify({ type: "session", id: "s0", version: 3, cwd: workDir, timestamp: new Date().toISOString() })];
+  let n = 0;
+  // Distinct prefix from the header's "s0": a duplicated id makes the seed ambiguous
+  // (buildTreeFromEntries keys nodes by id, so one entry would overwrite the other).
+  const next = () => `m${n++}`;
+  let parent = null;
+  const put = (id, role, content, extra = {}) => lines.push(JSON.stringify({ type: "message", id, parentId: parent, timestamp: new Date().toISOString(), message: { role, content, ...extra } }));
+  const ask = (text) => { const id = next(); put(id, "user", [{ type: "text", text }]); parent = id; return id; };
+  const reply = (text) => { const id = next(); put(id, "assistant", [{ type: "text", text }], { stopReason: "stop" }); parent = id; return id; };
+  const tool = () => { const t = next(); put(t, "assistant", [{ type: "toolCall", id: "tc1", name: "read", arguments: { path: "a.ts" } }]); parent = t; const r = next(); put(r, "toolResult", [{ type: "text", text: "ok" }], { toolCallId: "tc1" }); parent = r; };
+  ask("烟雾测试问题一");
+  reply("烟雾测试回答一");
+  tool();
+  // fork: two prompts under one entry
+  const fork = parent;
+  ask("烟雾分支甲");
+  reply("分支甲的回答");
+  parent = fork;
+  ask("烟雾分支乙");
+  reply("分支乙的回答");
+  ask("烟雾测试问题二");
+  reply("烟雾测试回答二");
+  const file = join(dir, "smoke-session.jsonl");
+  writeFileSync(file, lines.join("\n") + "\n");
+  return file;
+})();
 
 const mainLines = [];
 let app = null;
@@ -183,7 +218,7 @@ try {
   check("file.delete → {ok:true}", removed?.ok === true, JSON.stringify(removed));
 
   // Tab lifecycle (pty + the tab registry the sidebar follows).
-  const tabId = await evaluate(ws, `window.api.tab.create({ cwd: ${JSON.stringify(workDir)} })`, true);
+  const tabId = await evaluate(ws, `window.api.tab.create({ cwd: ${JSON.stringify(workDir)}, sessionPath: ${JSON.stringify(smokeSession)} })`, true);
   check("tab.create returns an id", typeof tabId === "string" && tabId.length > 0, String(tabId));
   await sleep(4000);
   const alive = await evaluate(ws, `window.api.tab.alive(${JSON.stringify(tabId)})`, true);
@@ -200,6 +235,12 @@ try {
     true,
   );
   await sleep(1200);
+  // The tree arrives over the pi RPC; a fixed wait is a race on a loaded machine
+  // (a vacuous "0 rows" pass would hide everything below), so poll for the rows
+  // this seeded session must produce.
+  for (let i = 0; i < 20 && !(await evaluate(ws, `document.querySelectorAll('.tree-dialog .tree-scroll .tree-row').length > 0`, true)); i += 1) {
+    await sleep(300);
+  }
   const treeOpen = await evaluate(ws, `!!document.querySelector('.tree-dialog')`);
   check("tree dialog opens on a live tab", treeOpen === true, String(treeOpen));
   if (treeOpen) {
@@ -216,82 +257,143 @@ try {
     );
     check("tree dialog renders without a crash", await evaluate(ws, `!document.querySelector('.crash-screen')`));
     check("tree dialog body is coherent (rows or an empty-state note)", rowsInfo?.hasEmpty === true || (rowsInfo?.rows ?? 0) > 0, JSON.stringify(rowsInfo));
-    // 思维导图视图 is the default: only your messages and the AI's replies, so a
-    // rendered row must never be a tool call / bookkeeping entry.
-    const mindInfo = await evaluate(
+    // One view (2026-09-28): the 导图/完整 switch is gone, the filter chips stay,
+    // and the tree is laid out by CONVERSATION level — prompts in one column,
+    // replies in another, plumbing in a third. That is checkable from the DOM:
+    // rows sharing an indent must put their content column at exactly one x, and
+    // all user rows must share one column (same for assistant rows).
+    // The anchor is the fold cell (the start of the content column), not the
+    // label: a ⑂ badge or a [label] tag legitimately shifts a label right.
+    const treeInfo = await evaluate(
       ws,
       `(() => {
          const dialog = document.querySelector('.tree-dialog');
          const chips = [...dialog.querySelectorAll('.tree-chip')].map((c) => c.textContent.trim());
-         const active = [...dialog.querySelectorAll('.tree-chip.active')].map((c) => c.textContent.trim());
          const rows = [...dialog.querySelectorAll('.tree-scroll .tree-row')];
-         const roles = [...new Set(rows.map((r) => r.getAttribute('data-role')))];
-         return { chips, active, rows: rows.length, roles };
-       })()`,
+         const byIndent = {};
+         for (const r of rows) {
+           const anchor = r.querySelector('.tree-fold') ?? r;
+           const key = r.getAttribute('data-indent');
+           (byIndent[key] ||= new Set()).add(Math.round(anchor.getBoundingClientRect().left * 10) / 10);
+         }
+         const misaligned = Object.entries(byIndent).filter(([, xs]) => xs.size > 1).map(([indent, xs]) => ({ indent, xs: [...xs] }));
+         const indentOf = (role) => [...new Set(rows.filter((r) => r.getAttribute('data-role') === role).map((r) => Number(r.getAttribute('data-indent'))))];
+         const markers = rows.reduce((m, r) => { const k = r.getAttribute('data-marker') || 'none'; m[k] = (m[k] || 0) + 1; return m; }, {});
+         // One level column per indent: the width contract with .tree-rail.
+         const railMismatch = rows.filter((r) => r.querySelectorAll('.tree-rail').length !== Number(r.getAttribute('data-indent'))).length;
+         // Step between two levels must be the width of ONE .tree-rail, and the
+         // glyph must be the one data-marker names (MARKER_GLYPH in TreeDialog).
+         const leftOf = {};
+         for (const r of rows) { const a = r.querySelector('.tree-fold') ?? r; const k = r.getAttribute('data-indent'); if (!(k in leftOf)) leftOf[k] = Math.round(a.getBoundingClientRect().left * 10) / 10; }
+         const lv = Object.keys(leftOf).map(Number).sort((a, b) => a - b);
+         const steps = [];
+         for (let i = 1; i < lv.length; i += 1) steps.push(Math.round((leftOf[String(lv[i])] - leftOf[String(lv[i - 1])]) * 10) / 10);
+         // Any row that has a rail (level 0 rows have none).
+         const railEl = rows.map((r) => r.querySelector('.tree-rail')).find(Boolean);
+         const railW = railEl ? Math.round(railEl.getBoundingClientRect().width * 10) / 10 : 0;
+         const GLYPHS = { '': '', 'branch-mid': '\u251c', 'branch-last': '\u2514', 'continuation': '\u2502' };
+         const glyphMismatch = rows.filter((r) => { const m = r.getAttribute('data-marker') ?? ''; return (r.querySelector('.tree-marker')?.textContent ?? '').trim() !== (GLYPHS[m] ?? '?'); }).length;
+         return { chips, rows: rows.length, misaligned, markers, railMismatch, railW, steps, glyphMismatch, userIndents: indentOf('user'), assistantIndents: indentOf('assistant'), toolIndents: indentOf('toolResult') };
+       })() `,
       true,
     );
     check(
-      "mind-map view is the default (导图 active, 完整 offered)",
-      mindInfo?.active?.includes("导图") === true && mindInfo?.chips?.includes("完整") === true,
-      JSON.stringify(mindInfo?.active),
+      "the 导图/完整 view switch is gone (only filter chips remain)",
+      treeInfo?.chips?.includes("导图") !== true && treeInfo?.chips?.includes("完整") !== true && treeInfo?.chips?.includes("标准") === true,
+      JSON.stringify(treeInfo?.chips),
     );
     check(
-      "mind-map rows are only user/assistant (no tool-call rows)",
-      (mindInfo?.rows ?? 0) === 0 || (mindInfo?.roles ?? []).every((r) => r === "user" || r === "assistant"),
-      JSON.stringify(mindInfo?.roles),
+      "the seeded session rendered rows (the layout checks are not vacuous)",
+      (treeInfo?.rows ?? 0) >= 6,
+      JSON.stringify({ rows: treeInfo?.rows }),
     );
-    // The card layout: a speaker line + a text line per row, and the 完整 view must
-    // switch the same dialog to the flat log rows (both are one dialog, one state).
-    const cardInfo = await evaluate(
+    check(
+      "rows at the same level share one column (同一层对齐)",
+      (treeInfo?.rows ?? 0) > 0 && (treeInfo?.misaligned ?? []).length === 0 && (treeInfo?.railMismatch ?? 1) === 0,
+      JSON.stringify({ misaligned: treeInfo?.misaligned, railMismatch: treeInfo?.railMismatch }),
+    );
+    check(
+      "the fork in the seeded session draws branch marks",
+      (treeInfo?.markers?.["branch-mid"] ?? 0) + (treeInfo?.markers?.["branch-last"] ?? 0) > 0,
+      JSON.stringify(treeInfo?.markers),
+    );
+    check(
+      "every row draws the glyph its data-marker names",
+      (treeInfo?.rows ?? 0) > 0 && (treeInfo?.glyphMismatch ?? 1) === 0,
+      JSON.stringify({ glyphMismatch: treeInfo?.glyphMismatch }),
+    );
+    check(
+      "the level step equals one .tree-rail width (the alignment contract)",
+      (treeInfo?.steps ?? []).length > 0 && (treeInfo?.railW ?? 0) > 0 && (treeInfo?.steps ?? []).every((s) => Math.abs(s - treeInfo.railW) <= 1.5),
+      JSON.stringify({ railW: treeInfo?.railW, steps: treeInfo?.steps }),
+    );
+    check(
+      "prompt / reply / tool rows each live in one column (and not the same one)",
+      (treeInfo?.userIndents ?? []).length === 1 &&
+        (treeInfo?.assistantIndents ?? []).length === 1 &&
+        (treeInfo?.toolIndents ?? []).length === 1 &&
+        (treeInfo?.assistantIndents ?? []).every((i) => !(treeInfo?.userIndents ?? []).includes(i)) &&
+        (treeInfo?.toolIndents ?? []).every((i) => !(treeInfo?.userIndents ?? []).includes(i)),
+      JSON.stringify({ userIndents: treeInfo?.userIndents, assistantIndents: treeInfo?.assistantIndents, toolIndents: treeInfo?.toolIndents }),
+    );
+
+    // Folding must collapse the WHOLE subtree, not just the row below it. The old
+    // hidden-set pass ran over the FILTERED list and lost the folded state at the
+    // first row whose own parent was filtered away (tool-call-only replies are
+    // dropped by the default filter), so only the row straight below collapsed —
+    // 「点折叠只折叠下面一条」 (2026-09-28). The seed's fork + tool chain is what makes
+    // this non-vacuous (a chain where every parent is visible would pass either way).
+    const foldInfo = await evaluate(
       ws,
-      `(() => {
-         const rows = [...document.querySelectorAll('.tree-dialog .tree-scroll .tree-row')];
-         const cards = rows.filter((r) => r.querySelector('.tree-card')).length;
-         const heads = rows.filter((r) => r.querySelector('.tree-card-head')).length;
-         const texts = rows.filter((r) => r.querySelector('.tree-card-text')).length;
-         return { rows: rows.length, cards, heads, texts };
-       })()`,
+      `(async () => {
+        const scroll = document.querySelector('.tree-dialog .tree-scroll');
+        if (!scroll) return { error: 'no .tree-scroll' };
+        scroll.scrollTop = 0;
+        scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await new Promise((r) => setTimeout(r, 250));
+        const before = Math.round(scroll.scrollHeight / 24);
+        const rows = [...scroll.querySelectorAll('.tree-row')];
+        const target = rows.find((r) => (r.querySelector('.tree-fold')?.textContent ?? '').trim() !== '');
+        if (!target) return { error: 'no foldable row at the head', before };
+        const id = target.getAttribute('data-row-id');
+        target.querySelector('.tree-fold').click();
+        await new Promise((r) => setTimeout(r, 400));
+        const sel = '.tree-dialog .tree-scroll .tree-row[data-row-id="' + id + '"] .tree-fold';
+        const after = Math.round(scroll.scrollHeight / 24);
+        const glyph = (document.querySelector(sel)?.textContent ?? '').trim();
+        document.querySelector(sel)?.click();
+        await new Promise((r) => setTimeout(r, 400));
+        return { id, before, after, hidden: before - after, glyph, restored: Math.round(scroll.scrollHeight / 24) };
+      })()`,
       true,
     );
     check(
-      "mind-map rows use the card layout (speaker line + text line)",
-      (cardInfo?.rows ?? 0) === (cardInfo?.cards ?? 0) && (cardInfo?.rows ?? 0) === (cardInfo?.heads ?? 0) && (cardInfo?.rows ?? 0) === (cardInfo?.texts ?? 0),
-      JSON.stringify(cardInfo),
+      "folding a row hides its whole subtree (not just the row below)",
+      foldInfo?.hidden >= 3,
+      JSON.stringify(foldInfo),
     );
-    const fullSwitch = await evaluate(
-      ws,
-      `(() => {
-         const btn = [...document.querySelectorAll('.tree-dialog .tree-chip')].find((c) => c.textContent.trim() === '完整');
-         if (!btn) return { switched: false };
-         btn.click();
-         return { switched: true };
-       })()`,
-      true,
-    );
-    await sleep(200);
-    const afterSwitch = await evaluate(
-      ws,
-      `(() => {
-         const active = [...document.querySelectorAll('.tree-dialog .tree-chip.active')].map((c) => c.textContent.trim());
-         const cards = document.querySelectorAll('.tree-dialog .tree-card').length;
-         return { active, cards };
-       })()`,
-      true,
-    );
+    check("the folded row shows the ⊞ marker", foldInfo?.glyph === "\u229e", JSON.stringify(foldInfo?.glyph));
     check(
-      "完整 view switches the same dialog off the card layout",
-      fullSwitch?.switched === true && afterSwitch?.active?.includes("完整") === true && (afterSwitch?.cards ?? 1) === 0,
-      JSON.stringify(afterSwitch),
+      "unfolding restores every row",
+      foldInfo?.restored === foldInfo?.before,
+      JSON.stringify({ before: foldInfo?.before, restored: foldInfo?.restored }),
     );
   }
-  // Close it the way a user would: the 关闭 button, else the overlay.
+  // Close it the way a user would: the 关闭 button, else the overlay. The overlay
+  // only dismisses on a press AND release on the backdrop (useOverlayDismiss), so
+  // the click below has to be a real press+release on the overlay itself.
   await evaluate(
     ws,
     `(() => {
        const b = [...document.querySelectorAll('.tree-dialog .btn')].find((x) => /关闭/.test(x.textContent || ''));
        if (b) { b.click(); return 'button'; }
-       const ov = document.querySelector('.dialog-overlay');
-       if (ov) { ov.click(); return 'overlay'; }
+       const ov = document.querySelector('.tree-dialog')?.parentElement;
+       if (ov) {
+         ov.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+         ov.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+         ov.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+         return 'overlay';
+       }
        return 'none';
      })()`,
     true,
