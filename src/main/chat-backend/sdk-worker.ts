@@ -50,10 +50,41 @@ import { decideCmdRouting, queueAtCapacity } from "./sdk-queue";
   }
 }
 
+// --- Native clipboard addon: keep it OUT of electron.exe -------------------
+// pi's SDK eagerly require()s the `@mariozechner/clipboard` N-API addon at
+// import time (dist/utils/clipboard-native.js) and it only ever serves pi's
+// interactive TUI, which this backend never runs. Inside electron.exe the
+// addon is a hard-crash vector: Windows Error Reporting recorded TWO access
+// violations (0xc0000005 / BEX64) in `clipboard.win32-x64-msvc.node_unloaded`
+// that killed the whole app — 2026-09-24 10:47:44 and 2026-09-25 08:45:19,
+// both in instances that had this worker alive for 18-24h. A native crash in
+// the main process logs nothing and closes every window at once, which is the
+// "窗口闪退" users report. `worker.terminate()` (closeAllSdkSessions) is a
+// second vector: it unloads the DLL from that thread.
+//
+// pi skips the addon when TERMUX_VERSION is set, so flip that flag for the
+// duration of the import only (the module reads it once, at evaluation, and
+// keeps `clipboard = null`). Restoring it immediately after keeps the lie out
+// of the env our shell tools and child processes inherit. Verified: control
+// import loads `clipboard.win32-x64-msvc.node`, guarded import loads nothing.
+const prevTermuxVersion = process.env.TERMUX_VERSION;
+process.env.TERMUX_VERSION = "pipi-sdk-worker";
+
 // Dynamic import: the SDK pulls in undici which must see the patched
 // worker_threads export above. (electron-vite keeps this as a runtime
-// import of the external package.)
-const sdk = await import("@earendil-works/pi-coding-agent");
+// import of the external package.) The `finally` matters: if the import
+// throws (a broken install, a missing optional dep) the flag must not stay
+// flipped — it is read as "we are running under Termux" by everything else
+// in this process.
+const sdk = await (async () => {
+  try {
+    return await import("@earendil-works/pi-coding-agent");
+  } finally {
+    if (prevTermuxVersion === undefined) delete process.env.TERMUX_VERSION;
+    else process.env.TERMUX_VERSION = prevTermuxVersion;
+  }
+})();
+
 const {
   ModelRuntime,
   SettingsManager,
