@@ -29,7 +29,17 @@ import { sameSessionPaths } from "../shared/session-paths";
 import { pickWslEventTab } from "./wsl-event-tab";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
-import { ensureShippedExtensions, retireShippedFiles, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshCatCommand } from "./extension-sync";
+import { ensureShippedExtensions, retireShippedFiles, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshInstallScript, buildSshCatCommand } from "./extension-sync";
+import { runSshCommand } from "./ssh-exec";
+import {
+  ensureShippedSkills,
+  nodeSkillsIo,
+  SHIPPED_SKILL_FILES,
+  syncSkills,
+  syncSkillsViaSftp,
+  syncSkillsViaSsh,
+  type SshScriptRunner,
+} from "./skill-sync";
 import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
 import { trackIpcHandlersOn } from "./in-flight";
 import { drainCorruptReports, onCorruptReport, type CorruptFileReport } from "./json-store";
@@ -262,7 +272,8 @@ const wslLastEmittedSessions = new Map<string, SessionEntry[]>();
 // cache and the change push all cross the same seam.
 const sessionIndex = new SessionIndex();
 // WSL home resolution is injected (async, non-blocking) so the click path
-// never spawnSync's wsl.exe — mirrors the CONTEXT.md no-sync-spawn rule.
+// never spawnSync's wsl.exe — mirrors the no-sync-spawn rule in
+// docs/invariants.md.
 sessionIndex.setWslHomeResolver(getWslHomeAsync);
 const fileTreeIndex = new FileTreeIndex();
 
@@ -711,10 +722,42 @@ async function syncWslExtensions(distro: string): Promise<void> {
   }
 }
 
+/**
+ * Same provisioning for skills, which live in a tree under ~/.pi/agent/skills.
+ * The classification rules (skill-sync.ts: 只读订阅 + 偏离保留) run over the UNC
+ * file system through the shared io adapter, so a skill the user edited inside
+ * the distro is kept rather than overwritten. Async like the extension path —
+ * UNC I/O on the main thread can stall.
+ */
+async function syncWslSkills(distro: string): Promise<void> {
+  try {
+    const winHome = wslToWinPath(distro, await getWslHomeAsync(distro));
+    const result = await syncSkills(nodeSkillsIo(join(winHome, ".pi", "agent", "skills")));
+    if (result.written.length > 0 || result.retired.length > 0) {
+      console.log(
+        `[skills] WSL ${distro}: wrote ${result.written.length}, retired ${result.retired.length}`,
+      );
+    }
+  } catch (e) {
+    console.error(`[skills] WSL ${distro} sync failed:`, e instanceof Error ? e.message : String(e));
+  }
+}
+
 /** Last-shipped content digest per key-auth server: a re-connect with
  *  unchanged shipped extensions skips the ssh round-trip entirely; an app
  *  upgrade changes the digest and re-syncs on the next connect. */
 const remoteKeyExtSyncHash = new Map<string, string>();
+
+/** Digest of everything the app provisions into an agent dir — extensions AND
+ *  the skills tree — so adding, removing or editing either one re-syncs on the
+ *  next connect. Rel paths are folded in, so a moved file is a change too. */
+function shippedProvisionDigest(): string {
+  return createHash("sha256")
+    .update(SHIPPED_EXTENSIONS.map((e) => e.content).join("\u0000"))
+    .update("\u0001")
+    .update(SHIPPED_SKILL_FILES.map((f) => `${f.relPath}\u0002${f.content}`).join("\u0000"))
+    .digest("hex");
+}
 
 /**
  * Ship app-bundled pi extensions to a KEY-AUTH (passwordless) remote over
@@ -733,41 +776,12 @@ const remoteKeyExtSyncHash = new Map<string, string>();
  *  remote path is base64-embedded via buildSshCatCommand, so quoting cannot
  *  break the Windows spawn → ssh.exe → bash chain. */
 function sshCatRemoteFile(remote: RemoteOpts, remotePath: string, timeoutMs = 30000): Promise<string> {
-  return new Promise((resolve) => {
-    const sshBin = findSshBin() ?? "ssh.exe";
-    const proc = spawn(
-      sshBin,
-      [
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-p", String(remote.port ?? 22),
-        `${remote.user}@${remote.host}`,
-        buildSshCatCommand(remotePath),
-      ],
-      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let out = "";
-    const timer = setTimeout(() => {
-      try {
-        proc.kill();
-      } catch {
-        /* already dead */
-      }
-      resolve("");
-    }, timeoutMs);
-    proc.stdout?.on("data", (d: Buffer | string) => {
-      out += d.toString();
-    });
-    proc.on("error", () => {
-      clearTimeout(timer);
-      resolve("");
-    });
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 ? out : "");
-    });
-  });
+  return runSshCommand({
+    remote,
+    sshBin: findSshBin() ?? "ssh.exe",
+    command: buildSshCatCommand(remotePath),
+    timeoutMs,
+  }).then((result) => (result.ok ? result.stdout : ""));
 }
 
 function syncKeyAuthExtensions(remote: RemoteOpts): void {
@@ -775,41 +789,43 @@ function syncKeyAuthExtensions(remote: RemoteOpts): void {
     console.log(`[extensions] key-auth remote with agentDir override — manual install required (${stableRemoteKey(remote)})`);
     return;
   }
-  const digest = createHash("sha256")
-    .update(SHIPPED_EXTENSIONS.map((e) => e.content).join("\u0000"))
-    .digest("hex");
+  const digest = shippedProvisionDigest();
   const key = stableRemoteKey(remote);
   if (remoteKeyExtSyncHash.get(key) === digest) return;
+  // The command is content-free and the base64 payload rides on stdin: a command
+  // line that grows with the shipped sources crosses Windows' 32,767-char limit,
+  // where spawn throws ENAMETOOLONG SYNCHRONOUSLY — i.e. out of this call site,
+  // which sits in the tab:create handler before emitTabs() (see ssh-exec.ts).
   const sshBin = findSshBin() ?? "ssh.exe";
-  const proc = spawn(
-    sshBin,
-    [
-      "-o", "BatchMode=yes",
-      "-o", "ConnectTimeout=10",
-      "-o", "StrictHostKeyChecking=accept-new",
-      "-p", String(remote.port ?? 22),
-      `${remote.user}@${remote.host}`,
-      buildSshInstallCommand(),
-    ],
-    { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] },
-  );
-  const timer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch {
-      /* already dead */
+  const run: SshScriptRunner = (options) => runSshCommand({ remote, sshBin, ...options });
+  void (async () => {
+    // Extensions: one trip, overwrite (they are not a user-editable tree).
+    const extResult = await run({ command: buildSshInstallCommand(), stdin: buildSshInstallScript(), timeoutMs: 20000 });
+    if (!extResult.ok) {
+      console.error(
+        `[extensions] key-auth remote sync failed (${key}): ${extResult.error ?? "unknown"}${extResult.stderr.trim() ? ` — ${extResult.stderr.trim()}` : ""}`,
+      );
+      return;
     }
-  }, 20000);
-  proc.on("error", () => clearTimeout(timer));
-  proc.on("exit", (code) => {
-    clearTimeout(timer);
-    if (code === 0) {
-      remoteKeyExtSyncHash.set(key, digest);
-      console.log(`[extensions] key-auth remote synced -> ${key}`);
-    } else {
-      console.error(`[extensions] key-auth remote sync failed (${key}) exit=${code}`);
+    console.log(`[extensions] key-auth remote synced -> ${key}`);
+    // Skills: probe → classify → apply (2-3 trips, see skill-sync.ts). The
+    // probe is what makes "keep what the user edited" work on a passwordless
+    // server, where nothing can read the remote file system except these
+    // round trips.
+    const skills = await syncSkillsViaSsh(run, 20000);
+    if (!skills.ok) {
+      console.error(`[skills] key-auth remote sync failed (${key}): ${skills.error ?? "unknown"}`);
+      return;
     }
-  });
+    if (skills.written.length > 0 || skills.retired.length > 0 || skills.diverged.length > 0) {
+      console.log(
+        `[skills] key-auth remote: wrote ${skills.written.length}, kept ${skills.diverged.length} edited by the user, retired ${skills.retired.length} -> ${key}`,
+      );
+    }
+    // Only a fully provisioned server is marked done, so a failed skills half
+    // is retried on the next connect instead of being skipped forever.
+    remoteKeyExtSyncHash.set(key, digest);
+  })();
 }
 
 // --- WSL session listing lives in SessionIndex (session-index.ts) ---------
@@ -1088,6 +1104,14 @@ if (gotSingleInstanceLock) {
   // tab can spawn pi, so every pi process auto-discovers them. The returned
   // list of actually-written files feeds the chat-page update notice.
   pendingExtensionSync = ensureShippedExtensions();
+  // Same contract for the skills tree (see skill-sync.ts): they must exist
+  // before any tab can spawn pi. Policy is 只读订阅 + 偏离保留 — a skill the
+  // user edited is kept (and reported), never overwritten, which needs the
+  // .pipi.json journal written next to the installed skills.
+  const skillSync = ensureShippedSkills();
+  if (skillSync.written.length > 0) {
+    console.log(`[skills] updated: ${skillSync.written.join(", ")}`);
+  }
   // Delete files we no longer ship: pi auto-loads every .ts under extensions/, so a
   // retired extension left on disk keeps running (we would only stop rendering its UI).
   const retiredAtStartup = retireShippedFiles();
@@ -1300,13 +1324,11 @@ if (gotSingleInstanceLock) {
       const syncKey = stableRemoteKey(opts.remote);
       const lastSync = remoteThemeSyncAt.get(syncKey) ?? 0;
       const themeDue = Date.now() - lastSync > REMOTE_THEME_SYNC_TTL_MS;
-      const extDigest = createHash("sha256")
-        .update(SHIPPED_EXTENSIONS.map((e) => e.content).join("\u0000"))
-        .digest("hex");
+      const provisionDigest = shippedProvisionDigest();
       const remote = opts.remote; // narrowed for the async closure
       void (async () => {
         try {
-          if (!themeDue && remoteKeyExtSyncHash.get(syncKey) === extDigest) return;
+          if (!themeDue && remoteKeyExtSyncHash.get(syncKey) === provisionDigest) return;
           const lease = await getSftpLease(remote);
           if (themeDue) {
             const result: RemoteThemeSyncResult = await syncThemesViaSftp(lease.client, lease.homeDir, remote.agentDir);
@@ -1317,15 +1339,26 @@ if (gotSingleInstanceLock) {
               console.error(`[theme] remote sync partial/failed (${syncKey}):`, result.error ?? "unknown");
             }
           }
-          if (remoteKeyExtSyncHash.get(syncKey) !== extDigest) {
+          if (remoteKeyExtSyncHash.get(syncKey) !== provisionDigest) {
             const extResult = await syncExtensionsViaSftp(lease.client, lease.homeDir, remote.agentDir);
             if (extResult.ok) {
-              remoteKeyExtSyncHash.set(syncKey, extDigest);
+              remoteKeyExtSyncHash.set(syncKey, provisionDigest);
               console.log(
                 `[extensions] remote synced ${extResult.uploaded.length} file(s)${extResult.retired?.length ? `, retired ${extResult.retired.length}` : ""} -> ${syncKey}`,
               );
             } else {
               console.error(`[extensions] remote sync partial/failed (${syncKey}):`, extResult.error ?? "unknown");
+            }
+            // The skills tree over the same lease. Unlike the ssh (key-auth)
+            // transport this one CAN read the server's files, so the journal
+            // rules apply: a skill edited on the server is kept, not clobbered.
+            const skillResult = await syncSkillsViaSftp(lease.client, lease.homeDir, remote.agentDir);
+            if (skillResult.ok) {
+              console.log(
+                `[skills] remote synced ${skillResult.written.length} file(s)${skillResult.retired.length ? `, retired ${skillResult.retired.length}` : ""}${skillResult.diverged.length ? `, kept ${skillResult.diverged.length} edited` : ""} -> ${syncKey}`,
+              );
+            } else {
+              console.error(`[skills] remote sync failed (${syncKey}):`, skillResult.error ?? "unknown");
             }
           }
           lease.lastUsedAt = Date.now();
@@ -1346,6 +1379,7 @@ if (gotSingleInstanceLock) {
     // extensions are needed for the tree-nav bridge, so ship them regardless.)
     if (opts.wsl) {
       void syncWslExtensions(opts.wsl.distro);
+      void syncWslSkills(opts.wsl.distro);
     }
     // Persist the server NODE (host/user/port/path) so it survives restarts,
     // but never a password: password persistence is opt-in via the UI's

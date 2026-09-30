@@ -1,0 +1,141 @@
+{
+  "upstream": {
+    "repo": "mattpocock/skills",
+    "url": "https://github.com/mattpocock/skills",
+    "commit": "d81f3a183412e71a5b1e84ca21bc1a35eea03a60",
+    "commitDate": "2026-09-29",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Matt Pocock"
+  },
+  "overlay": {
+    "description": "我们只做三类不可省略的改写，其余逐字保留上游原文。改写分两层：rewrites 是机械的字面约定替换（正则，对每个技能文件都生效，所以上游新增一处旧约定也会被自动改掉），patches 是逐条登记的语义改写（find 失配就报错，这是上游升级的信号）。",
+    "rules": [
+      "pi 的调用约定不是 Claude Code 的 Skill tool：模型的技能调用走 /skill:<name> 或读取该技能的 SKILL.md，因此上游的 \"Call the Skill tool with X\" 一律改写为 \"Use the `X` skill\"。",
+      "上游 setup-matt-pocock-skills 产生的 docs/agents/issue-tracker.md 不是所有人都有的硬依赖，把硬依赖降级为软依赖（有则用，无则走后续回退）。",
+      "不复制 agents/openai.yaml（Codex UI 元数据，pi 不读）。",
+      "vendoring 后仍含 \"Skill tool\" 字样的文件直接报错：说明上游又添了一处旧约定，需要人来决定怎么改。"
+    ],
+    "rewrites": [
+      {
+        "pattern": "([Cc])all the Skill tool twice, for \"([^\"]+)\" and \"([^\"]+)\"\\.",
+        "flags": "g",
+        "replace": "use the `$2` skill, then the `$3` skill.",
+        "preserveCase": true,
+        "why": "pi 的调用约定"
+      },
+      {
+        "pattern": "([Cc])all the Skill tool with ([\"`])([^\"`]+)\\2",
+        "flags": "g",
+        "replace": "use the `$3` skill",
+        "preserveCase": true,
+        "why": "pi 的调用约定"
+      },
+      {
+        "pattern": "should call the Skill tool for",
+        "flags": "g",
+        "replace": "should use",
+        "preserveCase": false,
+        "why": "pi 的调用约定"
+      }
+    ]
+  },
+  "skills": [
+    {
+      "name": "wizard",
+      "bucket": "engineering",
+      "ship": true,
+      "upstreamPath": "skills/engineering/wizard",
+      "patches": []
+    },
+    {
+      "name": "retro",
+      "bucket": "engineering",
+      "ship": true,
+      "upstreamPath": "skills/engineering/retro",
+      "patches": []
+    },
+    {
+      "name": "diagnosing-bugs",
+      "bucket": "engineering",
+      "ship": true,
+      "upstreamPath": "skills/engineering/diagnosing-bugs",
+      "patches": []
+    },
+    {
+      "name": "code-review",
+      "bucket": "engineering",
+      "ship": true,
+      "upstreamPath": "skills/engineering/code-review",
+      "patches": [
+        {
+          "file": "SKILL.md",
+          "find": "The issue tracker should have been provided to you. If `docs/agents/issue-tracker.md` is missing, tell the user to run `/setup-matt-pocock-skills`.",
+          "replace": "The spec source may be an issue tracker. If `docs/agents/issue-tracker.md` exists it says how to fetch issues; if it does not, fall back to the spec sources in step 2.",
+          "why": "硬依赖降级为软依赖"
+        },
+        {
+          "file": "SKILL.md",
+          "find": "1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md`.",
+          "replace": "1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md` when that file exists.",
+          "why": "硬依赖降级为软依赖"
+        }
+      ]
+    },
+    {
+      "name": "writing-for-agents",
+      "bucket": "productivity",
+      "ship": true,
+      "upstreamPath": "skills/productivity/writing-for-agents",
+      "patches": []
+    },
+    {
+      "name": "handoff",
+      "bucket": "productivity",
+      "ship": true,
+      "upstreamPath": "skills/productivity/handoff",
+      "patches": []
+    },
+    {
+      "name": "grilling",
+      "bucket": "productivity",
+      "ship": false,
+      "upstreamPath": "skills/productivity/grilling",
+      "patches": []
+    },
+    {
+      "name": "grill-me",
+      "bucket": "productivity",
+      "ship": false,
+      "upstreamPath": "skills/productivity/grill-me",
+      "patches": []
+    },
+    {
+      "name": "domain-modeling",
+      "bucket": "engineering",
+      "ship": false,
+      "upstreamPath": "skills/engineering/domain-modeling",
+      "patches": []
+    },
+    {
+      "name": "codebase-design",
+      "bucket": "engineering",
+      "ship": false,
+      "upstreamPath": "skills/engineering/codebase-design",
+      "patches": []
+    },
+    {
+      "name": "grill-with-docs",
+      "bucket": "engineering",
+      "ship": false,
+      "upstreamPath": "skills/engineering/grill-with-docs",
+      "patches": []
+    },
+    {
+      "name": "improve-codebase-architecture",
+      "bucket": "engineering",
+      "ship": false,
+      "upstreamPath": "skills/engineering/improve-codebase-architecture",
+      "patches": []
+    }
+  ]
+}

@@ -20,8 +20,12 @@
     "dist:dir": "npm run build && electron-builder --dir",
     "dist:portable": "npm run build && electron-builder --win portable",
     "smoke:robustness": "node scripts/robustness-smoke.mjs",
+    "skills:check": "node scripts/vendor-skills.mjs --check --from .upstream-skills",
+    "skills:install": "node scripts/install-skills.mjs",
+    "smoke:tree": "node scripts/diagnose-tree-rows.mjs",
     "test:scroll": "node scripts/diagnose-chat-scroll.mjs",
-    "tools": "node scripts/tools-inventory.mjs"
+    "tools": "node scripts/tools-inventory.mjs",
+    "smoke:skills-wsl": "node scripts/smoke-skills-wsl.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",

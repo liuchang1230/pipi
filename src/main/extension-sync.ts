@@ -10,6 +10,12 @@
  *
  * Source of truth: the files in src/main/extensions/, embedded at build time
  * via Vite `?raw` imports (no packaging/asar concerns).
+ *
+ * The ssh (key-auth) path splits its work in two on purpose — an ARGV half that
+ * is content-free and a STDIN half that carries the base64 payload — because a
+ * command line that grows with the shipped content hits Windows' 32,767-char
+ * CreateProcess limit and `spawn` then throws ENAMETOOLONG synchronously. See
+ * ssh-exec.ts; buildSshInstallCommand/buildSshInstallScript are that split.
  */
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
@@ -154,15 +160,26 @@ export function buildSshCatCommand(remotePath: string): string {
 }
 
 /**
- * Build the remote-shell command that installs the shipped extensions into a
- * Linux server's ~/.pi/agent/extensions. Content is base64-embedded so no
- * quoting/newline escaping crosses the ssh→bash layers; the command itself
- * avoids quotes entirely ($HOME expands in the remote shell; the default
- * agent path has no spaces). Used by the key-auth remote sync — there the
- * app has no SFTP credentials, so provisioning goes over ssh.exe with
- * BatchMode instead (see syncKeyAuthExtensions in index.ts).
+ * The ARGV half of the key-auth install: a deliberately content-free command
+ * that reads the real work from stdin. It must stay this small — see the
+ * module header and ssh-exec.ts (a ~35KB argv throws ENAMETOOLONG synchronously
+ * on Windows, which is how this provisioning used to die on EVERY key-auth
+ * connect once the shipped sources grew past ~24KB).
  */
-export function buildSshInstallCommand(extensions: ShippedExtension[] = SHIPPED_EXTENSIONS): string {
+export function buildSshInstallCommand(): string {
+  return "sh -s";
+}
+
+/**
+ * The STDIN half: the POSIX script that installs the shipped extensions into a
+ * Linux server's ~/.pi/agent/extensions. Content is base64-embedded so no
+ * quoting/newline escaping crosses the ssh→bash layers; the script itself
+ * avoids quotes entirely ($HOME expands in the remote shell; the default
+ * agent path has no spaces). Used by the key-auth remote sync — there the app
+ * has no SFTP credentials, so provisioning goes over ssh.exe with BatchMode
+ * instead (see syncKeyAuthExtensions in index.ts).
+ */
+export function buildSshInstallScript(extensions: ShippedExtension[] = SHIPPED_EXTENSIONS): string {
   const base = "$HOME/.pi/agent/extensions";
   const writes = extensions
     .map(({ fileName, content }) => {
@@ -170,7 +187,7 @@ export function buildSshInstallCommand(extensions: ShippedExtension[] = SHIPPED_
       return `echo ${b64} | base64 -d > ${base}/${fileName}`;
     })
     .join(" && ");
-  return `mkdir -p ${base} && ${writes}${buildSshRetireSuffix()}`;
+  return `mkdir -p ${base} && ${writes}${buildSshRetireSuffix()}\n`;
 }
 
 /**

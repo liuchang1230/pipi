@@ -10,6 +10,7 @@ import {
   ensureShippedExtensions,
   syncExtensionsViaSftp,
   buildSshInstallCommand,
+  buildSshInstallScript,
   buildSshCatCommand,
   SHIPPED_EXTENSIONS,
   RETIRED_FILES,
@@ -58,16 +59,40 @@ describe("ensureShippedExtensions", () => {
   });
 });
 
-describe("buildSshInstallCommand", () => {
-  it("produces a quote-free install command covering every shipped extension", () => {
-    const cmd = buildSshInstallCommand();
-    expect(cmd.startsWith("mkdir -p $HOME/.pi/agent/extensions && ")).toBe(true);
-    // The command crosses Windows spawn → ssh.exe → remote bash: any quote
-    // would need escaping, so the command must be entirely quote-free.
-    expect(cmd).not.toMatch(/['"]/);
+describe("buildSshInstallCommand / buildSshInstallScript", () => {
+  // Regression: the install used to embed every extension as base64 IN THE
+  // COMMAND LINE. Windows caps a command line at 32,767 characters and spawn
+  // throws ENAMETOOLONG *synchronously* past it — so adding
+  // pipi-approval-gate.ts (17.6KB) made syncKeyAuthExtensions throw out of the
+  // tab:create handler on every key-auth connect. The command must therefore
+  // never grow with the payload; the payload rides on stdin.
+  it("keeps the command content-free no matter how large the shipped set is", () => {
+    expect(buildSshInstallCommand()).toBe("sh -s");
+    const huge = [
+      { fileName: "a.ts", content: "x".repeat(200_000) },
+      { fileName: "b.ts", content: "y".repeat(200_000) },
+    ];
+    expect(buildSshInstallScript(huge).length).toBeGreaterThan(400_000);
+    expect(buildSshInstallCommand().length).toBeLessThan(64);
+  });
+
+  it("produces a quote-free install SCRIPT covering every shipped extension", () => {
+    const script = buildSshInstallScript();
+    expect(script.startsWith("mkdir -p $HOME/.pi/agent/extensions && ")).toBe(true);
+    // The script crosses Windows spawn → ssh.exe → remote bash: any quote
+    // would need escaping, so it must be entirely quote-free.
+    expect(script).not.toMatch(/['"]/);
     for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-      expect(cmd).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/extensions/${fileName}`);
+      expect(script).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/extensions/${fileName}`);
     }
+  });
+
+  it("is a complete script (`sh -s` reads it to EOF)", () => {
+    const script = buildSshInstallScript();
+    expect(script.endsWith("\n")).toBe(true);
+    // Every write is a complete line: base64 never contains a newline, and the
+    // retire suffix starts a new ` && (…)` clause rather than trailing text.
+    expect(script.split("\n").length).toBe(2);
   });
 });
 
@@ -239,17 +264,17 @@ describe("retireShippedFiles", () => {
     expect(retireShippedFiles(mkdtempSync(join(tmpdir(), "retire-")))).toEqual([]);
   });
 
-  it("the ssh install command retires guarded by our markers (and stays quote-free)", () => {
-    const cmd = buildSshInstallCommand();
-    expect(cmd).not.toMatch(/['"]/);
+  it("the ssh install script retires guarded by our markers (and stays quote-free)", () => {
+    const script = buildSshInstallScript();
+    expect(script).not.toMatch(/['"]/);
     for (const spec of RETIRED_FILES) {
       const path = `$HOME/.pi/agent/${spec.dir}/${spec.fileName}`;
-      expect(cmd).toContain(`( test -f ${path}`);
-      expect(cmd).toContain(`rm -f ${path}`);
+      expect(script).toContain(`( test -f ${path}`);
+      expect(script).toContain(`rm -f ${path}`);
       // every marker must be probed before the delete
       for (const m of spec.markers) {
         const b64 = Buffer.from(m, "utf8").toString("base64");
-        expect(cmd).toContain(`grep -q $(echo ${b64} | base64 -d) ${path}`);
+        expect(script).toContain(`grep -q $(echo ${b64} | base64 -d) ${path}`);
       }
     }
   });

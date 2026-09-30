@@ -29,3 +29,6 @@ NUL
 # Smoke-test profiles (CDP-driven e2e)
 .smoke-profile*/
 
+
+# Vendored skills: pinned upstream clone (see skills/NOTICE.md + docs/adr/0004)
+.upstream-skills/
