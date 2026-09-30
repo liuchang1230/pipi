@@ -1,6 +1,7 @@
 // Cross-pane geometry: the middle/right pane widths and the viewer collapse
 // flag are written by both sides of each resizer, so they live in a store
-// (CONTEXT.md rule: cross-pane data must be in a store, not App useState).
+// (docs/invariants.md rule: cross-pane data must be in a store, not App
+// useState).
 // The sidebar's own vertical split (sidebarSplit) stays local to SidebarPane.
 import { create } from "zustand";
 

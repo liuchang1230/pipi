@@ -8,7 +8,7 @@
 | 现象 | 实测/代码证据 | 根因 |
 |---|---|---|
 | 远程 tab 历史加载 17–45s | `pipi-debug.log`：`get_messages` 往返 17.8s / 33s / 44s / 28s / 15.5s | 载荷是整段 transcript JSON |
-| 「我的 agent 卡了」 | CONTEXT.md：rpc-mode 每条响应后 `await waitForRawStdoutBackpressure()`，命令循环串行 | 传历史的同时 `prompt`/`get_state`/`get_entries` **物理排队**在它后面 |
+| 「我的 agent 卡了」 | `docs/architecture-decisions.md`（2026-08-21）：rpc-mode 每条响应后 `await waitForRawStdoutBackpressure()`，命令循环串行 | 传历史的同时 `prompt`/`get_state`/`get_entries` **物理排队**在它后面 |
 | 三个多 MB 请求同时在飞 | 08:32:03.062 / .071 / 08:32:04.923 | 无在飞闸门 + 15s 超时丢响应（Stage 0 已修） |
 | 内存尖峰 | `[mem] tick rss=631MB heap=489/555MB` 落在 08:26:08–08:26:53 的 `get_messages` 窗口内 | 主进程缓存整份载荷，渲染层反复重解析 |
 

@@ -79,7 +79,7 @@ Phase 3 / 4 待开工
 
 ### F 类：机制性复发（元问题）
 
-CONTEXT.md 里**同一教训已出现三次**（"事件触发 + 大载荷 + 慢链路"必须有在飞闸门）：
+`docs/diagnosis/` 与 `docs/architecture-decisions.md` 里**同一教训已出现三次**（"事件触发 + 大载荷 + 慢链路"必须有在飞闸门）：
 `tree-poll-guard`（get_entries 12949 次）→ `history-gate`（get_messages 多 MB 重下风暴）→ 本轮 B1/B2。
 每次都"修一个对话框/一个 store"。**实例修复不产生免疫力。**
 
@@ -184,7 +184,7 @@ settle(key, Outcome)                   → 唯一出口
 - `failureStore`：每条失败生成**持久**记录（code/时间/目标/建议/面包屑/重试）。toast 只留"成功/瞬时"（E3 反转）。
 - `FailureCenter`（右下持久条 + 详情抽屉）：人话标题 + 技术原因 + 建议 + `[重试] [复制诊断] [诊断面板]`。
 - `<LoadState>` 统一四态（加载中 / 停滞 / 错误 / 空），**错误态永远带"重试 + 详情"**，替换 placeholder 与手写分支。
-- 文案规范写进 CONTEXT.md：`标题（人话）+ 原因（技术）+ 建议（可执行）`，必带 code。
+- 文案规范写进 `docs/invariants.md`（稳定性契约 #8）：`标题（人话）+ 原因（技术）+ 建议（可执行）`，必带 code。
 
 ### S6 可观测 —— `perf.ts` + 面包屑 + 日志纪律 + 诊断面板
 
@@ -303,7 +303,8 @@ shared/with-deadline 7）；typecheck + build 通过。
    **不受信数据**（畸形 fixture：`{"edits":[{"newText":…}]}` 缺 `oldText`、args 为字符串/null、超深嵌套）；
    **契约表**（每 channel 有 deadline 声明；每轮询经 single-flight）。
 2. 所有轮询/重试收编到 S8 原语。
-3. CONTEXT.md 追加「稳定性契约」章节（§4 规则 + 违反检测方式）。
+3. ~~CONTEXT.md 追加「稳定性契约」章节~~ 已落地：
+   `docs/invariants.md`（§硬规则 + 稳定性契约，2026-09-30 从 CONTEXT.md 拆出）。
 
 ---
 

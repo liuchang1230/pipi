@@ -11,6 +11,14 @@
   - 探索路径：痛点 → 复制示例 → `~/.pi/agent/extensions/` + `/reload` 热加载试错 → 迁移进 app
 - **不当 API 中转商**：法律/合规风险、价格战、压资金、无粘性。默认 BYOK（用户自带 key），app 只做"配置便利化"（模型一键配置模板：DeepSeek/硅基流动/Kimi/智谱 + 自定义 OpenAI 兼容端点）。
 
+## 文档地图
+- `GLOSSARY.md` — 领域词汇（唯一语言；`domain-modeling` 技能只认这个文件）
+- `docs/invariants.md` — 6 条硬规则 + 稳定性契约：**引用规则时引这里**
+- `docs/architecture-decisions.md` — 52 条带日期的架构决策（决策 + 理由 + 当时定的契约）
+- `docs/adr/` — 少数需要完整「动机 / 决策 / 后果」的决策，引用时给 `file:line`
+- `docs/diagnosis/<YYYY-MM-DD>.md` — 按日期的调试记录（历史，按需读，别整读）
+- `.out-of-scope/` — 明确不做的方向（有人再提，先读这里）
+
 ## 变现
 本地免费开源（open-core）；付费点 = 远程/团队/便利功能，与 API 成本无关。
 
