@@ -21,12 +21,26 @@ export interface SessionCommand {
 
 export interface CommandsResult {
   commands: SessionCommand[];
+  /**
+   * Set when the list could NOT be read (timeout, tab gone, pi error).
+   *
+   * `commands` is then only the mirrored built-ins above — that is NOT evidence
+   * that the session has no extension commands. Any caller asking "does this
+   * session know command X?" MUST check this field first: `rpcRequest` RESOLVES
+   * `{success:false}` on timeout instead of throwing, so without this check a
+   * slow host is indistinguishable from a session with no extensions at all.
+   */
   error?: string;
 }
 
 const cache = new Map<string, { at: number; commands: SessionCommand[] }>();
 const CACHE_TTL_MS = 60_000;
-const inflight = new Map<string, Promise<SessionCommand[]>>();
+/** Budget for one `get_commands` round trip. A remote host cold-starts pi per
+ *  tab, and the app's own log shows 10-12s routinely with 20.9s / 21.5s /
+ *  89.3s outliers — hence a deliberately generous 20s. Exported so the other
+ *  `get_commands` call sites stop inventing their own (shorter) budgets. */
+export const GET_COMMANDS_TIMEOUT_MS = 20_000;
+const inflight = new Map<string, Promise<CommandsResult>>();
 
 // Mirrored from pi dist/core/slash-commands.js. RPC get_commands intentionally
 // excludes these because they are interactive-mode built-ins, but users expect
@@ -61,7 +75,9 @@ const BUILTIN_COMMANDS: SessionCommand[] = [
   { name: "quit", description: "Quit pi", source: "builtin", supportedInChat: false, sortIndex: 21 },
 ];
 
-/** Fetch (cached) the session's commands. Empty array on failure. */
+/** Fetch (cached) the session's commands. Never rejects: on failure `commands`
+ *  is the built-in mirror and `error` says why (see CommandsResult). Failures
+ *  are not cached, so the next caller re-probes. */
 export function fetchCommands(tabId: string, force = false): Promise<CommandsResult> {
   const hit = cache.get(tabId);
   if (!force && hit && Date.now() - hit.at < CACHE_TTL_MS) {
@@ -70,20 +86,27 @@ export function fetchCommands(tabId: string, force = false): Promise<CommandsRes
   let pending = inflight.get(tabId);
   if (!pending) {
     pending = window.api.tab
-      .rpcRequest(tabId, { type: "get_commands" }, 20000)
-      .then((res) => {
+      .rpcRequest(tabId, { type: "get_commands" }, GET_COMMANDS_TIMEOUT_MS)
+      .then((res): CommandsResult => {
         const raw = res.data as { commands?: unknown[] } | undefined;
-        const commands = mergeCommands(parseCommands(raw?.commands));
-        if (res.success) {
-          cache.set(tabId, { at: Date.now(), commands });
-          pruneCache();
+        // A failed response carries no list at all (the renderer's rpcRequest
+        // resolves on timeout and drops the late frame). Handing back the
+        // built-ins as if they were this session's commands is what made a
+        // timed-out probe look like "this session has no extension commands" —
+        // and upstream in TreeDialog it refused branch jumps on a host that had
+        // the extension all along. Report the failure instead; never cache it.
+        if (!res.success || !Array.isArray(raw?.commands)) {
+          return { commands: mergeCommands([]), error: res.error ?? (res.success ? "命令列表格式异常" : "命令列表请求失败") };
         }
-        return commands;
+        const commands = mergeCommands(parseCommands(raw.commands));
+        cache.set(tabId, { at: Date.now(), commands });
+        pruneCache();
+        return { commands };
       })
       .finally(() => inflight.delete(tabId));
     inflight.set(tabId, pending);
   }
-  return pending.then((commands) => ({ commands }));
+  return pending;
 }
 
 export function invalidateCommands(tabId: string): void {

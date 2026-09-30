@@ -1183,11 +1183,31 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   // Per-tab cache in commands.ts; get_commands is static per session.
   useEffect(() => {
     let cancelled = false;
-    void fetchCommands(tabId).then((r) => {
-      if (!cancelled) setCommands(r.commands);
-    });
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    // One delayed retry when the read failed. On a cold remote host get_commands
+    // takes 10-21s and can miss the 20s budget; before this, that left the slash
+    // popup and the skill chips silently showing built-ins only for the whole
+    // session (the failure was never surfaced anywhere).
+    const load = (force: boolean): void => {
+      void fetchCommands(tabId, force).then((r) => {
+        if (cancelled) return;
+        if (r.error) {
+          window.api.debug.log(
+            `[commands] tab ${tabId}: get_commands 读取失败（${r.error}）—— 扩展/skill 命令暂不可见`,
+            "warn",
+          );
+          if (!force) {
+            retry = setTimeout(() => load(true), 1500);
+            return;
+          }
+        }
+        setCommands(r.commands);
+      });
+    };
+    load(false);
     return () => {
       cancelled = true;
+      if (retry !== undefined) clearTimeout(retry);
     };
   }, [tabId]);
 
@@ -1246,7 +1266,17 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         // Does this session know the shipped extension command?
         const cmds = await window.api.tab.rpcRequest(tabId, { type: "get_commands" }, 10000);
         if (cancelled) return;
-        const known = cmds.success && Array.isArray((cmds.data as { commands?: Array<{ name?: unknown }> } | undefined)?.commands)
+        if (!cmds.success) {
+          // Used to be completely silent: this probe times out on hosts that
+          // answer get_commands in 10-21s, the config is then never pushed, and
+          // the tab keeps a stale model with nothing in the log to explain it.
+          window.api.debug.log(
+            `[commands] tab ${tabId}: get_commands 失败（${cmds.error ?? "无响应"}）—— 未调用 pipi-model-sync`,
+            "warn",
+          );
+          return;
+        }
+        const known = Array.isArray((cmds.data as { commands?: Array<{ name?: unknown }> } | undefined)?.commands)
           && ((cmds.data as { commands: Array<{ name?: unknown }> }).commands.some((c) => c?.name === "pipi-model-sync"));
         if (!known) return; // old pi / extension not synced yet — next session restart picks the config up from disk
         // Invoke it. The prompt response arrives the moment the extension
@@ -1627,7 +1657,16 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           useUiStore.getState().showToast("已重新加载扩展 / 技能 / 模板", "ok");
           // Commands may have changed — refresh the slash menu cache.
           invalidateCommands(tabId);
-          void fetchCommands(tabId, true).then((r) => setCommands(r.commands));
+          void fetchCommands(tabId, true).then((r) => {
+            // A failed read is not a command list: applying it would replace the
+            // menu with mirror built-ins, i.e. drop exactly the extension commands
+            // the reload was meant to refresh. Keep what we had.
+            if (r.error) {
+              window.api.debug.log(`[commands] tab ${tabId}: reload 后重读命令失败（${r.error}）—— 沿旧列表`, "warn");
+              return;
+            }
+            setCommands(r.commands);
+          });
         } else {
           useUiStore.getState().showToast(res.error ?? "reload 仅支持 SDK 后端", "err");
         }
