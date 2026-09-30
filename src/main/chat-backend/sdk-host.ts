@@ -30,7 +30,7 @@ import {
   type WslOpts,
 } from "../pty";
 import type { ExtensionUiRequest } from "../rpc-session";
-import { subagentEnv } from "../subagent-model";
+import { piEnv } from "../pi-env";
 
 interface PendingRequest {
   resolve: (r: { id?: string; command: string; success: boolean; data?: unknown; error?: string }) => void;
@@ -232,7 +232,7 @@ export function openSdkSession(opts: CreateTabOptions & { id?: string; agentDir:
     // across setting changes — so the subagent model travels WITH each open
     // and the worker applies it to its own process.env (see sdk-worker.ts).
     // Absent = follow the main model (the object is empty).
-    subagentEnv: subagentEnv(),
+    subagentEnv: piEnv(),
   });
   return id;
 }

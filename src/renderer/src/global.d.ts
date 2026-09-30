@@ -1,4 +1,6 @@
 // Type bridge exposed by preload via contextBridge.
+import type { ApprovalSettings } from "../../shared/approval";
+
 export {};
 
 export interface FileNode {
@@ -155,6 +157,9 @@ export interface AppSettings {
    *  the subagent follows the main session's model. */
   subagents?: SubagentModelSettings | null;
   onboarding?: { seenAt?: number; completedAt?: number };
+  /** Ask before irreversible tool calls. Always present: the main process
+   *  normalizes a missing/corrupt value to the default, never to "off". */
+  approval: ApprovalSettings;
 }
 
 export interface SubagentModelSettings {

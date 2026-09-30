@@ -10,7 +10,18 @@ import { useUiStore } from "../stores/uiStore";
 import { formatTokens, specForModel } from "../../../shared/model-specs";
 import { MODEL_PRESETS, type ModelPreset } from "../../../shared/model-presets";
 import type { ModelEditorSpec, PiApi, PiInputType, ProviderEditorConfig } from "../../../shared/model-config-types";
+import {
+  APPROVAL_POLICIES,
+  APPROVAL_POLICY_LABELS,
+  DEFAULT_APPROVAL_SETTINGS,
+  MAX_APPROVAL_TIMEOUT_SECONDS,
+  MIN_APPROVAL_TIMEOUT_SECONDS,
+  normalizeApprovalTimeoutSeconds,
+  type ApprovalPolicy,
+  type ApprovalSettings,
+} from "../../../shared/approval";
 import { Icon } from "../components/Icon";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 
 interface ModelSpecEdit extends ModelEditorSpec {}
 
@@ -82,6 +93,14 @@ function computeInitialTarget(): ModelTarget {
 }
 
 export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
+  /**
+   * 闪退 fix (2026-09-28). Was `<div className="dialog-overlay" onClick={onClose}>`:
+   * select text in a field, release the mouse past the dialog's edge, and the
+   * browser dispatches `click` on the OVERLAY (a click's target is the common
+   * ancestor of press and release) — the dialog closed mid-edit while the app
+   * stayed alive. Now the gesture must START and END on the backdrop.
+   */
+  const overlayDismiss = useOverlayDismiss(onClose);
   const tabs = useTabsStore((s) => s.tabs);
   const activeTab = useTabsStore((s) => s.activeTab);
   const remoteHistory = useSessionsStore((s) => s.remoteHistory);
@@ -110,6 +129,16 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [subagentChoices, setSubagentChoices] = useState<ModelConfigItem[]>([]);
   const [subagentSel, setSubagentSel] = useState("");
   const [subagentLoaded, setSubagentLoaded] = useState(false);
+  /** Approval gate (docs/adr/0003-approval-gate.md). Also global, for the same
+   *  reason: it is injected into every pi the app spawns, on every target. */
+  const [approval, setApproval] = useState<ApprovalSettings>(DEFAULT_APPROVAL_SETTINGS);
+  const [approvalLoaded, setApprovalLoaded] = useState(false);
+  /** The timeout is edited as text and committed on blur/Enter: clamping on
+   *  every keystroke would fight the user mid-number (typing "5" on the way to
+   *  "50" clamps to the 10s minimum and overwrites what they typed). */
+  const [approvalTimeoutText, setApprovalTimeoutText] = useState(
+    String(DEFAULT_APPROVAL_SETTINGS.timeoutSeconds),
+  );
 
   const resetModelForm = useCallback(() => {
     setModelName("");
@@ -221,7 +250,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Subagent model: independent of the selected target (global setting).
+  // Subagent model + approval gate: both are global settings, independent of
+  // the selected target (the target only decides which models.json is edited).
   useEffect(() => {
     void (async () => {
       try {
@@ -232,8 +262,13 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         setSubagentChoices(list);
         const s = settings?.subagents;
         setSubagentSel(s?.model ? `${s.provider ?? ""}\u0000${s.model}` : "");
+        if (settings?.approval) {
+          setApproval(settings.approval);
+          setApprovalTimeoutText(String(settings.approval.timeoutSeconds));
+        }
       } finally {
         setSubagentLoaded(true);
+        setApprovalLoaded(true);
       }
     })();
   }, []);
@@ -266,6 +301,52 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     },
     [busyAction],
   );
+
+  /** Persist the approval gate (global app setting, not part of models.json). */
+  const handleApprovalPolicyChange = useCallback(
+    async (policy: ApprovalPolicy) => {
+      if (busyAction) return;
+      setBusyAction("approval");
+      try {
+        const next = await window.api.settings.set({ approval: { ...approval, policy } });
+        setApproval(next.approval);
+        setApprovalTimeoutText(String(next.approval.timeoutSeconds));
+        showToast(`审批门：${APPROVAL_POLICY_LABELS[next.approval.policy]}`, "ok");
+      } catch (error) {
+        showToast(`审批门保存失败：${error instanceof Error ? error.message : String(error)}`, "err");
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [approval, busyAction],
+  );
+
+  /** Commit the timeout field (blur / Enter). Reverts the text on failure, so
+   *  the box never shows a value the app did not actually accept. */
+  const commitApprovalTimeout = useCallback(async () => {
+    // Another action owns the dialog right now. Do not save — but do put the text
+    // back, because the box must never display a value the app did not accept
+    // (the input is disabled while busy, and that disable-triggered blur lands here).
+    if (busyAction) {
+      setApprovalTimeoutText(String(approval.timeoutSeconds));
+      return;
+    }
+    const wanted = normalizeApprovalTimeoutSeconds(approvalTimeoutText, approval.timeoutSeconds);
+    setApprovalTimeoutText(String(wanted));
+    if (wanted === approval.timeoutSeconds) return;
+    setBusyAction("approval");
+    try {
+      const next = await window.api.settings.set({ approval: { ...approval, timeoutSeconds: wanted } });
+      setApproval(next.approval);
+      setApprovalTimeoutText(String(next.approval.timeoutSeconds));
+      showToast(`审批门：${next.approval.timeoutSeconds} 秒无人应答将视为拒绝`, "ok");
+    } catch (error) {
+      setApprovalTimeoutText(String(approval.timeoutSeconds));
+      showToast(`审批门保存失败：${error instanceof Error ? error.message : String(error)}`, "err");
+    } finally {
+      setBusyAction(null);
+    }
+  }, [approval, approvalTimeoutText, busyAction]);
 
   const handleDiscoverModels = useCallback(async () => {
     if (!modelBaseUrl.trim()) {
@@ -330,7 +411,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   );
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">模型配置</div>
         <div className="dialog-body">
@@ -388,6 +469,51 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
             </select>
             <span className="dialog-hint">
               作用于被委派的子代理进程（本地/WSL/远程均适用）；改后对新开的会话生效，正在运行的标签需重开。
+            </span>
+          </div>
+
+          {/* 审批门：同样是全局设置（注入到 app 启动的每一个 pi），与下方写入目标无关 */}
+          <div className="dialog-section">
+            <div className="section-title">
+              审批门 <span className="dialog-hint">（不可逆操作执行前先问一句；默认开启）</span>
+            </div>
+            <div className="form-grid-2">
+              <label>
+                拦截范围
+                <select
+                  className="dialog-input"
+                  value={approval.policy}
+                  disabled={!approvalLoaded || busyAction !== null}
+                  onChange={(e) => void handleApprovalPolicyChange(e.target.value as ApprovalPolicy)}
+                >
+                  {APPROVAL_POLICIES.map((p) => (
+                    <option key={p} value={p}>
+                      {APPROVAL_POLICY_LABELS[p]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                无人应答的等待上限（秒）
+                <input
+                  className="dialog-input"
+                  type="number"
+                  min={MIN_APPROVAL_TIMEOUT_SECONDS}
+                  max={MAX_APPROVAL_TIMEOUT_SECONDS}
+                  step={10}
+                  value={approvalTimeoutText}
+                  disabled={!approvalLoaded || busyAction !== null || approval.policy === "off"}
+                  onChange={(e) => setApprovalTimeoutText(e.target.value)}
+                  onBlur={() => void commitApprovalTimeout()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void commitApprovalTimeout();
+                  }}
+                />
+              </label>
+            </div>
+            <span className="dialog-hint">
+              覆盖 bash / write / edit 三类工具调用（本地 / WSL / 远程均适用），改后对新开的会话生效。
+              它挡不住扩展自己直接执行的命令（如 pi-rewind 的 git add），也不能替代沙箱 —— 是速度缓冲，不是安全边界。
             </span>
           </div>
 

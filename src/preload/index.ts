@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { ModelEditorSpec, ProviderEditorConfig } from "../shared/model-config-types";
+import type { ApprovalSettings } from "../shared/approval";
 
 export interface FileReadResult {
   content: string;
@@ -380,9 +381,9 @@ const api = {
   },
 
   settings: {
-    get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }> =>
+    get: (): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number }; approval: ApprovalSettings }> =>
       ipcRenderer.invoke("settings:get"),
-    set: (patch: { autoFollow?: { enabled?: boolean; followReads?: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number } }> =>
+    set: (patch: { autoFollow?: { enabled?: boolean; followReads?: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number }; approval?: Partial<ApprovalSettings> }): Promise<{ autoFollow: { enabled: boolean; followReads: boolean }; subagents?: { provider?: string; model: string } | null; onboarding?: { seenAt?: number; completedAt?: number }; approval: ApprovalSettings }> =>
       ipcRenderer.invoke("settings:set", patch),
   },
 

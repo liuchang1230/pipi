@@ -16,7 +16,7 @@ import { spawnSync, spawn, type ChildProcess } from "node:child_process";
 import { delimiter, dirname, join, posix } from "node:path";
 import { sessionDirFor } from "./session-list";
 import { debugLog } from "./debug-log";
-import { subagentEnv, subagentShellPrefix } from "./subagent-model";
+import { piEnv, piShellPrefix } from "./pi-env";
 import { parseWslDistroList, type WslDistro } from "./wsl";
 import { themeEnv } from "./theme-sync";
 import { TERMINAL_THEMES, type ThemeMode } from "../shared/terminal-theme";
@@ -1420,7 +1420,7 @@ export function createTab(opts: CreateTabOptions): string {
       cwd: opts.cwd,
       env: {
         ...process.env,
-        ...subagentEnv(),
+        ...piEnv(),
         TERM: "xterm-256color",
         COLORTERM: "truecolor",
         ...themeEnv(mode),
@@ -1717,7 +1717,7 @@ function sessionArg(sessionPath: string): string {
     ` export PIPI_S="$(printf %s ${b64} | base64 -d 2>/dev/null || printf %s ${b64} | base64 -D 2>/dev/null)";` +
     // The subagent-model env must sit directly in front of `pi` (the agent
     // extensions inherit the pi process env; ssh/WSL do not forward ours).
-    ` ${subagentShellPrefix()}pi \${PIPI_S:+--session "$PIPI_S"}; exec bash -i`
+    ` ${piShellPrefix()}pi \${PIPI_S:+--session "$PIPI_S"}; exec bash -i`
   );
 }
 
@@ -1754,7 +1754,7 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
   // notice when pi is not installed in the distro.
   const inner = linuxSessionPath
     ? sessionArg(linuxSessionPath)
-    : `if command -v pi >/dev/null 2>&1; then ${subagentShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
+    : `if command -v pi >/dev/null 2>&1; then ${piShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
 
   const wslBin = findWslBin();
   const wslArgs = [
@@ -1863,7 +1863,7 @@ function createRemoteTab(id: string, opts: CreateTabOptions): string {
     : opts.sessionPath
       // sessionArg already ends with the `pi ...` invocation.
       ? sessionArg(opts.sessionPath)
-      : `if command -v pi >/dev/null 2>&1; then ${subagentShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
+      : `if command -v pi >/dev/null 2>&1; then ${piShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
   const remoteCmd = `cd ${shellPath} && bash -ic '${modeEnv}${agentDirEnv} ${inner}'`;
   sshArgs.push(remoteCmd);
 

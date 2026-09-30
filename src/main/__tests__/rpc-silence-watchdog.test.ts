@@ -59,4 +59,46 @@ describe("SilenceWatchdog", () => {
     w.arm(T0 + 5_000);
     expect(w.take(T0 + 5_000 + SEND_SILENCE_MS)).toBe(SEND_SILENCE_MS);
   });
+
+  // While pi is blocked inside a confirm/select/input it emits NOTHING, so long
+  // silence is not evidence of a dead pipe. It is still bounded: a request the
+  // user never answers must not mute liveness detection for the rest of the
+  // session (the caller's deadline is what bounds it — see hasPendingUiDialog).
+  describe("excused silence (a dialog is waiting for the user)", () => {
+    it("renews the window instead of reporting", () => {
+      const w = new SilenceWatchdog();
+      w.arm(T0);
+      expect(w.take(T0 + SEND_SILENCE_MS, SEND_SILENCE_MS, true)).toBeNull();
+      expect(w.armed).toBe(true);
+      // The renewal restarts the clock from NOW, so the next window is a full one.
+      expect(w.take(T0 + SEND_SILENCE_MS + 1, SEND_SILENCE_MS, true)).toBeNull();
+      expect(w.take(T0 + 2 * SEND_SILENCE_MS, SEND_SILENCE_MS, false)).toBe(SEND_SILENCE_MS);
+    });
+
+    it("defers, but never loses, the report once the excuse is gone", () => {
+      const w = new SilenceWatchdog();
+      w.arm(T0);
+      w.take(T0 + SEND_SILENCE_MS, SEND_SILENCE_MS, true);
+      // The renewal restarted the clock, so the outage is reported one window
+      // later and measured from the renewal — a bounded delay, not a blind spot:
+      // hasPendingUiDialog caps the excuse at UI_DIALOG_MAX_WAIT_MS.
+      expect(w.take(T0 + 2 * SEND_SILENCE_MS - 1, SEND_SILENCE_MS, false)).toBeNull();
+      expect(w.take(T0 + 2 * SEND_SILENCE_MS, SEND_SILENCE_MS, false)).toBe(SEND_SILENCE_MS);
+    });
+
+    it("does not arm the watchdog on its own", () => {
+      const w = new SilenceWatchdog();
+      expect(w.armed).toBe(false);
+      expect(w.take(T0 + SEND_SILENCE_MS, SEND_SILENCE_MS, true)).toBeNull();
+      expect(w.armed).toBe(false);
+    });
+
+    it("reports normally once bytes arrive, excuse or not", () => {
+      const w = new SilenceWatchdog();
+      w.arm(T0);
+      w.noteBytes();
+      expect(w.take(T0 + SEND_SILENCE_MS, SEND_SILENCE_MS, true)).toBeNull();
+      expect(w.armed).toBe(false);
+    });
+  });
 });

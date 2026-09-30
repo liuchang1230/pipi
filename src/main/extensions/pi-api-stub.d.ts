@@ -12,12 +12,20 @@ declare module "@earendil-works/pi-coding-agent" {
 
   export interface ExtensionContext {
     hasUI: boolean;
+    /** Working directory of the session (docs/extensions.md 「ctx.cwd」). Used by
+     *  the approval gate to spot a write that leaves the project. */
+    cwd: string;
     ui: {
       setWorkingIndicator(options?: WorkingIndicatorOptions): void;
       notify(message: string, type?: "info" | "warning" | "error"): Promise<void>;
-      /** Dialogs resolve via the extension_ui sub-protocol (rpc.md). */
+      /** Dialogs resolve via the extension_ui sub-protocol (rpc.md).
+       *
+       *  `opts.timeout` (ms) auto-dismisses with a countdown but returns the SAME
+       *  value as a user cancel; pass `opts.signal` instead to tell "the user said
+       *  no" from "nobody was there" (docs/extensions.md 「Return values on
+       *  timeout」). The approval gate needs that distinction, so it uses signal. */
       select(title: string, options: string[]): Promise<string | undefined>;
-      confirm(title: string, message: string): Promise<boolean>;
+      confirm(title: string, message: string, opts?: { timeout?: number; signal?: AbortSignal }): Promise<boolean>;
       editor(title: string, prefill?: string): Promise<string | undefined>;
       setStatus(key: string, text: string | undefined): void;
       setWidget(key: string, content: string[] | undefined): void;

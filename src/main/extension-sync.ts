@@ -27,6 +27,7 @@ import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
 import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
+import approvalGateSource from "./extensions/pipi-approval-gate.ts?raw";
 
 const AGENT_HOME = join(homedir(), ".pi", "agent");
 const EXTENSIONS_DIR = join(AGENT_HOME, "extensions");
@@ -41,6 +42,7 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
   { fileName: "pipi-model-sync.ts", content: modelSyncSource },
   { fileName: "pipi-subagent-model.ts", content: subagentModelSource },
+  { fileName: "pipi-approval-gate.ts", content: approvalGateSource },
 ];
 
 /**

@@ -16,10 +16,9 @@
  * foreign extension without the marker is returned verbatim as the headline,
  * so nothing is lost and nothing is invented.
  *
- * The app no longer ships any extension that requests confirmation (the
- * plan/edit modes were removed — the app is vanilla pi now), so this module
- * today only formats requests coming from user-installed extensions.
- */
+ * The app now ships exactly one extension that asks (pipi-approval-gate.ts,
+ * docs/adr/0003-approval-gate.md), and it writes this format; anything without
+ * the marker is a user-installed extension and is passed through untouched. */
 
 /** Literal marker separating the plain sentence from the raw detail. */
 export const CONFIRM_DETAIL_MARKER = "详情（供核对）";

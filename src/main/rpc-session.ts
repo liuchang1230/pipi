@@ -24,7 +24,7 @@ import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
 import { debugLog, debugLogDebug, debugLogWarn } from "./debug-log";
 import { isSshAuthError } from "./sftp-failure";
-import { subagentEnv, subagentShellPrefix } from "./subagent-model";
+import { piEnv, piShellPrefix } from "./pi-env";
 import {
   closeTab, createTab, getGlobalPiBin, getTab, linkTabSession, markTabRemoteDown, markTabRemoteReady, registerExternalTab, setTabTitle, unregisterExternalTab,
   type CreateTabOptions, type RemoteOpts, type TabInfo, type WslOpts,
@@ -49,11 +49,11 @@ class ChildProcessTransport implements RpcTransport {
   constructor(file: string, args: string[], cwd: string | undefined, label: string) {
     this.proc = spawn(file, args, {
       cwd,
-      // subagentEnv(): the local `node cli.js --mode rpc` child must carry
+      // piEnv(): the local `node cli.js --mode rpc` child must carry
       // PI_PROVIDER/PI_MODEL so delegated agents inherit the configured
       // subagent model. (wsl.exe/ssh.exe ignore them; their remote commands
       // get the env via subagentShellPrefix instead.)
-      env: { ...process.env, ...subagentEnv() },
+      env: { ...process.env, ...piEnv() },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -276,7 +276,7 @@ function sessionArg(sessionPath: string): string {
     // Subagent-model env directly in front of `pi`: the delegated-agent
     // extensions inherit the pi process env, and neither ssh exec nor WSL
     // forwards our Windows env.
-    ` ${subagentShellPrefix()}pi --mode rpc \${PIPI_S:+--session "$PIPI_S"}`
+    ` ${piShellPrefix()}pi --mode rpc \${PIPI_S:+--session "$PIPI_S"}`
   );
 }
 
@@ -299,6 +299,28 @@ function wslSessionToLinux(distro: string, sessionPath: string): string {
  * gone rather than busy.
  */
 export const SEND_SILENCE_MS = 90000;
+
+/**
+ * How long silence may be excused because pi is blocked inside a user dialog.
+ *
+ * While pi waits on a confirm/select/input it emits NOTHING — so the silence
+ * probe above would call a perfectly healthy connection dead. That is not
+ * hypothetical: the approve gate is a `confirm` on every irreversible tool
+ * call, and UiDialog lets the user MINIMISE the dialog and keep reading the
+ * conversation, so minutes of legitimate quiet are expected.
+ *
+ * The excuse is bounded: an orphaned request (tab closed mid-dialog, pi
+ * resolved its own timeout) must not disable liveness detection for the rest
+ * of the session. Must outlast every dialog the app can raise — the approval
+ * gate's own 120s confirm timeout plus slack for the user to read it.
+ */
+export const UI_DIALOG_MAX_WAIT_MS = 240000;
+
+/** Dialog methods that BLOCK pi until the client answers (rpc-mode's
+ *  createDialogPromise). Fire-and-forget methods (notify, setStatus, setTitle,
+ *  setWidget, set_editor_text) are deliberately absent: pi keeps working, so
+ *  silence after one of those still means a dead pipe. */
+export const UI_REPLY_METHODS = new Set(["confirm", "select", "input", "editor"]);
 
 /**
  * Round trip above which a response is worth a line at the DEFAULT log level.
@@ -326,11 +348,28 @@ export class SilenceWatchdog {
     this.since = null;
   }
 
-  /** Silent duration in ms when the window elapsed (and disarm), else null. */
-  take(now: number, limit = SEND_SILENCE_MS): number | null {
+  /** Is a window currently running? */
+  get armed(): boolean {
+    return this.since !== null;
+  }
+
+  /**
+   * Silent duration in ms when the window elapsed (and disarm), else null.
+   *
+   * `quietExpected` covers the one case where long silence is NOT evidence of a
+   * dead pipe: pi is blocked inside a user dialog and cannot emit a byte until
+   * it is answered. A window that elapses while that is true is RENEWED rather
+   * than reported, so a user studying a diff is never shown "connection lost".
+   * The caller bounds how long that can go on (UI_DIALOG_MAX_WAIT_MS).
+   */
+  take(now: number, limit = SEND_SILENCE_MS, quietExpected = false): number | null {
     if (this.since === null) return null;
     const elapsed = now - this.since;
     if (elapsed < limit) return null;
+    if (quietExpected) {
+      this.since = now;
+      return null;
+    }
     this.since = null;
     return elapsed;
   }
@@ -373,6 +412,9 @@ export class RpcSession {
   /** Zero-output watchdog state (see constructor). */
   private sawOutput = false;
   private noOutputTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Dialog id → deadline, for ui requests pi is blocked on (see
+   *  UI_DIALOG_MAX_WAIT_MS). Non-empty means silence is expected. */
+  private readonly awaitingUi = new Map<string, number>();
   /** Last stderr from the remote pi (kept bounded for the exit banner). */
   private lastStderr = "";
   /** Non-JSONL bytes received (e.g. a .bashrc echo or "command not found")
@@ -402,7 +444,7 @@ export class RpcSession {
     if (opts.wsl) {
       const inner = opts.sessionPath
         ? sessionArg(wslSessionToLinux(opts.wsl.distro, opts.sessionPath))
-        : `${subagentShellPrefix()}pi --mode rpc`;
+        : `${piShellPrefix()}pi --mode rpc`;
       const wslBin = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "wsl.exe");
       const wslCmd = `cd ${cdArg(opts.wsl.path || "~")} && ${inner}`;
       debugLog("rpc", `tab ${id} CMD wsl=${opts.wsl.distro} ${JSON.stringify(wslCmd)}`);
@@ -417,7 +459,7 @@ export class RpcSession {
       // Pi derives sessions from agentDir/sessions/<encoded-cwd>; do not pass
       // a flat session directory or the app's session index cannot find them.
       const agentDirEnv = r.agentDir ? `export PI_CODING_AGENT_DIR=${r.agentDir}; ` : "";
-      const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : `${subagentShellPrefix()}pi --mode rpc`;
+      const inner = opts.sessionPath ? sessionArg(opts.sessionPath) : `${piShellPrefix()}pi --mode rpc`;
       const remoteCmd = `cd ${cdArg(r.path || "~")} && bash -ic '${agentDirEnv}${inner}'`;
       debugLog("rpc", `tab ${id} CMD ssh=${r.user}@${r.host} ${JSON.stringify(remoteCmd)}`);
       if (r.password) {
@@ -496,7 +538,13 @@ export class RpcSession {
     // Zero-output watchdog: a password remote whose auth/exec stalls (wrong
     // password hangs in ssh2, bash -ic blocks on a slow .bashrc, pi missing)
     // produces NOT A SINGLE BYTE and never answers any command — the renderer
-    // would otherwise spin forever. 40s is generous (remote pi boots 15-20s).
+    // would otherwise spin forever. 40s is generous: measured remote boot
+    // (08-21→09-24, n=204) was p50 3.5s / max 16.2s, and 19.8s during the
+    // Sep-24 degradation. That degradation turned out NOT to be SSH/network:
+    // pi's rewind extension snapshots the whole worktree with `git add --all`
+    // on every session start, and the project had ~196 untracked drone photos
+    // (1.6GB) just under its 200-file guard. See
+    // docs/adr/0002-remote-rpc-process-pool.md §结案.
     this.noOutputTimer = setTimeout(() => {
       this.noOutputTimer = null;
       if (this.exited || this.sawOutput) return;
@@ -525,6 +573,11 @@ export class RpcSession {
       debugLogWarn("rpc", `tab ${this.id} SEND ${String(cmd.type)} DROPPED (exited=${this.exited} writable=${this.transport.stdin.writable})`);
       return false;
     }
+    // The user answered a dialog: pi is about to run again, so silence goes back
+    // to meaning "dead pipe" (see armSilenceWatchdog).
+    if (cmd.type === "extension_ui_response" && cmd.id !== undefined) {
+      this.awaitingUi.delete(String(cmd.id));
+    }
     // Per-message sends are debug (they were 26k of the log's lines); what
     // matters at the default level is the round trip, logged on the response.
     debugLogDebug("rpc", `tab ${this.id} SEND ${String(cmd.type)}${cmd.id ? ` id=${String(cmd.id)}` : ""}`);
@@ -551,6 +604,18 @@ export class RpcSession {
   }
 
   /**
+   * Is pi blocked on a user dialog right now? Expired entries (the user never
+   * answered and pi resolved its own timeout) are swept here, so one orphaned
+   * request cannot mute liveness detection forever.
+   */
+  private hasPendingUiDialog(now: number): boolean {
+    for (const [id, deadline] of this.awaitingUi) {
+      if (now >= deadline) this.awaitingUi.delete(id);
+    }
+    return this.awaitingUi.size > 0;
+  }
+
+  /**
    * Post-boot liveness: a command written while the pipe is dead (silently
    * dropped TCP, wedged remote process) reports `writable === true` and then
    * NOTHING comes back — no response frame, no exit event. The boot-time
@@ -563,8 +628,14 @@ export class RpcSession {
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = null;
       if (this.exited) return;
-      const silentMs = this.silence.take(Date.now());
-      if (silentMs === null) return;
+      const now = Date.now();
+      const silentMs = this.silence.take(now, SEND_SILENCE_MS, this.hasPendingUiDialog(now));
+      if (silentMs === null) {
+        // Nothing was armed, or the window was renewed because pi is waiting on
+        // the user. Keep watching: a later window is the one that can report.
+        if (this.silence.armed) this.armSilenceWatchdog();
+        return;
+      }
       console.error(`[rpc] tab ${this.id} no bytes for ${Math.round(silentMs / 1000)}s after a command — connection presumed dead`);
       debugLogWarn("rpc", `tab ${this.id} UNRESPONSIVE ${Math.round(silentMs / 1000)}s stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-400))}`);
       forwardEvent(this.id, {
@@ -644,7 +715,14 @@ export class RpcSession {
       return;
     }
     if (type === "extension_ui_request") {
-      onUiRequest?.(this.id, msg as unknown as ExtensionUiRequest);
+      const req = msg as unknown as ExtensionUiRequest;
+      // A blocking dialog means pi will emit NOTHING until it is answered.
+      // Register it so the silence watchdog excuses the quiet — and not a
+      // second longer than UI_DIALOG_MAX_WAIT_MS.
+      if (UI_REPLY_METHODS.has(String(req.method))) {
+        this.awaitingUi.set(String(req.id), Date.now() + UI_DIALOG_MAX_WAIT_MS);
+      }
+      onUiRequest?.(this.id, req);
       return;
     }
     forwardEvent(this.id, msg);
@@ -735,7 +813,7 @@ export function createRpcTab(opts: CreateTabOptions): string {
   if (remote) tab.remoteKey = `${remote.user}@${remote.host}:${remote.port ?? 22}${remote.agentDir ? `[${remote.agentDir}]` : ""}`;
   registerExternalTab(tab);
   // App-level boot stage: lets the chat UI show the actual connect phase
-  // instead of an opaque spinner (remote pi can take 15-20s to boot).
+  // instead of an opaque spinner (measured p50 3.5s, worst ~20s).
   forwardEvent(id, { type: "app_phase", phase: "connecting" });
 
   const session = new RpcSession(id, opts);
@@ -746,7 +824,11 @@ export function createRpcTab(opts: CreateTabOptions): string {
   // the sidebar list there); the watcher is a no-op for remote/wsl tabs.
   session.request<{ sessionFile?: string; sessionName?: string; thinkingLevel?: string | null; model?: { id?: string; name?: string; provider?: string } | null }>(
     { type: "get_state" },
-    // WSL/remote pi boots slowly (wsl.exe chain + pi startup can take 15-20s).
+    // WSL/remote pi boots slowly (wsl.exe chain + pi startup). Measured p50
+    // 3.5s / max 16.2s; the budget below is the ceiling, not the expectation.
+    // Note: a pi that never answers may be blocked in an extension's startup
+    // work rather than in SSH — check for child processes of pi (see
+    // docs/adr/0002-remote-rpc-process-pool.md §结案).
     remote || wsl ? 40000 : 15000
   ).then((res) => {
     const data = res.data;

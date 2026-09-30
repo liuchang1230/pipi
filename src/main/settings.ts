@@ -1,12 +1,24 @@
 /**
  * App settings persisted to userData/settings.json.
  *
- * Currently holds auto-follow preferences for the right-panel viewer.
+ * Holds auto-follow preferences for the right-panel viewer and the approval
+ * gate that decides which tool calls have to be confirmed (docs/adr/0003).
  * Keep this module self-contained: read → merge defaults → write.
  */
 import { app } from "electron";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { ApprovalSettings } from "../shared/approval";
+import {
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_APPROVAL_SETTINGS,
+  normalizeApprovalPolicy,
+  normalizeApprovalTimeoutSeconds,
+} from "../shared/approval";
+
+// The shape lives in src/shared/approval.ts so preload + renderer can name it
+// without importing this module (which pulls in electron `app`).
+export type { ApprovalSettings };
 import { readJsonRecoverable, writeJsonAtomic } from "./json-store";
 
 export interface AutoFollowSettings {
@@ -31,10 +43,15 @@ export interface AppSettings {
   /** Backend selection for local pi tabs: "rpc" forces the old child-process
    *  backend; unset/undefined uses the in-process SDK worker. */
   pipi?: { backend?: "rpc" };
+  /** Ask before irreversible tool calls (docs/adr/0003-approval-gate.md).
+   *  Absent in an old settings.json → the default policy, deliberately: the
+   *  gate is the feature, so "unknown" must not mean "off". */
+  approval: ApprovalSettings;
 }
 
 const DEFAULTS: AppSettings = {
   autoFollow: { enabled: true, followReads: true },
+  approval: { ...DEFAULT_APPROVAL_SETTINGS },
 };
 
 function settingsPath(): string {
@@ -42,7 +59,7 @@ function settingsPath(): string {
 }
 
 function cloneDefaults(): AppSettings {
-  return { autoFollow: { ...DEFAULTS.autoFollow } };
+  return { autoFollow: { ...DEFAULTS.autoFollow }, approval: { ...DEFAULTS.approval } };
 }
 
 export function getSettings(): AppSettings {
@@ -64,6 +81,16 @@ export function getSettings(): AppSettings {
     },
     subagents: normalizeSubagents(r.subagents),
     onboarding: r.onboarding,
+    approval: normalizeApproval(r.approval),
+  };
+}
+
+/** Keep only a usable policy + timeout; anything else means the default. */
+function normalizeApproval(value: unknown): ApprovalSettings {
+  const v = (value ?? {}) as { policy?: unknown; timeoutSeconds?: unknown };
+  return {
+    policy: normalizeApprovalPolicy(v.policy, DEFAULT_APPROVAL_POLICY),
+    timeoutSeconds: normalizeApprovalTimeoutSeconds(v.timeoutSeconds),
   };
 }
 
@@ -92,6 +119,9 @@ export function updateSettings(patch: Partial<AppSettings>): AppSettings {
     // keeps the previous value. JSON.stringify then drops the key entirely.
     subagents: patch.subagents === undefined ? prev.subagents : (normalizeSubagents(patch.subagents) ?? undefined),
     onboarding: patch.onboarding ? { ...prev.onboarding, ...patch.onboarding } : prev.onboarding,
+    // Merged field-by-field so a partial patch cannot silently reset the
+    // timeout to a default the user never chose.
+    approval: normalizeApproval({ ...prev.approval, ...(patch.approval ?? {}) }),
   };
   writeJsonAtomic(settingsPath(), next);
   return next;
