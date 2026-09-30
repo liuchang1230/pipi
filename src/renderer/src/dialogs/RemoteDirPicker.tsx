@@ -8,8 +8,12 @@ import { useUiStore } from "../stores/uiStore";
 import type { FileNode } from "../stores/types";
 import type { TargetRef } from "../stores/remote-target";
 import { Icon } from "../components/Icon";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 
 export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClose: () => void }) {
+  // Press AND release on the backdrop (see overlay-dismiss.ts) — a drag from the
+  // path field out of the dialog must not cancel the picker.
+  const overlayDismiss = useOverlayDismiss(onClose);
   const [pickerPath, setPickerPath] = useState("~");
   const [pickerEntries, setPickerEntries] = useState<FileNode[]>([]);
   const [pickerLoading, setPickerLoading] = useState(false);
@@ -73,7 +77,7 @@ export function RemoteDirPicker({ target, onClose }: { target: TargetRef; onClos
   }, [pickerSelectInner]);
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog" onClick={(e) => e.stopPropagation()} style={{ width: 480 }}>
         <div className="dialog-title">选择项目目录</div>
         <div className="dialog-body">

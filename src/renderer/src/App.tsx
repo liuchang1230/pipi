@@ -213,6 +213,20 @@ export default function App() {
 
   // --- Dialog open flags (dialogs own their state internally) -------------
   const [showModelConfig, setShowModelConfig] = useState(false);
+  /**
+   * The 模型配置 dialog has two openers: this local flag (onboarding / no-key
+   * guidance) and `uiStore.appDialog === "model-config"` (/settings from chat).
+   * They used to mount the dialog TWICE, so whenever both were true the user got
+   * two live instances — two `model:list` fetches and two sets of subscriptions
+   * over the same store. One flag, one mount, one close handler for both.
+   */
+  const appDialog = useUiStore((s) => s.appDialog);
+  const modelConfigOpen = showModelConfig || appDialog === "model-config";
+  const closeModelConfig = useCallback(() => {
+    setShowModelConfig(false);
+    const ui = useUiStore.getState();
+    if (ui.appDialog === "model-config") ui.closeAppDialog();
+  }, []);
   const [showRemote, setShowRemote] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showRemotePicker, setShowRemotePicker] = useState(false);
@@ -688,9 +702,7 @@ export default function App() {
         onSkip={skipOnboarding}
         onComplete={completeOnboarding}
       />
-      {showModelConfig && <ModelConfigDialog onClose={() => setShowModelConfig(false)} />}
-      {/* /settings from chat opens the model config dialog via uiStore. */}
-      {useUiStore((s) => s.appDialog) === "model-config" && <ModelConfigDialog onClose={() => useUiStore.getState().closeAppDialog()} />}
+      {modelConfigOpen && <ModelConfigDialog onClose={closeModelConfig} />}
       {/* pi agent auto-install progress — main-driven, self-contained. */}
       <PiInstallDialog />
       {showRemote && <RemoteDialog onClose={() => setShowRemote(false)} />}

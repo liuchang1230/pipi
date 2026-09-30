@@ -4,6 +4,7 @@
 // retries, and (opt-in) remembers it for the next connect.
 import { useState } from "react";
 import { Icon } from "../components/Icon";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 import type { RemoteProfileTarget } from "../stores/remote-target";
 
 export interface RemotePasswordRequest {
@@ -23,12 +24,20 @@ export function RemotePasswordDialog({
   onSubmit: (password: string, remember: boolean) => void;
   onCancel: () => void;
 }) {
+  // Press AND release on the backdrop (see overlay-dismiss.ts) — a password typed
+  // into the field must not be cancelled by releasing the mouse outside the dialog.
+  // The backdrop dismisses only when the probe is not in flight: the 取消 button is
+  // `disabled={busy}`, and dismissing mid-probe lets a late failure re-open the
+  // dialog (submitLogin re-sets loginRequest on completion).
+  const overlayDismiss = useOverlayDismiss(() => {
+    if (!busy) onCancel();
+  });
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(false);
   const { remote } = request;
   const label = `${remote.user}@${remote.host}${remote.port && remote.port !== 22 ? `:${remote.port}` : ""}`;
   return (
-    <div className="dialog-overlay" onClick={onCancel}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">远程登录</div>
         <div className="dialog-body">

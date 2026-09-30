@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { splitConfirmMessage } from "../../../shared/confirm-detail";
 import { useUiStore } from "../stores/uiStore";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 
 export interface UiRequest {
   id: string;
@@ -105,6 +106,10 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
     onClose();
   };
   const cancel = () => respond({ cancelled: true });
+  // Backdrop dismissal needs a press AND a release on the backdrop
+  // (overlay-dismiss.ts): pressing inside a long plan/confirm body and releasing
+  // outside used to cancel the request mid-read.
+  const overlayDismiss = useOverlayDismiss(cancel);
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
       e.stopPropagation();
@@ -128,7 +133,7 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
     req.method === "confirm" && splitConfirmMessage(req.message ?? "").detail !== undefined;
 
   return (
-    <div className={`dialog-overlay ui-dialog-overlay${minimized ? " minimized" : ""}`} onClick={cancel}>
+    <div className={`dialog-overlay ui-dialog-overlay${minimized ? " minimized" : ""}`} {...overlayDismiss}>
       <div
         className={`dialog ui-dialog${minimized ? " minimized" : ""}`}
         onClick={(e) => e.stopPropagation()}

@@ -9,6 +9,7 @@
  */
 import { useState } from "react";
 import { useFailureStore, type FailureRecord } from "../stores/failureStore";
+import { useOverlayDismiss } from "./overlay-dismiss";
 
 function copyableLine(f: FailureRecord): string {
   const when = new Date(f.at).toISOString();
@@ -20,6 +21,9 @@ function copyableLine(f: FailureRecord): string {
 export function FailureCenter() {
   const failures = useFailureStore((s) => s.failures);
   const [open, setOpen] = useState(false);
+  // Backdrop dismissal needs a press AND a release on the backdrop itself, else a
+  // text selection dragged past the dialog edge closes it (overlay-dismiss.ts).
+  const overlayDismiss = useOverlayDismiss(() => setOpen(false));
   const newest = failures[0];
   if (!newest) return null;
 
@@ -61,7 +65,7 @@ export function FailureCenter() {
       </div>
 
       {open && (
-        <div className="dialog-overlay" onClick={() => setOpen(false)}>
+        <div className="dialog-overlay" {...overlayDismiss}>
           <div className="dialog" onClick={(e) => e.stopPropagation()} style={{ width: 640 }}>
             <div className="dialog-title">最近的失败（{failures.length}）</div>
             <div className="dialog-body failure-list">

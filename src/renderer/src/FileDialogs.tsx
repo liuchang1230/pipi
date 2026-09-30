@@ -1,6 +1,7 @@
 // Small UI primitives for the file tree: right-click context menu + prompt/confirm dialogs.
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Icon, type IconName } from "./components/Icon";
+import { useOverlayDismiss } from "./components/overlay-dismiss";
 
 export interface CtxMenuItem {
   label: string;
@@ -99,8 +100,11 @@ export function PromptDialog({
     const v = value.trim();
     if (v) onConfirm(v);
   };
+  // Press AND release on the backdrop (overlay-dismiss.ts): selecting the text in
+  // the field and releasing outside must not cancel the prompt.
+  const overlayDismiss = useOverlayDismiss(onCancel);
   return (
-    <div className="dialog-overlay" onClick={onCancel}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">{title}</div>
         <div className="dialog-body">
@@ -145,10 +149,13 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  // Press AND release on the backdrop (overlay-dismiss.ts), so a drag or a text
+  // selection that ends outside the dialog cannot confirm-cancel it.
+  const overlayDismiss = useOverlayDismiss(onCancel);
   return (
     <div
       className="dialog-overlay"
-      onClick={onCancel}
+      {...overlayDismiss}
       onKeyDown={(e) => {
         if (e.key === "Escape") onCancel();
       }}

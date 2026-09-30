@@ -26,6 +26,7 @@ import { useViewerStore } from "../stores/viewerStore";
 import { useUiStore } from "../stores/uiStore";
 import { useLayoutStore } from "../stores/layoutStore";
 import { Icon, type IconName } from "../components/Icon";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 import type {
   FileNode,
   ProjectGroup,
@@ -122,6 +123,11 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0 });
   const [renameSession, setRenameSession] = useState<SessionItem | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  // Rename dialog: dismiss on a press AND release on the backdrop (a drag from the
+  // input out of the dialog used to close it while typing — overlay-dismiss.ts).
+  // Declared next to `setRenameSession` it closes over: the hook reads its callback
+  // only from event handlers, but keeping the pair together removes the TDZ trap.
+  const overlayDismiss = useOverlayDismiss(() => setRenameSession(null));
 
   // --- Remote hydration: main's background hydration → per-project caches ---
   useEffect(() => {
@@ -693,7 +699,7 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
       {/* Rename dialog */}
       {renameSession && (
-        <div className="dialog-overlay" onClick={() => setRenameSession(null)}>
+        <div className="dialog-overlay" {...overlayDismiss}>
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">重命名会话</div>
             <div className="dialog-body">

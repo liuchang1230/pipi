@@ -9,6 +9,7 @@ import { useSessionsStore } from "../stores/sessionsStore";
 import { useUiStore } from "../stores/uiStore";
 import type { FileNode, SessionItem } from "../stores/types";
 import { Icon } from "../components/Icon";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 
 const showToast = (text: string, type: "ok" | "err") => useUiStore.getState().showToast(text, type);
 
@@ -34,6 +35,13 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
   // does not silently erase that user's explicit choice.
   const [rememberPassword, setRememberPassword] = useState(false);
   const [remoteStatus, setRemoteStatus] = useState<"" | "connecting" | "connected" | "failed">("");
+  // Backdrop dismissal (press AND release on the backdrop — overlay-dismiss.ts)
+  // also clears the status, so reopening does not show the previous attempt's
+  // result as if it were the current connection's.
+  const overlayDismiss = useOverlayDismiss(() => {
+    onClose();
+    setRemoteStatus("");
+  });
   const [selectedRemoteHistory, setSelectedRemoteHistory] = useState("");
   const [wslDistros, setWslDistros] = useState<Array<{ name: string; default: boolean; running: boolean; version: number }>>([]);
   const [wslDistro, setWslDistro] = useState("");
@@ -140,7 +148,7 @@ export function RemoteDialog({ onClose }: { onClose: () => void }) {
   }, [cwd, onClose, projects, remoteAgentDir, remotePort, remotePath, remotePassword, remoteHost, remoteUser, remoteTab, rememberPassword, wslDistro, wslPath]);
 
   return (
-    <div className="dialog-overlay" onClick={() => { onClose(); setRemoteStatus(""); }}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">远程连接</div>
         <div className="dialog-tabs">

@@ -6,6 +6,7 @@
  * asks the main process to kill the npm child.
  */
 import { useEffect, useRef, useState } from "react";
+import { useOverlayDismiss } from "../components/overlay-dismiss";
 
 type Phase = "idle" | "installing" | "done" | "error" | "cancelled" | "notice";
 
@@ -85,6 +86,11 @@ export function PiInstallDialog() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Backdrop dismissal is a two-edge gesture (press AND release on the backdrop —
+  // see overlay-dismiss.ts) and a no-op while installing: hiding a running install
+  // would look like a crash. `setPhase("idle")` is what `close()` does.
+  const overlayDismiss = useOverlayDismiss(() => setPhase((p) => (p === "installing" ? p : "idle")));
+
   if (phase === "idle") return null;
 
   const fmt = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -100,7 +106,7 @@ export function PiInstallDialog() {
   };
 
   return (
-    <div className="dialog-overlay" onClick={phase === "installing" ? undefined : close}>
+    <div className="dialog-overlay" {...overlayDismiss}>
       <div className="dialog pi-install-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">安装 pi agent</div>
         <div className="dialog-body">
