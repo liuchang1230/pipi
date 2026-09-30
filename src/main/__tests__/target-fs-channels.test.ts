@@ -484,7 +484,9 @@ describe("wslBinding", () => {
     seen.length = 0;
     await expect(fs.readText("\\\\wsl$\\Ubuntu-22.04\\home\\u\\s.jsonl")).rejects.toBeTruthy();
     expect(seen).toEqual([]);
-  });
+    // This one reaches the REAL WSL channel, so it does UNC I/O against a share
+    // whose distro may not exist — seconds of SMB-level retry, not the 5s default.
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

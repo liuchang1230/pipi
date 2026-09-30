@@ -7,10 +7,19 @@ beforeEach(() => clearOpsForTests());
 
 describe("beginOp", () => {
   it("reports an in-flight operation with its elapsed time", () => {
-    beginOp("ipc:file:list");
-    const [op] = snapshotOps(Date.now() + 2500);
-    expect(op?.name).toBe("ipc:file:list");
-    expect(op?.elapsedMs).toBe(2500);
+    // Pinned clock: reading Date.now() twice around beginOp makes the expected
+    // value drift by however many milliseconds the process took to get there.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      beginOp("ipc:file:list");
+      vi.setSystemTime(1_002_500);
+      const [op] = snapshotOps();
+      expect(op?.name).toBe("ipc:file:list");
+      expect(op?.elapsedMs).toBe(2500);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("removes the operation when the disposer runs (no leak across calls)", () => {
@@ -43,8 +52,17 @@ describe("snapshotOps / describeOps", () => {
 
   it("formats a human sentence and stays empty when idle", () => {
     expect(describeOps()).toBe("");
-    beginOp("ipc:session:list-remote");
-    expect(describeOps(Date.now() + 3200, 3)).toBe("ipc:session:list-remote 3.2s");
+    // Pinned for the same reason as above: 3.2s must not become 3.3s because the
+    // machine paused for 100ms between two Date.now() calls.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      beginOp("ipc:session:list-remote");
+      vi.setSystemTime(1_003_200);
+      expect(describeOps(undefined, 3)).toBe("ipc:session:list-remote 3.2s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("caps how many operations it names", () => {
