@@ -1,9 +1,10 @@
-// The extension install script, executed for REAL on Linux (through WSL).
+// The shipped content, executed for REAL on Linux (through WSL).
 //
-// buildSshInstallScript() travels on stdin into `sh -s` on the remote host, so
-// only running it on a POSIX box proves the parts we do not control: the base64
-// round-trip, the nested `mkdir -p`, byte-exact content, and the marker-guarded
-// retire (delete what we shipped, keep what the user wrote).
+// Both ssh transports send a content-free argv (`sh -s`) and read the real work
+// from stdin, so only running them on a POSIX box proves the parts we do not
+// control: the base64 round-trip, the nested `mkdir -p`, byte-exact content, the
+// marker-guarded legacy retire (delete what we shipped, keep what the user
+// wrote) and the journal's classification of an edited file.
 //
 // Everything is seeded and read back INSIDE the distro, through the same shell
 // a remote host would use — nothing here depends on the app's \\wsl$ path
@@ -21,16 +22,12 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   buildSshInstallCommand,
-  buildSshInstallScript,
   RETIRED_FILES,
-  SHIPPED_EXTENSIONS,
+  SHIPPED_AGENT_FILES,
+  SHIPPED_EXTENSION_FILES,
+  syncAgentHomeViaSsh,
 } from "../extension-sync";
-import {
-  parseJournal,
-  SHIPPED_SKILL_FILES,
-  syncSkillsViaSsh,
-  type SshScriptRunner,
-} from "../skill-sync";
+import { parseJournal, SHIPPED_SKILL_FILES, syncSkillsViaSsh, type SshScriptRunner } from "../skill-sync";
 
 function pickDistro(): string | null {
   try {
@@ -62,67 +59,139 @@ function seed(path: string, content: string): void {
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
-describe.skipIf(!ENABLED || !DISTRO)("install script on real Linux (WSL)", () => {
-  /** The install script itself is not what this proves; running it on Linux is. */
-  it("installs every shipped file byte-for-byte, and retires only files carrying our markers", () => {
-    const home = `/tmp/pipi-e2e-${process.pid}-${Date.now()}`;
+/** `wsl.exe ... bash -s` plays the part of `ssh host sh -s`: a real shell, on a
+ *  real file system, with an isolated HOME standing in for the remote user's.
+ *  An SshScriptRunner never throws, so a failed call comes back as ok:false. */
+function wslRunner(home: string): SshScriptRunner {
+  return async ({ stdin = "" }) => {
+    try {
+      const stdout = wsl(["env", `HOME=${home}`, "bash", "-s"], stdin);
+      return { ok: true, code: 0, stdout, stderr: "" };
+    } catch (error) {
+      return { ok: false, code: 1, stdout: "", stderr: String(error), error: String(error) };
+    }
+  };
+}
+
+/** Remove a scratch dir inside the distro, ignoring a distro that has gone away. */
+function cleanup(home: string): void {
+  try {
+    wsl(["rm", "-rf", home]);
+  } catch {
+    /* the distro may be gone; the temp dir is under /tmp either way */
+  }
+}
+
+describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () => {
+  /**
+   * The key-auth ssh transport end to end, over both roots of an agent home:
+   * probe → classify → apply, executed by a real shell.
+   *
+   * Two properties can only be proven here — that the scripts are valid POSIX
+   * (the probe's `base64`/`printf` fallbacks, the nested mkdir) and that the
+   * classification reaches the right verdict on a real disk: the user's edits
+   * survive while our own tampered copies are restored.
+   */
+  it("probes, installs both roots byte-for-byte, and keeps what the user edited", async () => {
+    const home = `/tmp/pipi-e2e-ext-${process.pid}-${Date.now()}`;
     const extensions = `${home}/.pi/agent/extensions`;
+    const agents = `${home}/.pi/agent/agents`;
     const spec = RETIRED_FILES[0]!;
     const retirePath = `${home}/.pi/agent/${spec.dir}/${spec.fileName}`;
     const authoredPath = `${home}/.pi/agent/${spec.dir}/keep-me.md`;
+    const run = wslRunner(home);
     try {
-      // Seed the retired file (carrying every marker → ours, must go) and a file
-      // with no markers (→ the user's, must survive).
+      // Seed a pre-journal file carrying every marker (→ ours, must go) and a
+      // file with no markers (→ the user's, must survive).
       seed(retirePath, spec.markers.join("\n"));
       seed(authoredPath, "mine\n");
 
-      // The real thing: the command over argv, the script over stdin.
+      // 1. Empty agent home → everything lands byte-exact, on both roots.
       expect(buildSshInstallCommand()).toBe("sh -s");
-      wsl(["bash", "-c", `HOME=${home} bash -s`], buildSshInstallScript());
-
-      for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-        expect(wsl(["sha256sum", `${extensions}/${fileName}`]).split(" ")[0], `${fileName} content`).toBe(
-          sha256(content),
-        );
+      const first = await syncAgentHomeViaSsh(run, 60_000);
+      expect(first.ok).toBe(true);
+      expect(first.extensions.sort()).toEqual(SHIPPED_EXTENSION_FILES.map((f) => f.relPath).sort());
+      expect(first.agents.sort()).toEqual(SHIPPED_AGENT_FILES.map((f) => f.relPath).sort());
+      for (const { relPath, content } of SHIPPED_EXTENSION_FILES) {
+        expect(wsl(["sha256sum", `${extensions}/${relPath}`]).split(" ")[0], relPath).toBe(sha256(content));
       }
+      for (const { relPath, content } of SHIPPED_AGENT_FILES) {
+        expect(wsl(["sha256sum", `${agents}/${relPath}`]).split(" ")[0], relPath).toBe(sha256(content));
+      }
+      // The retired file is gone, the user's file is not.
       expect(wsl(["bash", "-c", `test -f ${retirePath} && echo yes || echo no`]).trim()).toBe("no");
-      expect(wsl(["bash", "-c", `test -f ${authoredPath} && echo yes || echo no`]).trim()).toBe("yes");
       expect(wsl(["cat", authoredPath])).toBe("mine\n");
-      // Exactly the 5 shipped extensions plus the file the "user" wrote.
-      const expected = ["keep-me.md", ...SHIPPED_EXTENSIONS.map((e) => e.fileName)].sort().join(" ");
-      expect(wsl(["bash", "-c", `ls -1 ${extensions} | sort | tr '\\n' ' '`]).trim()).toBe(expected);
+
+      // 2. Second run: nothing to do, and it says so.
+      const second = await syncAgentHomeViaSsh(run, 60_000);
+      expect(second).toMatchObject({ ok: true, extensions: [], agents: [], diverged: [], retired: [] });
+
+      // 3. The user tunes the delegation code and an agent definition.
+      const tunedExtension = "delegation/declarations.ts";
+      const tunedAgent = "reviewer.md";
+      seed(`${extensions}/${tunedExtension}`, "// my declarations\n");
+      seed(`${agents}/${tunedAgent}`, "my reviewer\n");
+      const third = await syncAgentHomeViaSsh(run, 60_000);
+      expect(third.ok).toBe(true);
+      expect(third.diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
+      expect(wsl(["cat", `${extensions}/${tunedExtension}`])).toBe("// my declarations\n");
+      expect(wsl(["cat", `${agents}/${tunedAgent}`])).toBe("my reviewer\n");
+      // …and both stay theirs after another sync: the journal did not adopt them,
+      // which is what would otherwise lose the edit on the next app update.
+      expect((await syncAgentHomeViaSsh(run, 60_000)).diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
+      expect(wsl(["cat", `${extensions}/${tunedExtension}`])).toBe("// my declarations\n");
+
+      // 4. Our OWN sources, in the same directory, are a different class: a
+      // tampered copy is a bug, so it is restored rather than kept.
+      const ours = "pipi-tree-nav.ts";
+      seed(`${extensions}/${ours}`, "// tampered\n");
+      const oursContent = SHIPPED_EXTENSION_FILES.find((f) => f.relPath === ours)!.content;
+      const fourth = await syncAgentHomeViaSsh(run, 60_000);
+      expect(fourth.extensions).toEqual([ours]);
+      expect(fourth.diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
+      expect(wsl(["sha256sum", `${extensions}/${ours}`]).split(" ")[0]).toBe(sha256(oursContent));
+
+      // 5. Each root's journal records that split, so the next run is stable.
+      const extJournal = parseJournal(wsl(["cat", `${extensions}/.pipi.json`]));
+      // The file the user tuned is theirs now: never in `shipped` (which would
+      // adopt it as ours and freeze it), always in `diverged`.
+      expect(Object.keys(extJournal.shipped).sort()).toEqual(
+        SHIPPED_EXTENSION_FILES.map((f) => f.relPath)
+          .filter((p) => p !== tunedExtension)
+          .sort(),
+      );
+      expect(Object.keys(extJournal.diverged)).toEqual([tunedExtension]);
+      const agentJournal = parseJournal(wsl(["cat", `${agents}/.pipi.json`]));
+      expect(Object.keys(agentJournal.shipped).sort()).toEqual(
+        SHIPPED_AGENT_FILES.map((f) => f.relPath)
+          .filter((p) => p !== tunedAgent)
+          .sort(),
+      );
+      expect(Object.keys(agentJournal.diverged)).toEqual([tunedAgent]);
+      // Nothing we installed is invisible to the journal: the extensions root
+      // holds our 5 sources, the delegation tree, the journal, and the file the
+      // user wrote — and nothing else.
+      expect(wsl(["bash", "-c", `ls -1A ${extensions} | sort | tr '\\n' ' '`]).trim()).toBe(
+        ["keep-me.md", ".pipi.json", "delegation", ...SHIPPED_EXTENSION_FILES.map((f) => f.relPath.split("/")[0]!)]
+          .filter((v, i, all) => all.indexOf(v) === i)
+          .sort()
+          .join(" "),
+      );
     } finally {
-      try {
-        wsl(["rm", "-rf", home]);
-      } catch {
-        /* the distro may be gone; the temp dir is under /tmp either way */
-      }
+      cleanup(home);
     }
-    // ~5s alone, but each wsl.exe call gets slower under a full parallel suite.
-  }, 30_000);
+    // ~10s alone, but each wsl.exe call gets slower under a full parallel suite.
+  }, 120_000);
 
   /**
-   * The key-auth ssh transport, against real Linux: `wsl.exe ... bash -s` plays
-   * the part of `ssh host sh -s`, so the probe and apply scripts are executed by
-   * a real shell on a real file system, with an isolated HOME standing in for
-   * the remote user's home dir.
-   *
-   * This is the case that used to be a silent overwrite: nothing can read a
-   * passwordless server's files except these round trips, so "the user edited
-   * this skill on the server" was invisible. Here the edit is made in the
-   * distro and must survive.
+   * The same transport for the skills tree, which shares the engine: an isolated
+   * HOME, a real shell, and a journal that has to tell "the user edited this"
+   * apart from "this is our older copy".
    */
   it("probes, installs, and KEEPS a skill edited inside the distro", async () => {
     const home = `/tmp/pipi-ssh-skills-${process.pid}-${Date.now()}`;
     const skills = `${home}/.pi/agent/skills`;
-    const run: SshScriptRunner = async ({ stdin = "" }) => {
-      try {
-        const stdout = wsl(["env", `HOME=${home}`, "bash", "-s"], stdin);
-        return { ok: true, code: 0, stdout, stderr: "" };
-      } catch (error) {
-        return { ok: false, code: 1, stdout: "", stderr: String(error), error: String(error) };
-      }
-    };
+    const run = wslRunner(home);
     try {
       // 1. Empty server → the whole bundle lands, byte-exact.
       const first = await syncSkillsViaSsh(run, 60_000);
@@ -164,11 +233,7 @@ describe.skipIf(!ENABLED || !DISTRO)("install script on real Linux (WSL)", () =>
       // The user's edit was not collateral damage.
       expect(wsl(["cat", `${skills}/${edited}`])).toBe("my own wizard\n");
     } finally {
-      try {
-        wsl(["rm", "-rf", home]);
-      } catch {
-        /* the distro may be gone; the temp dir is under /tmp either way */
-      }
+      cleanup(home);
     }
   }, 120_000);
 });

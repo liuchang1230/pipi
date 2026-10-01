@@ -1,22 +1,31 @@
-// ensureShippedExtensions — ships app-bundled pi extension sources to the
-// target dir, only writing when content differs, returning what was actually
-// updated. Uses a real temp dir (no Electron runtime needed).
+// extension-sync — the two roots of an agent home (extensions/, agents/) and the
+// ownership rules that separate app-owned sources from text the user tunes. The
+// policy mechanics live in content-sync.ts (see content-sync.test.ts); this file
+// pins how the app applies them: what ships, to which root, over which
+// transport, and what each transport reports.
 import { afterEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
-  ensureShippedExtensions,
-  syncExtensionsViaSftp,
   buildSshInstallCommand,
-  buildSshInstallScript,
-  buildSshCatCommand,
-  SHIPPED_EXTENSIONS,
+  buildSshRetireTrailer,
+  ensureShippedAgentHome,
+  ensureShippedAgents,
+  ensureShippedExtensions,
   RETIRED_FILES,
   retireShippedFiles,
   shouldRetire,
+  SHIPPED_AGENT_FILES,
+  SHIPPED_EXTENSION_FILES,
+  syncAgentHomeViaSsh,
+  syncExtensionsViaSftp,
+  buildSshCatCommand,
+  SHIPPED_EXTENSIONS,
 } from "../extension-sync";
+import { JOURNAL_FILE, parseJournal } from "../content-sync";
+import type { SshRunResult } from "../ssh-exec";
 
 let dirs: string[] = [];
 
@@ -31,13 +40,43 @@ afterEach(() => {
   dirs = [];
 });
 
+describe("the shipped bundle", () => {
+  it("puts our 5 sources at the extension root and the delegation tree underneath", () => {
+    const relPaths = SHIPPED_EXTENSION_FILES.map((f) => f.relPath);
+    expect(relPaths).toEqual(
+      expect.arrayContaining(["pipi-tree-nav.ts", "delegation/index.ts", "delegation/engine.ts"]),
+    );
+    // pi's discovery rule for a directory extension is extensions/<name>/index.ts,
+    // so the delegation tree has to be complete, not just present.
+    expect(relPaths.filter((p) => p.startsWith("delegation/"))).toHaveLength(5);
+  });
+
+  it("marks our own sources overwrite and the user-tunable text preserve", () => {
+    for (const file of SHIPPED_EXTENSION_FILES) {
+      const ours = SHIPPED_EXTENSIONS.some((e) => e.fileName === file.relPath);
+      expect(file.policy === "overwrite", file.relPath).toBe(ours);
+    }
+    // Agent definitions are prompts people tune → never overwritten.
+    for (const file of SHIPPED_AGENT_FILES) expect(file.policy).toBeUndefined();
+    expect(SHIPPED_AGENT_FILES.map((f) => f.relPath)).toEqual(["analyst.md", "reviewer.md", "scout.md"]);
+  });
+
+  it("ships the same bytes the bundle carries, including CRLF", () => {
+    // The sources are embedded verbatim via `?raw`: a normalizing step here would
+    // make every already-installed copy on every machine look like a user edit
+    // (the journal hash would no longer match) and freeze the upgrade path.
+    const nav = SHIPPED_EXTENSIONS.find((e) => e.fileName === "pipi-tree-nav.ts")!;
+    expect(nav.content).toBe(readFileSync(join(__dirname, "..", "extensions", "pipi-tree-nav.ts"), "utf8"));
+  });
+});
+
 describe("ensureShippedExtensions", () => {
   it("writes all shipped extensions on first run and returns their names", () => {
     const dir = tempDir();
     const updated = ensureShippedExtensions(dir);
     expect(updated.length).toBeGreaterThan(0);
     for (const name of updated) {
-      expect(existsSync(join(dir, name))).toBe(true);
+      expect(existsSync(join(dir, ...name.split("/")))).toBe(true);
     }
   });
 
@@ -51,48 +90,152 @@ describe("ensureShippedExtensions", () => {
     const dir = tempDir();
     const updated = ensureShippedExtensions(dir);
     expect(updated.length).toBeGreaterThan(1);
-    // Corrupt one file: the next sync must rewrite exactly that one.
+    // Corrupt one of OUR files: the next sync must rewrite exactly that one.
     const target = join(dir, updated[0]!);
     writeFileSync(target, "// tampered\n", "utf8");
     expect(ensureShippedExtensions(dir)).toEqual([updated[0]]);
     expect(existsSync(target)).toBe(true);
   });
+
+  it("keeps a delegation file the user edited, and says so", () => {
+    const dir = tempDir();
+    ensureShippedExtensions(dir);
+    const tuned = join(dir, "delegation", "declarations.ts");
+    writeFileSync(tuned, "// my own declarations\n", "utf8");
+    // Their bytes stay (they are running that code) …
+    expect(ensureShippedExtensions(dir)).toEqual([]);
+    expect(readFileSync(tuned, "utf8")).toBe("// my own declarations\n");
+    // … and the divergence is an explicit state in the journal, not silence.
+    const journal = parseJournal(readFileSync(join(dir, JOURNAL_FILE), "utf8"));
+    expect(Object.keys(journal.diverged)).toEqual(["delegation/declarations.ts"]);
+    expect(journal.shipped["delegation/declarations.ts"]).toBeUndefined();
+  });
 });
 
-describe("buildSshInstallCommand / buildSshInstallScript", () => {
-  // Regression: the install used to embed every extension as base64 IN THE
-  // COMMAND LINE. Windows caps a command line at 32,767 characters and spawn
-  // throws ENAMETOOLONG *synchronously* past it — so adding
-  // pipi-approval-gate.ts (17.6KB) made syncKeyAuthExtensions throw out of the
-  // tab:create handler on every key-auth connect. The command must therefore
-  // never grow with the payload; the payload rides on stdin.
+describe("ensureShippedAgents / ensureShippedAgentHome", () => {
+  it("writes agent definitions into agents/, not into extensions/", () => {
+    const home = tempDir();
+    expect(ensureShippedAgents(join(home, "agents")).length).toBe(SHIPPED_AGENT_FILES.length);
+    expect(existsSync(join(home, "agents", "reviewer.md"))).toBe(true);
+    expect(existsSync(join(home, "extensions", "reviewer.md"))).toBe(false);
+  });
+
+  it("provisions both roots and reports their journals separately", () => {
+    const home = tempDir();
+    const result = ensureShippedAgentHome(home);
+    expect(result.extensions).toHaveLength(SHIPPED_EXTENSION_FILES.length);
+    expect(result.agents).toHaveLength(SHIPPED_AGENT_FILES.length);
+    expect(result.diverged).toEqual([]);
+    // Separate journals: retiring a file in one root cannot touch the other.
+    const extJournal = parseJournal(readFileSync(join(home, "extensions", JOURNAL_FILE), "utf8"));
+    const agentJournal = parseJournal(readFileSync(join(home, "agents", JOURNAL_FILE), "utf8"));
+    expect(Object.keys(extJournal.shipped)).toHaveLength(SHIPPED_EXTENSION_FILES.length);
+    expect(Object.keys(agentJournal.shipped)).toHaveLength(SHIPPED_AGENT_FILES.length);
+  });
+
+  it("is a no-op on the second run and takes the legacy retire with it", () => {
+    const home = tempDir();
+    ensureShippedAgentHome(home);
+    const again = ensureShippedAgentHome(home);
+    expect(again.extensions).toEqual([]);
+    expect(again.agents).toEqual([]);
+    expect(again.retired).toEqual([]);
+    // A pre-journal file carrying our markers is removed by the same call.
+    const legacy = join(home, "agents", "planner.md");
+    writeFileSync(legacy, RETIRED_FILES[1]!.markers.join("\n"), "utf8");
+    expect(ensureShippedAgentHome(home).retired).toEqual([legacy]);
+    expect(existsSync(legacy)).toBe(false);
+  });
+});
+
+describe("key-auth ssh transport (unit shape)", () => {
+  /** A fake remote: records the scripts it is handed and answers from a queue. */
+  function fakeRunner(responses: Array<Partial<SshRunResult>>) {
+    const calls: Array<{ command: string; stdin: string }> = [];
+    const run = async (options: { command: string; stdin?: string }) => {
+      calls.push({ command: options.command, stdin: options.stdin ?? "" });
+      const answer = responses[calls.length - 1] ?? { ok: true };
+      return { ok: true, code: 0, stdout: "", stderr: "", ...answer } as SshRunResult;
+    };
+    return { run, calls };
+  }
+
   it("keeps the command content-free no matter how large the shipped set is", () => {
+    // Regression: the install used to embed every extension as base64 IN THE
+    // COMMAND LINE. Windows caps a command line at 32,767 characters and spawn
+    // throws ENAMETOOLONG *synchronously* past it — so adding
+    // pipi-approval-gate.ts (17.6KB) made syncKeyAuthExtensions throw out of the
+    // tab:create handler on every key-auth connect. The argv must never grow
+    // with the payload; the payload rides on stdin.
     expect(buildSshInstallCommand()).toBe("sh -s");
-    const huge = [
-      { fileName: "a.ts", content: "x".repeat(200_000) },
-      { fileName: "b.ts", content: "y".repeat(200_000) },
-    ];
-    expect(buildSshInstallScript(huge).length).toBeGreaterThan(400_000);
     expect(buildSshInstallCommand().length).toBeLessThan(64);
   });
 
-  it("produces a quote-free install SCRIPT covering every shipped extension", () => {
-    const script = buildSshInstallScript();
-    expect(script.startsWith("mkdir -p $HOME/.pi/agent/extensions && ")).toBe(true);
-    // The script crosses Windows spawn → ssh.exe → remote bash: any quote
-    // would need escaping, so it must be entirely quote-free.
-    expect(script).not.toMatch(/['"]/);
-    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-      expect(script).toContain(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > $HOME/.pi/agent/extensions/${fileName}`);
+  it("sends one probe→apply per root, extensions first, and the retire only with them", async () => {
+    const { run, calls } = fakeRunner([{}, {}, {}, {}]);
+    const result = await syncAgentHomeViaSsh(run, 20_000);
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(4);
+    expect(calls.every((c) => c.command === "sh -s")).toBe(true);
+    // Probe then apply, and the two roots never share a trip: the probe has to
+    // report the remote's own bytes for THIS root before the plan is made.
+    expect(calls[0]!.stdin).toContain(".pi/agent/extensions");
+    expect(calls[1]!.stdin).toContain("delegation/index.ts");
+    expect(calls[2]!.stdin).toContain(".pi/agent/agents");
+    expect(calls[3]!.stdin).toContain("reviewer.md");
+    // The pre-journal retire rides on the extensions apply (no extra round trip).
+    expect(calls[1]!.stdin).toContain("pipi-mode-switch.ts");
+    expect(calls[3]!.stdin).not.toContain("pipi-mode-switch.ts");
+    // Every payload line is `<base64> | base64 -d > <path>`: the bytes never
+    // touch the shell as text, and only the (quote-free, space-free) remote paths
+    // do. The probe's own shell syntax may quote freely — it is a script, not an
+    // argv — but the bytes we install must never need escaping.
+    for (const call of calls) {
+      expect(call.command).not.toMatch(/['"]/);
+      for (const line of call.stdin.split("\n")) {
+        if (line.includes("base64 -d >")) expect(line).not.toMatch(/['"]/);
+      }
     }
+    expect(result.extensions).toHaveLength(SHIPPED_EXTENSION_FILES.length);
+    expect(result.agents).toHaveLength(SHIPPED_AGENT_FILES.length);
   });
 
-  it("is a complete script (`sh -s` reads it to EOF)", () => {
-    const script = buildSshInstallScript();
-    expect(script.endsWith("\n")).toBe(true);
-    // Every write is a complete line: base64 never contains a newline, and the
-    // retire suffix starts a new ` && (…)` clause rather than trailing text.
-    expect(script.split("\n").length).toBe(2);
+  it("aborts before the agents root when the extensions probe fails", async () => {
+    const { run, calls } = fakeRunner([{ ok: false, error: "no route to host" }]);
+    const result = await syncAgentHomeViaSsh(run, 20_000);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("no route to host");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("fails the whole call when only the agents half fails, so the digest is not marked done", async () => {
+    const { run, calls } = fakeRunner([{}, {}, { ok: false, error: "permission denied" }]);
+    const result = await syncAgentHomeViaSsh(run, 20_000);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("permission denied");
+    // The extensions half DID land, and the caller still retries everything next
+    // connect — re-syncing is a no-op for what already arrived.
+    expect(result.extensions).toHaveLength(SHIPPED_EXTENSION_FILES.length);
+    expect(calls).toHaveLength(3);
+  });
+});
+
+describe("buildSshRetireTrailer", () => {
+  it("retires guarded by our markers, quote-free, without failing the script", () => {
+    const trailer = buildSshRetireTrailer();
+    expect(trailer).not.toMatch(/['"]/);
+    for (const spec of RETIRED_FILES) {
+      const path = `$HOME/.pi/agent/${spec.dir}/${spec.fileName}`;
+      expect(trailer).toContain(`( test -f ${path}`);
+      expect(trailer).toContain(`rm -f ${path}`);
+      // every marker must be probed before the delete, and every clause must be
+      // unable to fail the apply (the trailer is the last thing the shell runs).
+      for (const m of spec.markers) {
+        const b64 = Buffer.from(m, "utf8").toString("base64");
+        expect(trailer).toContain(`grep -q $(echo ${b64} | base64 -d) ${path}`);
+      }
+      expect(trailer).toMatch(/rm -f [^\n]*\|\| true \)/);
+    }
   });
 });
 
@@ -118,6 +261,7 @@ describe("syncExtensionsViaSftp", () => {
   function mockClient(remoteFiles: Map<string, string | Buffer>) {
     const puts: Array<{ path: string; content: Buffer }> = [];
     const mkdirs: string[] = [];
+    const deleted: string[] = [];
     return {
       client: {
         mkdir: async (dir: string) => {
@@ -132,62 +276,80 @@ describe("syncExtensionsViaSftp", () => {
           puts.push({ path, content });
           remoteFiles.set(path, content);
         },
+        delete: async (path: string) => {
+          deleted.push(path);
+          remoteFiles.delete(path);
+        },
       },
       puts,
       mkdirs,
+      deleted,
     };
   }
 
-  it("uploads every shipped extension to the remote agent extensions dir (missing files reject on get)", async () => {
+  it("uploads both roots on the first sync, journals included", async () => {
     const { client, puts, mkdirs } = mockClient(new Map());
     const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
     expect(result.ok).toBe(true);
-    expect(puts.length).toBe(SHIPPED_EXTENSIONS.length);
-    for (const p of puts) {
-      expect(p.path.startsWith("/home/user/.pi/agent/extensions/")).toBe(true);
-      expect(p.content.toString("utf8").length).toBeGreaterThan(0);
-    }
+    const paths = puts.map((p) => p.path);
+    expect(paths).toContain("/home/user/.pi/agent/extensions/delegation/index.ts");
+    expect(paths).toContain("/home/user/.pi/agent/agents/reviewer.md");
+    expect(paths).toContain("/home/user/.pi/agent/extensions/.pipi.json");
+    expect(paths).toContain("/home/user/.pi/agent/agents/.pipi.json");
+    expect(paths).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length + 2);
     expect(mkdirs).toContain("/home/user/.pi/agent/extensions");
+    expect(mkdirs).toContain("/home/user/.pi/agent/agents");
+    expect(result.uploaded).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length);
   });
 
   it("honors an absolute agentDir override when computing the remote base", async () => {
     const { client, puts } = mockClient(new Map());
     const result = await syncExtensionsViaSftp(client as never, "/home/user", "/srv/shared-pi");
     expect(result.ok).toBe(true);
-    for (const p of puts) expect(p.path.startsWith("/srv/shared-pi/extensions/")).toBe(true);
+    for (const p of puts) expect(p.path.startsWith("/srv/shared-pi/")).toBe(true);
+    expect(result.uploaded.some((p) => p.startsWith("/srv/shared-pi/agents/"))).toBe(true);
   });
 
   it("expands a ~/ agentDir override against the remote home", async () => {
     const { client, puts } = mockClient(new Map());
     const result = await syncExtensionsViaSftp(client as never, "/home/user", "~/shared-pi");
     expect(result.ok).toBe(true);
-    for (const p of puts) expect(p.path.startsWith("/home/user/shared-pi/extensions/")).toBe(true);
+    for (const p of puts) expect(p.path.startsWith("/home/user/shared-pi/")).toBe(true);
   });
 
-  it("skips files whose remote content already matches (string or Buffer)", async () => {
-    const existing = new Map<string, string | Buffer>();
-    SHIPPED_EXTENSIONS.forEach(({ fileName, content }, i) => {
-      const path = `/home/user/.pi/agent/extensions/${fileName}`;
-      existing.set(path, i % 2 === 0 ? Buffer.from(content, "utf8") : content);
-    });
-    const { client, puts } = mockClient(existing);
-    const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
-    expect(result.ok).toBe(true);
-    expect(puts.length).toBe(0);
-    expect(result.uploaded.length).toBe(0);
+  it("is a no-op on the second sync (the journal is what makes it idempotent)", async () => {
+    const files = new Map<string, string | Buffer>();
+    const { client, puts } = mockClient(files);
+    await syncExtensionsViaSftp(client as never, "/home/user", undefined);
+    puts.length = 0;
+    const second = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
+    expect(second.ok).toBe(true);
+    expect(puts).toEqual([]);
+    expect(second.uploaded).toEqual([]);
   });
 
-  it("re-uploads a file that drifted from the shipped content", async () => {
-    const file = SHIPPED_EXTENSIONS[0]!;
-    const existing = new Map<string, string | Buffer>([
-      [`/home/user/.pi/agent/extensions/${file.fileName}`, "// tampered\n"],
-    ]);
-    const { client, puts } = mockClient(existing);
-    const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
-    expect(result.ok).toBe(true);
-    const re = puts.find((p) => p.path.endsWith(`/${file.fileName}`));
-    expect(re).toBeDefined();
-    expect(re!.content.toString("utf8")).toBe(file.content);
+  it("re-uploads an app-owned extension that drifted, but keeps a tuned delegation file", async () => {
+    const files = new Map<string, string | Buffer>();
+    const first = mockClient(files);
+    await syncExtensionsViaSftp(first.client as never, "/home/user", undefined);
+    first.puts.length = 0;
+    // The user tweaks the delegation code ON THE SERVER, and something else
+    // tampers with one of our own sources.
+    const tuned = "/home/user/.pi/agent/extensions/delegation/engine.ts";
+    const ours = "/home/user/.pi/agent/extensions/pipi-tree-nav.ts";
+    files.set(tuned, "// my engine\n");
+    files.set(ours, "// tampered\n");
+    const second = await syncExtensionsViaSftp(first.client as never, "/home/user", undefined);
+    expect(second.ok).toBe(true);
+    const touched = first.puts.map((p) => p.path);
+    expect(touched).toContain(ours);
+    expect(touched).not.toContain(tuned);
+    expect(files.get(tuned)).toBe("// my engine\n");
+    expect(second.uploaded).not.toContain(tuned);
+    // Whatever the server says about it, the journal records the divergence so
+    // the next sync does not adopt their file as ours.
+    const journal = parseJournal(files.get("/home/user/.pi/agent/extensions/.pipi.json")!.toString());
+    expect(Object.keys(journal.diverged)).toContain("delegation/engine.ts");
   });
 
   it("reports a failure without throwing when mkdir rejects", async () => {
@@ -200,10 +362,10 @@ describe("syncExtensionsViaSftp", () => {
     expect(result.error).toContain("permission denied");
   });
 
-  it("reports partial progress when the second upload fails", async () => {
-    const { client, puts } = mockClient(new Map());
-    const original = (client as { put: (c: Buffer, p: string) => Promise<void> }).put.bind(client);
+  it("claims nothing when an upload fails midway (the next sync redoes that root)", async () => {
+    const { client } = mockClient(new Map());
     let putCount = 0;
+    const original = (client as { put: (c: Buffer, p: string) => Promise<void> }).put.bind(client);
     (client as { put: (c: Buffer, p: string) => Promise<void> }).put = async (c, p) => {
       putCount += 1;
       if (putCount === 2) throw new Error("disk full");
@@ -212,8 +374,9 @@ describe("syncExtensionsViaSftp", () => {
     const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
     expect(result.ok).toBe(false);
     expect(result.error).toContain("disk full");
-    expect(puts.length).toBe(1);
-    expect(result.uploaded.length).toBe(1);
+    // No journal was written for that root, so nothing is marked as ours there:
+    // the whole root is simply re-uploaded on the next connect.
+    expect(result.uploaded).toEqual([]);
   });
 });
 
@@ -262,20 +425,5 @@ describe("retireShippedFiles", () => {
 
   it("is a no-op when the files are already gone", () => {
     expect(retireShippedFiles(mkdtempSync(join(tmpdir(), "retire-")))).toEqual([]);
-  });
-
-  it("the ssh install script retires guarded by our markers (and stays quote-free)", () => {
-    const script = buildSshInstallScript();
-    expect(script).not.toMatch(/['"]/);
-    for (const spec of RETIRED_FILES) {
-      const path = `$HOME/.pi/agent/${spec.dir}/${spec.fileName}`;
-      expect(script).toContain(`( test -f ${path}`);
-      expect(script).toContain(`rm -f ${path}`);
-      // every marker must be probed before the delete
-      for (const m of spec.markers) {
-        const b64 = Buffer.from(m, "utf8").toString("base64");
-        expect(script).toContain(`grep -q $(echo ${b64} | base64 -d) ${path}`);
-      }
-    }
   });
 });

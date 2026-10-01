@@ -8,6 +8,12 @@
  *   - the user edited it       → keep their bytes, log it, never overwrite
  *   - we no longer ship it     → delete only if unedited, else keep
  *
+ * A file may opt out of the third rule with `policy: "overwrite"` — for
+ * app-owned code the user is not invited to edit (the extension sources in
+ * extensions/), where an out-of-date copy is the bug and a diverged copy is an
+ * unsupported state. Text the user is expected to tune (skills, agent
+ * definitions, the delegation extension) keeps the default, `preserve`.
+ *
  * "Did the user edit it" needs memory, which is what the journal (`.pipi.json`,
  * written next to the installed content) provides: it records the hash of the
  * bytes we last put there. Without it, our own older version and a user edit
@@ -42,6 +48,9 @@ export interface ShippedFile {
    *  "delegation/index.ts". Always /-separated. */
   relPath: string;
   content: string;
+  /** `overwrite` (app-owned code): always write ours, never call it a
+   *  divergence. Default `preserve`: the user's edits win and are kept. */
+  policy?: "preserve" | "overwrite";
 }
 
 export const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
@@ -85,6 +94,7 @@ export interface ContentPlan {
  *   2. differs, but matches the journal → our own older version → write ours
  *   3. differs from both → the user's → keep, do not write
  *
+ * `policy: "overwrite"` files skip step 3 entirely (see the module header).
  * Retirement uses the same test: only a file still holding the bytes we
  * recorded may be deleted.
  */
@@ -98,7 +108,12 @@ export function planSync(
 
   for (const file of files) {
     const actual = current[file.relPath];
-    if (actual == null || actual === file.content || sha256(actual) === journal.shipped[file.relPath]) {
+    if (
+      file.policy === "overwrite" ||
+      actual == null ||
+      actual === file.content ||
+      sha256(actual) === journal.shipped[file.relPath]
+    ) {
       plan.writes.push(file);
     } else {
       plan.diverged.push(file.relPath);

@@ -29,7 +29,8 @@ import { sameSessionPaths } from "../shared/session-paths";
 import { pickWslEventTab } from "./wsl-event-tab";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
-import { ensureShippedExtensions, retireShippedFiles, SHIPPED_EXTENSIONS, syncExtensionsViaSftp, buildSshInstallCommand, buildSshInstallScript, buildSshCatCommand } from "./extension-sync";
+import { ensureShippedAgentHome, syncAgentHomeViaSsh, syncExtensionsViaSftp, SHIPPED_EXTENSION_FILES, SHIPPED_AGENT_FILES, buildSshCatCommand } from "./extension-sync";
+import { nodeContentIo, syncContent } from "./content-sync";
 import { runSshCommand } from "./ssh-exec";
 import {
   ensureShippedSkills,
@@ -690,32 +691,29 @@ async function resolveWslPath(distro: string, linuxPath: string): Promise<string
 }
 
 /**
- * Ship app-bundled pi extensions into a WSL distro's ~/.pi/agent/extensions
- * via the \\wsl$ UNC filesystem (the app already reads WSL sessions this
- * way — see SessionIndex's WSL adapter). RPC-backed WSL chat tabs navigate the
- * session tree through the pipi-tree-nav extension command, which must
- * exist on the DISTRO side; without it the navigation prompt falls through
- * to a normal LLM turn. Content-compared, so it is a no-op once in sync;
- * fully async (non-blocking home resolution + fs/promises), failures are
- * logged, never fatal.
+ * Ship app-internal pi content into a WSL distro's ~/.pi/agent (extensions and
+ * agents) via the \\wsl$ UNC filesystem (the app already reads WSL sessions
+ * this way — see SessionIndex's WSL adapter). RPC-backed WSL chat tabs navigate
+ * the session tree through the pipi-tree-nav extension command, which must
+ * exist on the DISTRO side; without it the navigation prompt falls through to a
+ * normal LLM turn. Same journal rules as the local sync (our own sources are
+ * overwritten, a delegation file the user edited inside the distro is kept),
+ * and a no-op once in sync. Fully async: UNC I/O on the main thread can stall.
  */
 async function syncWslExtensions(distro: string): Promise<void> {
   try {
-    const home = await getWslHomeAsync(distro);
-    const winHome = wslToWinPath(distro, home);
-    const extDir = join(winHome, ".pi", "agent", "extensions");
-    await mkdir(extDir, { recursive: true });
-    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-      const target = join(extDir, fileName);
-      let current: string | null = null;
-      try {
-        current = await readFile(target, "utf8");
-      } catch {
-        current = null; // not present yet → write
+    const winHome = wslToWinPath(distro, await getWslHomeAsync(distro));
+    const agentHome = join(winHome, ".pi", "agent");
+    for (const [dir, files, label] of [
+      ["extensions", SHIPPED_EXTENSION_FILES, "extensions"],
+      ["agents", SHIPPED_AGENT_FILES, "agents"],
+    ] as const) {
+      const result = await syncContent(nodeContentIo(join(agentHome, dir)), files);
+      if (result.written.length > 0 || result.retired.length > 0) {
+        console.log(
+          `[${label}] WSL ${distro}: wrote ${result.written.length}, kept ${result.diverged.length} edited, retired ${result.retired.length}`,
+        );
       }
-      if (current === content) continue;
-      await writeFile(target, content, "utf8");
-      console.log(`[extensions] wrote WSL ${distro}: ${target}`);
     }
   } catch (e) {
     console.error(`[extensions] WSL ${distro} sync failed:`, e instanceof Error ? e.message : String(e));
@@ -749,11 +747,13 @@ async function syncWslSkills(distro: string): Promise<void> {
 const remoteKeyExtSyncHash = new Map<string, string>();
 
 /** Digest of everything the app provisions into an agent dir — extensions AND
- *  the skills tree — so adding, removing or editing either one re-syncs on the
- *  next connect. Rel paths are folded in, so a moved file is a change too. */
+ *  agents AND the skills tree — so adding, removing or editing any of them
+ *  re-syncs on the next connect. Rel paths are folded in, so a moved file is a
+ *  change too. */
 function shippedProvisionDigest(): string {
+  const trees = [...SHIPPED_EXTENSION_FILES, ...SHIPPED_AGENT_FILES].map((f) => `${f.relPath}\u0002${f.content}`);
   return createHash("sha256")
-    .update(SHIPPED_EXTENSIONS.map((e) => e.content).join("\u0000"))
+    .update(trees.join("\u0000"))
     .update("\u0001")
     .update(SHIPPED_SKILL_FILES.map((f) => `${f.relPath}\u0002${f.content}`).join("\u0000"))
     .digest("hex");
@@ -799,15 +799,20 @@ function syncKeyAuthExtensions(remote: RemoteOpts): void {
   const sshBin = findSshBin() ?? "ssh.exe";
   const run: SshScriptRunner = (options) => runSshCommand({ remote, sshBin, ...options });
   void (async () => {
-    // Extensions: one trip, overwrite (they are not a user-editable tree).
-    const extResult = await run({ command: buildSshInstallCommand(), stdin: buildSshInstallScript(), timeoutMs: 20000 });
-    if (!extResult.ok) {
+    // Extensions + agents: one probe→apply per root, with the legacy retire
+    // riding along on the extensions apply (see extension-sync.ts).
+    const provisioned = await syncAgentHomeViaSsh(run, 20000);
+    if (!provisioned.ok) {
       console.error(
-        `[extensions] key-auth remote sync failed (${key}): ${extResult.error ?? "unknown"}${extResult.stderr.trim() ? ` — ${extResult.stderr.trim()}` : ""}`,
+        `[extensions] key-auth remote sync failed (${key}): ${provisioned.error ?? "unknown"}`,
       );
       return;
     }
-    console.log(`[extensions] key-auth remote synced -> ${key}`);
+    if (provisioned.extensions.length > 0 || provisioned.agents.length > 0 || provisioned.diverged.length > 0) {
+      console.log(
+        `[extensions] key-auth remote: wrote ${provisioned.extensions.length} extensions, ${provisioned.agents.length} agents, kept ${provisioned.diverged.length} edited, retired ${provisioned.retired.length} -> ${key}`,
+      );
+    }
     // Skills: probe → classify → apply (2-3 trips, see skill-sync.ts). The
     // probe is what makes "keep what the user edited" work on a passwordless
     // server, where nothing can read the remote file system except these
@@ -1100,10 +1105,12 @@ if (gotSingleInstanceLock) {
   });
   const memTimer = setInterval(() => logMemory("tick"), 120_000);
   memTimer.unref?.();
-  // Ship app-bundled pi extensions (static working indicator etc.) BEFORE any
-  // tab can spawn pi, so every pi process auto-discovers them. The returned
-  // list of actually-written files feeds the chat-page update notice.
-  pendingExtensionSync = ensureShippedExtensions();
+  // Ship app-internal pi content (extensions/ + agents/) BEFORE any tab can
+  // spawn pi, so every pi process auto-discovers them. The returned lists of
+  // actually-written files feed the chat-page update notice; files the user
+  // edited are kept and reported, and files we no longer ship are deleted.
+  const shipped = ensureShippedAgentHome();
+  pendingExtensionSync = [...shipped.extensions, ...shipped.agents];
   // Same contract for the skills tree (see skill-sync.ts): they must exist
   // before any tab can spawn pi. Policy is 只读订阅 + 偏离保留 — a skill the
   // user edited is kept (and reported), never overwritten, which needs the
@@ -1114,9 +1121,9 @@ if (gotSingleInstanceLock) {
   }
   // Delete files we no longer ship: pi auto-loads every .ts under extensions/, so a
   // retired extension left on disk keeps running (we would only stop rendering its UI).
-  const retiredAtStartup = retireShippedFiles();
-  if (retiredAtStartup.length > 0) {
-    console.log(`[extensions] retired: ${retiredAtStartup.join(", ")}`);
+  // (The pre-journal cases — this is the migration path, the journal handles the rest.)
+  if (shipped.retired.length > 0) {
+    console.log(`[extensions] retired: ${shipped.retired.join(", ")}`);
   }
   if (pendingExtensionSync.length > 0) {
     console.log(`[extensions] updated: ${pendingExtensionSync.join(", ")}`);

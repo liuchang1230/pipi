@@ -1,36 +1,75 @@
 /**
- * Ship app-bundled pi extensions to ~/.pi/agent/extensions/ so every pi
- * spawned by a tab picks them up via auto-discovery (see docs/extensions.md).
+ * Ship app-internal pi content into an agent dir's extensions/ and agents/ so
+ * every pi spawned by a tab picks it up via auto-discovery (see pi's
+ * docs/extensions.md), on the local machine, in WSL, and on remote servers.
  *
- * The same files are also provisioned to REMOTE (password-authed SFTP) and
- * WSL agent dirs — RPC-backed remote/WSL chat tabs navigate the session tree
- * through the pipi-tree-nav extension command (upstream pi's rpc-mode has no
- * native `navigate_tree` RPC), so the extension must exist on the machine
- * that runs pi, not just the app's local install.
+ * Two destinations, two ownership postures (both live in content-sync.ts):
  *
- * Source of truth: the files in src/main/extensions/, embedded at build time
- * via Vite `?raw` imports (no packaging/asar concerns).
+ *   - extensions/: the 5 app-owned extension sources are code WE maintain and
+ *     the user is not invited to edit, so they are shipped with
+ *     `policy: "overwrite"` — an out-of-date copy is a bug, and a diverged copy
+ *     is an unsupported state.
+ *   - extensions/delegation/ + agents/: the delegation capability layer
+ *     (analyst / reviewer / scout) is text the user is expected to tune, so it
+ *     keeps the default `preserve` policy: their edits win, are logged, and are
+ *     never overwritten. It needs a journal for the same reason the skills tree
+ *     does — see content-sync.ts.
  *
- * The ssh (key-auth) path splits its work in two on purpose — an ARGV half that
- * is content-free and a STDIN half that carries the base64 payload — because a
- * command line that grows with the shipped content hits Windows' 32,767-char
- * CreateProcess limit and `spawn` then throws ENAMETOOLONG synchronously. See
- * ssh-exec.ts; buildSshInstallCommand/buildSshInstallScript are that split.
+ * Why the delegation layer ships at all (ADR 0005): the shipped `code-review`
+ * skill tells the model to spawn two parallel sub-agents, and pi core
+ * deliberately ships no sub-agents — the app would otherwise hand every user a
+ * skill whose step 4 cannot run, silently, in one context.
+ *
+ * RPC-backed remote/WSL chat tabs navigate the session tree through the
+ * pipi-tree-nav extension command (upstream pi's rpc-mode has no native
+ * `navigate_tree` RPC), so the extension must exist on the machine that runs
+ * pi, not just the app's local install — hence the four transports.
+ *
+ * Source of truth: src/main/extensions/ and src/main/agents/, embedded at build
+ * time via Vite `?raw` imports (no packaging/asar concerns).
+ *
+ * The ssh (key-auth) path sends a content-free command and carries the payload
+ * on stdin, because a command line that grows with the shipped content hits
+ * Windows' 32,767-char CreateProcess limit and `spawn` then throws
+ * ENAMETOOLONG synchronously. See ssh-exec.ts + content-sync.ts.
  */
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import type SftpClient from "ssh2-sftp-client";
 import { remoteAgentDir } from "./pty";
+import {
+  buildSshContentCommand,
+  ensureContent,
+  sftpContentIo,
+  syncContent,
+  syncContentViaSsh,
+  type ShippedFile,
+  type SshScriptRunner,
+} from "./content-sync";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
 import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
 import approvalGateSource from "./extensions/pipi-approval-gate.ts?raw";
+import delegationIndexSource from "./extensions/delegation/index.ts?raw";
+import delegationAgentsSource from "./extensions/delegation/agents.ts?raw";
+import delegationDeclarationsSource from "./extensions/delegation/declarations.ts?raw";
+import delegationEngineSource from "./extensions/delegation/engine.ts?raw";
+import delegationRenderSource from "./extensions/delegation/render.ts?raw";
+import analystAgentSource from "./agents/analyst.md?raw";
+import reviewerAgentSource from "./agents/reviewer.md?raw";
+import scoutAgentSource from "./agents/scout.md?raw";
 
 const AGENT_HOME = join(homedir(), ".pi", "agent");
-const EXTENSIONS_DIR = join(AGENT_HOME, "extensions");
+export const EXTENSIONS_DIR = join(AGENT_HOME, "extensions");
+export const AGENTS_DIR = join(AGENT_HOME, "agents");
+/** The remote roots, as POSIX expressions the REMOTE shell expands. Key-auth
+ *  provisioning is skipped when the remote uses an agentDir override (index.ts),
+ *  so `$HOME` is always the right root there. */
+const REMOTE_EXTENSIONS_DIR = "$HOME/.pi/agent/extensions";
+const REMOTE_AGENTS_DIR = "$HOME/.pi/agent/agents";
 
 export interface ShippedExtension {
   fileName: string;
@@ -45,12 +84,41 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-approval-gate.ts", content: approvalGateSource },
 ];
 
+/** The delegation capability layer, as `extensions/delegation/*.ts` — pi's
+ *  discovery rule for a directory extension is `extensions/<name>/index.ts`. */
+const DELEGATION_FILES: ShippedFile[] = [
+  { relPath: "delegation/index.ts", content: delegationIndexSource },
+  { relPath: "delegation/agents.ts", content: delegationAgentsSource },
+  { relPath: "delegation/declarations.ts", content: delegationDeclarationsSource },
+  { relPath: "delegation/engine.ts", content: delegationEngineSource },
+  { relPath: "delegation/render.ts", content: delegationRenderSource },
+];
+
+/** Everything the app installs into <agentHome>/extensions: our own single-file
+ *  extensions (overwrite) plus the delegation tree (preserve). */
+export const SHIPPED_EXTENSION_FILES: ShippedFile[] = [
+  ...SHIPPED_EXTENSIONS.map(({ fileName, content }) => ({ relPath: fileName, content, policy: "overwrite" as const })),
+  ...DELEGATION_FILES,
+];
+
+/** Everything the app installs into <agentHome>/agents. Agent definitions are
+ *  prompts the user tunes (or replaces) → preserve. */
+export const SHIPPED_AGENT_FILES: ShippedFile[] = [
+  { relPath: "analyst.md", content: analystAgentSource },
+  { relPath: "reviewer.md", content: reviewerAgentSource },
+  { relPath: "scout.md", content: scoutAgentSource },
+];
+
 /**
  * Files that EARLIER app versions shipped and that we no longer ship. They must be
  * DELETED on upgrade, not merely ignored: pi auto-loads every .ts under extensions/,
  * so a retired extension left on disk keeps running (the app would just stop
  * rendering its UI — the prompts, briefs and tool guards would still fire). Same for
  * an agent definition or prompt template nobody references any more.
+ *
+ * This is the PRE-JOURNAL migration path only: content the journal knows about is
+ * retired by the plan in content-sync.ts. A file from a version that predates the
+ * journal has no entry, so it needs to be recognized by its bytes.
  *
  * A file is removed ONLY when we recognize it as ours: its bytes are the ones we
  * shipped (`sha256`), or it carries EVERY marker (`markers`). Anything else — a file
@@ -118,38 +186,47 @@ export function retireShippedFiles(agentHome = AGENT_HOME): string[] {
 }
 
 /**
- * Best-effort sync of shipped extensions. Runs at app startup, before any
- * tab can spawn pi; only writes when content actually differs so we don't
- * churn mtimes on every launch. Failures are logged, never fatal.
- *
- * Returns the file names that were actually written (content changed), so
- * the caller can surface a chat-page notice. `dir` is overridable for tests.
+ * Best-effort sync of the shipped extensions (see content-sync.ts for the
+ * policy: our own sources are overwritten, the delegation tree the user edited
+ * is kept). `dir` is overridable for tests. Returns the rel paths actually
+ * written, so the caller can surface a chat-page notice.
  */
 export function ensureShippedExtensions(dir = EXTENSIONS_DIR): string[] {
-  const updated: string[] = [];
-  for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-    try {
-      mkdirSync(dir, { recursive: true });
-      const target = join(dir, fileName);
-      const current = existsSync(target) ? readFileSync(target, "utf8") : null;
-      if (current !== content) {
-        writeFileSync(target, content, "utf8");
-        updated.push(fileName);
-        console.log(`[extensions] wrote ${target}`);
-      }
-    } catch (e) {
-      console.error(`[extensions] failed to ship ${fileName}:`, e instanceof Error ? e.message : String(e));
-    }
-  }
-  return updated;
+  return ensureContent(dir, SHIPPED_EXTENSION_FILES, "extensions").written;
 }
 
-export interface RemoteExtensionsSyncResult {
-  ok: boolean;
-  error?: string;
-  uploaded: string[];
-  /** Paths removed because we no longer ship them (see RETIRED_FILES). */
-  retired?: string[];
+/** Same contract for agents/. Returns the rel paths actually written. */
+export function ensureShippedAgents(dir = AGENTS_DIR): string[] {
+  return ensureContent(dir, SHIPPED_AGENT_FILES, "agents").written;
+}
+
+export interface AgentHomeSyncResult {
+  /** Rel paths written, e.g. "pipi-tree-nav.ts", "delegation/index.ts". */
+  extensions: string[];
+  agents: string[];
+  /** Kept because the user edited them (never overwritten). */
+  diverged: string[];
+  /** Removed: no longer shipped, and unedited. */
+  retired: string[];
+}
+
+/**
+ * The whole local startup provisioning step, in one call: both roots of the
+ * agent home, plus the pre-journal retirement. Synchronous on purpose — the
+ * content must exist BEFORE any tab can spawn pi, which is why this runs at
+ * startup rather than on first use (same contract as ensureShippedSkills).
+ * Failures are logged, never fatal: the app must still start.
+ */
+export function ensureShippedAgentHome(agentHome = AGENT_HOME): AgentHomeSyncResult {
+  const extensions = ensureContent(join(agentHome, "extensions"), SHIPPED_EXTENSION_FILES, "extensions");
+  const agents = ensureContent(join(agentHome, "agents"), SHIPPED_AGENT_FILES, "agents");
+  const retired = retireShippedFiles(agentHome);
+  return {
+    extensions: extensions.written,
+    agents: agents.written,
+    diverged: [...extensions.diverged, ...agents.diverged],
+    retired: [...extensions.retired, ...agents.retired, ...retired],
+  };
 }
 
 /** Build the remote-shell command that cats a file whose path is
@@ -162,60 +239,92 @@ export function buildSshCatCommand(remotePath: string): string {
 }
 
 /**
- * The ARGV half of the key-auth install: a deliberately content-free command
- * that reads the real work from stdin. It must stay this small — see the
- * module header and ssh-exec.ts (a ~35KB argv throws ENAMETOOLONG synchronously
- * on Windows, which is how this provisioning used to die on EVERY key-auth
- * connect once the shipped sources grew past ~24KB).
+ * The ARGV half of every key-auth remote call: a deliberately content-free
+ * command that reads the real work from stdin. It must stay this small — see
+ * the module header and ssh-exec.ts (a ~35KB argv throws ENAMETOOLONG
+ * synchronously on Windows, which is how this provisioning used to die on
+ * EVERY key-auth connect once the shipped sources grew past ~24KB).
  */
 export function buildSshInstallCommand(): string {
-  return "sh -s";
+  return buildSshContentCommand();
 }
 
 /**
- * The STDIN half: the POSIX script that installs the shipped extensions into a
- * Linux server's ~/.pi/agent/extensions. Content is base64-embedded so no
- * quoting/newline escaping crosses the ssh→bash layers; the script itself
- * avoids quotes entirely ($HOME expands in the remote shell; the default
- * agent path has no spaces). Used by the key-auth remote sync — there the app
- * has no SFTP credentials, so provisioning goes over ssh.exe with BatchMode
- * instead (see syncKeyAuthExtensions in index.ts).
+ * The remote half of the PRE-JOURNAL retirement, appended to the apply trip
+ * (the apply script is already going there, so the legacy cleanup costs no
+ * extra round trip). `rm -f` only when our markers are all present. Quote-free
+ * (markers travel base64-encoded, and they contain no spaces) and each clause
+ * is wrapped in a subshell that always succeeds, so a retire miss can never
+ * fail the install.
  */
-export function buildSshInstallScript(extensions: ShippedExtension[] = SHIPPED_EXTENSIONS): string {
-  const base = "$HOME/.pi/agent/extensions";
-  const writes = extensions
-    .map(({ fileName, content }) => {
-      const b64 = Buffer.from(content, "utf8").toString("base64");
-      return `echo ${b64} | base64 -d > ${base}/${fileName}`;
-    })
-    .join(" && ");
-  return `mkdir -p ${base} && ${writes}${buildSshRetireSuffix()}\n`;
-}
-
-/**
- * The remote half of retirement: `rm -f` only when our markers are all present.
- * Quote-free (markers travel base64-encoded, and they contain no spaces) and
- * wrapped in a subshell that always succeeds, so a retire miss can never fail the
- * install command itself.
- */
-function buildSshRetireSuffix(): string {
-  return RETIRED_FILES.map(({ dir, fileName, markers }) => {
-    const path = `$HOME/.pi/agent/${dir}/${fileName}`;
+export function buildSshRetireTrailer(agentHome = "$HOME/.pi/agent"): string {
+  return `${RETIRED_FILES.map(({ dir, fileName, markers }) => {
+    const path = `${agentHome}/${dir}/${fileName}`;
     const probes = markers
       .map((m) => `grep -q $(echo ${Buffer.from(m, "utf8").toString("base64")} | base64 -d) ${path}`)
       .join(" && ");
-    return ` && ( test -f ${path} && ${probes} && rm -f ${path} && echo retired ${path} || true )`;
-  }).join("");
+    return `( test -f ${path} && ${probes} && rm -f ${path} && echo retired ${path} || true )`;
+  }).join("\n")}\n`;
 }
 
 /**
- * Upload the shipped extensions to a remote server's agent extensions dir
- * over an already-connected sftp session (mirrors syncThemesViaSftp in
- * theme-sync.ts). Content-compared per file: an unchanged remote file is
- * skipped, so this is cheap enough to run on every password-authed connect
- * — an app update reaches the server on the next tab open without waiting
- * for a TTL. The whole upload is wrapped in one try/catch (any failure
- * returns ok:false with the files uploaded so far), matching the theme
+ * The key-auth (passwordless) ssh transport: one probe→apply sequence per root
+ * of the agent home (extensions, then agents), with the legacy retire riding
+ * along on the extensions apply. The caller has already bound the remote and the
+ * ssh binary; `run` never throws (see ssh-exec.ts), so a failure here is a
+ * result, not an exception.
+ *
+ * Only a fully provisioned server may be marked done by the caller: a failed
+ * agents half must be retried on the next connect rather than skipped forever.
+ */
+export async function syncAgentHomeViaSsh(
+  run: SshScriptRunner,
+  timeoutMs = 20000,
+): Promise<AgentHomeSyncResult & { ok: boolean; error?: string }> {
+  const extensions = await syncContentViaSsh(
+    run,
+    {
+      remoteRoot: REMOTE_EXTENSIONS_DIR,
+      label: "extensions",
+      displayRoot: "~/.pi/agent/extensions",
+      trailer: buildSshRetireTrailer(),
+    },
+    SHIPPED_EXTENSION_FILES,
+    timeoutMs,
+  );
+  const agents = extensions.ok
+    ? await syncContentViaSsh(
+        run,
+        { remoteRoot: REMOTE_AGENTS_DIR, label: "agents", displayRoot: "~/.pi/agent/agents" },
+        SHIPPED_AGENT_FILES,
+        timeoutMs,
+      )
+    : { ok: false, written: [], diverged: [], retired: [], error: extensions.error };
+  return {
+    ok: extensions.ok && agents.ok,
+    error: extensions.error ?? agents.error,
+    extensions: extensions.written,
+    agents: agents.written,
+    diverged: [...extensions.diverged, ...agents.diverged],
+    retired: [...extensions.retired, ...agents.retired],
+  };
+}
+
+export interface RemoteExtensionsSyncResult {
+  ok: boolean;
+  error?: string;
+  uploaded: string[];
+  /** Paths removed because we no longer ship them (see RETIRED_FILES). */
+  retired?: string[];
+}
+
+/**
+ * Upload the shipped content to a remote server's agent home over an
+ * already-connected sftp session (mirrors syncThemesViaSftp in theme-sync.ts).
+ * Both roots go through the same journal rules as the local sync, so a
+ * delegation file or agent definition the user tuned ON THE SERVER is kept
+ * rather than clobbered. The whole upload is wrapped in one try/catch (any
+ * failure returns ok:false with the paths uploaded so far), matching the theme
  * sync's failure contract.
  */
 export async function syncExtensionsViaSftp(
@@ -225,10 +334,8 @@ export async function syncExtensionsViaSftp(
 ): Promise<RemoteExtensionsSyncResult> {
   const uploaded: string[] = [];
   const base = remoteAgentDir({ agentDir: agentDirRemote }, homeDir);
-  const extDir = `${base}/extensions`;
   const retired: string[] = [];
   try {
-    await client.mkdir(extDir, true);
     // Retire first: a retired extension must not survive the sync that stops
     // shipping it (pi loads it from disk regardless of what the app renders).
     for (const spec of RETIRED_FILES) {
@@ -249,19 +356,12 @@ export async function syncExtensionsViaSftp(
         console.error(`[extensions] failed to retire ${remotePath}:`, error instanceof Error ? error.message : String(error));
       }
     }
-    for (const { fileName, content } of SHIPPED_EXTENSIONS) {
-      const remotePath = `${extDir}/${fileName}`;
-      let current: string | Buffer | undefined;
-      try {
-        current = (await client.get(remotePath)) as string | Buffer | undefined;
-      } catch {
-        current = undefined; // not present yet → upload
-      }
-      const currentText = current === undefined ? "" : Buffer.isBuffer(current) ? current.toString("utf8") : String(current);
-      if (currentText === content) continue;
-      // put() treats a string as a LOCAL file path → pass a Buffer for raw content.
-      await client.put(Buffer.from(content, "utf8"), remotePath);
-      uploaded.push(remotePath);
+    for (const [root, files] of [
+      [`${base}/extensions`, SHIPPED_EXTENSION_FILES],
+      [`${base}/agents`, SHIPPED_AGENT_FILES],
+    ] as const) {
+      const result = await syncContent(sftpContentIo(client, root), files);
+      for (const relPath of result.written) uploaded.push(`${root}/${relPath}`);
     }
   } catch (error) {
     return {

@@ -1,0 +1,164 @@
+// The generic delivery engine: the ownership policy (只读订阅 + 偏离保留), the
+// overwrite opt-out, and the fact that one root's journal says nothing about
+// another root's files. Skills exercise the mechanics through skill-sync.ts;
+// this file pins the parts that only show up once MORE THAN ONE kind of content
+// ships (extensions/agents), which is what makes the engine generic.
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  buildApplyScript,
+  ensureContent,
+  JOURNAL_FILE,
+  nextJournal,
+  parseJournal,
+  planSync,
+  sha256,
+  type ShippedFile,
+} from "../content-sync";
+
+let dirs: string[] = [];
+
+function tempDir(): string {
+  const d = mkdtempSync(join(tmpdir(), "content-sync-"));
+  dirs.push(d);
+  return d;
+}
+
+afterEach(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  dirs = [];
+});
+
+const file = (relPath: string, content: string, policy?: ShippedFile["policy"]): ShippedFile => ({
+  relPath,
+  content,
+  ...(policy ? { policy } : {}),
+});
+
+describe("ownership policy", () => {
+  it("preserve (default): a divergent file is kept, overwrite: it is ours again", () => {
+    const bundle = [file("kept.md", "ours v2\n"), file("ours.ts", "ours v2\n", "overwrite")];
+    const current = { "kept.md": "the user's own text\n", "ours.ts": "the user's tweak\n" };
+    // Both look "divergent" to a journal-less eye; only the policy separates them.
+    const plan = planSync(current, { version: 1, shipped: {}, diverged: {} }, bundle);
+    expect(plan.diverged).toEqual(["kept.md"]);
+    expect(plan.writes.map((f) => f.relPath)).toEqual(["ours.ts"]);
+  });
+
+  it("an overwrite file is never recorded as a divergence, however it drifted", () => {
+    const bundle = [file("ours.ts", "ours v2\n", "overwrite")];
+    const previous = { version: 1 as const, shipped: { "ours.ts": sha256("ours v1\n") }, diverged: {} };
+    const plan = planSync({ "ours.ts": "hand-edited\n" }, previous, bundle);
+    expect(plan.diverged).toEqual([]);
+    const journal = nextJournal(plan, previous, bundle);
+    expect(journal.diverged).toEqual({});
+    // …and it is recorded as ours at the NEW bytes, which is what makes the next
+    // run a no-op instead of a rewrite.
+    expect(journal.shipped["ours.ts"]).toBe(sha256("ours v2\n"));
+  });
+
+  it("a preserved file that diverges is recorded with the INTENT, not our hash", () => {
+    const bundle = [file("kept.md", "ours v2\n")];
+    const previous = { version: 1 as const, shipped: { "kept.md": sha256("ours v1\n") }, diverged: {} };
+    const plan = planSync({ "kept.md": "the user's\n" }, previous, bundle);
+    const journal = nextJournal(plan, previous, bundle);
+    expect(journal.shipped["kept.md"]).toBeUndefined();
+    expect(journal.diverged["kept.md"]).toBe(sha256("ours v2\n"));
+  });
+});
+
+describe("ensureContent across two roots", () => {
+  it("writes both roots on first run and reports what it wrote", () => {
+    const home = tempDir();
+    const ext = ensureContent(join(home, "extensions"), [file("a.ts", "A\n"), file("delegation/index.ts", "I\n")], "extensions");
+    const agents = ensureContent(join(home, "agents"), [file("scout.md", "S\n")], "agents");
+    expect(ext.written).toEqual(["a.ts", "delegation/index.ts"]);
+    expect(agents.written).toEqual(["scout.md"]);
+    expect(readFileSync(join(home, "extensions", "delegation", "index.ts"), "utf8")).toBe("I\n");
+    // Each root owns its own journal: a file listed in one says nothing about
+    // the other, so retiring it in extensions cannot delete agents' copy.
+    expect(existsSync(join(home, "extensions", JOURNAL_FILE))).toBe(true);
+    expect(existsSync(join(home, "agents", JOURNAL_FILE))).toBe(true);
+    expect(parseJournal(readFileSync(join(home, "agents", JOURNAL_FILE), "utf8")).shipped).toEqual({
+      "scout.md": sha256("S\n"),
+    });
+  });
+
+  it("is a no-op on the second run (journal unchanged, nothing rewritten)", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    ensureContent(root, [file("a.ts", "A\n")], "extensions");
+    const before = readFileSync(join(root, JOURNAL_FILE), "utf8");
+    const mtime = readFileSync(join(root, "a.ts"), "utf8");
+    expect(ensureContent(root, [file("a.ts", "A\n")], "extensions").written).toEqual([]);
+    expect(readFileSync(join(root, JOURNAL_FILE), "utf8")).toBe(before);
+    expect(readFileSync(join(root, "a.ts"), "utf8")).toBe(mtime);
+  });
+
+  it("stops retiring a file the user replaced, even after we stop shipping it", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    ensureContent(root, [file("gone.ts", "G\n"), file("kept.ts", "K\n", "overwrite")], "extensions");
+    // The user replaces the file we shipped with their own…
+    writeFileSync(join(root, "gone.ts"), "mine\n", "utf8");
+    // …and we stop shipping both, so only the one still holding OUR bytes goes.
+    const result = ensureContent(root, [file("kept.ts", "K2\n", "overwrite")], "extensions");
+    expect(result.retired).toEqual([]);
+    expect(readFileSync(join(root, "gone.ts"), "utf8")).toBe("mine\n");
+  });
+
+  it("deletes a retired file and the directory it leaves empty", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    ensureContent(root, [file("delegation/a.ts", "A\n"), file("delegation/b.ts", "B\n")], "extensions");
+    const result = ensureContent(root, [file("delegation/a.ts", "A\n")], "extensions");
+    expect(result.retired).toEqual(["delegation/b.ts"]);
+    expect(existsSync(join(root, "delegation", "b.ts"))).toBe(false);
+    expect(existsSync(join(root, "delegation"))).toBe(true); // a.ts still there
+  });
+
+  it("survives a corrupt journal: everything looks like the user's, so nothing is touched", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    mkdirSync(join(root, "delegation"), { recursive: true });
+    writeFileSync(join(root, JOURNAL_FILE), "{ not json", "utf8");
+    writeFileSync(join(root, "delegation", "index.ts"), "mine\n", "utf8");
+    // A corrupt journal reads as empty → the file on disk matches neither our
+    // bytes nor a recorded hash → it is the user's → untouched. Losing that one
+    // upgrade is the safe direction; deleting their file is not.
+    const result = ensureContent(root, [file("delegation/index.ts", "I\n")], "extensions");
+    expect(result).toEqual({ written: [], diverged: ["delegation/index.ts"], retired: [] });
+    expect(readFileSync(join(root, "delegation", "index.ts"), "utf8")).toBe("mine\n");
+  });
+});
+
+describe("buildApplyScript", () => {
+  it("appends the trailer as its own always-succeeding lines", () => {
+    const script = buildApplyScript({
+      plan: { writes: [], diverged: [], retired: [] },
+      current: {},
+      journal: { version: 1, shipped: {}, diverged: {} },
+      remoteRoot: "$HOME/.pi/agent/extensions",
+      trailer: "( test -f $HOME/.pi/agent/agents/planner.md && rm -f $HOME/.pi/agent/agents/planner.md || true )\n",
+    });
+    const lines = script.trim().split("\n");
+    expect(lines.at(-1)).toBe(
+      "( test -f $HOME/.pi/agent/agents/planner.md && rm -f $HOME/.pi/agent/agents/planner.md || true )",
+    );
+    // The journal is still written before the trailer, so a failed legacy retire
+    // cannot lose the classification of everything we just installed.
+    expect(script.indexOf(JOURNAL_FILE)).toBeLessThan(script.indexOf("planner.md"));
+    // Every line is complete on its own: `sh -s` reads to EOF.
+    expect(script.endsWith("\n")).toBe(true);
+  });
+
+  it("writes nothing twice: an unchanged file is not in the payload", () => {
+    const files = [file("a.ts", "A\n")];
+    const journal = { version: 1 as const, shipped: { "a.ts": sha256("A\n") }, diverged: {} };
+    const plan = planSync({ "a.ts": "A\n" }, journal, files);
+    const script = buildApplyScript({ plan, current: { "a.ts": "A\n" }, journal, remoteRoot: "$HOME/.pi/agent" });
+    expect(script.split("\n").filter((line) => line.includes("a.ts"))).toEqual([]);
+  });
+});
