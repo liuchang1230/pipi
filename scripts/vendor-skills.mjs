@@ -194,6 +194,21 @@ function applyRewrites(text, rewrites, relPath) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const manifest = JSON.parse(readFileSync(join(SKILLS_DIR, "manifest.json"), "utf8"));
+  // Structural validation at LOAD time, not at apply time: patches are routed
+  // per file (byFile) before applyPatches ever sees them, so a patch missing
+  // its "file" field would land in no bucket and be silently skipped — the
+  // worst failure mode here (everything green, a registered rewrite never
+  // ships). Fail loudly instead.
+  for (const skill of manifest.skills) {
+    for (const patch of skill.patches ?? []) {
+      if (typeof patch.file !== "string" || patch.file.trim() === "") {
+        throw new Error(
+          `skills/manifest.json: ${skill.bucket}/${skill.name} has a patch without a "file" field.\n` +
+            `  Every patch targets one file (e.g. "SKILL.md"); add it, otherwise the patch is silently dropped.`,
+        );
+      }
+    }
+  }
   const upstream = resolve(args.from);
   const upstreamSkills = join(upstream, "skills");
 

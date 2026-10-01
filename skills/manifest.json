@@ -124,9 +124,16 @@
     {
       "name": "grilling",
       "bucket": "productivity",
-      "ship": false,
+      "ship": true,
       "upstreamPath": "skills/productivity/grilling",
-      "patches": []
+      "patches": [
+        {
+          "file": "SKILL.md",
+          "find": "When a frontier question needs a fact from the environment (filesystem, tools, etc.), dispatch a sub-agent to find it; don't ask the user for anything you could look up yourself.",
+          "replace": "When a frontier question needs a fact from the environment (filesystem, tools, etc.), dispatch a sub-agent (the `scout` tool, if available) to find it; don't ask the user for anything you could look up yourself. If no sub-agent tool exists, look it up inline in this context first, and note in the round that you did so.",
+          "why": "能力断言带降级：pi 核心不带子代理工具；pipi 分发的 delegation 层提供 scout。文本命名机制、写明拿不到时怎么办，并要求交代哪一种跑了。"
+        }
+      ]
     },
     {
       "name": "grill-me",

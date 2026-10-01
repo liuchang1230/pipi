@@ -10,7 +10,7 @@
 上游升级的流程是：克隆上游 → 确认 commit → 改 `skills/manifest.json`（只改 overlay 与 pin）→ 跑 `node scripts/vendor-skills.mjs --from <clone>`。
 手改会让下一次升级变成一次无人敢做的三方合并；`--check` 会把任何手改报成 drift。
 
-## 随 app 分发给用户（6 个）
+## 随 app 分发给用户（7 个）
 
 - `engineering/wizard` — `skills/engineering/wizard`
 - `engineering/retro` — `skills/engineering/retro`
@@ -18,10 +18,10 @@
 - `engineering/code-review` — `skills/engineering/code-review`
 - `productivity/writing-for-agents` — `skills/productivity/writing-for-agents`
 - `productivity/handoff` — `skills/productivity/handoff`
-
-## 仅本机开发使用，不随 app 分发（6 个）
-
 - `productivity/grilling` — `skills/productivity/grilling`
+
+## 仅本机开发使用，不随 app 分发（5 个）
+
 - `productivity/grill-me` — `skills/productivity/grill-me`
 - `engineering/domain-modeling` — `skills/engineering/domain-modeling`
 - `engineering/codebase-design` — `skills/engineering/codebase-design`
@@ -63,3 +63,6 @@
 - `engineering/code-review/SKILL.md`（报告必须交代两轴究竟是不是独立跑的）
   - 上游：Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned.
   - 我们：Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned, and say which mode produced them — two isolated sub-agents, or one context doing both axes in turn. The separation is only worth something when the second axis could not see the first; when it could, the reader has to know.
+- `productivity/grilling/SKILL.md`（能力断言带降级：pi 核心不带子代理工具；pipi 分发的 delegation 层提供 scout。文本命名机制、写明拿不到时怎么办，并要求交代哪一种跑了。）
+  - 上游：When a frontier question needs a fact from the environment (filesystem, tools, etc.), dispatch a sub-agent to find it; don't ask the user for anything you could look up yourself.
+  - 我们：When a frontier question needs a fact from the environment (filesystem, tools, etc.), dispatch a sub-agent (the `scout` tool, if available) to find it; don't ask the user for anything you could look up yourself. If no sub-agent tool exists, look it up inline in this context first, and note in the round that you did so.

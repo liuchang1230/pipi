@@ -71,4 +71,13 @@ describe("the shipped text and the shipped mechanism agree", () => {
     expect(description).not.toBe("");
     expect(description.toLowerCase()).not.toContain("parallel sub-agent");
   });
+
+  it("grilling's sub-agent instruction names the mechanism and the degrade", () => {
+    const text = shipped(SHIPPED_SKILL_FILES, "productivity/grilling/SKILL.md");
+    expect(text).toContain("scout");
+    // The degrade: no sub-agent tool → look it up inline and DISCLOSE it, not
+    // silently skip fact-finding or invent a tool that isn't there.
+    expect(text).toMatch(/If no sub-agent tool exists/);
+    expect(text).toMatch(/note in the round that you did so/);
+  });
 });

@@ -71,7 +71,7 @@ describe("the shipped bundle", () => {
   it("comes from the manifest's ship:true set, and only from it", () => {
     const dirs = shippedSkillDirs();
     expect(dirs).toContain("engineering/wizard");
-    expect(dirs).not.toContain("productivity/grilling"); // ship:false
+    expect(dirs).not.toContain("productivity/grill-me"); // ship:false
     expect(SHIPPED_SKILL_FILES.length).toBeGreaterThan(0);
     for (const file of SHIPPED_SKILL_FILES) {
       expect(dirs).toContain(file.relPath.split("/").slice(0, 2).join("/"));
@@ -514,7 +514,7 @@ describe("the shipped bundle", () => {
 
   it("carries no dev-only skill, and no manifest or NOTICE", () => {
     const shipped = SHIPPED_SKILL_FILES.map((f) => f.relPath);
-    for (const devOnly of ["productivity/grilling", "engineering/codebase-design", "engineering/grill-with-docs"]) {
+    for (const devOnly of ["productivity/grill-me", "engineering/codebase-design", "engineering/grill-with-docs"]) {
       expect(shipped.some((rel) => rel.startsWith(`${devOnly}/`))).toBe(false);
     }
     expect(shipped).not.toContain("manifest.json");

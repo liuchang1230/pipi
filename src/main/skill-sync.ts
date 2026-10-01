@@ -82,7 +82,7 @@ export function shippedSkillDirs(manifest: string = manifestSource): string[] {
  * to this module ("../../skills/<bucket>/<name>/<rest>").
  *
  * The patterns are literals because Vite resolves `import.meta.glob` at build
- * time — and they list only the SHIPPED directories, so the six dev-only skills
+ * time — and they list only the SHIPPED directories, so the five dev-only skills
  * (35.6 KB, 42% of all skill bytes) do not ride along in the installer payload
  * of every release. Two consequences worth knowing:
  *
@@ -97,7 +97,7 @@ function collectBundle(): ShippedSkillFile[] {
   const all = import.meta.glob(
     [
       "../../skills/engineering/{code-review,wizard,retro,diagnosing-bugs}/**/*",
-      "../../skills/productivity/{handoff,writing-for-agents}/**/*",
+      "../../skills/productivity/{handoff,writing-for-agents,grilling}/**/*",
     ],
     { query: "?raw", import: "default", eager: true },
   ) as Record<string, string>;
