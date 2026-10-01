@@ -5,7 +5,7 @@
  *
  * Two destinations, two ownership postures (both live in content-sync.ts):
  *
- *   - extensions/: the 5 app-owned extension sources are code WE maintain and
+ *   - extensions/: the 6 app-owned extension sources are code WE maintain and
  *     the user is not invited to edit, so they are shipped with
  *     `policy: "overwrite"` — an out-of-date copy is a bug, and a diverged copy
  *     is an unsupported state.
@@ -56,6 +56,7 @@ import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
 import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
 import approvalGateSource from "./extensions/pipi-approval-gate.ts?raw";
+import askUserQuestionSource from "./extensions/pipi-ask-user-question.ts?raw";
 import delegationIndexSource from "./extensions/delegation/index.ts?raw";
 import delegationAgentsSource from "./extensions/delegation/agents.ts?raw";
 import delegationDeclarationsSource from "./extensions/delegation/declarations.ts?raw";
@@ -85,6 +86,7 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-model-sync.ts", content: modelSyncSource },
   { fileName: "pipi-subagent-model.ts", content: subagentModelSource },
   { fileName: "pipi-approval-gate.ts", content: approvalGateSource },
+  { fileName: "pipi-ask-user-question.ts", content: askUserQuestionSource },
 ];
 
 /** The delegation capability layer, as `extensions/delegation/*.ts` — pi's
