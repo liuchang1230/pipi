@@ -111,3 +111,21 @@ Status: **accepted**（2026-09-30）
 验证：单元测试用假远端（`fakeRemote`：内存盘 + 讲协议的 `run`）跑完整循环，真实 Linux 端到端跑在 WSL 里（`wsl.exe env HOME=<tmp> bash -s` 扮 `ssh host sh -s`）：空服务器全量落地逐字节一致 → 第二次零写入 → 在 distro 里改一个技能后**该文件原样保留且第三次仍然保留** → 其佉文件仍能正常升级。`npm run smoke:skills-wsl`。
 
 **补记三（2026-09-30）：接口已并入通用引擎。** 本文写作时引用的 `buildSshInstallCommand()` / `buildSshInstallScript()` 已不存在 —— 它们被提升为与技能共用的通用内容投递引擎（`src/main/content-sync.ts`），扩展/agents 走 `syncAgentHomeViaSsh()`（每根一次 probe→apply，旧版退役作为 trailer 搭在 extensions 那一趟上），技能走 `syncSkillsViaSsh()`（同一个引擎的薄包装）。本文其余结论（argv 固定 `sh -s`、正文走 stdin、账本不上远端就不算数、`@@x` 哨兵、失败时中止整次同步）在改名后逐条保持；见 ADR 0005 与提交 `12320b4`。
+
+## 实施状态补记四（2026-09-30，能力断言必须带降级）
+
+这是 overlay 的第四条规则，治的是**文本制造的假确定性**：`code-review` 原文（以及我们发出去的 description）断言两轴**在并行子代理里**跑，而 pi 核心不带子代理 —— 这句在两种情况下都是假的：能力层所在的那台机器还没同步（新指的远程服务器、同步失败、用户自己装的 pi），或者 diff 小到不值得起一个子代理。模型拿到一个跑不了的步骤时不会报错，它会**静默地在一个上下文里做完两轴，然后在报告里写成两条独立轴**。
+
+看似自然的做法是把它改成“如果有子代理就用”，但那样仍然把“怎么调”留给模型猜 —— 而猜错的代价就是上面那句假报告。所以三条一起改：
+
+1. **常驻的那行不做无条件承诺**。frontmatter 的 `description` 是每轮都在系统提示里的唯一部分（实测 6 个技能 ≈ 248 token/轮），所以它只说保证成立的那半：“Reports the two reviews side by side, without merging them.”；机制与降级下沉到正文。（顺带一处口径不符：上面那个“248 token/轮”按逐文件 `description` 行复量不出来 —— `078522f` 的 6 个发布技能是 1125 字符 ≈ 281 token，本提交后是 1113 字符 ≈ 278 token。差 134 字符的旧口径没留下算法，先记在这里，别拿 248 当基准。）
+2. **正文写出真实调用形态**：pi 里那不是一个叫“子代理”的原语，而是我们自己发的 `reviewer` 工具，一次调用带两条 `tasks`（`MAX_PARALLEL_TASKS = 8`，真并行）。并且写出拿不到它时怎么办：在本上下文里依次跑两轴，**并且要在报告里交代是哪一种**——因为两轴分开的全部价值就在于第二条轴看不到第一条，读者必须知道它到底是分着的还是没分开。
+3. **可执行的束缚**：`manifest.overlay.rules` 新增这条规则（渲染进 `skills/NOTICE.md`），新增 `src/main/__tests__/shipped-text-capabilities.test.ts`（4 条）把“文本与机制一致”钉住：任何已发布技能里出现 `reviewer` / `scout` / `analyst`，就必须同时发出对应的 `agents/<name>.md`；`code-review` 命名 `reviewer` 就必须真的发出一个能跑 `tasks` 的 `reviewer`（从**打包字节**里解析 `MAX_PARALLEL_TASKS ≥ 2`）；降级句与“报告里交代模式”必须在文本里；description 里不得再出现无条件的能力承诺。测试断的是 `SHIPPED_*`（即将写到用户磁盘上的那串字节），不是源模块。
+
+**顺带定了一条 overlay 约定**：patch 的 `find` / `replace` 不得跨行。vendored 文件是 CRLF，多行改写就得赌一种换行并把赌注写进我们分发的字节（还会把生成的 NOTICE 列表打断）；`scripts/vendor-skills.mjs` 现在对跨行 patch 直接报错（实测触发过）。这条不是风格洁癖：它让“改写不碰换行”成为一个机器能检查的事实，而不是一句口头约定。
+
+**顺带修了漂移检查的换行口径**：上游 blob 是 LF，而本机 `core.autocrlf=true` 把检出变成 CRLF，`--check` 原来逐字节比较 —— 在一台 LF 检出的机器（任何 Linux CI）上会把 21 个文件全部报成 drift，而一个常年误报的检查会训练人忽略它（与“空转的断言”同一种病）。现在比较按 LF 归一化（`sameContent()`），**写出去的东西一字不改**（理由见 ADR 0005：改变已分发字节会让账本把每份都当成用户手改）；内容 digest 也同样归一化，于是同一个修订在 Windows 与 Linux 上是同一个值。A/B 实测：把一份 LF 检出的副本喂给旧脚本 → `DRIFT 21 file(s)`，喂给新脚本 → `no drift`，且两边 digest 都是 `ffa4bbe5…`，与 CRLF 检出上算出的完全相同。**代价是口径变了**：本文与前文引用的 `af8620b5…` / `91e3ab38…` 是旧口径（按检出字节算，只在 Windows 检出上可复现），不要拿旧值跟现在的 `--check` 输出比对。
+
+**验证**：`node scripts/vendor-skills.mjs --from .upstream-skills` 一次重算 → `--check` no drift，digest `ffa4bbe5…`，改完的文件仍是全 CRLF（87/87，无裸 LF）；全量 1137 passed | 2 skipped（1139），`npm run smoke:skills-wsl`（真 Linux）2 passed。诚实测试是否空转已反向验证：手动删掉降级句 → 对应的那条测试变红 → 重跑 vendoring 恢复。
+
+**同类项、还没做的**：`grilling`（`ship: false`，所以不发出去）依赖一个同样不在 stock pi 里的能力（`ask_user_question`，用户本机那一份来自第三方包）。它的文本要在 P2 把自有问答能力层做出来之前先说完降级，否则一旦提为 `ship: true` 就是同一个缺陷的第二次发行。

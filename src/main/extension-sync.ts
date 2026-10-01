@@ -16,9 +16,12 @@
  *     does — see content-sync.ts.
  *
  * Why the delegation layer ships at all (ADR 0005): the shipped `code-review`
- * skill tells the model to spawn two parallel sub-agents, and pi core
- * deliberately ships no sub-agents — the app would otherwise hand every user a
- * skill whose step 4 cannot run, silently, in one context.
+ * skill tells the model to run both axes as one `reviewer` call with two
+ * `tasks`, and pi core deliberately ships no sub-agents — the app would
+ * otherwise hand every user a skill whose step 4 cannot run, silently, in one
+ * context. The skill text no longer assumes it WILL run (ADR 0004 补记四): it
+ * names the mechanism, states what to do without it, and requires the report to
+ * say which mode ran, so a machine that never got this sync degrades out loud.
  *
  * RPC-backed remote/WSL chat tabs navigate the session tree through the
  * pipi-tree-nav extension command (upstream pi's rpc-mode has no native

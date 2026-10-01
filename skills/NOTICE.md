@@ -33,6 +33,8 @@
 - pi 的调用约定不是 Claude Code 的 Skill tool：模型的技能调用走 /skill:<name> 或读取该技能的 SKILL.md，因此上游的 "Call the Skill tool with X" 一律改写为 "Use the `X` skill"。
 - 上游 setup-matt-pocock-skills 产生的 docs/agents/issue-tracker.md 不是所有人都有的硬依赖，把硬依赖降级为软依赖（有则用，无则走后续回退）。
 - 不复制 agents/openai.yaml（Codex UI 元数据，pi 不读）。
+- 文本里对 pi 能力的断言必须带降级：正文写清真实调用形态（`code-review` 的 `reviewer` 一次调用带两条 `tasks`），也写清拿不到时怎么办（在本上下文里依次跑两轴，并在报告里交代是哪一种）；常驻的 `description` 不做无条件的能力承诺，因为它每轮都在上下文里。
+- patch 的 find / replace 都不得跨行：vendored 文件是 CRLF，多行改写就得赌一种换行（写进我们分发的字节里），而且会把生成的 NOTICE 的列表打断。
 - vendoring 后仍含 "Skill tool" 字样的文件直接报错：说明上游又添了一处旧约定，需要人来决定怎么改。
 
 机械改写（对每个技能文件都生效）：
@@ -49,3 +51,15 @@
 - `engineering/code-review/SKILL.md`（硬依赖降级为软依赖）
   - 上游：1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md`.
   - 我们：1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md` when that file exists.
+- `engineering/code-review/SKILL.md`（「并行子代理」是 pi 里并不保证存在的能力，不该写在常驻的 description 里；机制与降级写进正文）
+  - 上游：Runs both reviews in parallel sub-agents and reports them side by side.
+  - 我们：Reports the two reviews side by side, without merging them.
+- `engineering/code-review/SKILL.md`（子代理不是 pi 的通用原语：写出真实调用形态，并规定拿不到它时的诚实降级（否则文本会制造「两条独立轴」的假确定性））
+  - 上游：Both axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
+  - 我们：Both axes run in separate sub-agents — in pi, one `reviewer` call carrying both briefs as `tasks` — so they don't pollute each other's context; this skill then aggregates their findings. Hand a diff to a sub-agent only when it is big enough to be worth one (the `reviewer` tool's own description gives that line); when no such tool exists, run the two axes one after the other in this context and say so in the final report — sequential is not independent, and the report must not imply it was.
+- `engineering/code-review/SKILL.md`（把「并行」落到真实调用形态：两条 brief 必须一次调用发出，且各自带轴名）
+  - 上游：If the spec is missing, skip the Spec sub-agent and note this in the final report.
+  - 我们：If the spec is missing, skip the Spec sub-agent and note this in the final report. Send both briefs in ONE call (`reviewer` with a `tasks` array) — that is what makes the two run in parallel and keeps each out of the other's context — and open each task with its axis (`Standards` / `Spec`) so the two reports come back attributable.
+- `engineering/code-review/SKILL.md`（报告必须交代两轴究竟是不是独立跑的）
+  - 上游：Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned.
+  - 我们：Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned, and say which mode produced them — two isolated sub-agents, or one context doing both axes in turn. The separation is only worth something when the second axis could not see the first; when it could, the reader has to know.

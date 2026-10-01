@@ -66,9 +66,11 @@ Status: **accepted**（2026-09-30）
 - 免密 ssh：每根一次 probe→apply，旧版退役作为 trailer 搭在 extensions 那一趟上。往返 1 → 4（加技能那 2-3 次），门控仍是内存里的内容摘要，重连不重传。
 - **验证**：全量 1122 passed | 2 skipped（1124）；`npm run smoke:skills-wsl`（真 Linux）2 passed —— 在一个真 shell 上装完两个根、逐字节一致、第二次空跑、**用户改过的 `delegation/declarations.ts` 与 `agents/reviewer.md` 原样保留**、我们自己被篡改的 `pipi-tree-nav.ts` 被恢复。这条正是决策 3 要的那个保证。
 
-**未落地**：P1 诚实降级文本、P2 问答能力层、P3 红命令账本；以及下面两项已知限制。
+**未落地**：P2 问答能力层、P3 红命令账本；以及下面两项已知限制。
 
 **已修（补记四，同日）**：
+
+- **P1 诚实降级文本**：`code-review` 的正文与常驻 `description` 不再断言两轴“在并行子代理里”跑（那在我们那台还没同步的机器上是假的），而是写出真实调用形态（一次 `reviewer` 调用带两条 `tasks`）与拿不到时的降级，并要求**报告交代两轴到底是分着跑的还是一个上下文里跑完**；overlay 因此多了一条规则（`manifest.overlay.rules`），`src/main/__tests__/shipped-text-capabilities.test.ts`（4 条）把“文本命名的能力必须真的发出去”钉在打包字节上。细节与反向验证见 ADR 0004 补记四。
 
 - **写入原子化**（原为已知限制，见下）：四条通路（启动同步 / WSL 异步 io / SFTP / 免密 ssh 脚本）全部改成「写 `<目标>.pipi-tmp`，再 rename 覆盖目标」。半截文件因此永远不会出现在目标位置，也就永远不会被账本记成「我们的」而在下一次被误判为用户修改。细节与实测见 `TMP_SUFFIX`、`replaceViaRename()` 与提交说明；验证：全量 1133 passed | 2 skipped（1135），`npm run smoke:skills-wsl`（真 Linux）2 passed，含新增的「整根目录下无 `.pipi-tmp` 残留」断言。
 

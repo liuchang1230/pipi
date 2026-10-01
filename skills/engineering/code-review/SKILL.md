@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match what the originating issue/spec asked for?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
+description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match what the originating issue/spec asked for?). Reports the two reviews side by side, without merging them. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
 ---
 
 Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
@@ -8,7 +8,7 @@ Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
 - **Standards**: does the code conform to this repo's documented coding standards?
 - **Spec**: does the code faithfully implement the originating issue / spec?
 
-Both axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
+Both axes run in separate sub-agents — in pi, one `reviewer` call carrying both briefs as `tasks` — so they don't pollute each other's context; this skill then aggregates their findings. Hand a diff to a sub-agent only when it is big enough to be worth one (the `reviewer` tool's own description gives that line); when no such tool exists, run the two axes one after the other in this context and say so in the final report — sequential is not independent, and the report must not imply it was.
 
 The spec source may be an issue tracker. If `docs/agents/issue-tracker.md` exists it says how to fetch issues; if it does not, fall back to the spec sources in step 2.
 
@@ -69,11 +69,11 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 - The path or fetched contents of the spec.
 - The brief: "Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."
 
-If the spec is missing, skip the Spec sub-agent and note this in the final report.
+If the spec is missing, skip the Spec sub-agent and note this in the final report. Send both briefs in ONE call (`reviewer` with a `tasks` array) — that is what makes the two run in parallel and keeps each out of the other's context — and open each task with its axis (`Standards` / `Spec`) so the two reports come back attributable.
 
 ### 5. Aggregate
 
-Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings, because the two axes are deliberately separate (see _Why two axes_).
+Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned, and say which mode produced them — two isolated sub-agents, or one context doing both axes in turn. The separation is only worth something when the second axis could not see the first; when it could, the reader has to know. Do **not** merge or rerank findings, because the two axes are deliberately separate (see _Why two axes_).
 
 End with a one-line summary: total findings per axis, and the worst issue _within each axis_ (if any). Don't pick a single winner across axes: that's the reranking the separation exists to prevent.
 

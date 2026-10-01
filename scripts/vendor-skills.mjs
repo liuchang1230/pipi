@@ -61,9 +61,22 @@ function walk(dir, prefix = "") {
  * Upstream content with this skill's patches applied. A patch that matches
  * nothing, or matches more than once, throws: both mean the manifest and
  * upstream have diverged and a human has to look.
+ *
+ * Patches are single-line by rule. The vendored files are CRLF, so a find or
+ * replace containing a newline would have to commit to one line ending (baking
+ * it into the bytes we ship) and would also break the generated NOTICE, which
+ * renders each patch as one bullet. A patch that seems to need two lines is
+ * usually one sentence too many — append to an existing line instead.
  */
 function applyPatches(relPath, text, patches, seen) {
   for (const patch of patches) {
+    if (/[\r\n]/.test(patch.find) || /[\r\n]/.test(patch.replace)) {
+      throw new Error(
+        `${relPath}: patch ${JSON.stringify(patch.find.slice(0, 60))}… spans lines.\n` +
+          `  Patches must be single-line (the vendored files are CRLF, and NOTICE.md renders each patch as one bullet).\n` +
+          `  Fold the new text into an existing line, or register the added sentence as its own single-line patch.`,
+      );
+    }
     const count = text.split(patch.find).length - 1;
     if (count !== 1) {
       throw new Error(
@@ -76,6 +89,19 @@ function applyPatches(relPath, text, patches, seen) {
   }
   return text;
 }
+
+/**
+ * Content equality that ignores line endings.
+ *
+ * Upstream stores LF; this machine's `core.autocrlf=true` turns the worktree
+ * into CRLF, and a Linux checkout would be LF again — so exact-byte comparison
+ * would report all 20 files as drift on one of the two machines, which is the
+ * kind of check people learn to ignore. What we *write* is still whatever
+ * upstream has: see ADR 0005, the shipped newline is never normalised, because
+ * normalising it would change bytes already installed on users' machines and
+ * the ownership journal would then classify every one of them as hand-edited.
+ */
+const sameContent = (a, b) => typeof a === "string" && a.replace(/\r\n/g, "\n") === b.replace(/\r\n/g, "\n");
 
 /**
  * NOTICE.md is generated, not written by hand: attribution that drifts from the
@@ -197,7 +223,7 @@ function main() {
       const text = applyPatches(`${rel}/${file}`, applyRewrites(original, manifest.overlay.rewrites, `${rel}/${file}`), patches, new Set());
       const target = join(dest, file);
       const current = existsSync(target) && statSync(target).isFile() ? readFileSync(target, "utf8") : null;
-      if (current !== text) {
+      if (!sameContent(current, text)) {
         drifted.push(rel + "/" + file);
         if (!args.check) {
           mkdirSync(dirname(target), { recursive: true });
@@ -235,14 +261,14 @@ function main() {
   const generated = join(SKILLS_DIR, "NOTICE.md");
   const notice = renderNotice(manifest);
   const noticeCurrent = existsSync(generated) ? readFileSync(generated, "utf8") : null;
-  if (noticeCurrent !== notice) {
+  if (!sameContent(noticeCurrent, notice)) {
     drifted.push("skills/NOTICE.md");
     if (!args.check) writeFileSync(generated, notice, "utf8");
   }
   const licenseDest = join(SKILLS_DIR, "LICENSE-mattpocock-skills.txt");
   const license = readFileSync(join(upstream, "LICENSE"), "utf8");
   const licenseCurrent = existsSync(licenseDest) ? readFileSync(licenseDest, "utf8") : null;
-  if (licenseCurrent !== license) {
+  if (!sameContent(licenseCurrent, license)) {
     drifted.push("skills/LICENSE-mattpocock-skills.txt");
     if (!args.check) writeFileSync(licenseDest, license, "utf8");
   }
@@ -272,9 +298,10 @@ function main() {
   if (args.check && drifted.length) process.exitCode = 1;
 
   // Sanity: the vendored set is what the app will bundle, so the digest is the
-  // value an app version pins.
+  // value an app version pins. Line endings are normalised (see sameContent),
+  // so the same revision has the same digest on Windows and on Linux.
   const digest = createHash("sha256")
-    .update([...expected].sort().map((f) => f + "\u0000" + readFileSync(join(REPO, f), "utf8")).join("\u0000"))
+    .update([...expected].sort().map((f) => f + "\u0000" + readFileSync(join(REPO, f), "utf8").replace(/\r\n/g, "\n")).join("\u0000"))
     .digest("hex");
   console.log(`[skills] content digest ${digest}`);
 }
