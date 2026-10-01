@@ -9,14 +9,17 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildApplyScript,
+  buildProbeScript,
   ensureContent,
   JOURNAL_FILE,
   nextJournal,
   nodeContentIo,
   parseJournal,
+  parseProbe,
   planSync,
   sha256,
   syncContent,
+  syncContentViaSsh,
   TMP_SUFFIX,
   type ShippedFile,
 } from "../content-sync";
@@ -234,20 +237,39 @@ describe("buildApplyScript", () => {
       journal: nextJournal(plan, { version: 1, shipped: {}, diverged: {} }, files),
       remoteRoot: "$HOME/.pi/agent/extensions",
     });
-    const writes = script.split("\n").filter((line) => line.includes("base64 -d >"));
-    expect(writes).toHaveLength(3); // two files + the journal
-    for (const line of writes) {
-      // `<b64> | base64 -d > <target>.pipi-tmp && mv -f <target>.pipi-tmp <target>`
-      // and nothing else: the target is only ever touched by the rename.
-      const m = /^echo (\S+) \| base64 -d > (\S+) && mv -f (\S+) (\S+)$/.exec(line);
+    const lines = script.split("\n");
+    // `set -e` is first and load-bearing: a script's exit status is its LAST
+    // command's, and the last thing here is the journal write. Without it, a
+    // failed write in the middle is masked (`ok: true`, "synced"), and the
+    // journal claims a file we never landed — which the next connect reads as
+    // "the user edited it", freezing it forever.
+    expect(lines[0]).toBe("set -e");
+    let installs = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      if (!line.includes("base64 -d >")) continue;
+      installs++;
+      // The decode and the rename are SEPARATE statements. They cannot share an
+      // `&&`: `set -e` does not fire on the left-hand side of one (a pipeline
+      // whose status is being tested is exempt), so the classic one-liner is
+      // masked exactly when it matters.
+      const m = /^echo (\S+) \| base64 -d > (\S+)\.pipi-tmp$/.exec(line);
       expect(m, line).not.toBeNull();
-      expect(m![2]).toBe(`${m![4]}${TMP_SUFFIX}`);
-      expect(m![3]).toBe(m![2]);
-      expect(m![4]).toContain("$HOME/.pi/agent/extensions/");
+      const target = m![2]!;
+      const tmp = `${target}${TMP_SUFFIX}`;
+      expect(target).toContain("$HOME/.pi/agent/extensions/");
+      // …and the target is only ever touched by the rename, which is adjacent.
+      expect(lines[i + 1]).toBe(`mv -f ${tmp} ${target}`);
     }
-    // `&&` is what makes a failed decode harmless: the rename never runs, so the
-    // remote keeps its last complete copy.
-    for (const line of writes) expect(line).toContain("&& mv -f");
+    expect(installs).toBe(3); // two files + the journal
+    // The ledger is the LAST thing written, which is what makes the abort safe:
+    // a failure anywhere above it leaves the OLD journal in place, so the next
+    // connect can still tell our copies from the user's edits.
+    const body = script.trimEnd().split("\n");
+    expect(body[body.length - 2]).toContain(`${JOURNAL_FILE}${TMP_SUFFIX}`);
+    expect(body[body.length - 1]).toBe(
+      `mv -f $HOME/.pi/agent/extensions/${JOURNAL_FILE}${TMP_SUFFIX} $HOME/.pi/agent/extensions/${JOURNAL_FILE}`,
+    );
   });
 
   it("cleans up the temp of a file it retires", () => {
@@ -257,6 +279,14 @@ describe("buildApplyScript", () => {
     const script = buildApplyScript({ plan, current: { "gone.ts": "G\n" }, journal: previous, remoteRoot: "$R" });
     expect(script).toContain("rm -f $R/gone.ts\n");
     expect(script).toContain(`rm -f $R/gone.ts${TMP_SUFFIX}`);
+    // Deliberately NOT `|| true`: a retire that fails (a root-owned file, a
+    // non-empty directory in the way) has to stop the script, because stopping
+    // keeps the journal entry and the next connect retries. Swallowing it would
+    // drop the entry while the file is still there — a retired extension that
+    // pi keeps loading, invisible from then on. Verified on real Linux: the
+    // script exits 1 and the journal is never written.
+    expect(script).not.toContain("rm -f $R/gone.ts || true");
+    expect(script).not.toContain(`rm -f $R/gone.ts${TMP_SUFFIX} || true`);
     // The bundle itself never contains a relPath that ends in the temp suffix,
     // so a retired temp can never collide with a real file.
     expect(files.some((f) => f.relPath.endsWith(TMP_SUFFIX))).toBe(false);
@@ -268,5 +298,53 @@ describe("buildApplyScript", () => {
     const plan = planSync({ "a.ts": "A\n" }, journal, files);
     const script = buildApplyScript({ plan, current: { "a.ts": "A\n" }, journal, remoteRoot: "$HOME/.pi/agent" });
     expect(script.split("\n").filter((line) => line.includes("a.ts"))).toEqual([]);
+  });
+});
+
+/**
+ * The probe's second job — after "what are the bytes there" — is to say whether
+ * there is a journal it could READ. "Absent" means a fresh server; "present but
+ * unreadable" means we cannot tell our copies from the user's, and the only safe
+ * answer is to touch nothing.
+ */
+describe("the probe tells an absent journal apart from an unreadable one", () => {
+  const script = () => buildProbeScript(["a.ts"], "$HOME/.pi/agent/skills");
+
+  it("tests for existence, not for file-ness, and marks a failed read", () => {
+    expect(script()).toContain(`if [ -e $HOME/.pi/agent/skills/${JOURNAL_FILE} ]; then`);
+    // `|| printf` rather than `|| true`: the old form swallowed the failure and
+    // the parse then saw an EMPTY journal — a lie the apply went on to write
+    // back to the remote, destroying the real one.
+    expect(script()).toContain("base64 $HOME/.pi/agent/skills/.pipi.json 2>/dev/null || printf '@@ju\\n'");
+    expect(script()).not.toContain("${JOURNAL_FILE}\\n' 2>/dev/null || true");
+  });
+
+  it("parses the three answers: absent, unreadable, readable", () => {
+    expect(parseProbe("")).toMatchObject({ journalUnreadable: false, journal: { shipped: {}, diverged: {} } });
+    const unreadable = parseProbe("@@f a.ts\nQUJD\n@@j\n@@ju\n");
+    expect(unreadable.journalUnreadable).toBe(true);
+    // …and the marker line is not mistaken for payload: the file's bytes still
+    // arrive intact.
+    expect(unreadable.files["a.ts"]).toBe("ABC");
+    const readable = parseProbe(`@@j\n${Buffer.from(JSON.stringify({ version: 1, shipped: { "a.ts": "h" }, diverged: {} })).toString("base64")}\n`);
+    expect(readable.journalUnreadable).toBe(false);
+    expect(readable.journal.shipped).toEqual({ "a.ts": "h" });
+  });
+
+  it("refuses to apply anything when the journal cannot be read", async () => {
+    const calls: string[] = [];
+    const result = await syncContentViaSsh(
+      async ({ stdin = "" }) => {
+        calls.push(stdin);
+        return { ok: true, code: 0, stdout: "@@j\n@@ju\n", stderr: "" };
+      },
+      { remoteRoot: "$HOME/.pi/agent/skills", label: "[skills]" },
+      [file("a.ts", "A\n")],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain(`.pipi.json`);
+    // One trip: the probe. No apply, no retirement probe, nothing written.
+    expect(calls).toHaveLength(1);
+    expect(result.written).toEqual([]);
   });
 });

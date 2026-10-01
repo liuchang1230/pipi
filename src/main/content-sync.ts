@@ -418,6 +418,12 @@ const FILE_MARK = "@@f";
  *  The sentinel is a value no file can hold (and no hash of it can match). */
 const UNREADABLE_MARK = "@@x";
 const JOURNAL_MARK = "@@j";
+/** The journal is THERE but cannot be read as a file (permissions, an I/O
+ *  error, something that is not a file at all). Distinct from absent, and the
+ *  distinction is the whole point: an absent journal means a fresh server, an
+ *  unreadable one means we do not know which files are ours — and guessing
+ *  "none of them" silently freezes every copy we ever shipped. */
+const JOURNAL_UNREADABLE_MARK = "@@ju";
 export const UNREADABLE = "\u0000pipi-unreadable";
 
 /**
@@ -440,9 +446,9 @@ export function buildProbeScript(relPaths: string[], remoteRoot: string): string
     );
   }
   lines.push(
-    `if [ -f ${remoteRoot}/${JOURNAL_FILE} ]; then`,
+    `if [ -e ${remoteRoot}/${JOURNAL_FILE} ]; then`,
     `  printf '${JOURNAL_MARK}\\n'`,
-    `  base64 ${remoteRoot}/${JOURNAL_FILE} 2>/dev/null || true`,
+    `  base64 ${remoteRoot}/${JOURNAL_FILE} 2>/dev/null || printf '${JOURNAL_UNREADABLE_MARK}\\n'`,
     `fi`,
   );
   return `${lines.join("\n")}\n`;
@@ -454,9 +460,14 @@ export function buildProbeScript(relPaths: string[], remoteRoot: string): string
  * Unparseable base64 decodes to whatever it decodes to, which is not our
  * content, which is the safe direction (keep it).
  */
-export function parseProbe(stdout: string): { journal: ContentJournal; files: Record<string, string | null> } {
+export function parseProbe(stdout: string): {
+  journal: ContentJournal;
+  journalUnreadable: boolean;
+  files: Record<string, string | null>;
+} {
   const files: Record<string, string | null> = {};
   let journal = EMPTY_JOURNAL;
+  let journalUnreadable = false;
   let target: string | null = null;
   let buffer: string[] = [];
   const flush = (): void => {
@@ -478,6 +489,12 @@ export function parseProbe(stdout: string): { journal: ContentJournal; files: Re
       files[line.slice(UNREADABLE_MARK.length + 1)] = UNREADABLE;
       continue;
     }
+    if (line === JOURNAL_UNREADABLE_MARK) {
+      flush();
+      target = null;
+      journalUnreadable = true;
+      continue;
+    }
     if (line === JOURNAL_MARK) {
       flush();
       target = JOURNAL_MARK;
@@ -486,7 +503,7 @@ export function parseProbe(stdout: string): { journal: ContentJournal; files: Re
     if (target !== null) buffer.push(line.trim());
   }
   flush();
-  return { journal, files };
+  return { journal, journalUnreadable, files };
 }
 
 /**
@@ -507,15 +524,25 @@ export function buildApplyScript(args: {
   const root = args.remoteRoot;
   const writes = args.plan.writes.filter((f) => args.current[f.relPath] !== f.content);
   const dirs = [...new Set(writes.map((f) => posix.dirname(f.relPath)))].sort();
-  // Write to <target>.pipi-tmp, then rename over the target. `&&` matters: if the
-  // decode fails (no base64, a truncated payload), the temp holds a partial file
-  // and the rename — the only step that touches the target — never runs. The
-  // remote therefore keeps the last complete copy, not a half one.
-  const install = (target: string, content: string): string =>
-    `echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > ${target}${TMP_SUFFIX} && mv -f ${target}${TMP_SUFFIX} ${target}`;
-  const lines: string[] = [];
+  // Write to <target>.pipi-tmp, then rename over the target. The two steps are
+  // SEPARATE statements, and `set -e` (first line) aborts the script on the
+  // first failure: a failed write must not leave the journal — the last thing
+  // this script writes — claiming a file we never landed, because the next
+  // connect would read that mismatch as "the user edited it" and freeze it.
+  //
+  // Two details are load-bearing. The redirect and the rename cannot share an
+  // `&&`: `set -e` does not fire on the left-hand side of one (a failing
+  // pipeline in `A && B` is exempt, since its status is being tested), so the
+  // classic one-liner is masked exactly when it matters. And `set -e` must come
+  // before `mkdir -p`, so a root we cannot even create stops us before a single
+  // byte is sent.
+  const install = (target: string, content: string): string[] => [
+    `echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > ${target}${TMP_SUFFIX}`,
+    `mv -f ${target}${TMP_SUFFIX} ${target}`,
+  ];
+  const lines: string[] = ["set -e"];
   if (dirs.length > 0) lines.push(`mkdir -p ${dirs.map((d) => `${root}/${d}`).join(" ")}`);
-  for (const { relPath, content } of writes) lines.push(install(`${root}/${relPath}`, content));
+  for (const { relPath, content } of writes) lines.push(...install(`${root}/${relPath}`, content));
   for (const relPath of args.plan.retired) {
     lines.push(`rm -f ${root}/${relPath}`, `rm -f ${root}/${relPath}${TMP_SUFFIX}`);
   }
@@ -523,7 +550,7 @@ export function buildApplyScript(args: {
   // The journal is the whole point of the probe: it is what makes "ours" and
   // "the user's edit" distinguishable on the next connect.
   const journalBlob = journalText(args.journal);
-  lines.push(`mkdir -p ${root}`, install(`${root}/${JOURNAL_FILE}`, journalBlob));
+  lines.push(`mkdir -p ${root}`, ...install(`${root}/${JOURNAL_FILE}`, journalBlob));
   if (args.trailer) lines.push(args.trailer.replace(/\n+$/, ""));
   return `${lines.join("\n")}\n`;
 }
@@ -578,6 +605,16 @@ export async function syncContentViaSsh(
     if (!probe.ok) return fail(probe.error ?? `probe failed${probe.stderr.trim() ? `: ${probe.stderr.trim()}` : ""}`);
 
     const found = parseProbe(probe.stdout);
+    // A journal that is there but unreadable is not a fresh server: it is a
+    // server whose ownership record we cannot see. Applying with an empty one
+    // would (a) classify every file we shipped as the user's own, so it is
+    // never upgraded again, and (b) hand that verdict back as the new journal,
+    // destroying the evidence. Refuse instead; the next connect retries.
+    if (found.journalUnreadable) {
+      return fail(
+        `${displayRoot}/${JOURNAL_FILE} exists on the remote but could not be read — refusing to sync, because that file is what tells our copies apart from yours`,
+      );
+    }
     const previous = found.journal;
     // Every bundle path was asked about explicitly, so absent-from-the-probe
     // means absent-on-the-remote (→ write it). A path the probe answered for but

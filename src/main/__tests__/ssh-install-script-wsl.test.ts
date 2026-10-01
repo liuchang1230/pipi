@@ -246,4 +246,74 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
       cleanup(home);
     }
   }, 120_000);
+
+  /**
+   * A write that fails has to be reported.
+   *
+   * A shell script's exit status is the LAST command's, and the last thing this
+   * one does is write the journal — so a failed `> <target>.pipi-tmp` in the
+   * middle was masked by it: the app logged a successful sync, and the journal
+   * claimed a file we never landed. The next connect probes that file, finds
+   * bytes that match neither the bundle nor a journal entry, and concludes the
+   * user edited it — after which it is never updated again. Wrong answer, kept
+   * forever.
+   */
+  it("reports a failed write instead of a success masked by the last command", async () => {
+    const home = `/tmp/pipi-e2e-writefail-${process.pid}-${Date.now()}`;
+    const skills = `${home}/.pi/agent/skills`;
+    const blocked = "engineering/wizard/SKILL.md";
+    const run = wslRunner(home);
+    try {
+      // The temp path is already a directory, so the redirect fails (EISDIR) and
+      // the rename — the only step that touches the target — cannot run. On a
+      // real server this is EACCES or ENOSPC; the difficulty of arranging it as
+      // root is why it took a test to find.
+      wsl(["bash", "-c", `mkdir -p ${skills}/${blocked}${TMP_SUFFIX}`]);
+      const result = await syncSkillsViaSsh(run, 60_000);
+      expect(result.ok, "a failed write must not be reported as a successful sync").toBe(false);
+      expect(result.error ?? "").not.toBe("");
+      // And no ledger that disagrees with the disk: a journal recording the
+      // blocked file as ours is what would freeze it forever.
+      expect(
+        wsl(["bash", "-c", `test -f ${skills}/.pipi.json && echo has-journal || echo no-journal`]).trim(),
+      ).toBe("no-journal");
+      expect(wsl(["bash", "-c", `test -f ${skills}/${blocked} && echo yes || echo no`]).trim()).toBe("no");
+    } finally {
+      cleanup(home);
+    }
+  }, 120_000);
+
+  /**
+   * The probe must not answer "no journal" when a journal is there but cannot be
+   * read.
+   *
+   * An emptied ledger makes every file we ever shipped look like the user's own
+   * (so they are never upgraded again), and the apply — which runs anyway, since
+   * the script exits 0 — replaces the real journal with that lie. One unreadable
+   * file turned into permanent, silent divergence.
+   */
+  it("refuses to sync when the remote journal exists but cannot be read", async () => {
+    const home = `/tmp/pipi-e2e-noledger-${process.pid}-${Date.now()}`;
+    const skills = `${home}/.pi/agent/skills`;
+    const edited = "engineering/wizard/SKILL.md";
+    const run = wslRunner(home);
+    try {
+      expect((await syncSkillsViaSsh(run, 60_000)).ok).toBe(true);
+      seed(`${skills}/${edited}`, "my own wizard\n");
+      // A directory stands in for the unreadable journal a real server can hand
+      // us (root-owned, or EACCES — root bypasses chmod, a directory does not).
+      wsl(["bash", "-c", `rm -f ${skills}/.pipi.json && mkdir ${skills}/.pipi.json`]);
+      const result = await syncSkillsViaSsh(run, 60_000);
+      expect(result.ok, "an unreadable ledger must stop the sync, not silently empty itself").toBe(false);
+      expect(result.error ?? "").toMatch(/\.pipi\.json/);
+      // Nothing was written and nothing was overwritten: not the file the user
+      // wrote, not the journal we could not read.
+      expect(wsl(["cat", `${skills}/${edited}`])).toBe("my own wizard\n");
+      expect(
+        wsl(["bash", "-c", `test -d ${skills}/.pipi.json && echo still-a-directory || echo replaced`]).trim(),
+      ).toBe("still-a-directory");
+    } finally {
+      cleanup(home);
+    }
+  }, 120_000);
 });

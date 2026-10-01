@@ -17,6 +17,7 @@
 - 终端输出（pty → 渲染层）必须合并写；输入路径（渲染层 → pty）不合并。
 - 跨 pane 动作必须收进 store action（`viewerStore.openFile` / `sessionsStore.openSession` 族 / `tabsStore.createTab` 族），容器不许把动作重新放回 App 回调；App 的 selector 订阅只覆盖对话框/编排真正读的 slice。
 - 对话框是自含模块：状态不回流到 App，App 只持打开标志；store 的 `set` 一律用函数式更新，循环内禁止用一次性快照（会互相覆盖）。
+- **当作「账本/播报」的 shell 脚本（`sh -s`）必须 `set -e` 开头**，且写入与 rename 必须分成两条语句（`set -e` 在 `A && B` 左侧不生效）；账本写在最后。**「读不到」不等于「不存在」**：读不到的状态一律返回失败或哨兵，不得当空值继续（同规则 6）。来由：`docs/diagnosis/2026-10-01.md`。
 
 ## 稳定性契约 / Stability Contract（2026-09-24）
 

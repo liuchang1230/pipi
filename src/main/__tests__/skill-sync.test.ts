@@ -9,6 +9,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { TMP_SUFFIX } from "../content-sync";
 import {
   buildSshApplyScript,
   buildSshProbeScript,
@@ -373,8 +374,12 @@ describe("the key-auth ssh transport", () => {
     const script = buildSshProbeScript(["engineering/wizard/SKILL.md", "productivity/handoff/SKILL.md"]);
     expect(script).toContain("for p in engineering/wizard/SKILL.md productivity/handoff/SKILL.md; do");
     expect(script).toContain('printf \'@@f %s\\n\' "$p"');
-    expect(script).toContain(`if [ -f $HOME/.pi/agent/skills/${JOURNAL_FILE} ]; then`);
+    expect(script).toContain(`if [ -e $HOME/.pi/agent/skills/${JOURNAL_FILE} ]; then`);
     expect(script).toContain("printf '@@j\\n'");
+    // Existence is tested with `-e`, not `-f`, and a failed read prints its own
+    // marker instead of `|| true`: "there is no journal" and "I cannot read the
+    // journal" are different worlds, and only one of them is safe to write to.
+    expect(script).toContain("|| printf '@@ju\\n'");
     // A missing file prints no marker line at all: absence is the absence of data.
     expect(script).toContain('[ -f "$f" ]');
     expect(script.endsWith("\n")).toBe(true);
@@ -413,9 +418,12 @@ describe("the key-auth ssh transport", () => {
   });
 
   it("treats an empty or garbage probe as \"nothing of ours is there\"", () => {
-    expect(parseSshProbe("")).toEqual({ journal: EMPTY_JOURNAL, files: {} });
+    expect(parseSshProbe("")).toEqual({ journal: EMPTY_JOURNAL, journalUnreadable: false, files: {} });
     expect(parseSshProbe("@@f a\n!!!not base64!!!\n").files["a"]).not.toBe("");
     expect(parseSshProbe("@@j\nnot json\n").journal).toEqual(EMPTY_JOURNAL);
+    // …but an unreadable journal is not "nothing of ours is there": the caller
+    // has to refuse rather than treat every file as the user's.
+    expect(parseSshProbe("@@j\n@@ju\n").journalUnreadable).toBe(true);
   });
 
   it("writes only what changed, and always leaves a journal behind", () => {
@@ -443,8 +451,14 @@ describe("the key-auth ssh transport", () => {
     const script = buildSshApplyScript({ plan, current, journal: nextJournal(plan, EMPTY_JOURNAL, files), files });
     expect(script).not.toContain("base64 -d > $HOME/.pi/agent/skills/engineering");
     expect(script).not.toContain("mkdir -p $HOME/.pi/agent/skills/engineering");
-    // Only the journal line, so the next run can still classify.
-    expect(script.trimEnd().split("\n")).toHaveLength(2);
+    // Only the ledger: `set -e`, the root, the decode into a temp, the rename.
+    // Nothing else runs, so the next run can still classify.
+    const lines = script.trimEnd().split("\n");
+    expect(lines[0]).toBe("set -e");
+    expect(lines).toHaveLength(4);
+    expect(lines[1]).toBe("mkdir -p $HOME/.pi/agent/skills");
+    expect(lines[2]).toContain(`> $HOME/.pi/agent/skills/${JOURNAL_FILE}${TMP_SUFFIX}`);
+    expect(lines[3]).toContain(`${JOURNAL_FILE}${TMP_SUFFIX} $HOME/.pi/agent/skills/${JOURNAL_FILE}`);
   });
 
   it("retires by path and prunes deepest-first, never the skills dir itself", () => {
@@ -525,16 +539,20 @@ describe("the key-auth ssh transport", () => {
    *  apply protocols, so the whole loop is exercised the way ssh would drive it
    *  — including that the SECOND run's classification depends on what the FIRST
    *  run wrote (the journal), which is exactly what used to be impossible. */
-  function fakeRemote(initial: Record<string, string> = {}): {
+  function fakeRemote(
+    initial: Record<string, string> = {},
+    options: { unreadableJournal?: boolean } = {},
+  ): {
     run: SshScriptRunner;
     disk: Map<string, string>;
     calls: { command: string; stdin: string }[];
   } {
     const disk = new Map(Object.entries(initial));
     const calls: { command: string; stdin: string }[] = [];
+    const fail = (why: string) => ({ ok: false, code: 1, stdout: "", stderr: why, error: "exit 1" });
     const run: SshScriptRunner = async ({ command, stdin = "" }) => {
       calls.push({ command, stdin });
-      if (command !== "sh -s") return { ok: false, code: 1, stdout: "", stderr: "bad option", error: "exit 1" };
+      if (command !== "sh -s") return fail("bad option");
       if (stdin.includes("@@j") && stdin.includes("printf")) {
         // Probe: answer for exactly the paths it asked about.
         const requested = [...stdin.matchAll(/for p in (.+?); do/g)].flatMap((m) => m[1]!.split(" "));
@@ -546,29 +564,48 @@ describe("the key-auth ssh transport", () => {
         }
         const journal = disk.get(JOURNAL_FILE);
         if (journal !== undefined) out.push("@@j", Buffer.from(journal, "utf8").toString("base64"));
+        else if (options.unreadableJournal) out.push("@@j", "@@ju");
         return { ok: true, code: 0, stdout: `${out.join("\n")}\n`, stderr: "" };
       }
-      // Apply: replay the writes and deletes it contains. The write shape is
-      // `<base64> | base64 -d > <target>.pipi-tmp && mv -f <target>.pipi-tmp
-      // <target>`; a write line the fake does not recognise is a FAILURE, not
-      // something to ignore (otherwise a script change would silently stop
-      // being covered and every assertion below would pass vacuously).
+      // Apply: replay the writes and deletes it contains.
+      //
+      // A write is TWO statements — `echo <base64> | base64 -d >
+      // <target>.pipi-tmp`, then `mv -f <target>.pipi-tmp <target>` — and every
+      // line the fake does not recognise is a FAILURE, not something to ignore:
+      // a script change that stopped being covered would otherwise leave every
+      // assertion below passing vacuously. `set -e` is what makes either line's
+      // failure end the real script, so a fake that cannot replay a line stops
+      // there too.
       const root = "$HOME/.pi/agent/skills/";
+      let pending: { tmp: string; blob: string } | null = null;
       for (const line of stdin.split("\n")) {
+        if (line === "" || line === "set -e" || line.startsWith("mkdir -p ") || line.startsWith("rmdir ")) {
+          continue;
+        }
         if (line.includes("base64 -d >")) {
-          const write = /^echo (\S+) \| base64 -d > (\S+)\.pipi-tmp && mv -f (\S+)\.pipi-tmp (\S+)$/.exec(line);
-          if (!write) return { ok: false, code: 1, stdout: "", stderr: `unrecognized write: ${line}`, error: "exit 1" };
-          const [blob, tmp, moved, target] = [write[1]!, write[2]!, write[3]!, write[4]!];
+          const decode = /^echo (\S+) \| base64 -d > (\S+)\.pipi-tmp$/.exec(line);
+          if (!decode) return fail(`unrecognized write: ${line}`);
+          if (pending) return fail(`a second write started before its temp was renamed: ${line}`);
+          pending = { tmp: decode[2]!, blob: decode[1]! };
+          continue;
+        }
+        const move = /^mv -f (\S+)\.pipi-tmp (\S+)$/.exec(line);
+        if (move) {
           // The rename must move the very file that was just written.
-          if (tmp !== moved || !tmp.startsWith(root) || !target.startsWith(root)) {
-            return { ok: false, code: 1, stdout: "", stderr: `bad rename: ${line}`, error: "exit 1" };
-          }
-          disk.set(target.slice(root.length), Buffer.from(blob, "base64").toString("utf8"));
+          if (!pending || pending.tmp !== move[1]!) return fail(`rename of a temp nobody wrote: ${line}`);
+          if (!move[2]!.startsWith(root)) return fail(`bad rename target: ${line}`);
+          disk.set(move[2]!.slice(root.length), Buffer.from(pending.blob, "base64").toString("utf8"));
+          pending = null;
           continue;
         }
         const remove = /^rm -f \S+\/skills\/(\S+)$/.exec(line);
-        if (remove) disk.delete(remove[1]!);
+        if (remove) {
+          disk.delete(remove[1]!);
+          continue;
+        }
+        return fail(`unrecognized line: ${line}`);
       }
+      if (pending) return fail("a temp was written and never renamed");
       return { ok: true, code: 0, stdout: "", stderr: "" };
     };
     return { run, disk, calls };
@@ -589,6 +626,23 @@ describe("the key-auth ssh transport", () => {
     await syncSkillsViaSsh(remote.run);
     const again = await syncSkillsViaSsh(remote.run);
     expect(again).toMatchObject({ ok: true, written: [], diverged: [], retired: [] });
+  });
+
+  it("refuses to touch a server whose journal it cannot read", async () => {
+    // A journal that is there but unreadable (root-owned, EACCES, not a file at
+    // all) is not a fresh server. Treating it as one would make every file we
+    // ever shipped look like the user's own — never upgraded again — and would
+    // then write that verdict back as the new journal, destroying the evidence.
+    const remote = fakeRemote({ "engineering/wizard/SKILL.md": "mine\n" }, { unreadableJournal: true });
+    const before = new Map(remote.disk);
+    const result = await syncSkillsViaSsh(remote.run);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain(JOURNAL_FILE);
+    // One trip, the probe. Nothing written, nothing retired, and nobody's copy
+    // declared "theirs" on the strength of a journal we never saw.
+    expect(remote.calls).toHaveLength(1);
+    expect(remote.disk).toEqual(before);
+    expect(result).toMatchObject({ written: [], diverged: [], retired: [] });
   });
 
   it("KEEPS a skill the user edited on the server (the gap this closed)", async () => {
