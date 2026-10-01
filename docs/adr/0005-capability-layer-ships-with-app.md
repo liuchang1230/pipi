@@ -50,12 +50,26 @@ Status: **accepted**（2026-09-30）
 **代价**：
 - 我们开始**维护别人的代码**（这份委派扩展的作者就是用户自己），升级路径与 `.pipi.json` 账本必须一起设计，否则"我们发的"和"用户改的"分不清。
 - 目录形状扩展 + agents 目录让投递面变大（更多文件、更多往返），key-auth 通道的探测脚本要覆盖两种新形状。
-- 未验证的风险：`core.autocrlf=true` 且仓库无 `.gitattributes`，新检出得到 CRLF。扩展 `.ts` 大概率无所谓，但 **agent `.md` 的 frontmatter 若被 CRLF 污染，`name:` 会带上 `\r`**——这正是本轮已经踩过一次的那类坑（shebang + CRLF）。倾向在打包时把内置文本统一成 LF，不依赖 git 配置。
+- **CRLF：实测无害，且因此不能“顺手修”。** 原文担心的「CRLF 污染 agent `.md` 的 frontmatter，`name:` 带上 `\r`」已经实测否定：`skills/engineering/code-review/SKILL.md`（CR=87）、本机已安装的同一份、`~/.pi/agent/extensions/pipi-tree-nav.ts`（CR=65）、`src/main/agents/reviewer.md`（CR=46）**全是 CRLF**，而用户正在跑的那份 pi 正常加载它们（常驻 token 也正常）。pi 的 frontmatter 解析器（与 `delegation/engine.ts:390` 复用的是同一个 `parseFrontmatter`）容得下 CRLF。**所以刻意不做 LF 归一化**：归一化会改变「已经发出去过的字节」，让每台机器上已安装的文件与账本哈希失配，于是被一律归为「用户改过」而**永远不再升级**。代价：本机 `core.autocrlf=true` 且仓库无 `.gitattributes`，新检出得到 CRLF —— 两种换行都得能跑，测试因此断言「逐字节等于打进包里的那份」，不断言某种换行。
+- **我们自己的 typecheck 覆盖不到这次收编的 5 个文件**：它们 import pi 内部（`@earendil-works/pi-agent-core` 等）、用 `.ts` 后缀说明符与扩展运行时 API（`pi.registerTool` / `getAgentDir` / `parseFrontmatter`），放进 `tsconfig.node.json` 会让 `typecheck:node` 变红（真的变红过，见 `7f9bed1`），所以那个 config 里 `exclude` 了 `src/main/extensions/delegation`。**它们的第一个失败信号是 pi 加载失败，不是类型检查。** 补偿：端到端测试直接在真 Linux 上装、再读回校验；但提交一个手改的 `engine.ts` 不会被任何本仓检查拦住。
 
 **未落地（下一批）**：P0 投递接线、P1 诚实降级文本、P2 问答能力层、P3 红命令账本。
 
 ## 实施状态（2026-09-30）
 
-**已落地**：源码收编 —— `src/main/extensions/delegation/{index,agents,declarations,engine,render}.ts`（44,792 B）+ `src/main/agents/{analyst,reviewer,scout}.md`（5,557 B），逐文件 `sha256` 与 `~/.pi/agent/` 源一致性核对通过；本 ADR 记下顺序与取舍。
+**已落地一：源码收编** —— `src/main/extensions/delegation/{index,agents,declarations,engine,render}.ts`（44,792 B）+ `src/main/agents/{analyst,reviewer,scout}.md`（5,557 B），逐文件 `sha256` 与 `~/.pi/agent/` 源一致性核对通过（提交 `ac0a5bb`）。5 个扩展源本不能在 `tsconfig.node.json` 下编译，同批修掉（`7f9bed1`）。
 
-**未落地**：投递接线（含账本不对称的解决）、降级文本、问答能力层、证据循环。
+**已落地二：账本提升为通用 + P0 投递**（提交 `ff396e5` 抽引擎 + `12320b4` 接线）—— 决策 3 的「所有权不对称」以**把账本从技能专用提升为内置内容通用**解决：
+
+- `src/main/content-sync.ts`：一套所有权规则（只读订阅 + 偏离保留）、一个 `.pipi.json` 账本、四种传输（本机、WSL、SFTP、key-auth ssh）。内容的种类退化为「一个根 + 一个标签」（`SshContentTarget`），不再是引擎里的特例。
+- 扩展根住两类所有权：5 个自有扩展 `policy: "overwrite"`（app 维护的源码，旧副本就是 bug），`delegation/**` 5 个文件默认 `preserve`（用户会改）。同目录、同账本，互不干扰。`agents/` 3 个定义同理 preserve。
+- 免密 ssh：每根一次 probe→apply，旧版退役作为 trailer 搭在 extensions 那一趟上。往返 1 → 4（加技能那 2-3 次），门控仍是内存里的内容摘要，重连不重传。
+- **验证**：全量 1122 passed | 2 skipped（1124）；`npm run smoke:skills-wsl`（真 Linux）2 passed —— 在一个真 shell 上装完两个根、逐字节一致、第二次空跑、**用户改过的 `delegation/declarations.ts` 与 `agents/reviewer.md` 原样保留**、我们自己被篡改的 `pipi-tree-nav.ts` 被恢复。这条正是决策 3 要的那个保证。
+
+**未落地**：P1 诚实降级文本、P2 问答能力层、P3 红命令账本；以及下面三项已知限制。
+
+**已知限制**（不藏，各自独立可修）：
+
+- **写入不是原子的**：`base64 -d > 目标文件`，中途失败会留下半个文件，而账本已经把它记成我们的 —— 下次同步会因哈希不符而当成「用户改的」保留，也就是永久坏在服务器上。修法：写临时文件 + `mv`（本机/SFTP 同理）。独立提交。
+- **渲染层措辞不准**：扩展投递后弹出的提醒仍写「内置扩展已更新」，而现在列里会出现 `reviewer.md`、`delegation/index.ts`。改一行字的事，但 `App.tsx` 当时在别人未提交的改动里，没碰。
+- 上文「typecheck 覆盖不到收编的 5 个文件」仍然成立。

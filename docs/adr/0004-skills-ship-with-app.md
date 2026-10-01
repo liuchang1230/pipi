@@ -109,3 +109,5 @@ Status: **accepted**（2026-09-30）
 - 远端 journal 被删/损坏后，我们自己写的旧版本与用户手改无法区分 → 一律**保留**并报 diverged，不自动升级。
 
 验证：单元测试用假远端（`fakeRemote`：内存盘 + 讲协议的 `run`）跑完整循环，真实 Linux 端到端跑在 WSL 里（`wsl.exe env HOME=<tmp> bash -s` 扮 `ssh host sh -s`）：空服务器全量落地逐字节一致 → 第二次零写入 → 在 distro 里改一个技能后**该文件原样保留且第三次仍然保留** → 其佉文件仍能正常升级。`npm run smoke:skills-wsl`。
+
+**补记三（2026-09-30）：接口已并入通用引擎。** 本文写作时引用的 `buildSshInstallCommand()` / `buildSshInstallScript()` 已不存在 —— 它们被提升为与技能共用的通用内容投递引擎（`src/main/content-sync.ts`），扩展/agents 走 `syncAgentHomeViaSsh()`（每根一次 probe→apply，旧版退役作为 trailer 搭在 extensions 那一趟上），技能走 `syncSkillsViaSsh()`（同一个引擎的薄包装）。本文其余结论（argv 固定 `sh -s`、正文走 stdin、账本不上远端就不算数、`@@x` 哨兵、失败时中止整次同步）在改名后逐条保持；见 ADR 0005 与提交 `12320b4`。
