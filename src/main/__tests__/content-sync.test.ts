@@ -6,7 +6,7 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildApplyScript,
   buildProbeScript,
@@ -18,9 +18,12 @@ import {
   parseProbe,
   planSync,
   sha256,
+  sftpContentIo,
   syncContent,
   syncContentViaSsh,
   TMP_SUFFIX,
+  UNREADABLE,
+  type ContentIo,
   type ShippedFile,
 } from "../content-sync";
 
@@ -298,6 +301,129 @@ describe("buildApplyScript", () => {
     const plan = planSync({ "a.ts": "A\n" }, journal, files);
     const script = buildApplyScript({ plan, current: { "a.ts": "A\n" }, journal, remoteRoot: "$HOME/.pi/agent" });
     expect(script.split("\n").filter((line) => line.includes("a.ts"))).toEqual([]);
+  });
+});
+
+/**
+ * "Unreadable" and "absent" look identical to a plain `catch { return null }`,
+ * and they could not be more different: absence is written to, unreadability
+ * never must be. The key-auth ssh transport carries this as the `@@x` / `@@ju`
+ * markers; every other transport gets it from its io adapter.
+ */
+describe("an unreadable path is not an absent one", () => {
+  function fakeIo(
+    disk: Record<string, string>,
+    options: { unreadable?: string[]; throwOn?: string } = {},
+  ): { io: ContentIo; writes: Record<string, string>; reads: string[] } {
+    const writes: Record<string, string> = {};
+    const reads: string[] = [];
+    const io: ContentIo = {
+      async read(relPath) {
+        reads.push(relPath);
+        if (options.throwOn === relPath) throw new Error("connection reset");
+        if (options.unreadable?.includes(relPath)) return UNREADABLE;
+        return disk[relPath] ?? null;
+      },
+      async write(relPath, content) {
+        writes[relPath] = content;
+        disk[relPath] = content;
+      },
+      async remove(relPath) {
+        delete disk[relPath];
+      },
+    };
+    return { io, writes, reads };
+  }
+
+  it("refuses the whole sync when the journal cannot be read", async () => {
+    const { io, writes } = fakeIo({ "a.ts": "mine\n" }, { unreadable: [JOURNAL_FILE] });
+    await expect(syncContent(io, [file("a.ts", "A\n")])).rejects.toThrow(/\.pipi\.json/);
+    // Not even the journal: an empty one would classify every file we ship as
+    // the user's and hand that verdict back as the new record.
+    expect(writes).toEqual({});
+  });
+
+  it("keeps an unreadable file, reports it, and still writes the ledger", async () => {
+    const { io, writes } = fakeIo({ "a.ts": "mine\n" }, { unreadable: ["a.ts"] });
+    const result = await syncContent(io, [file("a.ts", "A\n")]);
+    expect(result).toMatchObject({ written: [], diverged: ["a.ts"], retired: [] });
+    expect(writes["a.ts"]).toBeUndefined();
+    // The journal records our INTENT for it, so a later run cannot adopt it as ours.
+    expect(parseJournal(writes[JOURNAL_FILE]!).diverged["a.ts"]).toBe(sha256("A\n"));
+  });
+
+  it("lets a transport failure out instead of passing it off as the user's file", async () => {
+    const { io } = fakeIo({ "a.ts": "mine\n" }, { throwOn: "a.ts" });
+    await expect(syncContent(io, [file("a.ts", "A\n")])).rejects.toThrow("connection reset");
+  });
+
+  it("nodeContentIo: absent → null, a directory → UNREADABLE", async () => {
+    const dir = tempDir();
+    const io = nodeContentIo(dir);
+    expect(await io.read("nope.ts")).toBeNull();
+    expect(await io.read("deep/nope.ts")).toBeNull(); // ENOTDIR is absence too
+    mkdirSync(join(dir, "sub"), { recursive: true });
+    expect(await io.read("sub")).toBe(UNREADABLE);
+  });
+
+  it("ensureContent: one unreadable file does not stop the others", () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, "a.ts"), { recursive: true }); // a DIRECTORY where our file goes
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...args) => void logs.push(args.join(" ")));
+    try {
+      const result = ensureContent(dir, [file("a.ts", "A\n"), file("b.ts", "B\n")], "probe");
+      expect(result.written).toEqual(["b.ts"]);
+      expect(result.diverged).toEqual(["a.ts"]);
+      expect(readdirSync(join(dir, "a.ts"))).toEqual([]); // untouched
+      expect(readFileSync(join(dir, "b.ts"), "utf8")).toBe("B\n");
+      // And the log does not claim to know something it cannot know.
+      expect(logs.some((l) => l.startsWith("[probe] keeping") && l.endsWith("a.ts: could not be read"))).toBe(true);
+      expect(logs.some((l) => l.includes("edited by the user"))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("ensureContent: refuses to write anything when the journal cannot be read", () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, JOURNAL_FILE), { recursive: true });
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args) => void errors.push(args.join(" ")));
+    try {
+      const result = ensureContent(dir, [file("a.ts", "A\n")], "probe");
+      expect(result).toEqual({ written: [], diverged: [], retired: [] });
+      expect(existsSync(join(dir, "a.ts"))).toBe(false);
+      expect(errors.some((e) => e.includes(".pipi.json"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("sftpContentIo: asks `exists` only after `get` fails", async () => {
+    const calls: string[] = [];
+    const client = {
+      async get(path: string) {
+        calls.push(`get ${path}`);
+        if (!path.endsWith("/ok.ts")) throw new Error("permission denied");
+        return Buffer.from("hello\n");
+      },
+      async exists(path: string) {
+        calls.push(`exists ${path}`);
+        return path.endsWith("/mine.ts") ? "d" : false;
+      },
+    } as unknown as Parameters<typeof sftpContentIo>[0];
+    const io = sftpContentIo(client, "/root");
+    expect(await io.read("ok.ts")).toBe("hello\n");
+    expect(await io.read("mine.ts")).toBe(UNREADABLE);
+    expect(await io.read("absent.ts")).toBeNull();
+    expect(calls).toEqual([
+      "get /root/ok.ts",
+      "get /root/mine.ts",
+      "exists /root/mine.ts",
+      "get /root/absent.ts",
+      "exists /root/absent.ts",
+    ]);
   });
 });
 

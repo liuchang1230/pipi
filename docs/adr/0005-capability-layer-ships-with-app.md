@@ -78,6 +78,8 @@ Status: **accepted**（2026-09-30）
 
 - **补记五见 ADR 0004**（2026-10-01）：`set -e` 在 `A && B` 左侧不生效的实测、`@@ju` 标记与 `journalUnreadable` 拒绝同步、退役不接 `|| true` 的理由。验证：全量 1141 passed | 4 skipped（1145），`npm run smoke:skills-wsl`（真 Linux）4 passed。
 
+- **「读不到」不等于「不存在」，四条通路一个语义**（2026-10-01，同一批里 io 缝的那一半）：`ContentIo.read` 的契约写死为 `null` = 不在、文本 = 内容、`UNREADABLE` = 在但读不出来（`ContentIo` 的注释就是契约）；`nodeContentIo` 只把 `ENOENT`/`ENOTDIR` 当缺席，`EISDIR`/`EACCES`/`EPERM`/`ELOOP` 一律 `UNREADABLE`；`sftpContentIo` 在 `get` 失败后再问一次 `exists`（真库是 `lstat`）来区分「没有这个文件」和「不让我读」——`get` 本身把两者都 reject。本机启动路径（`ensureContent`）同步跟上：单个文件读不出来就保留并上报（不再让一个读不出文件阻断整次升级），账本读不出来则整次拒绝。`logDivergences` 拿到 `current` 后说「could not be read」，不再对没看见过的文件猜「edited by the user」。验证：全量 1148 passed | 4 skipped（1152），`npm run smoke:skills-wsl`（真 Linux）4 passed，另加一次实跑——真机 `~/.pi/agent/skills` 的副本上 `ensureContent` 仍是 `{"written":[],"diverged":[],"retired":[]}`，真机 `~/.pi/agent/{extensions,agents}` 的副本上 `ensureShippedAgentHome` 仍是 `{"extensions":[],"agents":[],"diverged":[],"retired":[]}`。
+
 **已知限制**（不藏，各自独立可修）：
 
 - ~~**写入不是原子的**~~ → **已修，见上**。原表述：`base64 -d > 目标文件`，中途失败会留下半个文件，而账本已经把它记成我们的 —— 下次同步会因哈希不符而当成「用户改的」保留，也就是永久坏在服务器上。

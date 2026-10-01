@@ -276,6 +276,10 @@ describe("syncExtensionsViaSftp", () => {
           if (v === undefined) throw new Error("No such file");
           return v;
         },
+        // `get` cannot tell "no such file" from "I may not read it" — real
+        // ssh2-sftp-client answers that with lstat(), so the fake does too:
+        // absent → false, a regular file → "-".
+        exists: async (path: string) => remoteFiles.has(path) && "-",
         put: async (content: Buffer, path: string) => {
           puts.push({ path, content });
           remoteFiles.set(path, content);

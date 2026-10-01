@@ -185,16 +185,25 @@ export function logDivergences(
   files: ShippedFile[],
   label: string,
   abs: (relPath: string) => string,
+  current?: Record<string, string | null>,
 ): void {
   for (const relPath of diverged) {
     const intent = sha256(files.find((f) => f.relPath === relPath)?.content ?? "");
-    if (previous.diverged[relPath] !== intent) console.log(`[${label}] keeping ${abs(relPath)}: edited by the user`);
+    if (previous.diverged[relPath] === intent) continue;
+    // Say only what we know: "cannot be read" is a different fact from "the
+    // user changed it", and the second one is a guess about a file we never saw.
+    const why = current?.[relPath] === UNREADABLE ? "could not be read" : "edited by the user";
+    console.log(`[${label}] keeping ${abs(relPath)}: ${why}`);
   }
 }
 
 /**
  * The only thing a transport has to provide. A missing file is `null`, never a
- * throw — "not there yet" is the normal first-sync state everywhere.
+ * throw — "not there yet" is the normal first-sync state everywhere. A file that
+ * is THERE but cannot be read as a file (permissions, a directory, a broken
+ * link) is `UNREADABLE`, never `null`: absence gets overwritten, unreadability
+ * must not. Anything else (a dead connection) throws, and the caller refuses to
+ * write rather than guess.
  */
 export interface ContentIo {
   read(relPath: string): Promise<string | null>;
@@ -214,6 +223,16 @@ export const journalText = (journal: ContentJournal): string => `${JSON.stringif
 /** Read the journal, classify every file, apply the plan, write the journal. */
 export async function syncContent(io: ContentIo, files: ShippedFile[]): Promise<ContentSyncResult> {
   const previousText = await io.read(JOURNAL_FILE);
+  // A journal we cannot read is not a fresh server: it is a server whose
+  // ownership record we cannot see. Applying with an empty one would classify
+  // every file we ever shipped as the user's — never upgraded again — and then
+  // write that verdict back as the new journal. Refuse instead; the same
+  // decision the key-auth ssh transport makes on its `@@ju` marker.
+  if (previousText === UNREADABLE) {
+    throw new Error(
+      `${JOURNAL_FILE} is there but could not be read — refusing to sync, because that file is what tells our copies apart from yours`,
+    );
+  }
   const previous = parseJournal(previousText);
   const relPaths = new Set([
     ...files.map((f) => f.relPath),
@@ -245,8 +264,15 @@ export function nodeContentIo(root: string): ContentIo {
     async read(relPath) {
       try {
         return await readFile(abs(relPath), "utf8");
-      } catch {
-        return null;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        // Not there yet — the normal first-sync state.
+        if (code === "ENOENT" || code === "ENOTDIR") return null;
+        // There, but not something we can read as a file (EISDIR: the path is a
+        // directory; EACCES/EPERM: no permission — e.g. a file a `sudo pi` run
+        // left behind; ELOOP: a broken symlink chain). Keep it and say so.
+        if (code === "EISDIR" || code === "EACCES" || code === "EPERM" || code === "ELOOP") return UNREADABLE;
+        throw error;
       }
     },
     async write(relPath, content) {
@@ -267,12 +293,18 @@ export function sftpContentIo(client: SftpClient, root: string): ContentIo {
   const abs = (relPath: string): string => `${root}/${relPath}`;
   return {
     async read(relPath) {
+      const path = abs(relPath);
       try {
-        const data = (await client.get(abs(relPath))) as string | Buffer | undefined;
+        const data = (await client.get(path)) as string | Buffer | undefined;
         if (data === undefined) return null;
         return Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       } catch {
-        return null; // absent, or unreadable → treat as not ours
+        // `get` rejects for "no such file" and for "I may not read it" alike —
+        // asking a second, cheaper question tells them apart. They are not
+        // interchangeable: there is nothing of ours at a path that is absent
+        // (so write ours), but a path we cannot read might be the user's copy of
+        // our own file, and overwriting it would destroy their edit.
+        return (await client.exists(path)) ? UNREADABLE : null;
       }
     },
     async write(relPath, content) {
@@ -324,7 +356,19 @@ export function ensureContent(root: string, files: ShippedFile[], label = "conte
   const abs = (relPath: string): string => join(root, ...relPath.split("/"));
   try {
     const journalPath = abs(JOURNAL_FILE);
-    const previousText = existsSync(journalPath) ? readFileSync(journalPath, "utf8") : null;
+    let previousText: string | null = null;
+    if (existsSync(journalPath)) {
+      try {
+        previousText = readFileSync(journalPath, "utf8");
+      } catch (error) {
+        // There but unreadable. An empty journal would classify every file we
+        // ever shipped as the user's — and hand that verdict back as the new
+        // record. Stop before writing anything.
+        throw new Error(
+          `${JOURNAL_FILE} is there but could not be read — refusing to sync (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+    }
     const previous = parseJournal(previousText);
     const relPaths = new Set([
       ...files.map((f) => f.relPath),
@@ -334,7 +378,17 @@ export function ensureContent(root: string, files: ShippedFile[], label = "conte
     const current: Record<string, string | null> = {};
     for (const relPath of relPaths) {
       const target = abs(relPath);
-      current[relPath] = existsSync(target) ? readFileSync(target, "utf8") : null;
+      if (!existsSync(target)) {
+        current[relPath] = null;
+        continue;
+      }
+      try {
+        current[relPath] = readFileSync(target, "utf8");
+      } catch {
+        // There but not readable as a file → keep it and report it. Treating it
+        // as absent would overwrite the very file we could not look at.
+        current[relPath] = UNREADABLE;
+      }
     }
     const plan = planSync(current, previous, files);
     const written: string[] = [];
@@ -348,7 +402,7 @@ export function ensureContent(root: string, files: ShippedFile[], label = "conte
       written.push(relPath);
       console.log(`[${label}] wrote ${target}`);
     }
-    logDivergences(plan.diverged, previous, files, label, abs);
+    logDivergences(plan.diverged, previous, files, label, abs, current);
     for (const relPath of plan.retired) {
       rmSync(abs(relPath), { force: true });
       console.log(`[${label}] retired ${abs(relPath)}`);
@@ -647,7 +701,7 @@ export async function syncContentViaSsh(
     });
     if (!apply.ok) return fail(apply.error ?? `install failed${apply.stderr.trim() ? `: ${apply.stderr.trim()}` : ""}`);
 
-    logDivergences(plan.diverged, previous, files, label, (rel) => `${displayRoot}/${rel}`);
+    logDivergences(plan.diverged, previous, files, label, (rel) => `${displayRoot}/${rel}`, current);
     return {
       ok: true,
       written: plan.writes.filter((f) => current[f.relPath] !== f.content).map((f) => f.relPath),
