@@ -28,6 +28,7 @@ import {
   syncAgentHomeViaSsh,
 } from "../extension-sync";
 import { parseJournal, SHIPPED_SKILL_FILES, syncSkillsViaSsh, type SshScriptRunner } from "../skill-sync";
+import { TMP_SUFFIX } from "../content-sync";
 
 function pickDistro(): string | null {
   try {
@@ -150,6 +151,12 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
       expect(fourth.extensions).toEqual([ours]);
       expect(fourth.diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
       expect(wsl(["sha256sum", `${extensions}/${ours}`]).split(" ")[0]).toBe(sha256(oursContent));
+      // Every write above went through a temp file and a real `mv`; a real disk
+      // is the only place that proves the rename left nothing behind (an
+      // interrupted one would show up here as a stray temp).
+      expect(
+        wsl(["bash", "-c", `find ${home}/.pi/agent -name '*${TMP_SUFFIX}' | wc -l`]).trim(),
+      ).toBe("0");
 
       // 5. Each root's journal records that split, so the next run is stable.
       const extJournal = parseJournal(wsl(["cat", `${extensions}/.pipi.json`]));
@@ -230,6 +237,9 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
       expect(fourth.written).toEqual([pristine]);
       const shippedHandoff = SHIPPED_SKILL_FILES.find((f) => f.relPath === pristine)!.content;
       expect(wsl(["sha256sum", `${skills}/${pristine}`]).split(" ")[0]).toBe(sha256(shippedHandoff));
+      // Every install went through a temp file and a real `mv`, and the user's
+      // edit is still there afterwards.
+      expect(wsl(["bash", "-c", `find ${home}/.pi/agent -name '*${TMP_SUFFIX}' | wc -l`]).trim()).toBe("0");
       // The user's edit was not collateral damage.
       expect(wsl(["cat", `${skills}/${edited}`])).toBe("my own wizard\n");
     } finally {

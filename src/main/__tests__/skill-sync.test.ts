@@ -548,12 +548,22 @@ describe("the key-auth ssh transport", () => {
         if (journal !== undefined) out.push("@@j", Buffer.from(journal, "utf8").toString("base64"));
         return { ok: true, code: 0, stdout: `${out.join("\n")}\n`, stderr: "" };
       }
-      // Apply: replay the writes and deletes it contains.
+      // Apply: replay the writes and deletes it contains. The write shape is
+      // `<base64> | base64 -d > <target>.pipi-tmp && mv -f <target>.pipi-tmp
+      // <target>`; a write line the fake does not recognise is a FAILURE, not
+      // something to ignore (otherwise a script change would silently stop
+      // being covered and every assertion below would pass vacuously).
+      const root = "$HOME/.pi/agent/skills/";
       for (const line of stdin.split("\n")) {
-        const write = /^echo (\S+) \| base64 -d > (\S+)$/.exec(line);
-        if (write) {
-          const rel = write[2]!.replace(/^\$HOME\/\.pi\/agent\/skills\//, "");
-          disk.set(rel, Buffer.from(write[1]!, "base64").toString("utf8"));
+        if (line.includes("base64 -d >")) {
+          const write = /^echo (\S+) \| base64 -d > (\S+)\.pipi-tmp && mv -f (\S+)\.pipi-tmp (\S+)$/.exec(line);
+          if (!write) return { ok: false, code: 1, stdout: "", stderr: `unrecognized write: ${line}`, error: "exit 1" };
+          const [blob, tmp, moved, target] = [write[1]!, write[2]!, write[3]!, write[4]!];
+          // The rename must move the very file that was just written.
+          if (tmp !== moved || !tmp.startsWith(root) || !target.startsWith(root)) {
+            return { ok: false, code: 1, stdout: "", stderr: `bad rename: ${line}`, error: "exit 1" };
+          }
+          disk.set(target.slice(root.length), Buffer.from(blob, "base64").toString("utf8"));
           continue;
         }
         const remove = /^rm -f \S+\/skills\/(\S+)$/.exec(line);

@@ -19,6 +19,14 @@
  * bytes we last put there. Without it, our own older version and a user edit
  * are indistinguishable.
  *
+ * Every write goes through a temp file and a rename (`TMP_SUFFIX`), on all four
+ * transports. Without that, a write interrupted halfway (dropped connection,
+ * full disk, a killed process) leaves a truncated file that the journal — which
+ * is written after the payload — then records as ours, so the next run sees a
+ * hash mismatch and classifies our own broken file as “the user edited it”:
+ * permanently wrong on that machine, with the real content on neither side.
+ * With the rename, the target holds either the old bytes or the new ones.
+ *
  * The split of concerns: planSync/nextJournal are PURE — given what is on disk,
  * the journal, and the bundle, they say what to do. syncContent executes that
  * plan through an injected ContentIo, and the transports are thin adapters:
@@ -33,8 +41,8 @@
  * servers as everywhere else.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import type SftpClient from "ssh2-sftp-client";
 import type { SshRunResult } from "./ssh-exec";
@@ -42,6 +50,20 @@ import type { SshRunResult } from "./ssh-exec";
 /** Journal file name — inert to pi everywhere we install (it discovers skills
  *  by SKILL.md, extensions by *.ts, agents by *.md). */
 export const JOURNAL_FILE = ".pipi.json";
+
+/**
+ * Suffix of the temp file every write goes through: `<target>.pipi-tmp`, renamed
+ * over the target once it is complete. POSIX `rename` is atomic and Node's
+ * `fs.rename` replaces an existing file on Windows (MOVEFILE_REPLACE_EXISTING),
+ * so one mechanism serves the local, WSL and SFTP transports as well as the
+ * remote shell script (`mv -f`).
+ *
+ * The suffix deliberately ends in neither `.ts`, `.md` nor `SKILL.md`: pi's
+ * discovery rules match those exact shapes, so a temp file left behind by an
+ * interrupted run is invisible to pi and harmless until the next sync overwrites
+ * it.
+ */
+export const TMP_SUFFIX = ".pipi-tmp";
 
 export interface ShippedFile {
   /** Path inside the target root, e.g. "engineering/wizard/SKILL.md" or
@@ -228,8 +250,11 @@ export function nodeContentIo(root: string): ContentIo {
       }
     },
     async write(relPath, content) {
-      await mkdir(dirname(abs(relPath)), { recursive: true });
-      await writeFile(abs(relPath), content, "utf8");
+      const target = abs(relPath);
+      const tmp = target + TMP_SUFFIX;
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(tmp, content, "utf8");
+      await rename(tmp, target);
     },
     async remove(relPath) {
       await rm(abs(relPath), { force: true });
@@ -251,14 +276,42 @@ export function sftpContentIo(client: SftpClient, root: string): ContentIo {
       }
     },
     async write(relPath, content) {
-      await client.mkdir(posix.dirname(abs(relPath)), true);
+      const target = abs(relPath);
+      const tmp = target + TMP_SUFFIX;
+      await client.mkdir(posix.dirname(target), true);
       // put() treats a string as a LOCAL path → always hand it a Buffer.
-      await client.put(Buffer.from(content, "utf8"), abs(relPath));
+      await client.put(Buffer.from(content, "utf8"), tmp);
+      await replaceViaRename(client, tmp, target);
     },
     async remove(relPath) {
       await client.delete(abs(relPath), true);
     },
   };
+}
+
+/**
+ * Move a freshly uploaded temp file onto its target, replacing whatever is
+ * there. `posixRename` is the atomic path (the posix-rename@openssh.com
+ * extension, i.e. any OpenSSH server); it is an EXTENSION, so a server without it
+ * has to take the longer route — plain `rename`, and if that refuses to clobber an
+ * existing file, delete-then-rename. All three keep the promise that matters: the
+ * target is never a partially written file.
+ */
+export async function replaceViaRename(client: SftpClient, tmp: string, target: string): Promise<void> {
+  try {
+    await client.posixRename(tmp, target);
+    return;
+  } catch {
+    /* no posix-rename extension (or it refused) → try the plain protocol op */
+  }
+  try {
+    await client.rename(tmp, target);
+  } catch {
+    // Deleting first widens the window in which the target does not exist, so it
+    // is the LAST resort. noErrorOK: an absent target is exactly what we want.
+    await client.delete(target, true);
+    await client.rename(tmp, target);
+  }
 }
 
 /**
@@ -288,8 +341,10 @@ export function ensureContent(root: string, files: ShippedFile[], label = "conte
     for (const { relPath, content } of plan.writes) {
       if (current[relPath] === content) continue;
       const target = abs(relPath);
+      const tmp = target + TMP_SUFFIX;
       mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, content, "utf8");
+      writeFileSync(tmp, content, "utf8");
+      renameSync(tmp, target);
       written.push(relPath);
       console.log(`[${label}] wrote ${target}`);
     }
@@ -302,7 +357,11 @@ export function ensureContent(root: string, files: ShippedFile[], label = "conte
     // Same text-only-when-changed rule as the async path: the steady state is a
     // no-op, which is what makes "nothing to report" honest.
     const nextText = journalText(nextJournal(plan, previous, files));
-    if (previousText !== nextText) writeFileSync(journalPath, nextText, "utf8");
+    if (previousText !== nextText) {
+      const tmp = journalPath + TMP_SUFFIX;
+      writeFileSync(tmp, nextText, "utf8");
+      renameSync(tmp, journalPath);
+    }
     return { written, diverged: plan.diverged, retired: plan.retired };
   } catch (error) {
     console.error(`[${label}] sync failed:`, error instanceof Error ? error.message : String(error));
@@ -448,17 +507,23 @@ export function buildApplyScript(args: {
   const root = args.remoteRoot;
   const writes = args.plan.writes.filter((f) => args.current[f.relPath] !== f.content);
   const dirs = [...new Set(writes.map((f) => posix.dirname(f.relPath)))].sort();
+  // Write to <target>.pipi-tmp, then rename over the target. `&&` matters: if the
+  // decode fails (no base64, a truncated payload), the temp holds a partial file
+  // and the rename — the only step that touches the target — never runs. The
+  // remote therefore keeps the last complete copy, not a half one.
+  const install = (target: string, content: string): string =>
+    `echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > ${target}${TMP_SUFFIX} && mv -f ${target}${TMP_SUFFIX} ${target}`;
   const lines: string[] = [];
   if (dirs.length > 0) lines.push(`mkdir -p ${dirs.map((d) => `${root}/${d}`).join(" ")}`);
-  for (const { relPath, content } of writes) {
-    lines.push(`echo ${Buffer.from(content, "utf8").toString("base64")} | base64 -d > ${root}/${relPath}`);
+  for (const { relPath, content } of writes) lines.push(install(`${root}/${relPath}`, content));
+  for (const relPath of args.plan.retired) {
+    lines.push(`rm -f ${root}/${relPath}`, `rm -f ${root}/${relPath}${TMP_SUFFIX}`);
   }
-  for (const relPath of args.plan.retired) lines.push(`rm -f ${root}/${relPath}`);
   for (const dir of retireDirCandidates(args.plan.retired)) lines.push(`rmdir ${root}/${dir} 2>/dev/null || true`);
   // The journal is the whole point of the probe: it is what makes "ours" and
   // "the user's edit" distinguishable on the next connect.
-  const journalBlob = Buffer.from(journalText(args.journal), "utf8").toString("base64");
-  lines.push(`mkdir -p ${root}`, `echo ${journalBlob} | base64 -d > ${root}/${JOURNAL_FILE}`);
+  const journalBlob = journalText(args.journal);
+  lines.push(`mkdir -p ${root}`, install(`${root}/${JOURNAL_FILE}`, journalBlob));
   if (args.trailer) lines.push(args.trailer.replace(/\n+$/, ""));
   return `${lines.join("\n")}\n`;
 }

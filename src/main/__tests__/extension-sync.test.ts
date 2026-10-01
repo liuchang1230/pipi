@@ -262,6 +262,10 @@ describe("syncExtensionsViaSftp", () => {
     const puts: Array<{ path: string; content: Buffer }> = [];
     const mkdirs: string[] = [];
     const deleted: string[] = [];
+    const renames: Array<{ from: string; to: string; how: "posix" | "plain" }> = [];
+    // Every real SFTP server we care about (OpenSSH) implements
+    // posix-rename@openssh.com; tests override this to exercise the fallbacks.
+    let posixRenameFails = false;
     return {
       client: {
         mkdir: async (dir: string) => {
@@ -280,26 +284,48 @@ describe("syncExtensionsViaSftp", () => {
           deleted.push(path);
           remoteFiles.delete(path);
         },
+        posixRename: async (from: string, to: string) => {
+          if (posixRenameFails) throw new Error("Operation unsupported");
+          if (!remoteFiles.has(from)) throw new Error(`No such file: ${from}`);
+          renames.push({ from, to, how: "posix" });
+          remoteFiles.set(to, remoteFiles.get(from)!);
+          remoteFiles.delete(from);
+        },
+        rename: async (from: string, to: string) => {
+          if (!remoteFiles.has(from)) throw new Error(`No such file: ${from}`);
+          renames.push({ from, to, how: "plain" });
+          remoteFiles.set(to, remoteFiles.get(from)!);
+          remoteFiles.delete(from);
+        },
       },
       puts,
       mkdirs,
       deleted,
+      renames,
+      failPosixRename: () => {
+        posixRenameFails = true;
+      },
     };
   }
 
   it("uploads both roots on the first sync, journals included", async () => {
-    const { client, puts, mkdirs } = mockClient(new Map());
+    const files = new Map<string, string | Buffer>();
+    const { client, puts, mkdirs } = mockClient(files);
     const result = await syncExtensionsViaSftp(client as never, "/home/user", undefined);
     expect(result.ok).toBe(true);
-    const paths = puts.map((p) => p.path);
-    expect(paths).toContain("/home/user/.pi/agent/extensions/delegation/index.ts");
-    expect(paths).toContain("/home/user/.pi/agent/agents/reviewer.md");
-    expect(paths).toContain("/home/user/.pi/agent/extensions/.pipi.json");
-    expect(paths).toContain("/home/user/.pi/agent/agents/.pipi.json");
-    expect(paths).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length + 2);
+    // put() only ever targets a temp path; the live paths appear because the
+    // rename put them there (so they are complete files, never partial ones).
+    for (const p of puts) expect(p.path).toMatch(/\.pipi-tmp$/);
+    const installed = [...files.keys()];
+    expect(installed).toContain("/home/user/.pi/agent/extensions/delegation/index.ts");
+    expect(installed).toContain("/home/user/.pi/agent/agents/reviewer.md");
+    expect(installed).toContain("/home/user/.pi/agent/extensions/.pipi.json");
+    expect(installed).toContain("/home/user/.pi/agent/agents/.pipi.json");
+    expect(installed).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length + 2);
     expect(mkdirs).toContain("/home/user/.pi/agent/extensions");
     expect(mkdirs).toContain("/home/user/.pi/agent/agents");
     expect(result.uploaded).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length);
+    expect(result.uploaded).toContain("/home/user/.pi/agent/extensions/delegation/index.ts");
   });
 
   it("honors an absolute agentDir override when computing the remote base", async () => {
@@ -332,7 +358,7 @@ describe("syncExtensionsViaSftp", () => {
     const files = new Map<string, string | Buffer>();
     const first = mockClient(files);
     await syncExtensionsViaSftp(first.client as never, "/home/user", undefined);
-    first.puts.length = 0;
+    first.renames.length = 0;
     // The user tweaks the delegation code ON THE SERVER, and something else
     // tampers with one of our own sources.
     const tuned = "/home/user/.pi/agent/extensions/delegation/engine.ts";
@@ -341,7 +367,7 @@ describe("syncExtensionsViaSftp", () => {
     files.set(ours, "// tampered\n");
     const second = await syncExtensionsViaSftp(first.client as never, "/home/user", undefined);
     expect(second.ok).toBe(true);
-    const touched = first.puts.map((p) => p.path);
+    const touched = first.renames.map((r) => r.to);
     expect(touched).toContain(ours);
     expect(touched).not.toContain(tuned);
     expect(files.get(tuned)).toBe("// my engine\n");
@@ -377,6 +403,81 @@ describe("syncExtensionsViaSftp", () => {
     // No journal was written for that root, so nothing is marked as ours there:
     // the whole root is simply re-uploaded on the next connect.
     expect(result.uploaded).toEqual([]);
+  });
+
+  /**
+   * Atomicity: files are uploaded to `<target>.pipi-tmp` and renamed over the
+   * target, so an interrupted sync can never leave a truncated file where the
+   * next run would find it, hash it, and file it under "the user edited this".
+   */
+  it("installs through a temp file plus rename, never a direct overwrite", async () => {
+    const files = new Map<string, string | Buffer>();
+    const { client, renames } = mockClient(files);
+    await syncExtensionsViaSftp(client as never, "/home/user", undefined);
+    const target = "/home/user/.pi/agent/extensions/pipi-tree-nav.ts";
+    expect(renames).toContainEqual({ from: `${target}.pipi-tmp`, to: target, how: "posix" });
+    // Every uploaded path is a temp path; nothing is ever put() straight onto a
+    // live target (a half-written extension file would be loaded by pi).
+    for (const p of files.keys()) expect(p.endsWith(".pipi-tmp")).toBe(false);
+  });
+
+  it("falls back to plain rename when the server has no posix-rename extension", async () => {
+    const files = new Map<string, string | Buffer>();
+    const mock = mockClient(files);
+    mock.failPosixRename();
+    const result = await syncExtensionsViaSftp(mock.client as never, "/home/user", undefined);
+    expect(result.ok).toBe(true);
+    expect(mock.renames.length).toBeGreaterThan(0);
+    expect(mock.renames.every((r) => r.how === "plain")).toBe(true);
+    expect(mock.deleted).toEqual([]); // rename clobbered the target on its own
+  });
+
+  it("deletes the target then renames, when the server refuses to clobber", async () => {
+    const files = new Map<string, string | Buffer>();
+    const mock = mockClient(files);
+    await syncExtensionsViaSftp(mock.client as never, "/home/user", undefined);
+    // A server with no posix-rename that ALSO refuses to rename onto an existing
+    // file: the only way left is delete-then-rename.
+    mock.failPosixRename();
+    (mock.client as { rename: (f: string, t: string) => Promise<void> }).rename = async (from, to) => {
+      if (files.has(to)) throw new Error("Failure: target exists");
+      files.set(to, files.get(from)!);
+      files.delete(from);
+    };
+    // Drift one of our own files so there is something to write at all (the
+    // journal says everything else is already ours).
+    const target = "/home/user/.pi/agent/extensions/pipi-tree-nav.ts";
+    files.set(target, "// tampered\n");
+    mock.deleted.length = 0;
+    const second = await syncExtensionsViaSftp(mock.client as never, "/home/user", undefined);
+    expect(second.ok).toBe(true);
+    expect(mock.deleted).toEqual([target]);
+    expect(files.get(target)?.toString()).toContain("pipi-tree-nav");
+    // Nothing was left behind half-written or as a stray temp.
+    expect([...files.keys()].filter((k) => k.endsWith(".pipi-tmp"))).toEqual([]);
+  });
+
+  it("keeps the previous bytes when the upload itself fails", async () => {
+    const files = new Map<string, string | Buffer>();
+    const mock = mockClient(files);
+    const target = "/home/user/.pi/agent/extensions/pipi-tree-nav.ts";
+    await syncExtensionsViaSftp(mock.client as never, "/home/user", undefined);
+    const before = files.get(target);
+    // Now make the next upload of THAT file fail at the put() step.
+    const original = (mock.client as { put: (c: Buffer, p: string) => Promise<void> }).put.bind(mock.client);
+    (mock.client as { put: (c: Buffer, p: string) => Promise<void> }).put = async (c, p) => {
+      if (p === `${target}.pipi-tmp`) throw new Error("connection reset");
+      return original(c, p);
+    };
+    files.set(target, "// tampered\n");
+    files.delete("/home/user/.pi/agent/extensions/.pipi.json");
+    const result = await syncExtensionsViaSftp(mock.client as never, "/home/user", undefined);
+    expect(result.ok).toBe(false);
+    // The temp never became the target: the file on the server is still the
+    // (tampered) copy it was, not a half-written one, and the journal does not
+    // claim the new bytes as ours.
+    expect(files.get(target)).toBe("// tampered\n");
+    expect(before).toBeDefined();
   });
 });
 

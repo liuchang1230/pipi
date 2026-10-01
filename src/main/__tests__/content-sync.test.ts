@@ -3,7 +3,7 @@
 // another root's files. Skills exercise the mechanics through skill-sync.ts;
 // this file pins the parts that only show up once MORE THAN ONE kind of content
 // ships (extensions/agents), which is what makes the engine generic.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -12,9 +12,12 @@ import {
   ensureContent,
   JOURNAL_FILE,
   nextJournal,
+  nodeContentIo,
   parseJournal,
   planSync,
   sha256,
+  syncContent,
+  TMP_SUFFIX,
   type ShippedFile,
 } from "../content-sync";
 
@@ -134,6 +137,73 @@ describe("ensureContent across two roots", () => {
   });
 });
 
+describe("writes are atomic (temp file + rename)", () => {
+  it("names every temp file so pi's discovery rules cannot pick it up", () => {
+    // pi loads extensions/*.ts, extensions/*/index.ts, agents/*.md and any
+    // directory containing SKILL.md. A leftover temp must match none of those.
+    expect(TMP_SUFFIX.startsWith(".")).toBe(true);
+    expect(TMP_SUFFIX.endsWith(".ts")).toBe(false);
+    expect(TMP_SUFFIX.endsWith(".md")).toBe(false);
+    expect(`${TMP_SUFFIX}`).not.toContain("SKILL.md");
+  });
+
+  it("leaves the old bytes AND the old journal entry when the write fails", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    ensureContent(root, [file("a.ts", "ours v1\n")], "extensions");
+    const journalBefore = readFileSync(join(root, JOURNAL_FILE), "utf8");
+    // Block the temp path with a directory: the write of the temp file fails
+    // before anything touches the target.
+    mkdirSync(join(root, `a.ts${TMP_SUFFIX}`));
+    const result = ensureContent(root, [file("a.ts", "ours v2\n")], "extensions");
+    expect(result.written).toEqual([]);
+    // The target still holds a COMPLETE file (the old one) — a truncated file
+    // here is the failure mode this whole mechanism exists to prevent.
+    expect(readFileSync(join(root, "a.ts"), "utf8")).toBe("ours v1\n");
+    // And the journal still says v1, so the next run retries the upgrade instead
+    // of mistaking our own broken copy for a user edit.
+    expect(readFileSync(join(root, JOURNAL_FILE), "utf8")).toBe(journalBefore);
+    expect(parseJournal(journalBefore).shipped["a.ts"]).toBe(sha256("ours v1\n"));
+    // Control: unblock the temp path and the very same call succeeds, so the
+    // assertions above are about the blocked write and nothing else.
+    rmSync(join(root, `a.ts${TMP_SUFFIX}`), { recursive: true, force: true });
+    const retry = ensureContent(root, [file("a.ts", "ours v2\n")], "extensions");
+    expect(retry.written).toEqual(["a.ts"]);
+    expect(readFileSync(join(root, "a.ts"), "utf8")).toBe("ours v2\n");
+  });
+
+  it("leaves no temp file behind on a successful write", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    ensureContent(root, [file("a.ts", "A\n"), file("delegation/i.ts", "I\n")], "extensions");
+    expect(readdirSync(root).filter((n) => n.includes(TMP_SUFFIX))).toEqual([]);
+    expect(readdirSync(join(root, "delegation")).filter((n) => n.includes(TMP_SUFFIX))).toEqual([]);
+  });
+
+  it("ignores a stale temp file from an interrupted run", () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    mkdirSync(join(root, "delegation"), { recursive: true });
+    writeFileSync(join(root, `delegation/i.ts${TMP_SUFFIX}`), "half-writ", "utf8");
+    const result = ensureContent(root, [file("delegation/i.ts", "I\n")], "extensions");
+    expect(result.written).toEqual(["delegation/i.ts"]);
+    expect(readFileSync(join(root, "delegation", "i.ts"), "utf8")).toBe("I\n");
+    // A stale temp is never entered into the journal either.
+    expect(Object.keys(parseJournal(readFileSync(join(root, JOURNAL_FILE), "utf8")).shipped)).toEqual([
+      "delegation/i.ts",
+    ]);
+  });
+
+  it("does the same through the async io (the WSL path)", async () => {
+    const home = tempDir();
+    const root = join(home, "extensions");
+    await syncContent(nodeContentIo(root), [file("a.ts", "A\n")]);
+    expect(readdirSync(root).filter((n) => n.includes(TMP_SUFFIX))).toEqual([]);
+    expect(readFileSync(join(root, "a.ts"), "utf8")).toBe("A\n");
+    expect(parseJournal(readFileSync(join(root, JOURNAL_FILE), "utf8")).shipped["a.ts"]).toBe(sha256("A\n"));
+  });
+});
+
 describe("buildApplyScript", () => {
   it("appends the trailer as its own always-succeeding lines", () => {
     const script = buildApplyScript({
@@ -152,6 +222,44 @@ describe("buildApplyScript", () => {
     expect(script.indexOf(JOURNAL_FILE)).toBeLessThan(script.indexOf("planner.md"));
     // Every line is complete on its own: `sh -s` reads to EOF.
     expect(script.endsWith("\n")).toBe(true);
+  });
+
+  it("installs each file through a temp file and renames it into place", () => {
+    const files = [file("x.ts", "X\n"), file("delegation/i.ts", "I\n")];
+    files[0]!.policy = "overwrite";
+    const plan = planSync({}, { version: 1, shipped: {}, diverged: {} }, files);
+    const script = buildApplyScript({
+      plan,
+      current: {},
+      journal: nextJournal(plan, { version: 1, shipped: {}, diverged: {} }, files),
+      remoteRoot: "$HOME/.pi/agent/extensions",
+    });
+    const writes = script.split("\n").filter((line) => line.includes("base64 -d >"));
+    expect(writes).toHaveLength(3); // two files + the journal
+    for (const line of writes) {
+      // `<b64> | base64 -d > <target>.pipi-tmp && mv -f <target>.pipi-tmp <target>`
+      // and nothing else: the target is only ever touched by the rename.
+      const m = /^echo (\S+) \| base64 -d > (\S+) && mv -f (\S+) (\S+)$/.exec(line);
+      expect(m, line).not.toBeNull();
+      expect(m![2]).toBe(`${m![4]}${TMP_SUFFIX}`);
+      expect(m![3]).toBe(m![2]);
+      expect(m![4]).toContain("$HOME/.pi/agent/extensions/");
+    }
+    // `&&` is what makes a failed decode harmless: the rename never runs, so the
+    // remote keeps its last complete copy.
+    for (const line of writes) expect(line).toContain("&& mv -f");
+  });
+
+  it("cleans up the temp of a file it retires", () => {
+    const files = [file("gone.ts", "G\n")];
+    const previous = { version: 1 as const, shipped: { "gone.ts": sha256("G\n") }, diverged: {} };
+    const plan = planSync({ "gone.ts": "G\n" }, previous, []);
+    const script = buildApplyScript({ plan, current: { "gone.ts": "G\n" }, journal: previous, remoteRoot: "$R" });
+    expect(script).toContain("rm -f $R/gone.ts\n");
+    expect(script).toContain(`rm -f $R/gone.ts${TMP_SUFFIX}`);
+    // The bundle itself never contains a relPath that ends in the temp suffix,
+    // so a retired temp can never collide with a real file.
+    expect(files.some((f) => f.relPath.endsWith(TMP_SUFFIX))).toBe(false);
   });
 
   it("writes nothing twice: an unchanged file is not in the payload", () => {
