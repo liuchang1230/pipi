@@ -53,7 +53,7 @@ Status: **accepted**（2026-09-30）
 - **CRLF：实测无害，且因此不能“顺手修”。** 原文担心的「CRLF 污染 agent `.md` 的 frontmatter，`name:` 带上 `\r`」已经实测否定：`skills/engineering/code-review/SKILL.md`（CR=87）、本机已安装的同一份、`~/.pi/agent/extensions/pipi-tree-nav.ts`（CR=65）、`src/main/agents/reviewer.md`（CR=46）**全是 CRLF**，而用户正在跑的那份 pi 正常加载它们（常驻 token 也正常）。pi 的 frontmatter 解析器（与 `delegation/engine.ts:390` 复用的是同一个 `parseFrontmatter`）容得下 CRLF。**所以刻意不做 LF 归一化**：归一化会改变「已经发出去过的字节」，让每台机器上已安装的文件与账本哈希失配，于是被一律归为「用户改过」而**永远不再升级**。代价：本机 `core.autocrlf=true` 且仓库无 `.gitattributes`，新检出得到 CRLF —— 两种换行都得能跑，测试因此断言「逐字节等于打进包里的那份」，不断言某种换行。
 - **我们自己的 typecheck 覆盖不到这次收编的 5 个文件**：它们 import pi 内部（`@earendil-works/pi-agent-core` 等）、用 `.ts` 后缀说明符与扩展运行时 API（`pi.registerTool` / `getAgentDir` / `parseFrontmatter`），放进 `tsconfig.node.json` 会让 `typecheck:node` 变红（真的变红过，见 `7f9bed1`），所以那个 config 里 `exclude` 了 `src/main/extensions/delegation`。**它们的第一个失败信号是 pi 加载失败，不是类型检查。** 补偿：端到端测试直接在真 Linux 上装、再读回校验；但提交一个手改的 `engine.ts` 不会被任何本仓检查拦住。
 
-**未落地（下一批）**：P0 投递接线、P1 诚实降级文本、P2 问答能力层、P3 红命令账本。
+**未落地（下一批）**：P0 投递接线、P1 诚实降级文本、P2 问答能力层、P3 红命令账本。（P0/P1/P2 均已落地，见下「实施状态」。）
 
 ## 实施状态（2026-09-30）
 
@@ -66,7 +66,7 @@ Status: **accepted**（2026-09-30）
 - 免密 ssh：每根一次 probe→apply，旧版退役作为 trailer 搭在 extensions 那一趟上。往返 1 → 4（加技能那 2-3 次），门控仍是内存里的内容摘要，重连不重传。
 - **验证**：全量 1122 passed | 2 skipped（1124）；`npm run smoke:skills-wsl`（真 Linux）2 passed —— 在一个真 shell 上装完两个根、逐字节一致、第二次空跑、**用户改过的 `delegation/declarations.ts` 与 `agents/reviewer.md` 原样保留**、我们自己被篡改的 `pipi-tree-nav.ts` 被恢复。这条正是决策 3 要的那个保证。
 
-**未落地**：P2 问答能力层、P3 红命令账本；以及下面三项已知限制。
+**未落地**：P3 红命令账本（P2 已落地，见「已落地三」）；以及下面三项已知限制。
 
 **已修（补记四，同日；补记五，2026-10-01）**：
 
@@ -85,7 +85,7 @@ Status: **accepted**（2026-09-30）
 - **现状纠正**：P2 立项时的理由（「让 `grilling` 能跑」）是错的 —— 上游 `grilling` 是纯文本访谈，整棵 vendored skills 树里 `ask_user_question` **零命中**。真正的价值是：pi 不含这个工具，生态里只有第三方包 `@juicesharp/rpiv-ask-user-question` 提供它，而 app 不分发第三方包 —— 于是 app 里那套完整问卷界面（`QuestionnaireDialog.tsx`）对绝大多数用户是死代码，模型也少一个结构化决策原语。
 - **新分发件 `src/main/extensions/pipi-ask-user-question.ts`**（约 450 行）：注册同名工具 `ask_user_question`，RPC/SDK 下走 select/input 对话框走查（一问一个对话框，与渲染层 `walkerTitleStarts` / `buildFlushSteps` 的对接契约写在文件头），TUI 下同走查（**刻意不做**覆盖层：聊天视图拿到完整问卷，终端视图是一问一个原生选择框，没有选项卡/并排预览/多选复选框）。与渲染层零改动对接：ChatPane 拦截第一个对话框、弹完整问卷、提交后按序喂回答案。
 - **三个关键实现决策**：①参数 schema 用纯 JSON Schema 不用 typebox（pi-ai `validateToolArguments` 显式支持无 TypeBox.Kind 的 schema，`validation.js:285` 的 `coerceWithJsonSchema` 分支；typebox 在本仓库根不可解析，一旦 import 分发件就再也进不了 vitest）—— 代价是 `params` 类型上为 `unknown`，归一/校验由自己的 `normalizeParams` 兜（边界 + 保留标签变成可测纯函数）；②同名工具让路（注册放 `session_start`，那时所有扩展已加载完，`pi.getAllTools()` 看得见 rpiv —— 装了 rpiv 的人保留它的完整 TUI 覆盖层）；③不加 `promptGuidelines`（rpiv 那三条约 1200 字符 ≈ 300 tok/轮的驻留成本，关键约束已写进 tool description —— 同样驻留、不重复付钱）。
-- **验证**：单测 29 条（假件只回显式排队的答案；跨边界契约用**字节级互钉** —— 本侧测试钉住走查发出的确切字符串（`[header] question` 前缀、`N. label — description` 选项行、`N+1. Type something.` 哨兵行、`\n\nType your answer:` 后续输入），渲染层的 `questionnaire.test.ts` 钉住 ChatPane 的匹配器接受同样的字面量；两侧任一单独漂移，一边先红。不直接 import `QuestionnaireDialog.tsx`，因为 main 的 tsc 工程不开 jsx）。三个突变探针（标题前缀拼法、哨兵行格式、让路逻辑）各自砸下去都被先红捕获后还原。真机 pi 验证：`-e` 加载本文件 + 探针扩展打印 `getAllTools()` —— 装 rpiv 的机器上让路（source 指向 rpiv），干净 agent 目录（`PI_CODING_AGENT_DIR`）上注册成功（source 指向本文件）。**残余风险**：pi-ai 对纯 JSON Schema 的运行时校验分支是读源码确认的，还没在真对话里被模型参数走到 —— 首次真实验证后回来划掉。
+- **验证**：单测 32 条（假件只回显式排队的答案；跨边界契约用**字节级互钉** —— 本侧测试钉住走查发出的确切字符串（`[header] question` 前缀、`N. label — description` 选项行、`N+1. Type something.` 哨兵行、`\n\nType your answer:` 后续输入），渲染层的 `questionnaire.test.ts` 钉住 ChatPane 的匹配器接受同样的字面量；两侧任一单独漂移，一边先红。不直接 import `QuestionnaireDialog.tsx`，因为 main 的 tsc 工程不开 jsx）。三个突变探针（标题前缀拼法、哨兵行格式、让路逻辑）各自砸下去都被先红捕获后还原。真机 pi 验证：`-e` 加载本文件 + 探针扩展打印 `getAllTools()` —— 装 rpiv 的机器上让路（source 指向 rpiv），干净 agent 目录（`PI_CODING_AGENT_DIR`）上注册成功（source 指向本文件）。~~**残余风险**：pi-ai 对纯 JSON Schema 的运行时校验分支是读源码确认的，还没在真对话里被模型参数走到~~ → **已消除**（同日补）：pi 运行时用的那个校验器（pi-ai `validateToolArguments`）被直接拉进单测（`createRequire` 挂在 pi 包内图上加载，绕过全锁的 exports map），当场验证：合法参数通过、5 问/1 选项/超长 header 各自被真校验器拒绝、缺 `description` 被 schema `required` 拒绝且 `normalizeParams` 双层防线同钉。真对话不再是必要条件。
 - **测试桩账本**：`src/main/extensions/pi-api-stub.d.ts`（分发扩展源的 pi 表面清单）新增 `getAllTools()` / `registerTool()` / `ui.input()` / `ExtensionToolDefinition`。这个桩存在的原因：pi 的 .d.ts 内部用 `.ts` specifier，在本仓库 composite 模式下解不开 —— 所以对分发扩展源用环境模块声明盖住真包，桩里**只写我们真正依赖的成员**（不再用的要删，不是留着备用）。
 
 **未落地**：P3 红命令账本。

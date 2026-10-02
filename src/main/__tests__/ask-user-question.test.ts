@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import pipiAskUserQuestion from "../extensions/pipi-ask-user-question";
 import {
   alreadyProvidesAskUserQuestion,
+  ASK_USER_QUESTION_SCHEMA,
   buildAnswerEnvelope,
   formatOptionLine,
   MAX_HEADER_LENGTH,
@@ -19,6 +20,7 @@ import {
   normalizeParams,
   parseIndex,
   questionTitlePrefix,
+  RESERVED_LABELS,
   SENTINEL_LABEL,
   walkQuestionnaire,
   type AskAnswer,
@@ -408,6 +410,24 @@ describe("registration — defer to an existing provider", () => {
 
 // --- 分发件本身 --------------------------------------------------------------
 
+// 真 pi-ai 校验器（pi 运行时用的那份）：我们 schema 的第一条防线是它在 pi 里
+// 真的生效。pi-ai 的 exports map 全锁（且 typebox 不可从仓库根解析），所以用
+// createRequire 从 pi 包内图加载 —— 布局变了这里会加载失败，那也是信号。
+import { createRequire } from "node:module";
+import { join } from "node:path";
+
+const requireFromPi = createRequire(join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "index.js"));
+const { validateToolArguments } = requireFromPi("./node_modules/@earendil-works/pi-ai/dist/utils/validation.js") as {
+  validateToolArguments: (tool: { name: string; parameters: unknown }, call: { name?: string; arguments: unknown }) => unknown;
+};
+
+const schemaTool = { name: "ask_user_question", parameters: ASK_USER_QUESTION_SCHEMA };
+
+/** 真 pi-ai 校验器过一遍。返回归一后的参数；拒绝则抛出 pi 自己的错误文案。 */
+function piValidate(args: unknown): unknown {
+  return validateToolArguments(schemaTool, { name: "ask_user_question", arguments: args });
+}
+
 describe("shipped artifact", () => {
   const shipped = SHIPPED_EXTENSIONS.find((e) => e.fileName === "pipi-ask-user-question.ts");
   it("ships as an app-owned (overwrite) extension file", () => {
@@ -419,5 +439,46 @@ describe("shipped artifact", () => {
     // 这条是「能被单测」的前提：文件里不允许出现非 type-only 的包导入。
     const imports = [...shipped!.content.matchAll(/^import\s+(?!type\b)([^;]+)$/gm)].map((m) => m[1]!);
     expect(imports).toEqual([]);
+  });
+  it("description quotes the exact bounds the schema enforces (they must drift together)", () => {
+    // 扩展注释承诺过：改常量必须同步改 description 文案。钉法：schema JSON 里
+    // 的每个数字（1/2/4/16/60）必须同时出现在 TOOL_DESCRIPTION 里。
+    const desc = shipped!.content;
+    for (const n of [MAX_QUESTIONS, MIN_OPTIONS, MAX_OPTIONS, MAX_HEADER_LENGTH, MAX_LABEL_LENGTH]) {
+      expect(desc).toContain(String(n));
+    }
+    // 保留标签同理：description 警告了这两个名字。
+    for (const label of RESERVED_LABELS) {
+      expect(desc).toContain(label);
+    }
+  });
+
+  it("the real pi-ai validator (the one pi runs) enforces this schema", () => {
+    // 上一轮的残余风险当场关闭：不用等真实对话，pi 运行时用的那个校验器
+    // 在这里直接跑。它接受合法参数、拒绝越界参数。
+    const valid = {
+      questions: [{ question: "Q?", options: [{ label: "A", description: "a" }, { label: "B", description: "b" }] }],
+    };
+    expect((piValidate(valid) as { questions: unknown[] }).questions).toHaveLength(1);
+
+    const five = Array.from({ length: MAX_QUESTIONS + 1 }, (_, i) => ({
+      question: `Q${i}?`,
+      options: [{ label: "A", description: "a" }, { label: "B", description: "b" }],
+    }));
+    expect(() => piValidate({ questions: five })).toThrow(/Validation failed/);
+    expect(() => piValidate({ questions: [{ question: "Q?", options: [{ label: "A", description: "a" }] }] })).toThrow(
+      /Validation failed/,
+    );
+    expect(() =>
+      piValidate({ questions: [{ question: "Q?", header: "x".repeat(MAX_HEADER_LENGTH + 1), options: valid.questions![0]!.options }] }),
+    ).toThrow(/Validation failed/);
+  });
+
+  it("the schema's required description is enforced by pi (and again by our normalize)", () => {
+    // 双层防线的一致性：pi 拒绝缺 description（schema required），即使将来
+    // pi 层松了，normalizeParams 仍在。两侧都要断言，防的是「只改一侧」。
+    const args = { questions: [{ question: "Q?", options: [{ label: "A" }, { label: "B" }] }] };
+    expect(() => piValidate(args)).toThrow(/must have required properties description/);
+    expect(() => normalizeParams(args)).toThrow(/description must be a non-empty string/);
   });
 });
