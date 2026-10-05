@@ -1,6 +1,7 @@
 import { app } from "electron";
 import { existsSync } from "node:fs";
 import { readJsonRecoverable, writeJsonAtomic } from "./json-store";
+import { localPiSpawnPlan } from "./local-pi";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
 import { specForModel } from "../shared/model-specs";
@@ -431,7 +432,9 @@ export function syncModelToPi(input: ModelConfigEntry, overrides?: Record<string
 
 /** Ask pi whether it recognises the provider/model. The old spawnSync of
  *  `pi.cmd --list-models` blocked the main thread ~1s on every 验证 click —
- *  async now (with a 15s cap so a hung pi never leaks an in-flight call). */
+ *  async now (with a 15s cap so a hung pi never leaks an in-flight call).
+ *  解析归 `local-pi.ts`（与标签页、RPC 启动同一泡）：裸 `pi.cmd` 靠 PATH，而
+ *  标签页跑的是解析出来的那一个 —— 两处不一致时验证会对着另一个 pi 说话。 */
 export async function checkPiModelSync(providerId: string, modelId: string): Promise<{ ok: boolean; piModelsPath: string; providerExists: boolean; modelExists: boolean; listModelsContains: boolean; error?: string }> {
   const normalizedProvider = providerId.trim();
   const normalizedModel = modelId.trim();
@@ -441,9 +444,10 @@ export async function checkPiModelSync(providerId: string, modelId: string): Pro
   const modelExists = !!provider?.models?.some((m) => m.id === normalizedModel);
   try {
     const { stdout, stderr, code, error } = await new Promise<{ stdout: string; stderr: string; code: number | string | null; error?: Error }>((resolve) => {
+      const plan = localPiSpawnPlan(["--list-models"]);
       execFile(
-        "cmd.exe",
-        ["/d", "/c", "pi.cmd", "--list-models"],
+        plan.file,
+        plan.args,
         {
           encoding: "utf8",
           windowsHide: true,

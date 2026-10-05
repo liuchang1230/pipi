@@ -49,8 +49,8 @@ import {
   syncContent,
   syncContentViaSsh,
   type ShippedFile,
-  type SshScriptRunner,
 } from "./content-sync";
+import type { CommandRunner } from "./runner";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
@@ -283,7 +283,7 @@ export function buildSshRetireTrailer(agentHome = "$HOME/.pi/agent"): string {
  * agents half must be retried on the next connect rather than skipped forever.
  */
 export async function syncAgentHomeViaSsh(
-  run: SshScriptRunner,
+  run: CommandRunner,
   timeoutMs = 20000,
 ): Promise<AgentHomeSyncResult & { ok: boolean; error?: string }> {
   const extensions = await syncContentViaSsh(

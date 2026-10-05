@@ -27,7 +27,7 @@ import {
   SHIPPED_EXTENSION_FILES,
   syncAgentHomeViaSsh,
 } from "../extension-sync";
-import { parseJournal, SHIPPED_SKILL_FILES, syncSkillsViaSsh, type SshScriptRunner } from "../skill-sync";
+import { parseJournal, SHIPPED_SKILL_FILES, syncSkillsViaSsh, type CommandRunner } from "../skill-sync";
 import { TMP_SUFFIX } from "../content-sync";
 
 function pickDistro(): string | null {
@@ -62,8 +62,8 @@ const sha256 = (text: string): string => createHash("sha256").update(text, "utf8
 
 /** `wsl.exe ... bash -s` plays the part of `ssh host sh -s`: a real shell, on a
  *  real file system, with an isolated HOME standing in for the remote user's.
- *  An SshScriptRunner never throws, so a failed call comes back as ok:false. */
-function wslRunner(home: string): SshScriptRunner {
+ *  An CommandRunner never throws, so a failed call comes back as ok:false. */
+function wslRunner(home: string): CommandRunner {
   return async ({ stdin = "" }) => {
     try {
       const stdout = wsl(["env", `HOME=${home}`, "bash", "-s"], stdin);

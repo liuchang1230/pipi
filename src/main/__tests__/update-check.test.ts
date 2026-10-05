@@ -1,80 +1,38 @@
 /**
- * Remote pi alignment + probe diagnostics — pure-logic tests. The remote
- * commands nest inside `bash -ic '…'`, so the invariants here matter: no
- * single quotes, no metacharacters from inputs, version pinned to the app's
- * bundle, and the probe stderr maps to an actionable message.
+ * Remote pi 探测失败 → 给人看的话术（纯文本映射）。命令怎么造、探测怎么
+ * 分类，看 pi-version.test.ts；这里只测「原文 → 用户读到的句子」。
  */
 import { describe, expect, it } from "vitest";
-import {
-  buildRemoteAlignCommand,
-  friendlyRemoteInstallError,
-  friendlyRemoteProbeError,
-  pickVersionFromOutput,
-  stripShellNoise,
-  targetPiCommand,
-} from "../update-check";
+import { PiCommandError } from "../pi-version";
+import { friendlyRemoteInstallError, friendlyRemoteProbeError, remoteProbeFailureText, stripShellNoise } from "../update-check";
 
-describe("buildRemoteAlignCommand", () => {
-  it("pins the exact bundled version and detects bun installs", () => {
-    const cmd = buildRemoteAlignCommand("0.84.4");
-    expect(cmd).toContain("@earendil-works/pi-coding-agent@0.84.4");
-    // Same npm install on the bun path (bun has no --registry flag; only the
-    // runtime differs). Fetch timeouts are clamped on every attempt so a
-    // black-holed registry cannot eat the whole 600s command budget.
-    expect(cmd).toContain("*/.bun/*) npm install -g --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000 @earendil-works/pi-coding-agent@0.84.4;;");
-    expect(cmd).toContain("*) npm install -g --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000 @earendil-works/pi-coding-agent@0.84.4;;");
+describe("remoteProbeFailureText", () => {
+  it("keeps the remote stderr verbatim (the friendly mapper reads it)", () => {
+    const e = new PiCommandError("failed", undefined, "bash: pi: command not found\n", "exit 127", "");
+    expect(remoteProbeFailureText(e)).toBe("bash: pi: command not found");
   });
 
-  it("registry fallback retries via npmmirror (China-reachable) on the npm path only", () => {
-    // 2026-09 incident: server default registry = official registry, but the
-    // server could not reach it — npm served STALE CACHE metadata as a bogus
-    // ETARGET for a version published days earlier. The official registry is
-    // the worst fallback target from inside China; npmmirror syncs within
-    // hours and is directly reachable, so it is the baked-in retry target.
-    const fallback = buildRemoteAlignCommand("0.85.1", true);
-    expect(fallback).toContain("--registry=https://registry.npmmirror.com");
-    expect(fallback).not.toContain("registry.npmjs.org");
-    // The bun branch has no registry override (bun has no --registry flag;
-    // its default registry is the official one anyway).
-    expect(fallback).toContain("*/.bun/*) npm install -g --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000 @earendil-works/pi-coding-agent@0.85.1;;");
-    // The mirror retry reuses the same clamps.
-    expect(fallback).toContain("--fetch-retry-maxtimeout=10000 @earendil-works/pi-coding-agent@0.85.1 --registry=https://registry.npmmirror.com");
-    // Default (no fallback) has no registry override.
-    expect(buildRemoteAlignCommand("0.85.1")).not.toContain("npmmirror");
+  it("falls back to 远程 pi 不可用 for a bare exit code", () => {
+    expect(remoteProbeFailureText(new PiCommandError("failed", "install", "", "exit 1", ""))).toBe("远程 pi 不可用");
   });
 
-  it("contains no single quotes (safe inside bash -ic '…'), including the fallback chain", () => {
-    for (const v of ["0.84.4", "0.85.0", "0.85.1"]) {
-      expect(buildRemoteAlignCommand(v)).not.toContain("'");
-      expect(buildRemoteAlignCommand(v, true)).not.toContain("'");
-    }
+  it("treats a signal death (no exit code) as noise too", () => {
+    // ssh2 的 channel 可以不给退出码就关掉（被信号杀掉）：旧实现同样退到
+    // “远程 pi 不可用”，而不是把 `exit signal` 当诊断原文给用户。
+    expect(remoteProbeFailureText(new PiCommandError("failed", undefined, "", "exit signal", ""))).toBe("远程 pi 不可用");
   });
 
-  it("keeps extension update best-effort with a failure guard", () => {
-    const cmd = buildRemoteAlignCommand("0.84.4");
-    expect(cmd).toContain("pi update --extensions 2>/dev/null || true");
-  });
-});
-
-describe("targetPiCommand", () => {
-  it("resolves ~ and ~/… cwd before cd (tilde expansion must run)", () => {
-    const cmd = targetPiCommand(undefined, "~/code/proj", "pi --version");
-    expect(cmd).toContain('case "$P" in "~") P="$HOME"');
-    expect(cmd).toContain("cd \"$P\" && pi --version");
-    expect(cmd).not.toContain("'"); // no quotes inside the nested layer
+  it("surfaces a transport reason that is not an exit code", () => {
+    expect(remoteProbeFailureText(new PiCommandError("failed", undefined, "", "ssh not found", ""))).toBe("ssh not found");
   });
 
-  it("injects PI_CODING_AGENT_DIR only for a safe agentDir", () => {
-    const cmd = targetPiCommand({ agentDir: "~/team-a/agent" } as never, "/home/u/p", "pi --version");
-    expect(cmd).toContain("export PI_CODING_AGENT_DIR='~/team-a/agent'");
-    // Unsafe agentDir (spaces / ..) must be dropped, not spliced.
-    const bad = targetPiCommand({ agentDir: "../../etc" } as never, "/home/u/p", "pi --version");
-    expect(bad).not.toContain("export PI_CODING_AGENT_DIR");
+  it("names the timeout in our own words", () => {
+    expect(remoteProbeFailureText(new PiCommandError("timeout", undefined, "", "timeout", ""))).toBe("远程 pi 版本检查超时");
   });
 
-  it("passes the command through when no cwd is given", () => {
-    const cmd = targetPiCommand(undefined, undefined, "pi --version");
-    expect(cmd).toBe("pi --version");
+  it("passes non-PiCommandError through", () => {
+    expect(remoteProbeFailureText(new Error("boom"))).toBe("boom");
+    expect(remoteProbeFailureText("boom")).toBe("boom");
   });
 });
 
@@ -135,18 +93,6 @@ describe("friendlyRemoteInstallError", () => {
     // The hint runs on the RAW text (npm's verdict lines live on stderr) and
     // must still classify it after noise would have been stripped away.
     expect(friendlyRemoteInstallError(raw, "0.85.1")).toContain("npmmirror.com");
-  });
-});
-
-describe("pickVersionFromOutput", () => {
-  it("takes the last semver-looking line (banner noise before pi's line)", () => {
-    const out = "Welcome to Ubuntu 22.04.3 LTS\n0.84.4\n";
-    expect(pickVersionFromOutput(out)).toBe("0.84.4");
-  });
-
-  it("returns null when nothing looks like a version", () => {
-    expect(pickVersionFromOutput("pi: command not found")).toBeNull();
-    expect(pickVersionFromOutput("")).toBeNull();
   });
 });
 

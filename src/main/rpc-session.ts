@@ -18,17 +18,18 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
-import { existsSync, readFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
 import { debugLog, debugLogDebug, debugLogWarn } from "./debug-log";
 import { isSshAuthError } from "./sftp-failure";
 import { piEnv, piShellPrefix } from "./pi-env";
 import {
-  closeTab, createTab, getGlobalPiBin, getTab, linkTabSession, markTabRemoteDown, markTabRemoteReady, registerExternalTab, setTabTitle, unregisterExternalTab,
+  closeTab, createTab, getTab, linkTabSession, markTabRemoteDown, markTabRemoteReady, registerExternalTab, setTabTitle, unregisterExternalTab,
   type CreateTabOptions, type RemoteOpts, type TabInfo, type WslOpts,
 } from "./pty";
+import { localPiSpawnPlan } from "./local-pi";
 
 // --- Transports -------------------------------------------------------------
 
@@ -198,55 +199,13 @@ class Ssh2Transport implements RpcTransport {
 
 // --- Process resolution (local pi) -----------------------------------------
 
-function findNodeBin(): string | null {
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const cand = join(dir, "node.exe");
-    if (existsSync(cand)) return cand;
-  }
-  const candidates = [
-    "C:\\Program Files\\nodejs\\node.exe",
-    "C:\\Program Files (x86)\\nodejs\\node.exe",
-    join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\node.exe"),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  return null;
-}
-
-function resolveCliJs(): string | null {
-  const piBin = getGlobalPiBin();
-  if (/\.cmd$/i.test(piBin)) {
-    try {
-      const content = readFileSync(piBin, "utf8");
-      const m = content.match(/"([^"]*cli\.js)"/i);
-      if (m && existsSync(m[1]!)) return m[1];
-    } catch {
-      /* fall through */
-    }
-    const cand = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-    if (existsSync(cand)) return cand;
-  }
-  return null;
-}
-
-/** Local spawn: node <cli.js> --mode rpc [--session …] [-c] */
+/** Local spawn: node <cli.js> --mode rpc [--session …] [-c]
+ *  解析（哪个 pi、哪个 node、哪个 cli.js）归 `local-pi.ts`；这里只说 argv。 */
 function localSpawnPlan(opts: CreateTabOptions): { file: string; args: string[] } {
-  const nodeBin = findNodeBin();
-  const cliJs = resolveCliJs();
-  if (nodeBin && cliJs) {
-    const args = [cliJs, "--mode", "rpc"];
-    if (opts.sessionPath) args.push("--session", opts.sessionPath);
-    else if (opts.continueRecent === true) args.push("-c");
-    return { file: nodeBin, args };
-  }
-  // Fallback: cmd shim.
-  const piBin = getGlobalPiBin().replace(/\//g, "\\");
   const args = ["--mode", "rpc"];
   if (opts.sessionPath) args.push("--session", opts.sessionPath);
   else if (opts.continueRecent === true) args.push("-c");
-  return { file: "cmd.exe", args: ["/d", "/c", `"${piBin}"`, ...args] };
+  return localPiSpawnPlan(args);
 }
 
 // --- Remote/WSL command builders -------------------------------------------

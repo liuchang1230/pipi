@@ -32,7 +32,7 @@ import {
   type SkillIo,
   type SkillJournal,
   type SkillSyncPlan,
-  type SshScriptRunner,
+  type CommandRunner,
 } from "../skill-sync";
 
 const tmpDirs: string[] = [];
@@ -543,14 +543,14 @@ describe("the key-auth ssh transport", () => {
     initial: Record<string, string> = {},
     options: { unreadableJournal?: boolean } = {},
   ): {
-    run: SshScriptRunner;
+    run: CommandRunner;
     disk: Map<string, string>;
     calls: { command: string; stdin: string }[];
   } {
     const disk = new Map(Object.entries(initial));
     const calls: { command: string; stdin: string }[] = [];
     const fail = (why: string) => ({ ok: false, code: 1, stdout: "", stderr: why, error: "exit 1" });
-    const run: SshScriptRunner = async ({ command, stdin = "" }) => {
+    const run: CommandRunner = async ({ command, stdin = "" }) => {
       calls.push({ command, stdin });
       if (command !== "sh -s") return fail("bad option");
       if (stdin.includes("@@j") && stdin.includes("printf")) {
@@ -688,7 +688,7 @@ describe("the key-auth ssh transport", () => {
     const target = "engineering/wizard/SKILL.md";
     const disk = new Map([[target, "unreadable"]]);
     let probeAnswers = 0;
-    const run: SshScriptRunner = async ({ stdin = "" }) => {
+    const run: CommandRunner = async ({ stdin = "" }) => {
       if (stdin.includes("for p in")) {
         probeAnswers++;
         return { ok: true, code: 0, stdout: `@@f ${target}\n@@x ${target}\n`, stderr: "" };
@@ -735,7 +735,7 @@ describe("the key-auth ssh transport", () => {
 
     // Probe 1 (the bundle) answers; the retirement probe dies.
     let probes = 0;
-    const flaky: SshScriptRunner = async (options) => {
+    const flaky: CommandRunner = async (options) => {
       if (options.stdin?.includes("for p in") && ++probes === 2) {
         return { ok: false, code: 255, stdout: "", stderr: "connection reset", error: "exit 255" };
       }
@@ -759,9 +759,9 @@ describe("the key-auth ssh transport", () => {
   });
 
   it("reports a failed probe or apply instead of throwing", async () => {
-    const dead: SshScriptRunner = async () => ({ ok: false, code: 255, stdout: "", stderr: "boom", error: "exit 255" });
+    const dead: CommandRunner = async () => ({ ok: false, code: 255, stdout: "", stderr: "boom", error: "exit 255" });
     await expect(syncSkillsViaSsh(dead)).resolves.toMatchObject({ ok: false, error: "exit 255" });
-    const throws: SshScriptRunner = async () => {
+    const throws: CommandRunner = async () => {
       throw new Error("spawn exploded");
     };
     await expect(syncSkillsViaSsh(throws)).resolves.toMatchObject({ ok: false, error: "spawn exploded" });

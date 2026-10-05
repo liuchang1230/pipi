@@ -3,6 +3,9 @@
 // copying the BUNDLED pi over the user's global install, which would silently
 // downgrade a pi they keep current with `pi update`. Regression for
 // docs/robustness-plan.md A1 (bounded, non-destructive detection).
+//
+// ADR 0007 决策 6：这条规则现在是具名状态 `unverified`，不再折叠成一个
+// boolean 让调用方去猜 —— 测试直接断言三态，而不是断言 `true`。
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({
@@ -13,7 +16,7 @@ vi.mock("../debug-log", () => ({ debugLog: vi.fn() }));
 const spawnSync = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ spawnSync, spawn: vi.fn() }));
 
-const { hasGlobalPiInstalled, invalidatePiDetection } = await import("../pty");
+const { present, invalidate } = await import("../local-pi");
 
 function probeResult(code: string | undefined, status: number | null) {
   return {
@@ -29,31 +32,40 @@ function probeResult(code: string | undefined, status: number | null) {
 
 describe("pi detection timeout", () => {
   beforeEach(() => {
-    invalidatePiDetection();
+    invalidate();
     spawnSync.mockReset();
   });
 
-  it("reports a TIMED-OUT probe as present, so nothing reinstalls over the user's pi", () => {
+  it("reports a TIMED-OUT probe as unverified, so nothing reinstalls over the user's pi", () => {
     spawnSync.mockReturnValue(probeResult("ETIMEDOUT", null));
-    expect(hasGlobalPiInstalled()).toBe(true);
+    expect(present()).toBe("unverified");
   });
 
-  it("still reports a genuinely MISSING pi as not installed (install path stays reachable)", () => {
+  it("still reports a genuinely MISSING pi as absent (install path stays reachable)", () => {
     spawnSync.mockReturnValue(probeResult("ENOENT", null));
-    expect(hasGlobalPiInstalled()).toBe(false);
+    expect(present()).toBe("absent");
   });
 
-  it("treats a successful probe as installed", () => {
+  it("treats a successful probe as present", () => {
     spawnSync.mockReturnValue(probeResult(undefined, 0));
-    expect(hasGlobalPiInstalled()).toBe(true);
+    expect(present()).toBe("present");
   });
 
   it("recovers once a later probe succeeds (the timeout is not sticky)", () => {
     spawnSync.mockReturnValue(probeResult("ETIMEDOUT", null));
-    expect(hasGlobalPiInstalled()).toBe(true);
+    expect(present()).toBe("unverified");
 
-    invalidatePiDetection();
+    invalidate();
     spawnSync.mockReturnValue(probeResult(undefined, 0));
-    expect(hasGlobalPiInstalled()).toBe(true);
+    expect(present()).toBe("present");
+  });
+
+  it("keeps the timeout verdict inside the re-check window (no second probe)", () => {
+    spawnSync.mockReturnValue(probeResult("ETIMEDOUT", null));
+    expect(present()).toBe("unverified");
+    const probes = spawnSync.mock.calls.length;
+    expect(present()).toBe("unverified");
+    // 一次超时只换一次有界冻结：窗口内不再探测（第二次调用没多出 spawn）。
+    expect(spawnSync.mock.calls.length).toBe(probes);
   });
 });

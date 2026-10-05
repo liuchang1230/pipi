@@ -215,7 +215,7 @@ declare global {
       };
       update: {
         check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
-        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
+        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl" | "local"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
         runTarget: (tabId: string) => Promise<{ ok: boolean; output: string; error?: string }>;
         run: () => Promise<{ ok: boolean; output: string; error?: string }>;
         /** App-bundled extensions re-shipped at startup (content changed), pull-once. */

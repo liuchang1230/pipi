@@ -25,7 +25,7 @@ import {
   SHIPPED_EXTENSIONS,
 } from "../extension-sync";
 import { JOURNAL_FILE, parseJournal } from "../content-sync";
-import type { SshRunResult } from "../ssh-exec";
+import type { RunResult } from "../runner";
 
 let dirs: string[] = [];
 
@@ -150,12 +150,12 @@ describe("ensureShippedAgents / ensureShippedAgentHome", () => {
 
 describe("key-auth ssh transport (unit shape)", () => {
   /** A fake remote: records the scripts it is handed and answers from a queue. */
-  function fakeRunner(responses: Array<Partial<SshRunResult>>) {
+  function fakeRunner(responses: Array<Partial<RunResult>>) {
     const calls: Array<{ command: string; stdin: string }> = [];
     const run = async (options: { command: string; stdin?: string }) => {
       calls.push({ command: options.command, stdin: options.stdin ?? "" });
       const answer = responses[calls.length - 1] ?? { ok: true };
-      return { ok: true, code: 0, stdout: "", stderr: "", ...answer } as SshRunResult;
+      return { ok: true, code: 0, stdout: "", stderr: "", ...answer } as RunResult;
     };
     return { run, calls };
   }

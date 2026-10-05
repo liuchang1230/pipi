@@ -17,7 +17,9 @@ vi.mock("electron", () => ({
 }));
 
 // Import AFTER mocking electron; pty.ts imports electron at module load.
-const { resolveCliJsFromShim, installGlobalPiFromBundled, npmGlobalDir, classifyInstallStage, resolveNpmEntry } = await import("../pty");
+const { installGlobalPiFromBundled, classifyInstallStage, resolveNpmEntry } = await import("../pty");
+const { resolveCliJsFromShim } = await import("../local-pi");
+const { npmGlobalDir } = await import("../find-exe");
 
 describe("resolveCliJsFromShim", () => {
   let dir: string;

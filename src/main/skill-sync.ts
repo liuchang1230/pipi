@@ -37,8 +37,8 @@ import {
   type ContentPlan,
   type ContentSyncResult,
   type ShippedFile,
-  type SshScriptRunner,
 } from "./content-sync";
+import type { CommandRunner } from "./runner";
 import manifestSource from "../../skills/manifest.json?raw";
 
 const AGENT_HOME = join(homedir(), ".pi", "agent");
@@ -55,7 +55,7 @@ export type SkillJournal = ContentJournal;
 export type SkillSyncPlan = ContentPlan;
 export type SkillIo = ContentIo;
 export type SkillSyncResult = ContentSyncResult;
-export type { SshScriptRunner };
+export type { CommandRunner };
 export {
   EMPTY_JOURNAL,
   JOURNAL_FILE,
@@ -202,7 +202,7 @@ export function ensureShippedSkills(skillsDir = SKILLS_DIR): SkillSyncResult {
  * caller has already bound the remote and the ssh binary.
  */
 export function syncSkillsViaSsh(
-  run: SshScriptRunner,
+  run: CommandRunner,
   timeoutMs = 20000,
   files: ShippedSkillFile[] = SHIPPED_SKILL_FILES,
 ): Promise<SkillSyncResult & { ok: boolean; error?: string }> {

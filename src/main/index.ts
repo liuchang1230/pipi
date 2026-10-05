@@ -13,12 +13,14 @@ import {
   createTab, closeTab, closeAllTabs, getTab, listTabs, setActiveTab,
   resizeTab, writeTab, subscribeTab, getActiveTab, findSshBin,
   getRemoteBrowsePath, setRemoteBrowsePath, buildRemoteKey, setThemeMode,
-  hasGlobalPiInstalled, warmPiDetection, invalidatePiDetection,
   startGlobalPiInstall, classifyInstallStage, installGlobalPiFromBundled,
   onTabsChanged, setTabTitle, linkTabSession, listWslDistros, sanitizeRemoteAgentDir, remoteAgentDir,
   restartTab, isPtyTabAlive,
   type TabInfo, type RemoteOpts, type WslOpts,
 } from "./pty";
+// 模块成员名故意取得短（present/warm/invalidate），在这个万行文件里用命名空间导入
+// 限定一下，免得与 index.ts 自己的函数撞名、也免得两套名字指同一件事。
+import * as localPi from "./local-pi";
 import { ensureLocalSettingsTheme, ensureLocalThemeFiles, syncThemesViaSftp, agentDir, type RemoteThemeSyncResult } from "./theme-sync";
 import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
@@ -39,7 +41,7 @@ import {
   syncSkills,
   syncSkillsViaSftp,
   syncSkillsViaSsh,
-  type SshScriptRunner,
+  type CommandRunner,
 } from "./skill-sync";
 import { debugLog, debugLogDebug, debugLogError, debugLogWarn, flushLog } from "./debug-log";
 import { trackIpcHandlersOn } from "./in-flight";
@@ -79,7 +81,7 @@ import {
   ensureSdkWorkerStarted,
   setUiRequestHandler as setSdkUiRequestHandler,
 } from "./chat-backend/sdk-host";
-import { checkAppUpdate, checkPiUpdate, checkRemotePiUpdate, openAppUpdateDownload, runPiUpdate, runRemotePiUpdate, type RemoteUpdateTarget } from "./update-check";
+import { checkAppUpdate, checkPiUpdate, checkRemotePiUpdate, openAppUpdateDownload, runPiUpdate, runRemotePiUpdate } from "./update-check";
 import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileContent, listGitCommits, getFileAt, type FileVersionEvent } from "./diff-session";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
@@ -797,7 +799,7 @@ function syncKeyAuthExtensions(remote: RemoteOpts): void {
   // where spawn throws ENAMETOOLONG SYNCHRONOUSLY — i.e. out of this call site,
   // which sits in the tab:create handler before emitTabs() (see ssh-exec.ts).
   const sshBin = findSshBin() ?? "ssh.exe";
-  const run: SshScriptRunner = (options) => runSshCommand({ remote, sshBin, ...options });
+  const run: CommandRunner = (options) => runSshCommand({ remote, sshBin, ...options });
   void (async () => {
     // Extensions + agents: one probe→apply per root, with the legacy retire
     // riding along on the extensions apply (see extension-sync.ts).
@@ -1234,8 +1236,8 @@ if (gotSingleInstanceLock) {
   ipcMain.handle("pi-install:run", async (): Promise<{ ok: boolean }> => {
     const install = await runLocalPiInstall();
     if (install.ok) {
-      invalidatePiDetection();
-      warmPiDetection();
+      localPi.invalidate();
+      localPi.warm();
     }
     return install;
   });
@@ -1245,13 +1247,13 @@ if (gotSingleInstanceLock) {
     // re-install it locally from the app's bundled copy (plain directory
     // copy + shim write — no npm, no network), which also gives users the
     // `pi` command inside the terminal's shell.
-    if (hasGlobalPiInstalled() || process.env.PI_CODING_AGENT === "true") {
+    if (localPi.present() !== "absent" || process.env.PI_CODING_AGENT === "true") {
       return { ok: true, backend: "global" };
     }
     // Authoritative re-check (bypass the startup-warm TTL cache) so a
     // transient warm-time failure doesn't trigger a needless reinstall.
-    invalidatePiDetection();
-    if (hasGlobalPiInstalled() || process.env.PI_CODING_AGENT === "true") {
+    localPi.invalidate();
+    if (localPi.present() !== "absent" || process.env.PI_CODING_AGENT === "true") {
       return { ok: true, backend: "global" };
     }
     // Reuse runLocalPiInstall: it streams begin/result events for the
@@ -1260,8 +1262,8 @@ if (gotSingleInstanceLock) {
     const installed = await runLocalPiInstall();
     if (installed.ok) {
       console.log("[pi-detect] global pi missing — auto-installed from bundled copy");
-      invalidatePiDetection();
-      if (hasGlobalPiInstalled() || process.env.PI_CODING_AGENT === "true") {
+      localPi.invalidate();
+      if (localPi.present() !== "absent" || process.env.PI_CODING_AGENT === "true") {
         return { ok: true, backend: "bundled-install" };
       }
     }
@@ -2371,22 +2373,16 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
 
   // --- pi / extension updates (RPC chat has no TUI update banner) ---
   ipcMain.handle("update:check", (_e, force?: boolean) => checkPiUpdate(force));
-  function updateTargetForTab(tabId: string): RemoteUpdateTarget | null {
-    const tab = getTab(tabId);
-    if (!tab) return null;
-    if (tab.wsl) return { kind: "wsl", label: `WSL ${tab.wsl.distro}`, wsl: tab.wsl };
-    if (tab.remote) return { kind: "ssh", label: `${tab.remote.user}@${tab.remote.host}`, remote: tab.remote };
-    return null;
-  }
   ipcMain.handle("update:check-target", (_e, tabId: string) => {
-    const target = updateTargetForTab(tabId);
-    return target
-      ? checkRemotePiUpdate(target)
-      : { target: { kind: "ssh" as const, label: "未知目标" }, current: null, latest: null, extensions: [], hasUpdate: false, error: "目标标签不存在" };
+    const tab = getTab(tabId);
+    // ADR 0001 的那条规矩：不再就地问「这个 tab 是哪类目标」——`targetFromTab`
+    // 是唯一的桥，Target 是唯一的真值。本机标签在这条 IPC 上不可达（渲染层
+    // 只在 isRemote 时调它），update-check 会给一个诚实的答复。
+    return checkRemotePiUpdate(tab ? targetFromTab(tab) : undefined);
   });
   ipcMain.handle("update:run-target", (_e, tabId: string) => {
-    const target = updateTargetForTab(tabId);
-    return target ? runRemotePiUpdate(target) : { ok: false, output: "", error: "目标标签不存在" };
+    const tab = getTab(tabId);
+    return runRemotePiUpdate(tab ? targetFromTab(tab) : undefined);
   });
   ipcMain.handle("update:run", () => runPiUpdate());
   ipcMain.handle("app-update:check", (_e, force?: boolean) => checkAppUpdate(force));
@@ -3405,7 +3401,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   // `pi --version` block the main process ~1s each). Done once at startup so
   // the FIRST session click doesn't pay for detection; the window paints
   // first and the warm-up runs 250ms later.
-  setTimeout(() => warmPiDetection(), 250);
+  setTimeout(() => localPi.warm(), 250);
 
   // Open the initial tab: continue the most recent session for the cwd.
   emitTabs();

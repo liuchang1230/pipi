@@ -5,12 +5,17 @@
  */
 import { app, shell } from "electron";
 import { spawn } from "node:child_process";
-import { Client as SshClient } from "ssh2";
 import { existsSync, readFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { bundledPiPackagePath, findSshBin, findWslBin, getGlobalPiBin, type RemoteOpts, type WslOpts } from "./pty";
+import { buildRemoteKey, findSshBin, findWslBin } from "./pty";
+import { bundledPiVersion, bundledPiPackagePath, localPiSpawnPlan, resolveLocal } from "./local-pi";
+import type { Target } from "./target-fs";
+import { runSshCommand } from "./ssh-exec";
+import { runSsh2Command } from "./ssh2-exec";
+import { runWslCommand } from "./wsl-exec";
+import { align, cachedProbe, parseVersion, PiCommandError, type PiPort } from "./pi-version";
 
 const REGISTRY_URL = "https://registry.npmjs.org/@earendil-works%2fpi-coding-agent/latest";
 const APP_RELEASES_URL = "https://api.github.com/repos/liuchang1230/pipi/releases/latest";
@@ -30,16 +35,9 @@ export interface UpdateRunResult {
   error?: string;
 }
 
-export interface RemoteUpdateTarget {
-  kind: "ssh" | "wsl";
-  label: string;
-  remote?: RemoteOpts;
-  wsl?: WslOpts;
-}
-
 export interface RemoteUpdateInfo {
   /** Sanitized target identity; credentials never cross back to the renderer. */
-  target: Pick<RemoteUpdateTarget, "kind" | "label">;
+  target: { kind: "ssh" | "wsl" | "local"; label: string };
   current: string | null;
   latest: string | null;
   hasUpdate: boolean;
@@ -61,17 +59,10 @@ export interface AppUpdateInfo {
 
 let cached: UpdateInfo | null = null;
 let lastCheckedAt = 0;
-const remoteCached = new Map<string, { checkedAt: number; info: RemoteUpdateInfo }>();
 let updateInFlight = false;
 let cachedApp: AppUpdateInfo | null = null;
 let appLastCheckedAt = 0;
 const CHECK_TTL_MS = 6 * 60 * 60 * 1000; // re-check at most every 6h
-
-function parseVersion(v: string | null | undefined): string | null {
-  if (!v) return null;
-  const m = v.trim().match(/\d+\.\d+\.\d+/);
-  return m ? m[0] : null;
-}
 
 /** Semver-ish compare: "0.84.1" > "0.84.0". Returns 1/0/-1. */
 function compareVersions(a: string, b: string): number {
@@ -84,49 +75,12 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-function resolveNodeBin(): string | null {
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const cand = join(dir, "node.exe");
-    if (existsSync(cand)) return cand;
-  }
-  const candidates = [
-    "C:\\Program Files\\nodejs\\node.exe",
-    "C:\\Program Files (x86)\\nodejs\\node.exe",
-    join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\node.exe"),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  return null;
-}
-
-function resolveCliJs(): string | null {
-  const piBin = getGlobalPiBin();
-  if (/\.cmd$/i.test(piBin)) {
-    try {
-      const content = readFileSync(piBin, "utf8");
-      const m = content.match(/"([^"]*cli\.js)"/i);
-      if (m && existsSync(m[1]!)) return m[1];
-    } catch {
-      /* fall through */
-    }
-    const cand = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-    if (existsSync(cand)) return cand;
-  }
-  return null;
-}
-
 function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const nodeBin = findNodeBinForSpawn();
-    let child;
-    if (nodeBin && resolveCliJs()) {
-      child = spawn(nodeBin, [resolveCliJs()!, ...args], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    } else {
-      const piBin = getGlobalPiBin().replace(/\//g, "\\");
-      child = spawn("cmd.exe", ["/d", "/c", `"${piBin}"`, ...args], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    }
+    // node-vs-shim 的分支与本地 RPC 启动共用一条（`localPiSpawnPlan`）：
+    // 两边都偏好 node + cli.js，因为那是终端里跑 `pi` 的同一件事。
+    const plan = localPiSpawnPlan(args);
+    const child = spawn(plan.file, plan.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -149,10 +103,6 @@ function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null
       resolve({ code, stdout, stderr });
     });
   });
-}
-
-function findNodeBinForSpawn(): string | null {
-  return resolveNodeBin();
 }
 
 async function getLocalPiVersion(): Promise<string | null> {
@@ -184,7 +134,7 @@ async function getLatestVersion(): Promise<string | null> {
  *     because a standalone node process cannot read asar archives.
  */
 function resolvePiPackageEntry(): string | null {
-  const piBin = getGlobalPiBin();
+  const piBin = resolveLocal().piBin;
   if (piBin) {
     const globalEntry = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
     if (existsSync(globalEntry)) return globalEntry;
@@ -212,7 +162,7 @@ function resolvePiPackageEntry(): string | null {
  * the whole main process. Dynamic `import()` is used instead.
  */
 async function getExtensionUpdates(): Promise<string[]> {
-  const nodeBin = resolveNodeBin();
+  const nodeBin = resolveLocal().nodeBin;
   const piEntry = resolvePiPackageEntry();
   if (!nodeBin || !piEntry) return [];
   const cwd = process.cwd();
@@ -339,56 +289,6 @@ export async function checkPiUpdate(force = false): Promise<UpdateInfo> {
   return info;
 }
 
-/** The pi version bundled with the app — the RPC protocol contract. Remote
- * pi must match this version, NOT npm latest: a newer remote pi can diverge
- * from the app's RPC protocol, and newer pi may require a runtime the app's
- * own Electron (Node 20) cannot satisfy — e.g. 0.84.3+ imports fs.globSync
- * (Node ≥22.13) and 0.84.2+ bundles undici needing markAsUncloneable (Bun
- * lacks it), so the bundle is pinned to the last version that runs on the
- * app's Node 20 (0.84.2).
- *
- * IMPORTANT: read the pi package the app SHIPS (its own node_modules —
- * main-process fs reads through app.asar) — NEVER the user's GLOBAL pi.
- * Global pi is free to chase npm latest (local `pi update`), and the remote
- * align target must stay on the bundle: aligning a server to 0.85.x both
- * diverges from the app's RPC protocol and asks the server's npm registry
- * for a version a lagging mirror may not have synced (npm ETARGET). */
-let bundledPiVersionCache: string | null = null;
-function getBundledPiVersion(): string | null {
-  if (bundledPiVersionCache !== null) return bundledPiVersionCache;
-  try {
-    const pkgPath = join(bundledPiPackagePath(), "package.json");
-    if (existsSync(pkgPath)) {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-      const v = parseVersion(pkg.version);
-      if (v) bundledPiVersionCache = v;
-    }
-  } catch {
-    /* fall through */
-  }
-  if (bundledPiVersionCache === null) {
-    // Last resort: the app's own package.json pins the dependency exactly
-    // ("@earendil-works/pi-coding-agent": "0.84.2" — no caret). Same
-    // contract number even if node_modules is not on disk.
-    try {
-      const appPkg = JSON.parse(readFileSync(join(app.getAppPath(), "package.json"), "utf8")) as {
-        dependencies?: Record<string, unknown>;
-      };
-      const spec = appPkg.dependencies?.["@earendil-works/pi-coding-agent"];
-      bundledPiVersionCache = typeof spec === "string" ? parseVersion(spec) : null;
-    } catch {
-      /* best effort */
-    }
-  }
-  return bundledPiVersionCache;
-}
-
-/** Take the last semver-looking line from `pi --version` output: interactive
- * shells print banners first, and pi's own version line comes last. */
-export function pickVersionFromOutput(output: string): string | null {
-  return [...output.split(/\r?\n/)].reverse().map(parseVersion).find((v): v is string => v !== null) ?? null;
-}
-
 /** Drop the noise `bash -ic` prints WITHOUT a controlling tty (ioctl / job
  * control warnings) from a remote command's stderr. These two lines sit
  * ABOVE the real error (bash prints them at startup), so tail-selection
@@ -455,200 +355,120 @@ export function friendlyRemoteProbeError(stderr: string): string {
   return tail.slice(0, 160) || "远程 pi 版本检测失败";
 }
 
-/** Check pi --version inside one remote/WSL execution target and compare it
- * against the app's bundled version. */
-export async function checkRemotePiUpdate(target: RemoteUpdateTarget): Promise<RemoteUpdateInfo> {
-  const cacheKey = target.kind === "wsl"
-    ? `wsl:${target.wsl?.distro ?? target.label}`
-    : `ssh:${target.remote?.user ?? ""}@${target.remote?.host ?? target.label}:${target.remote?.port ?? 22}[${target.remote?.agentDir ?? ""}]`;
-  const previous = remoteCached.get(cacheKey);
-  if (previous && Date.now() - previous.checkedAt < CHECK_TTL_MS) return previous.info;
-  let current: string | null = null;
-  let probeStderr = "";
-  try {
-    const output = target.kind === "wsl"
-      ? await runWslVersion(target.wsl!)
-      : target.remote?.password
-        ? await runSsh2Version(target.remote)
-        : await runSshVersion(target.remote!);
-    current = pickVersionFromOutput(output);
-  } catch (e) {
-    probeStderr = e instanceof Error ? e.message : String(e);
+/** 一次远程探测失败 → 给人看的诊断原文。与今天逐字相同：有 stderr 就用它
+ * （`pi: command not found`、undici 的 markAsUncloneable 崩溃都在里面），
+ * 裸退出码退到「远程 pi 不可用」，传输层的具体原因（`ssh not found` /
+ * `spawn failed: …`）则直接用——那是唯一能解释“连都没连上”的线索。 */
+export function remoteProbeFailureText(e: unknown): string {
+  if (e instanceof PiCommandError) {
+    if (e.kind === "timeout") return "远程 pi 版本检查超时";
+    // 裸退出码（含 code 为 null 的信号死）不算诊断信息：旧实现同样退到
+    // “远程 pi 不可用”而不是“exit 1”。
+    const detail = e.detail && !/^exit\b/.test(e.detail) ? e.detail : "";
+    return e.stderr.trim() || detail || "远程 pi 不可用";
   }
-  const bundled = getBundledPiVersion();
+  return e instanceof Error ? e.message : String(e);
+}
+
+function buildRemoteInfo(target: Target | undefined, current: string | null, bundled: string | null, probeStderr: string): RemoteUpdateInfo {
   const info: RemoteUpdateInfo = {
-    target: { kind: target.kind, label: target.label }, current, latest: bundled,
+    target: target ? { kind: targetKind(target), label: targetLabel(target) } : { kind: "ssh", label: "未知目标" },
+    current, latest: bundled,
     hasUpdate: !!(current && bundled && current !== bundled),
     extensions: [],
   };
   if (!bundled) info.error = "无法确定应用配套的 pi 版本";
   else if (!current) info.error = friendlyRemoteProbeError(probeStderr);
-  remoteCached.set(cacheKey, { checkedAt: Date.now(), info });
-  console.log(`[update] ${target.label} pi ${current ?? "?"} → bundled ${bundled ?? "?"}${info.hasUpdate ? " (version mismatch)" : ""}${info.error ? ` error=${info.error.slice(0, 80)}` : ""}`);
   return info;
 }
 
-function collectVersion(child: ReturnType<typeof spawn>, timeoutMs = 20000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* best effort */ } reject(new Error("远程 pi 版本检查超时")); }, timeoutMs);
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (d: string) => { stdout += d; });
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (d: string) => { stderr += d; });
-    child.once("error", (e) => { clearTimeout(timer); reject(e); });
-    child.once("close", (code) => { clearTimeout(timer); code === 0 ? resolve(stdout) : reject(new Error(stderr || "远程 pi 不可用")); });
-  });
+/** 一个 Target 的 pi 端点（ADR 0007）：免密 ssh / 密码 ssh2 / WSL 都接在同一个
+ * seam 上，凭据只决定绑定，不决定语义。本机目标不属于远程更新对话框，返回 null。
+ *
+ * `key` 复用既有格式（`buildRemoteKey(remote)` / `wsl:<distro>`）——update-check
+ * 原本自己拼了第三种 key 格式，这里收回一种。 */
+function portForTarget(target: Target): PiPort | null {
+  if (target.kind === "wsl") {
+    return {
+      key: `wsl:${target.distro}`,
+      // root 就是标签页的 cwd（`targetFromTab` 已把缺省 path 归一为 `~`），
+      // 所以探测跑在 pi 真正跑的那个目录里。
+      target: { cwd: target.root },
+      run: (options) => runWslCommand({ distro: target.distro, wslBin: findWslBin(), ...options }),
+    };
+  }
+  if (target.kind === "local") return null;
+  const remote = target.remote;
+  return {
+    key: `ssh:${buildRemoteKey(remote)}`,
+    target: { cwd: target.root, agentDir: remote.agentDir },
+    run: remote.password
+      ? (options) => runSsh2Command({ remote, ...options })
+      : (options) => runSshCommand({ remote, sshBin: findSshBin(), ...options }),
+  };
 }
 
-function runSshVersion(remote: RemoteOpts): Promise<string> {
-  return runSshCommand(remote, "pi --version", 20000);
+/** 渲染层只认这三个 kind（`sftp` 与 `ssh` 对用户是同一件事：一台远端服务器），
+ * label 与 `updateTargetForTab` 时代逐字相同。 */
+function targetLabel(target: Target): string {
+  if (target.kind === "wsl") return `WSL ${target.distro}`;
+  if (target.kind === "local") return "本机";
+  return `${target.remote.user}@${target.remote.host}`;
 }
 
-function runWslVersion(wsl: WslOpts): Promise<string> {
-  return runWslCommand(wsl, "pi --version", 20000);
+function targetKind(target: Target): "ssh" | "wsl" | "local" {
+  return target.kind === "wsl" ? "wsl" : target.kind === "local" ? "local" : "ssh";
 }
 
-function runSsh2Version(remote: RemoteOpts): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const conn = new SshClient();
-    const timer = setTimeout(() => { conn.end(); reject(new Error("远程 pi 版本检查超时")); }, 20000);
-    conn.on("error", (e) => { clearTimeout(timer); conn.end(); reject(e); });
-    conn.once("ready", () => conn.exec(`bash -ic '${targetPiCommand(remote, remote.path, "pi --version")}'`,  (err, stream) => {
-      if (err) { clearTimeout(timer); conn.end(); reject(err); return; }
-      let out = ""; let error = "";
-      stream.on("data", (d: Buffer) => { out += d.toString("utf8"); });
-      stream.stderr.on("data", (d: Buffer) => { error += d.toString("utf8"); });
-      stream.once("close", (code?: number) => { clearTimeout(timer); conn.end(); code === 0 ? resolve(out) : reject(new Error(error || "远程 pi 不可用")); });
-    }));
-    const password = remote.password ?? "";
-    conn.on("keyboard-interactive", (_name, _instructions, _lang, prompts, finish) => {
-      finish(prompts.map(() => password));
-    });
-    // Match the existing rpc-session ssh2 transport's host-key stance.
-    conn.connect({ host: remote.host, port: remote.port ?? 22, username: remote.user, password, tryKeyboard: true, hostVerifier: () => true, readyTimeout: 15000 });
-  });
+/** Check pi --version inside one remote/WSL execution target and compare it
+ * against the app's bundled version. */
+export async function checkRemotePiUpdate(target: Target | undefined): Promise<RemoteUpdateInfo> {
+  const bundled = bundledPiVersion();
+  const port = target && portForTarget(target);
+  if (!target) return buildRemoteInfo(target, null, bundled, "目标标签不存在");
+  if (!port) return buildRemoteInfo(target, null, bundled, "本机标签不适用远程 pi 检查");
+  let current: string | null = null;
+  let probeStderr = "";
+  try {
+    current = (await cachedProbe(port)).version;
+  } catch (e) {
+    probeStderr = remoteProbeFailureText(e);
+  }
+  const info = buildRemoteInfo(target, current, bundled, probeStderr);
+  console.log(`[update] ${targetLabel(target)} pi ${current ?? "?"} → bundled ${bundled ?? "?"}${info.hasUpdate ? " (version mismatch)" : ""}${info.error ? ` error=${info.error.slice(0, 80)}` : ""}`);
+  return info;
 }
 
 /** Align the remote/WSL pi to the app's bundled version (not npm latest).
  * Detects the remote install method (bun vs npm) so the pin lands in the
  * same location `pi` currently resolves from; extensions are updated
  * best-effort afterwards. The renderer only supplies a tab id. */
-export async function runRemotePiUpdate(target: RemoteUpdateTarget): Promise<UpdateRunResult> {
-  const bundled = getBundledPiVersion();
+export async function runRemotePiUpdate(target: Target | undefined): Promise<UpdateRunResult> {
+  const bundled = bundledPiVersion();
   if (!bundled) return { ok: false, output: "", error: "无法确定应用配套的 pi 版本" };
-  // ONE round trip: the shell command chains the server's default registry
-  // and the China-reachable npmmirror with `||`. Default source wins when
-  // healthy; a stale-cache ETARGET or an unreachable official registry falls
-  // through to the mirror with no second UI round-trip. (2026-09 incident:
-  // server default = official registry, unreachable → npm silently served
-  // pre-release cached metadata as ETARGET; npmmirror had the version all
-  // along — the official registry is the WORST fallback from inside China,
-  // so the mirror is the baked-in retry target instead.)
-  const command = buildRemoteAlignCommand(bundled, true);
-  let output = "";
+  if (!target) return { ok: false, output: "", error: "目标标签不存在" };
+  const port = portForTarget(target);
+  if (!port) return { ok: false, output: "", error: "本机标签不适用远程 pi 更新" };
   try {
-    output = target.kind === "wsl"
-      ? await runWslCommand(target.wsl!, command)
-      : target.remote?.password
-        ? await runSsh2Command(target.remote, command)
-        : await runSshCommand(target.remote!, command);
+    const { output, version } = await align(port, bundled);
+    // Post-install verification: the newest bundle needs undici's
+    // markAsUncloneable, which old Node (<20.10) and every stable Bun lack —
+    // the install can succeed while `pi` still crashes at startup. 是否算
+    // 失败是策略，所以这一步在本模块之外判定。
+    if (!version || version !== bundled) {
+      return { ok: false, output, error: `已安装，但远程 pi 无法启动（未检测到 ${bundled}）。请升级服务器 Node（≥20.10，建议 22 LTS）并确保 pi 用 npm 安装，或改用 bun 但保留旧版 pi。` };
+    }
+    return { ok: true, output: (output + "\npi " + version).slice(-2000) };
   } catch (e) {
-    const raw = e instanceof Error ? e.message : String(e);
+    if (e instanceof PiCommandError && e.phase === "verify") {
+      const line = e.stderr.split(/\r?\n/).filter((l) => /markAsUncloneable|TypeError/i.test(l))[0] ?? "";
+      return { ok: false, output: e.output, error: `已安装，但远程 pi 无法启动——服务器运行时过旧（新版 pi 的 undici 需要 Node ≥20.10 的 markAsUncloneable；所有稳定版 Bun 均不支持）。请升级服务器 Node 并用 npm 安装 pi 后重试。（${line}）` };
+    }
+    const raw = remoteProbeFailureText(e);
     const cleaned = stripShellNoise(raw);
     const hint = friendlyRemoteInstallError(raw, bundled);
     return { ok: false, output: "", error: `远程安装失败：${cleaned}${hint ? `\n${hint}` : ""}` };
   }
-  // Post-install verification: the newest bundle needs undici's
-  // markAsUncloneable, which old Node (<20.10) and every stable Bun lack —
-  // the install can succeed while `pi` still crashes at startup. Run
-  // `pi --version` and report a clear runtime fix instead of a false success.
-  try {
-    const versionOut = target.kind === "wsl"
-      ? await runWslVersion(target.wsl!)
-      : target.remote?.password
-        ? await runSsh2Version(target.remote)
-        : await runSshVersion(target.remote!);
-    const current = [...versionOut.split(/\r?\n/)].reverse().map(parseVersion).find((v): v is string => v !== null) ?? null;
-    if (!current || current !== bundled) {
-      return { ok: false, output, error: `已安装，但远程 pi 无法启动（未检测到 ${bundled}）。请升级服务器 Node（≥20.10，建议 22 LTS）并确保 pi 用 npm 安装，或改用 bun 但保留旧版 pi。` };
-    }
-    remoteCached.clear();
-    return { ok: true, output: (output + "\npi " + current).slice(-2000) };
-  } catch (e) {
-    return { ok: false, output, error: `已安装，但远程 pi 无法启动——服务器运行时过旧（新版 pi 的 undici 需要 Node ≥20.10 的 markAsUncloneable；所有稳定版 Bun 均不支持）。请升级服务器 Node 并用 npm 安装 pi 后重试。${e instanceof Error ? `（${e.message.split(/\r?\n/).filter((l) => /markAsUncloneable|TypeError/i.test(l))[0] ?? ""}）` : ""}` };
-  }
-}
-
-/** Build the remote align command. No single quotes (it nests inside
- * `bash -ic '…'`) and no shell metacharacters from inputs.
- * When withRegistryFallback is set, npm falls back to npmmirror in the SAME
- * command: the official registry is frequently unreachable from China
- * servers (direct egress), and when npm can't reach a registry it may serve
- * STALE LOCAL CACHE metadata instead — which surfaces as a bogus ETARGET
- * "No matching version" for versions that were published days ago.
- * npmmirror is China-reachable and syncs from the official registry within
- * hours, so it is the reliable retry target. bun has no --registry flag →
- * `bun pm` config unchanged; its default registry is the official one.
- */
-export function buildRemoteAlignCommand(version: string, withRegistryFallback = false): string {
-  // fetch-timeout/retries are clamped so a black-holed default registry
-  // cannot eat the whole 600s budget before the npmmirror fallback runs.
-  const npmFlags = "--fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000";
-  const npmInstall = `npm install -g ${npmFlags} @earendil-works/pi-coding-agent@${version}`;
-  const npmSpec = withRegistryFallback ? `${npmInstall} || ${npmInstall} --registry=https://registry.npmmirror.com` : npmInstall;
-  return `P=$(command -v pi || true); case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac && (pi update --extensions 2>/dev/null || true)`;
-}
-
-export function targetPiCommand(remote: RemoteOpts | undefined, cwd: string | undefined, command: string): string {
-  const agentDir = remote?.agentDir?.trim();
-  // Match pty's AgentDir constraints even though tabs were already validated.
-  const agentEnv = agentDir && /^(?:~|~\/[-A-Za-z0-9_./]+|\/[-A-Za-z0-9_./]+)$/.test(agentDir) && !agentDir.includes("..")
-    ? `export PI_CODING_AGENT_DIR='${agentDir}' && `
-    : "";
-  if (!cwd) return `${agentEnv}${command}`;
-  // Paths are transferred as base64: no shell quoting edge cases and the
-  // check/update target matches the tab's actual project working directory.
-  const encodedCwd = Buffer.from(cwd, "utf8").toString("base64");
-  // base64 has no shell metacharacters, so it can stay unquoted inside the
-  // nested `bash -ic '…'` layer (inner single quotes would terminate it).
-  return `P="$(printf %s ${encodedCwd} | base64 -d)"; case "$P" in "~") P="$HOME";; "~/"*) P="$HOME/\${P#\\~/}";; esac; cd "$P" && ${agentEnv}${command}`;
-}
-
-// 600s default: the align command may run npm twice (default registry, then
-// the npmmirror fallback) — a hung default source must still leave time for
-// the mirror attempt to finish.
-function runSshCommand(remote: RemoteOpts, command: string, timeoutMs = 600000): Promise<string> {
-  const args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"];
-  if (remote.port && remote.port !== 22) args.push("-p", String(remote.port));
-  args.push(`${remote.user}@${remote.host}`, `bash -ic '${targetPiCommand(remote, remote.path, command)}'`);
-  return collectVersion(spawn(findSshBin(), args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }), timeoutMs);
-}
-
-function runWslCommand(wsl: WslOpts, command: string, timeoutMs = 600000): Promise<string> {
-  return collectVersion(spawn(findWslBin(), ["-d", wsl.distro, "--", "bash", "-ic", targetPiCommand(undefined, wsl.path, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }), timeoutMs);
-}
-
-function runSsh2Command(remote: RemoteOpts, command: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const conn = new SshClient();
-    // 600s: the align command may run npm twice (default registry, then the
-    // npmmirror fallback) — a hung default source must still leave time for
-    // the mirror attempt to finish.
-    const timer = setTimeout(() => { conn.end(); reject(new Error("远程 pi 更新超时")); }, 600000);
-    conn.on("error", (e) => { clearTimeout(timer); conn.end(); reject(e); });
-    conn.once("ready", () => conn.exec(`bash -ic '${targetPiCommand(remote, remote.path, command)}'`, (err, stream) => {
-      if (err) { clearTimeout(timer); conn.end(); reject(err); return; }
-      let out = ""; let error = "";
-      stream.on("data", (d: Buffer) => { out += d.toString("utf8"); });
-      stream.stderr.on("data", (d: Buffer) => { error += d.toString("utf8"); });
-      stream.once("close", (code?: number) => { clearTimeout(timer); conn.end(); code === 0 ? resolve(out + (error ? `\n${error}` : "")) : reject(new Error(error || "远程 pi 更新失败")); });
-    }));
-    const password = remote.password ?? "";
-    conn.on("keyboard-interactive", (_name, _instructions, _lang, prompts, finish) => finish(prompts.map(() => password)));
-    conn.connect({ host: remote.host, port: remote.port ?? 22, username: remote.user, password, tryKeyboard: true, hostVerifier: () => true, readyTimeout: 20000 });
-  });
 }
 
 /** Run `pi update` (pi itself + extension packages). Rejects concurrent

@@ -12,8 +12,10 @@
 import { app, BrowserWindow } from "electron";
 import * as pty from "node-pty";
 import { existsSync, readFileSync, readdirSync, statSync, watch, openSync, closeSync, readSync, mkdirSync, writeFileSync, cpSync, type FSWatcher } from "node:fs";
-import { spawnSync, spawn, type ChildProcess } from "node:child_process";
-import { delimiter, dirname, join, posix } from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { dirname, join, posix } from "node:path";
+import { findExe, findExeOrNull, npmGlobalDir } from "./find-exe";
+import { bundledPiPackagePath, globalPiBin } from "./local-pi";
 import { sessionDirFor } from "./session-list";
 import { debugLog } from "./debug-log";
 import { piEnv, piShellPrefix } from "./pi-env";
@@ -371,89 +373,12 @@ export interface ResolvedPiBin {
  * pi (or an explicit notice) is guaranteed before we get here.
  */
 function resolvePiBin(): ResolvedPiBin {
-  const globalPi = findPiBin();
+  const globalPi = globalPiBin();
   if (/\.cmd$/i.test(globalPi)) {
     const escaped = globalPi.replace(/\//g, "\\");
     return { file: "cmd.exe", args: ["/d", "/c", escaped] };
   }
   return { file: globalPi, args: [] };
-}
-
-export function getGlobalPiBin(): string {
-  return findPiBin();
-}
-
-/** Path to the bundled pi package inside this app (works dev + packaged/asar). */
-export function bundledPiPackagePath(): string {
-  return join(app.getAppPath(), "node_modules", "@earendil-works", "pi-coding-agent");
-}
-
-export function hasNodeInstalled(): boolean {
-  if (cachedNodeOk !== null) return cachedNodeOk;
-  const nodeBin = findExe("node.exe", [
-    "C:\\Program Files\\nodejs\\node.exe",
-    "C:\\Program Files (x86)\\nodejs\\node.exe",
-    join(process.env.LOCALAPPDATA ?? "", "Programs\\nodejs\\node.exe"),
-  ]);
-  const result = spawnSync(nodeBin, ["--version"], { stdio: "pipe", windowsHide: true, timeout: DETECT_SPAWN_TIMEOUT_MS });
-  cachedNodeOk = !result.error && result.status === 0;
-  return cachedNodeOk;
-}
-
-export function hasGlobalPiInstalled(): boolean {
-  if (cachedPiOk === true) return true;
-  // A cached FALSE must not be trusted blindly: the warm async probe can
-  // fail transiently (startup load, AV scan, slow CLI boot) and would
-  // otherwise poison the cache for the whole session — every local tab would
-  // then claim "pi not found". Re-verify with the authoritative sync probe,
-  // throttled so a genuinely-missing pi doesn't block the main thread on
-  // every click.
-  if (cachedPiOk === false && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
-    return false;
-  }
-  // A TIMEOUT is inconclusive, and must never be reported as "missing":
-  // ensurePiReady() answers a missing pi by copying the BUNDLED pi over the
-  // user's global install, which would silently downgrade a pi they keep up to
-  // date with `pi update`. Report "present, unverified" for the re-check window
-  // so a wedged probe costs at most one bounded freeze per window, and let the
-  // tab's own watchdogs deal with a pi that really is stuck.
-  if (cachedPiTimedOut && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
-    return true;
-  }
-  cachedPiCheckAt = Date.now();
-  const probe = getPiDetectionDiagnostics();
-  cachedPiTimedOut = probe.timedOut;
-  if (probe.timedOut) {
-    cachedPiOk = null;
-    debugLog("probe", `pi --version timed out after ${DETECT_SPAWN_TIMEOUT_MS}ms (${probe.piBin}) — assuming present, unverified`);
-    return true;
-  }
-  cachedPiOk = probe.ok;
-  return cachedPiOk;
-}
-
-export function getPiDetectionDiagnostics(): {
-  ok: boolean;
-  timedOut: boolean;
-  piBin: string;
-  piEnv: string | undefined;
-  status: number | null;
-  error?: string;
-  stdout: string;
-  stderr: string;
-} {
-  const piBin = findPiBin();
-  const result = runPiVersion(piBin);
-  return {
-    ok: !result.error && result.status === 0,
-    timedOut: isSpawnTimeout(result),
-    piBin,
-    piEnv: process.env.PI_CODING_AGENT,
-    status: result.status,
-    error: result.error?.message,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-  };
 }
 
 /** Map npm install output lines to a short human stage for the progress dialog. */
@@ -500,12 +425,6 @@ export interface GlobalPiInstallHandle {
   promise: Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
-/** npm global dir (where `pi.cmd` / the pi package live). */
-export function npmGlobalDir(): string {
-  return join(process.env.APPDATA ?? join(process.env.USERPROFILE ?? "", "AppData", "Roaming"), "npm");
-}
-
-/** Global pi package dir (npm global layout). */
 export function globalPiPackageDir(): string {
   return join(npmGlobalDir(), "node_modules", "@earendil-works", "pi-coding-agent");
 }
@@ -760,119 +679,6 @@ export function startGlobalPiInstall(onOutput?: (line: string) => void): GlobalP
   };
 }
 
-/** Find an absolute global `pi` executable for conpty (cached). */
-// --- pi/node detection cache ------------------------------------------------
-// Detection spawns child processes that BLOCK the main process: where.exe,
-// node --version, and especially `pi --version` (~1.1s on Windows — it boots
-// the whole pi CLI). These are environment facts that don't change during the
-// app's lifetime; the session-click path (tab:create → ensurePiReady →
-// resolvePiBin) used to pay 3-4 sync spawns before the pty even spawned.
-// Cache the results and warm them at startup (see warmPiDetection).
-let cachedPiBin: string | undefined;
-let cachedNodeOk: boolean | null = null;
-let cachedPiOk: boolean | null = null;
-/** True when the last authoritative probe did not finish inside
- *  DETECT_SPAWN_TIMEOUT_MS. A timeout is INCONCLUSIVE, not "pi is missing" —
- *  see hasGlobalPiInstalled. */
-let cachedPiTimedOut = false;
-/** When the last authoritative (sync) pi probe ran; used to throttle the
- *  re-verification of a cached false (a transient failure must self-heal,
- *  but a genuinely missing pi shouldn't block the main thread every click). */
-let cachedPiCheckAt: number | null = null;
-const PI_RECHECK_TTL_MS = 5000;
-/** Hard cap for every detection spawn (where.exe / node --version / pi --version).
- *  These run on the tab:create click path, so an unbounded child means an
- *  unbounded main-process freeze: the whole app (every IPC, every terminal
- *  stream) stops until the child exits. A timed-out probe reports "not
- *  detected"; the 5s re-check TTL above lets a transient timeout self-heal
- *  instead of poisoning the cache for the rest of the session. */
-const DETECT_SPAWN_TIMEOUT_MS = 10_000;
-
-/** Reset the detection caches (after auto-installing pi, so the freshly
- *  installed binary is picked up instead of the stale failure). */
-export function invalidatePiDetection(): void {
-  cachedPiBin = undefined;
-  cachedNodeOk = null;
-  cachedPiOk = null;
-  cachedPiCheckAt = null;
-  cachedPiTimedOut = false;
-}
-
-/** Compute the detection caches in the background (best-effort, no dialogs).
- *  The cheap spawns (where.exe, node --version, ~100ms total) run sync;
- *  `pi --version` boots the whole pi CLI (~1.1s) so it is probed with an
- *  async spawn — the main process never blocks, and by the time the user
- *  clicks a session the cache is warm (zero spawns on the click path). */
-export function warmPiDetection(): void {
-  try {
-    findPiBin();
-    hasNodeInstalled();
-  } catch {
-    /* detection is best-effort; ensurePiReady surfaces real problems */
-  }
-  const piBin = cachedPiBin;
-  if (!piBin) return;
-  const child = spawnVersionProbe(piBin);
-  // Cache ONLY the success: a transient probe failure must NOT poison the
-  // cache — leave it null so the next hasGlobalPiInstalled() runs the
-  // authoritative sync probe on demand (the click path pays ~1.1s only when
-  // the warm probe failed).
-  child.once("exit", (code) => {
-    if (code === 0) cachedPiOk = true;
-  });
-  child.once("error", () => {
-    /* keep cachedPiOk = null → sync re-check on demand */
-  });
-}
-
-/** spawnSync reports hitting its own `timeout` as an ETIMEDOUT error. */
-function isSpawnTimeout(result: { error?: unknown }): boolean {
-  return (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
-}
-
-/** Async version probe (the sync `pi --version` blocks ~1.1s on Windows). */
-function spawnVersionProbe(piBin: string): ChildProcess {
-  const child = /\.cmd$/i.test(piBin)
-    ? spawn("cmd.exe", ["/d", "/c", piBin.replace(/\//g, "\\"), "--version"], { stdio: "ignore", windowsHide: true })
-    : spawn(piBin, ["--version"], { stdio: "ignore", windowsHide: true });
-  // The warm probe used to have no kill timer: a hung `pi --version` leaked a
-  // child process and left cachedPiOk null forever, so every later click paid
-  // the authoritative SYNC probe (the 1.1s main-thread freeze this cache
-  // exists to avoid).
-  const killTimer = setTimeout(() => child.kill(), DETECT_SPAWN_TIMEOUT_MS);
-  child.once("exit", () => clearTimeout(killTimer));
-  child.once("error", () => clearTimeout(killTimer));
-  return child;
-}
-
-function findPiBin(): string {
-  if (cachedPiBin !== undefined) return cachedPiBin;
-  // 1. npm 全局权威位置（`npm install -g` 的唯一目标目录，绝对路径不受
-  //    PATH/where 选择影响）。
-  const npmGlobalCandidates = [
-    join(npmGlobalDir(), "pi.cmd"),
-    join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", "pi.cmd"),
-  ];
-  for (const c of npmGlobalCandidates) {
-    if (existsSync(c)) {
-      cachedPiBin = c;
-      return c;
-    }
-  }
-  // 2. where.exe（用户 PATH 里的 pi——自定义安装 / nvm 布局）。
-  const fromWhere = findViaWhere("pi");
-  if (fromWhere) {
-    cachedPiBin = fromWhere;
-    return fromWhere;
-  }
-  // 3. 其他常见位置。
-  cachedPiBin = findExe("pi.cmd", [
-    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "pi.cmd"),
-    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "node-v22.19.0-win-x64", "pi.cmd"),
-  ]);
-  return cachedPiBin;
-}
-
 /** Find an absolute `ssh` binary for conpty. */
 export function findSshBin(): string {
   // Windows OpenSSH is more reliable with conpty than Git's bundled ssh.
@@ -927,101 +733,6 @@ export async function listWslDistros(): Promise<WslDistro[]> {
   return parseWslDistroList(stdout);
 }
 
-
-/** Generic: find an executable's absolute path. */
-function findExe(name: string, commonFallbacks: string[]): string {
-  // 1. process.execPath if it matches.
-  if (process.execPath && process.execPath.toLowerCase().endsWith(name.toLowerCase())) {
-    return process.execPath;
-  }
-  // 2. Search PATH.
-  const pathDirs = (process.env.PATH ?? "").split(delimiter);
-  for (const dir of pathDirs) {
-    const cand = join(dir, name);
-    if (existsSync(cand)) return cand;
-  }
-  // 3. Common install locations.
-  for (const c of commonFallbacks) {
-    if (c && existsSync(c)) return c;
-  }
-  // 4. Fallback to bare name.
-  return name.replace(/\.(exe|cmd)$/i, "");
-}
-
-function findViaWhere(command: string): string | null {
-  const result = spawnSync("where.exe", [command], { encoding: "utf8", stdio: "pipe", windowsHide: true, timeout: DETECT_SPAWN_TIMEOUT_MS });
-  if (result.error || result.status !== 0) return null;
-
-  const candidates = (result.stdout ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const preferred = candidates.find((line) => /\.(cmd|exe)$/i.test(line));
-  return preferred || candidates[0] || null;
-}
-
-/**
- * Resolve the real cli.js a pi shim points at. This is exactly what running
- * `pi` in a terminal does (pi.cmd → node cli.js); resolving it lets us verify
- * the install by spawning node.exe directly — node is an .exe, so there is no
- * cmd.exe /c quoting to get wrong (a pi.cmd under a path with spaces used to
- * make the old `cmd /c <path> --version` probe fail → false "pi missing").
- */
-export function resolveCliJsFromShim(piBin: string): string | null {
-  if (!/\.(cmd|bat)$/i.test(piBin)) return null;
-  // Standard npm layout: <npmGlobalDir>\node_modules\@earendil-works\pi-coding-agent\dist\cli.js
-  const standard = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-  if (existsSync(standard)) return standard;
-  // Custom layout: read the shim and find the cli.js it references.
-  try {
-    const content = readFileSync(piBin, "utf8");
-    const m = content.match(/("[^"]*cli\.js"|[^\s"]*cli\.js)/i);
-    if (m) {
-      const cand = m[1].replace(/%dp0%/gi, dirname(piBin)).replace(/"/g, "").replace(/\\/g, "/");
-      const abs = cand.startsWith("/") || /^[A-Za-z]:/.test(cand) ? cand : join(dirname(piBin), cand);
-      if (existsSync(abs)) return abs;
-    }
-  } catch {
-    /* unreadable shim → fall through */
-  }
-  return null;
-}
-
-function runPiVersion(piBin: string) {
-  // Preferred: shim → cli.js → node.exe directly (= what a terminal does when
-  // you run `pi`). Bypasses cmd.exe /c quoting entirely.
-  const cli = resolveCliJsFromShim(piBin);
-  const nodeBin = findExe("node.exe", [
-    "C:\\Program Files\\nodejs\\node.exe",
-    "C:\\Program Files (x86)\\nodejs\\node.exe",
-    join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", "node.exe"),
-  ]);
-  if (cli && nodeBin) {
-    return spawnSync(nodeBin, [cli, "--version"], {
-      encoding: "utf8",
-      stdio: "pipe",
-      windowsHide: true,
-      timeout: DETECT_SPAWN_TIMEOUT_MS,
-    });
-  }
-  // Fallback: run the shim/binary directly as before.
-  if (/\.cmd$/i.test(piBin)) {
-    const escaped = piBin.replace(/\//g, "\\");
-    return spawnSync("cmd.exe", ["/d", "/c", escaped, "--version"], {
-      encoding: "utf8",
-      stdio: "pipe",
-      windowsHide: true,
-      timeout: DETECT_SPAWN_TIMEOUT_MS,
-    });
-  }
-  return spawnSync(piBin, ["--version"], {
-    encoding: "utf8",
-    stdio: "pipe",
-    windowsHide: true,
-    timeout: DETECT_SPAWN_TIMEOUT_MS,
-  });
-}
 
 export interface WslOpts {
   distro: string;
@@ -1136,13 +847,6 @@ export function remoteAgentDir(remote: Pick<RemoteOpts, "agentDir">, homeDir: st
 
 export function buildRemoteKey(remote: Pick<RemoteOpts, "host" | "user" | "port" | "agentDir">): string {
   return `${remote.user}@${remote.host}:${remote.port ?? 22}${remote.agentDir ? `[${remote.agentDir}]` : ""}`;
-}
-
-/** findExe, but returns null instead of the bare-name fallback when missing. */
-function findExeOrNull(name: string, fallbacks: string[]): string | null {
-  const found = findExe(name, fallbacks);
-  const bare = name.replace(/\.(exe|cmd)$/i, "");
-  return found === bare ? null : found;
 }
 
 /** Pick a local interactive shell: pwsh → powershell → cmd. */

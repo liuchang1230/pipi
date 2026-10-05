@@ -12,7 +12,7 @@
 **新增代码违反下列任一规则，在评审里按 bug 处理。** 每条都对应一次真实故障，证据在 `docs/diagnosis/`。
 
 - 点击会话 → 中间页显示的路径上，主进程不允许出现同步全量 JSONL 解析（会阻塞全部 IPC，包括终端流）。一切会话列表读取必须走 SessionIndex（异步 + 缓存 + 增量）。
-- 点击路径上主进程不允许出现同步子进程 spawn（`where.exe` / `node --version` / `pi --version` 各阻塞 0.03-1.2s）：检测结果（pi 路径 / node 是否安装 / pi 是否可用）必须在启动时预热并缓存（`warmPiDetection` / 检测缓存），会话文件标题只做首尾 64KB 范围读取。
+- 点击路径上主进程不允许出现同步子进程 spawn（`where.exe` / `node --version` / `pi --version` 各阻塞 0.03-1.2s）：检测结果（pi 路径 / node 是否安装 / pi 是否可用）必须在启动时预热并缓存（`localPi.warm()` / 检测缓存），会话文件标题只做首尾 64KB 范围读取。
 - 渲染层任何跨面板数据必须放在 store，不得重新放回 App 的本地 useState；App 保持为组合壳 + 事件编排。
 - 终端输出（pty → 渲染层）必须合并写；输入路径（渲染层 → pty）不合并。
 - 跨 pane 动作必须收进 store action（`viewerStore.openFile` / `sessionsStore.openSession` 族 / `tabsStore.createTab` 族），容器不许把动作重新放回 App 回调；App 的 selector 订阅只覆盖对话框/编排真正读的 slice。

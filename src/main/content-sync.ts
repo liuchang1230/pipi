@@ -45,7 +45,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import type SftpClient from "ssh2-sftp-client";
-import type { SshRunResult } from "./ssh-exec";
+import type { CommandRunner } from "./runner";
 
 /** Journal file name — inert to pi everywhere we install (it discovers skills
  *  by SKILL.md, extensions by *.ts, agents by *.md). */
@@ -620,12 +620,10 @@ export function buildApplyScript(args: {
  * arrives with a probe that asks for it. That trip happens only in the release
  * where we stop shipping something, and a failure there aborts the whole sync —
  * an unreadable retirement candidate is not something to guess about.
+ *
+ * The `run` shape itself lives in runner.ts — one name for all three bindings
+ * (key-auth ssh, ssh2 password, wsl.exe) and both users of it.
  */
-export type SshScriptRunner = (options: {
-  command: string;
-  stdin?: string;
-  timeoutMs?: number;
-}) => Promise<SshRunResult>;
 
 /** Everything one key-auth remote call needs to know about its destination. */
 export interface SshContentTarget {
@@ -642,7 +640,7 @@ export interface SshContentTarget {
 }
 
 export async function syncContentViaSsh(
-  run: SshScriptRunner,
+  run: CommandRunner,
   target: SshContentTarget,
   files: ShippedFile[],
   timeoutMs = 20000,

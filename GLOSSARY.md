@@ -21,4 +21,14 @@
 - **目标文件系统（TargetFs）**：主进程中唯一负责「按目标读写文件」的深模块。interface 是根相对路径上的 `list / readPreview / write / mkdir / remove / rename / readText`；截断与预览语义（1MB 上限、头尾窗口、二进制判定）属于它，不属于调用方。缓存是它的**内部 seam**（TTL / in-flight / generation / 失效传播，`FileTreeIndex` 泛化为 target-keyed）。通道差异全部在 seam 之下。
 - **通道（Channel）**：满足 TargetFs interface 的一条传输路径，即 seam 下的 adapter。三份：`localFs`（真 fs；**WSL 通过注入 path mapper 复用它**，与 SessionIndex 的 `setWslPathMapperForTests` 同一注入点）、`SFTP`（远程浏览/预览/mention 的唯一通道，走 pooled lease；认证材料含密码、agent 与默认密钥，**密码不是通道选择条件**）、`ssh`（只有 `ssh cat`：会话文件快路径，不占 SFTP 租约、远端 pi 死掉时仍可读）。通道选择规则只有一处真值。
   _Avoid_: 后端、传输层
+- **命令运行器（CommandRunner）**：表示「在某台机器上跑一条 posix 命令」的唯一类型——`(options: {command, stdin?, timeoutMs?}) => Promise<RunResult>`。命令文本由调用方给（POSIX 文本，由目标 shell 展开），凭据、二进制与 shell 方言由绑定方给：免密 ssh → `src/main/ssh-exec.ts`、WSL → `src/main/wsl-exec.ts`、密码 ssh2 → `src/main/ssh2-exec.ts`（走 `ssh2` 库的 channel，不走 `spawn`）。spawn、超时、输出截断与「永不抛、失败以 `ok:false + error` 回来」的契约只有一份实现——`runner.ts` 的 `runCommand()`（ssh2 绑定不走 spawn，但复用同一条契约里的有界输出累加器 `createOutputCollector`）；绑定方只贡献连接参数、argv 形状与默认值。它是 content-sync 里 `SshScriptRunner` 的通用形态（2026-10-05，`docs/adr/0007-pi-runtime-seam.md`）。
+  _Avoid_: PiRun、执行器、传输层、ssh 执行器
+- **pi 端点（PiPort）**：一次「对某个目标上的 pi 做版本探测/对齐」的完整输入——`{ run: CommandRunner, key, target?: { cwd?, agentDir? } }`。`key` 是缓存身份（`"local"` / `wsl:<distro>` / `buildRemoteKey(remote)`），版本缓存挂在它上面；`target` 只回答「在哪个目录、要不要注入 `PI_CODING_AGENT_DIR`」，不是目标词汇。注入 PiPort 意味着 pi 版本模块**不认识** `Target`，也就不会长出第七份「目标」。
+  _Avoid_: target、目标描述、远端连接对象
+- **pi 在场状态（PiPresence）**：本机 pi 的三态——`present | unverified | absent`，由 `src/main/local-pi.ts` 的 `present()` 回答（同步、有界、带缓存）。「探测超时 ≠ 缺失」是历史结论（超时若被当成缺失，`ensurePiReady` 会把捆绑 pi 覆盖到用户追新的全局安装上）；折叠成布尔的判断由调用方负责（今天只有 `index.ts` 的三处 `present() !== "absent"`），不再藏在探测里面。
+  _Avoid_: 有没有装 pi、pi OK、boolean present
+- **本机 pi 事实（Local Pi Facts）**：本机到底跑哪一个 pi —— `{ piBin, source, nodeBin, cliJs }`，由 `src/main/local-pi.ts` 的 `resolveLocal()` 一次解析（纯解析：不探测、不带版本号，因为 `createTab` 是同步的、点击路径不许有副作用）。`source` 记的是哪条候选赢了（`npm-global` / `where` / `fallback` / `unresolved`）。**只有一处**：标签页的 pty spawn、本地聊天（`pi --mode rpc`）、`pi update`、模型验证（`pi --list-models`）全部问它，不再各自扫 PATH。与 Windows 可执行文件查找（`find-exe.ts`）分开，因为后者的消费者还有 ssh/wsl/npm，且不认识 pi。
+  _Avoid_: 找 pi、pi 路径、本地 pi 检测
+- **捆绑 pi 版本（Bundled Pi Version）**：app 自带 pi 包的版本号，也是唯一的 pin——远程/WSL 对齐到它，本地聊天走它的代码，漂移判断以它为基准。取值只读 app 自带的 `node_modules`（打包后透读 asar），兜底读 app `package.json` 的精确依赖 pin；**用户的全局 pi 永不参与**（它被允许追 npm latest，一旦参与就会出现「捆绑版本被影子化」的 ETARGET 事故）。它必须满足 app 自带 Electron 的 Node 版本（今天 0.85.1 的 `engines` 下限 `>=22.19.0` 正好等于 Electron 36.9.5 的 Node）。
+  _Avoid_: 最新版 pi、全局 pi 版本、latest
 
