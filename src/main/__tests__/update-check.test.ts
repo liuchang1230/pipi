@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { PiCommandError } from "../pi-version";
-import { friendlyRemoteInstallError, friendlyRemoteProbeError, remoteProbeFailureText, stripShellNoise } from "../update-check";
+import { friendlyRemoteInstallError, friendlyRemoteProbeError, remoteProbeFailureText, remoteProbeOutcome, stripShellNoise } from "../update-check";
 
 describe("remoteProbeFailureText", () => {
   it("keeps the remote stderr verbatim (the friendly mapper reads it)", () => {
@@ -144,5 +144,40 @@ describe("stripShellNoise", () => {
 
   it("passes clean text through untouched", () => {
     expect(stripShellNoise("npm error code ETARGET\n")).toBe("npm error code ETARGET");
+  });
+});
+
+// 探测失败 → 状态：三种「坏」不是一件事（ADR 0008）。传输层失败尤其不能算
+// 「目标上没有 pi」—— 那会让人去重装一个本来装着的 pi。
+describe("remoteProbeOutcome", () => {
+  it("names a timeout as a timeout (unknown, retryable)", () => {
+    expect(remoteProbeOutcome(new PiCommandError("timeout", undefined, "", "timeout", ""))).toEqual({ kind: "timeout" });
+  });
+
+  it("reads command-not-found as absent", () => {
+    const e = new PiCommandError("failed", undefined, "bash: pi: command not found\n", "exit 127", "");
+    expect(remoteProbeOutcome(e)).toEqual({ kind: "absent" });
+  });
+
+  it("reads a runtime too old to load pi as unrunnable, with the reason", () => {
+    const e = new PiCommandError("failed", undefined, "TypeError: markAsUncloneable is not a function\n", "exit 1", "");
+    const outcome = remoteProbeOutcome(e);
+    expect(outcome.kind).toBe("unrunnable");
+    expect(outcome.kind === "unrunnable" && outcome.detail).toContain("运行时过旧");
+  });
+
+  it("keeps transport failures OUT of absent/unrunnable (we learned nothing about the target)", () => {
+    for (const text of ["ssh not found", "Permission denied (publickey).", "Connection closed by remote host", "wsl not found"]) {
+      expect(remoteProbeOutcome(new PiCommandError("failed", undefined, text, "exit 255", ""))).toEqual({ kind: "unverified" });
+    }
+  });
+
+  it("keeps a bare exit code unknown (no evidence either way)", () => {
+    expect(remoteProbeOutcome(new PiCommandError("failed", "install", "", "exit 1", ""))).toEqual({ kind: "unrunnable", detail: "远程 pi 版本检测失败" });
+  });
+
+  it("passes non-PiCommandError through as unverified", () => {
+    expect(remoteProbeOutcome(new Error("boom"))).toEqual({ kind: "unverified" });
+    expect(remoteProbeOutcome("boom")).toEqual({ kind: "unverified" });
   });
 });

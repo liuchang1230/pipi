@@ -25,10 +25,12 @@
   _Avoid_: PiRun、执行器、传输层、ssh 执行器
 - **pi 端点（PiPort）**：一次「对某个目标上的 pi 做版本探测/对齐」的完整输入——`{ run: CommandRunner, key, target?: { cwd?, agentDir? } }`。`key` 是缓存身份（`"local"` / `wsl:<distro>` / `buildRemoteKey(remote)`），版本缓存挂在它上面；`target` 只回答「在哪个目录、要不要注入 `PI_CODING_AGENT_DIR`」，不是目标词汇。注入 PiPort 意味着 pi 版本模块**不认识** `Target`，也就不会长出第七份「目标」。
   _Avoid_: target、目标描述、远端连接对象
-- **pi 在场状态（PiPresence）**：本机 pi 的三态——`present | unverified | absent`，由 `src/main/local-pi.ts` 的 `present()` 回答（同步、有界、带缓存）。「探测超时 ≠ 缺失」是历史结论（超时若被当成缺失，`ensurePiReady` 会把捆绑 pi 覆盖到用户追新的全局安装上）；折叠成布尔的判断由调用方负责（今天只有 `index.ts` 的三处 `present() !== "absent"`），不再藏在探测里面。
+- **pi 在场状态（PiPresence）**：本机 pi 的四态——`present | unverified | absent | unrunnable`，由 `src/main/local-pi.ts` 的 `present()` 从 `probeOutcome()` 投影出来（同步、有界、带缓存）。`absent` 只给「可执行文件根本不在」（spawn 的 `ENOENT`），`unrunnable` 是「装了但跑不起来」（跑完非零退出）：两者在 `ensurePiReady` 走同一条修复路（都用捆绑副本重装），但提示要说清是哪一种。**探测超时 ≠ 缺失**是历史结论（超时若被当成缺失，会把用户用 `pi update` 保持最新的全局 pi 悄悄降级）：超时报 `unverified`，`present() !== "absent"` 这种折叠由调用方负责，不再藏在探测里面。
   _Avoid_: 有没有装 pi、pi OK、boolean present
 - **本机 pi 事实（Local Pi Facts）**：本机到底跑哪一个 pi —— `{ piBin, source, nodeBin, cliJs }`，由 `src/main/local-pi.ts` 的 `resolveLocal()` 一次解析（纯解析：不探测、不带版本号，因为 `createTab` 是同步的、点击路径不许有副作用）。`source` 记的是哪条候选赢了（`npm-global` / `where` / `fallback` / `unresolved`）。**只有一处**：标签页的 pty spawn、本地聊天（`pi --mode rpc`）、`pi update`、模型验证（`pi --list-models`）全部问它，不再各自扫 PATH。与 Windows 可执行文件查找（`find-exe.ts`）分开，因为后者的消费者还有 ssh/wsl/npm，且不认识 pi。
   _Avoid_: 找 pi、pi 路径、本地 pi 检测
 - **捆绑 pi 版本（Bundled Pi Version）**：app 自带 pi 包的版本号，也是唯一的 pin——远程/WSL 对齐到它，本地聊天走它的代码，漂移判断以它为基准。取值只读 app 自带的 `node_modules`（打包后透读 asar），兜底读 app `package.json` 的精确依赖 pin；**用户的全局 pi 永不参与**（它被允许追 npm latest，一旦参与就会出现「捆绑版本被影子化」的 ETARGET 事故）。它必须满足 app 自带 Electron 的 Node 版本（今天 0.85.1 的 `engines` 下限 `>=22.19.0` 正好等于 Electron 36.9.5 的 Node）。
   _Avoid_: 最新版 pi、全局 pi 版本、latest
+- **pi 漂移（Pi Drift）**：契约版本（捆绑 pi）与**某一个具体运行时会跑的那个 pi** 之间的关系，具名六态：`pinned | drifted-newer | drifted-older | absent | unrunnable | unknown`，由 `src/shared/pi-drift.ts` 的纯分类器 `classifyPiDrift({ bundled, runtime, probe })` 从「已探到的事实」算出（不自己探测、不缓存——缓存了就有两份真相）。运行时有三（决策 36 的自由各属一个）：`bundled`（本机聊天 / `pi update` / `--list-models` 真正执行的）、`global`（终端 TUI 启动的那个 `pi` 命令，用户自己 `pi update` 追的是它）、`remote`（SSH/WSL 目标机上那个）。`unknown` **不是**「一致」，是没探明（传输层失败 / 超时 / 输出里没有 semver），不许猜。漂移**不是失败**（追新是允许的）；只有 `absent` 与 `unrunnable` 进故障中心（硬规则 8）。见 `docs/adr/0008-pi-drift-as-state.md`。
+  _Avoid_: 版本不一致、版本落后、hasUpdate、版本不对
 

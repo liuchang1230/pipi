@@ -69,7 +69,13 @@ export function PiInstallDialog() {
       }
     });
     const offNotice = window.api.piInstall.onNotice((n) => {
-      setNotice("未检测到全局 pi agent，已使用内置版本运行。");
+      // 「没装」与「装了但跑不起来」是两件事（ADR 0008）：提示要说清是哪一种，
+      // 否则用户会在一个“明明装了 pi”的机器上看到「未检测到全局 pi」。
+      setNotice(
+        n.presence === "unrunnable"
+          ? `全局 pi 跑不起来（${n.detail ?? "原因未明"}），已使用内置版本运行。`
+          : "未检测到全局 pi agent，已使用内置版本运行。",
+      );
       setPhase("notice");
     });
     return () => {

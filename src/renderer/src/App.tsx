@@ -38,6 +38,7 @@ import { useSessionsStore } from "./stores/sessionsStore";
 import { useTreeStore } from "./stores/treeStore";
 import { useViewerStore } from "./stores/viewerStore";
 import { useUiStore } from "./stores/uiStore";
+import { driftRecordText, updateBannerText } from "./pi-drift-text";
 import { FailureCenter } from "./components/FailureCenter";
 import { useLayoutStore } from "./stores/layoutStore";
 import type { RemoteServerGroup, SessionItem, RemoteHistoryItem } from "./stores/types";
@@ -176,11 +177,7 @@ function UpdateBanner() {
           <span>
             {piUpdating
               ? "正在更新 pi agent 和扩展包…"
-              : updateInfo.targetLabel
-                ? `${updateInfo.targetLabel} pi agent 版本（${updateInfo.current ?? "?"}）与应用配套版本（${updateInfo.latest ?? "?"}）不一致；更新将对齐版本并同步扩展包`
-                : updateInfo.latest
-                  ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
-                  : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
+              : updateBannerText(updateInfo)}
           </span>
           <button
             className="btn btn-primary update-banner-btn"
@@ -272,7 +269,17 @@ export default function App() {
       if (active?.isRemote || (tabsState.tabs.length > 0 && !active)) return;
       if (r.hasUpdate) {
         useUiStore.getState().setUpdateResult(null);
-        useUiStore.getState().setUpdateInfo({ current: r.current, latest: r.latest, extensions: r.extensions ?? [] });
+        useUiStore.getState().setUpdateInfo({ current: r.current, latest: r.latest, extensions: r.extensions ?? [], drift: r.drift, terminalDrift: r.terminalDrift });
+      }
+      // 本机那个 pi 坏掉时要说清是「没装」还是「装了跑不起来」（ADR 0008）：
+      // 每次会话每个状态记一次，不让每回启动都重生一条。
+      for (const d of [r.drift, r.terminalDrift]) {
+        const record = d && driftRecordText(d);
+        const key = d ? `${d.runtime}:${d.state}` : "";
+        if (record && !probeErrorShownRef.current.has(key)) {
+          probeErrorShownRef.current.add(key);
+          useUiStore.getState().showToast(record.text, "err", { failure: true, cause: record.cause });
+        }
       }
     }).catch(() => {});
     window.api.update.getExtensionSynced().then((r) => {
@@ -317,14 +324,15 @@ export default function App() {
         window.api.update.checkTarget(id).then((info) => {
           if (activeTabRef.current !== id) return;
           if (info.hasUpdate) {
-            useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions ?? [], targetLabel: info.target.label, targetTabId: id });
+            useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions ?? [], targetLabel: info.target.label, targetTabId: id, drift: info.drift });
             return;
           }
           // The remote pi probe failed (missing pi / runtime too old / …):
           // surface the reason once per tab instead of failing silently.
+          // 硬规则 8：这不能只是 3 秒 toast —— 同一条也进 FailureCenter。
           if (info.error && !probeErrorShownRef.current.has(id)) {
             probeErrorShownRef.current.add(id);
-            useUiStore.getState().showToast(`${info.target.label}：${info.error}`, "err");
+            useUiStore.getState().showToast(`${info.target.label}：${info.error}`, "err", { failure: true, cause: info.error });
           }
         }).catch(() => {});
       } else if (id && !r) {
@@ -332,7 +340,7 @@ export default function App() {
         useUiStore.getState().setUpdateResult(null);
         window.api.update.check().then((info) => {
           if (activeTabRef.current !== id || !info.hasUpdate) return;
-          useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions });
+          useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions, drift: info.drift, terminalDrift: info.terminalDrift });
         }).catch(() => {});
       }
       activeTabRef.current = id;

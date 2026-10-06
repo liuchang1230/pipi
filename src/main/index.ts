@@ -1247,29 +1247,44 @@ if (gotSingleInstanceLock) {
     // re-install it locally from the app's bundled copy (plain directory
     // copy + shim write — no npm, no network), which also gives users the
     // `pi` command inside the terminal's shell.
-    if (localPi.present() !== "absent" || process.env.PI_CODING_AGENT === "true") {
+    //
+    // 「没装」与「装了但跑不起来」走同一条修复路（ADR 0008）：修复动作相同，
+    // 但原因要在日志与提示里说清。`unverified`（探测超时）**不算**不可用——
+    // 那会把用户自己 `pi update` 保持最新的全局 pi 悄悄降级。
+    const unusable = (): boolean => {
+      const presence = localPi.present();
+      return presence === "absent" || presence === "unrunnable";
+    };
+    if (!unusable() || process.env.PI_CODING_AGENT === "true") {
       return { ok: true, backend: "global" };
     }
     // Authoritative re-check (bypass the startup-warm TTL cache) so a
     // transient warm-time failure doesn't trigger a needless reinstall.
     localPi.invalidate();
-    if (localPi.present() !== "absent" || process.env.PI_CODING_AGENT === "true") {
+    if (!unusable() || process.env.PI_CODING_AGENT === "true") {
       return { ok: true, backend: "global" };
     }
+    // 原因要在重装前记下：上面那次探测已进缓存，但 install 会 invalidate。
+    const failure = localPi.probeOutcome();
     // Reuse runLocalPiInstall: it streams begin/result events for the
     // renderer's progress dialog AND guards against a concurrent manual
     // install (double installs must never run).
     const installed = await runLocalPiInstall();
     if (installed.ok) {
-      console.log("[pi-detect] global pi missing — auto-installed from bundled copy");
+      console.log(`[pi-detect] global pi ${failure.kind} — auto-installed from bundled copy`);
       localPi.invalidate();
-      if (localPi.present() !== "absent" || process.env.PI_CODING_AGENT === "true") {
+      if (!unusable() || process.env.PI_CODING_AGENT === "true") {
         return { ok: true, backend: "bundled-install" };
       }
     }
-    console.warn("[pi-detect] global pi unavailable and auto-install failed");
+    console.warn(`[pi-detect] global pi ${failure.kind} and auto-install failed`);
     // Non-blocking notice (renderer shows it); no blocking install dialog.
-    sendInstallEvent("pi-install:notice", { backend: "missing" });
+    // 带上原因：提示要说清是「没装」还是「装了但跑不起来」（ADR 0008）。
+    sendInstallEvent("pi-install:notice", {
+      backend: "missing",
+      presence: failure.kind,
+      ...(failure.kind === "unrunnable" && failure.detail ? { detail: failure.detail } : {}),
+    });
     return { ok: true, backend: "missing" };
   }
 

@@ -9,6 +9,7 @@
 import { create } from "zustand";
 import { useFailureStore } from "./failureStore";
 import type { AppErrorTarget } from "../../../shared/outcome";
+import type { PiDrift } from "../../../shared/pi-drift";
 
 export type ToastType = "ok" | "err";
 
@@ -16,6 +17,12 @@ export interface UpdateNoticeInfo {
   current: string | null;
   latest: string | null;
   extensions: string[];
+  /** 契约版本与实际会跑的那个 pi 的关系（ADR 0008）：横幅读它说话，不再自己
+   *  拼「版本不一致」的判定。 */
+  drift: PiDrift;
+  /** 本机终端 TUI 真正启动的那个 pi（全局 `pi` 命令）的漂移。远程目标没有
+   *  这一项——那时 `drift` 说的就是目标机上那个 pi。 */
+  terminalDrift?: PiDrift;
   /** Omitted for the local agent; present when the checked pi runs on SSH/WSL. */
   targetLabel?: string;
   /** Authoritative tab id used to execute a remote update in that exact target. */

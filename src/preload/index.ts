@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { ModelEditorSpec, ProviderEditorConfig } from "../shared/model-config-types";
 import type { ApprovalSettings } from "../shared/approval";
+import type { PiDrift } from "../shared/pi-drift";
 
 export interface FileReadResult {
   content: string;
@@ -235,9 +236,9 @@ const api = {
     download: (url: string): Promise<boolean> => ipcRenderer.invoke("app-update:download", url),
   },
   update: {
-    check: (force?: boolean): Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }> =>
+    check: (force?: boolean): Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; terminalDrift?: PiDrift; error?: string }> =>
       ipcRenderer.invoke("update:check", force),
-    checkTarget: (tabId: string): Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }> =>
+    checkTarget: (tabId: string): Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; error?: string }> =>
       ipcRenderer.invoke("update:check-target", tabId),
     runTarget: (tabId: string): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run-target", tabId),
     run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
@@ -246,7 +247,8 @@ const api = {
   /** pi agent: main streams begin/progress/result; renderer shows the
    *  progress dialog and can cancel. `run` is the manual "install global
    *  pi" action (never auto-triggered); `onNotice` fires when the global pi
-   *  is missing and the bundled pi is used instead. */
+   *  is unusable (absent OR present-but-broken) and the bundled pi is used
+   *  instead — `presence` says which, `detail` carries the reason. */
   piInstall: {
     run: (): Promise<{ ok: boolean; cancelled?: boolean }> => ipcRenderer.invoke("pi-install:run"),
     cancel: (): Promise<void> => ipcRenderer.invoke("pi-install:cancel"),
@@ -265,8 +267,8 @@ const api = {
       ipcRenderer.on("pi-install:result", h);
       return () => ipcRenderer.removeListener("pi-install:result", h);
     },
-    onNotice: (callback: (n: { backend: string }) => void): (() => void) => {
-      const h = (_e: Electron.IpcRendererEvent, n: { backend: string }) => callback(n);
+    onNotice: (callback: (n: { backend: string; presence?: "absent" | "unrunnable"; detail?: string }) => void): (() => void) => {
+      const h = (_e: Electron.IpcRendererEvent, n: { backend: string; presence?: "absent" | "unrunnable"; detail?: string }) => callback(n);
       ipcRenderer.on("pi-install:notice", h);
       return () => ipcRenderer.removeListener("pi-install:notice", h);
     },

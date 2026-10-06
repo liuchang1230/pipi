@@ -16,9 +16,9 @@ vi.mock("../debug-log", () => ({ debugLog: vi.fn() }));
 const spawnSync = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ spawnSync, spawn: vi.fn() }));
 
-const { present, invalidate } = await import("../local-pi");
+const { present, invalidate, probeOutcome } = await import("../local-pi");
 
-function probeResult(code: string | undefined, status: number | null) {
+function probeResult(code: string | undefined, status: number | null, stderr = "") {
   return {
     error: code ? Object.assign(new Error(`spawnSync pi ${code}`), { code }) : undefined,
     status,
@@ -26,7 +26,7 @@ function probeResult(code: string | undefined, status: number | null) {
     output: [],
     pid: 1,
     stdout: status === 0 ? "0.85.1\n" : "",
-    stderr: "",
+    stderr,
   };
 }
 
@@ -67,5 +67,32 @@ describe("pi detection timeout", () => {
     expect(present()).toBe("unverified");
     // 一次超时只换一次有界冻结：窗口内不再探测（第二次调用没多出 spawn）。
     expect(spawnSync.mock.calls.length).toBe(probes);
+  });
+});
+
+// ADR 0008：「装了但跑不起来」与「没装」是两种状态（修复动作相同，说法不同）。
+describe("broken vs absent", () => {
+  beforeEach(() => {
+    invalidate();
+    spawnSync.mockReset();
+  });
+
+  it("a binary that runs but fails is unrunnable, with the first error line", () => {
+    spawnSync.mockReturnValue(
+      probeResult(undefined, 1, "Error: Cannot find module '@earendil-works/pi-server'\n    at Module._resolveFilename\nNode.js v22.22.2\n"),
+    );
+    expect(present()).toBe("unrunnable");
+    expect(probeOutcome()).toEqual({ kind: "unrunnable", detail: "Error: Cannot find module '@earendil-works/pi-server'" });
+  });
+
+  it("keeps the version the probe already paid for", () => {
+    spawnSync.mockReturnValue(probeResult(undefined, 0));
+    expect(probeOutcome()).toEqual({ kind: "version", version: "0.85.1" });
+    expect(present()).toBe("present");
+  });
+
+  it("does not invent a version when pi answers without a semver", () => {
+    spawnSync.mockReturnValue({ ...probeResult(undefined, 0), stdout: "hello\n" });
+    expect(probeOutcome()).toEqual({ kind: "version", version: null });
   });
 });

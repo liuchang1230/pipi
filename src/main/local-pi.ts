@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { debugLog } from "./debug-log";
 import { DETECT_SPAWN_TIMEOUT_MS, findExe, findExeOrNull, findViaWhere, isSpawnTimeout, npmGlobalDir } from "./find-exe";
 import { parseVersion } from "./pi-version";
+import type { PiProbeOutcome } from "../shared/pi-drift";
 
 // --- Facts: where pi and node are on this machine ---------------------------
 
@@ -184,8 +185,10 @@ export function bundledPiVersion(): string | null {
 
 // --- Presence / probing -----------------------------------------------------
 
-/** 「本机 pi 在不在」的三态（决策 6）：超时是 `unverified`，不是 `absent`。 */
-export type PiPresence = "present" | "unverified" | "absent";
+/** 「本机 pi 能不能用」的四态（决策 6 + ADR 0008）：超时是 `unverified`，
+ *  不是 `absent`；**装了但跑不起来**是 `unrunnable`，也不是 `absent`（找不到
+ *  二进制才是）。区别在恢复动作：`absent` 要装，`unrunnable` 要修。 */
+export type PiPresence = "present" | "unverified" | "absent" | "unrunnable";
 
 // Detection spawns child processes that BLOCK the main process: where.exe,
 // node --version, and especially `pi --version` (~1.1s on Windows — it boots
@@ -194,14 +197,14 @@ export type PiPresence = "present" | "unverified" | "absent";
 // resolvePiBin) used to pay 3-4 sync spawns before the pty even spawned.
 // Cache the results and warm them at startup (see warm).
 let cachedNodeOk: boolean | null = null;
-let cachedPiOk: boolean | null = null;
-/** True when the last authoritative probe did not finish inside
- *  DETECT_SPAWN_TIMEOUT_MS. A timeout is INCONCLUSIVE, not "pi is missing" —
- *  see present. */
-let cachedPiTimedOut = false;
+/** The last probe VERDICT (not just present/absent): the version we may run in a
+ *  terminal is learned here and would otherwise be thrown away — the drift state
+ *  (`shared/pi-drift.ts`) needs it, and this probe already paid for it. */
+let cachedOutcome: PiProbeOutcome | null = null;
 /** When the last authoritative (sync) pi probe ran; used to throttle the
- *  re-verification of a cached false (a transient failure must self-heal,
- *  but a genuinely missing pi shouldn't block the main thread every click). */
+ *  re-verification of a cached negative verdict (a transient failure must
+ *  self-heal, but a genuinely missing pi shouldn't block the main thread on
+ *  every click). */
 let cachedPiCheckAt: number | null = null;
 const PI_RECHECK_TTL_MS = 5000;
 
@@ -211,9 +214,8 @@ export function invalidate(): void {
   cachedPiBin = undefined;
   cachedNodeBin = undefined;
   cachedNodeOk = null;
-  cachedPiOk = null;
+  cachedOutcome = null;
   cachedPiCheckAt = null;
-  cachedPiTimedOut = false;
 }
 
 function nodeInstalled(): boolean {
@@ -225,10 +227,18 @@ function nodeInstalled(): boolean {
 }
 
 /** Async version probe (the sync `pi --version` blocks ~1.1s on Windows). */
-function spawnVersionProbe(piBin: string): ChildProcess {
+function spawnVersionProbe(piBin: string): { child: ChildProcess; output: () => { stdout: string; stderr: string } } {
   const child = /\.cmd$/i.test(piBin)
-    ? spawn("cmd.exe", ["/d", "/c", piBin.replace(/\//g, "\\"), "--version"], { stdio: "ignore", windowsHide: true })
-    : spawn(piBin, ["--version"], { stdio: "ignore", windowsHide: true });
+    ? spawn("cmd.exe", ["/d", "/c", piBin.replace(/\//g, "\\"), "--version"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+    : spawn(piBin, ["--version"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  // The pipes MUST be drained: an unread stdout can block the child (pi's
+  // --version output is tiny, but a full pipe is a hang, not a slow probe).
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (d: string) => { stdout += d; });
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (d: string) => { stderr += d; });
   // The warm probe used to have no kill timer: a hung `pi --version` leaked a
   // child process and left cachedPiOk null forever, so every later click paid
   // the authoritative SYNC probe (the 1.1s main-thread freeze this cache
@@ -236,7 +246,7 @@ function spawnVersionProbe(piBin: string): ChildProcess {
   const killTimer = setTimeout(() => child.kill(), DETECT_SPAWN_TIMEOUT_MS);
   child.once("exit", () => clearTimeout(killTimer));
   child.once("error", () => clearTimeout(killTimer));
-  return child;
+  return { child, output: () => ({ stdout, stderr }) };
 }
 
 /** Compute the detection caches in the background (best-effort, no dialogs).
@@ -253,15 +263,18 @@ export function warm(): void {
   }
   const piBin = cachedPiBin?.bin;
   if (!piBin) return;
-  const child = spawnVersionProbe(piBin);
+  const { child, output } = spawnVersionProbe(piBin);
   // Cache ONLY the success: a transient probe failure must NOT poison the
-  // cache — leave it null so the next present() runs the authoritative sync
-  // probe on demand (the click path pays ~1.1s only when the warm probe failed).
+  // cache — leave it null so the next probeOutcome() runs the authoritative
+  // sync probe on demand (the click path pays ~1.1s only when warm failed).
   child.once("exit", (code) => {
-    if (code === 0) cachedPiOk = true;
+    // The version comes along for free (the async probe already booted pi):
+    // without it the terminal's own pi stays nameless and the drift state
+    // could only ever report `unknown`.
+    if (code === 0) cachedOutcome = { kind: "version", version: parseVersion(output().stdout.split(/\r?\n/)[0]) };
   });
   child.once("error", () => {
-    /* keep cachedPiOk = null → sync re-check on demand */
+    /* keep cachedOutcome = null → sync re-check on demand */
   });
 }
 
@@ -304,11 +317,15 @@ function probeSync(): {
   piEnv: string | undefined;
   status: number | null;
   error?: string;
+  /** spawn 自身的失败码（`ENOENT` = 可执行文件根本不在）——「找不到」与
+   *  「找到了但跑不起来」的唯一区分依据。 */
+  errorCode?: string;
   stdout: string;
   stderr: string;
 } {
   const piBin = findPiBin().bin;
   const result = runPiVersion(piBin);
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
   return {
     ok: !result.error && result.status === 0,
     timedOut: isSpawnTimeout(result),
@@ -316,39 +333,76 @@ function probeSync(): {
     piEnv: process.env.PI_CODING_AGENT,
     status: result.status,
     error: result.error?.message,
+    ...(errorCode ? { errorCode } : {}),
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
   };
 }
 
+/** 一次探测的结论：跑起来了 / 明确不在 / 装了跑不起来 / 超时。 */
+function outcomeFromProbe(probe: ReturnType<typeof probeSync>): PiProbeOutcome {
+  if (probe.timedOut) return { kind: "timeout" };
+  if (probe.ok) return { kind: "version", version: parseVersion(probe.stdout.split(/\r?\n/)[0]) };
+  // 裸名字（`findPiBin` 的兜底）或被删掉的 shim：spawn 直接 ENOENT ——
+  // 这才是「没装」。
+  if (probe.errorCode === "ENOENT") return { kind: "absent" };
+  const detail = probeDetail(probe.stderr) || probe.error || `exit ${probe.status ?? "?"}`;
+  return { kind: "unrunnable", detail };
+}
+
+/** 从 `pi --version` 的 stderr 里挑一行给用户看的原因（node 的报错在首行，
+ *  尾行往往是 `Node.js v22.22.2` 这种噪声）。 */
+function probeDetail(stderr: string): string {
+  const lines = stderr.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const useful = lines.find((l) => /error|cannot find|not found|denied|refused|invalid/i.test(l)) ?? lines[0] ?? "";
+  return useful.slice(0, 200);
+}
+
 /**
- * 本机 pi 在不在。三态而不是布尔，因为「探测超时」既不能算缺失也不能算证明
- * 在场：调用方（`ensurePiReady`）把缺失读成「用捆绑副本重装」，那会把用户用
- * `pi update` 保持最新的全局 pi 悄悄降级 —— 所以超时报告 `unverified`，让
- * 最坏情况只是每个窗口一次有界冻结。
+ * 本机全局 pi 的探测结论：**唯一**的探测入口（`present()` 与漂移状态都从这里
+ * 取事实），带缓存与节流。
+ *
+ * 四态而不是布尔：「探测超时」既不能算缺失也不能算证明在场：调用方
+ * （`ensurePiReady`）把缺失读成「用捆绑副本重装」，那会把用户用 `pi update`
+ * 保持最新的全局 pi 悄悄降级 —— 所以超时报告 `unverified`，让最坏情况只是
+ * 每个窗口一次有界冻结。同理，`absent` 只给「可执行文件根本不在」。
  */
-export function present(): PiPresence {
-  if (cachedPiOk === true) return "present";
-  // A cached FALSE must not be trusted blindly: the warm async probe can
+export function probeOutcome(): PiProbeOutcome {
+  // 预热成功过：结论已经是权威的（零 spawn）。
+  if (cachedOutcome !== null && cachedOutcome.kind === "version") return cachedOutcome;
+  // A cached NEGATIVE must not be trusted blindly: the warm async probe can
   // fail transiently (startup load, AV scan, slow CLI boot) and would
   // otherwise poison the cache for the whole session — every local tab would
   // then claim "pi not found". Re-verify with the authoritative sync probe,
   // throttled so a genuinely-missing pi doesn't block the main thread on
   // every click.
-  if (cachedPiOk === false && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
-    return "absent";
-  }
-  if (cachedPiTimedOut && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
-    return "unverified";
+  if (cachedOutcome !== null && cachedPiCheckAt !== null && Date.now() - cachedPiCheckAt < PI_RECHECK_TTL_MS) {
+    return cachedOutcome;
   }
   cachedPiCheckAt = Date.now();
   const probe = probeSync();
-  cachedPiTimedOut = probe.timedOut;
+  const outcome = outcomeFromProbe(probe);
+  cachedOutcome = outcome;
   if (probe.timedOut) {
-    cachedPiOk = null;
     debugLog("probe", `pi --version timed out after ${DETECT_SPAWN_TIMEOUT_MS}ms (${probe.piBin}) — assuming present, unverified`);
-    return "unverified";
+  } else if (!probe.ok) {
+    debugLog("probe", `pi --version failed (${probe.errorCode ?? probe.status ?? "?"}) ${probe.stderr.trim().slice(0, 200)}`);
   }
-  cachedPiOk = probe.ok;
-  return cachedPiOk ? "present" : "absent";
+  return outcome;
+}
+
+/** 探测结论 → 在场状态（四态，见 `PiPresence`）。 */
+export function present(): PiPresence {
+  const outcome = probeOutcome();
+  switch (outcome.kind) {
+    case "version":
+      return "present";
+    case "absent":
+      return "absent";
+    case "unrunnable":
+      return "unrunnable";
+    case "timeout":
+    case "unverified":
+      return "unverified";
+  }
 }

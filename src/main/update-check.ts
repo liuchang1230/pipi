@@ -10,7 +10,9 @@ import { delimiter, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { buildRemoteKey, findSshBin, findWslBin } from "./pty";
-import { bundledPiVersion, bundledPiPackagePath, localPiSpawnPlan, resolveLocal } from "./local-pi";
+import { bundledPiVersion, bundledPiPackagePath, localPiSpawnPlan, probeOutcome, resolveLocal } from "./local-pi";
+import { classifyPiDrift, type PiDrift, type PiProbeOutcome } from "../shared/pi-drift";
+import { compareVersions } from "../shared/version-compare";
 import type { Target } from "./target-fs";
 import { runSshCommand } from "./ssh-exec";
 import { runSsh2Command } from "./ssh2-exec";
@@ -26,6 +28,12 @@ export interface UpdateInfo {
   /** Configured npm/git pi packages with newer versions available. */
   extensions: string[];
   hasUpdate: boolean;
+  /** 契约版本（捆绑 pi）与实际会跑的那个 pi 的关系。`hasUpdate` 说的只是
+   *  「npm 上有更新的版本」，漂移说的是「是不是契约版本」——两件事。 */
+  drift: PiDrift;
+  /** 本机终端 TUI 真正启动的那个 pi（全局 `pi` 命令）的漂移。远程目标没有
+   *  这一项；本机聊天/更新走的是契约版本（`drift`）。 */
+  terminalDrift?: PiDrift;
   error?: string;
 }
 
@@ -43,6 +51,9 @@ export interface RemoteUpdateInfo {
   hasUpdate: boolean;
   /** pi update --all also updates configured extension packages. */
   extensions: string[];
+  /** 目标机上那个 pi 的漂移（ADR 0008）：与契约不一致、不在、跑不起来，
+   *  是四种不同的事。 */
+  drift: PiDrift;
   error?: string;
 }
 
@@ -64,18 +75,7 @@ let cachedApp: AppUpdateInfo | null = null;
 let appLastCheckedAt = 0;
 const CHECK_TTL_MS = 6 * 60 * 60 * 1000; // re-check at most every 6h
 
-/** Semver-ish compare: "0.84.1" > "0.84.0". Returns 1/0/-1. */
-function compareVersions(a: string, b: string): number {
-  const pa = a.split(".").map((x) => parseInt(x, 10) || 0);
-  const pb = b.split(".").map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    const x = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (x !== 0) return Math.sign(x);
-  }
-  return 0;
-}
-
-function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
     // node-vs-shim 的分支与本地 RPC 启动共用一条（`localPiSpawnPlan`）：
     // 两边都偏好 node + cli.js，因为那是终端里跑 `pi` 的同一件事。
@@ -83,7 +83,9 @@ function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null
     const child = spawn(plan.file, plan.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         child.kill();
       } catch {
@@ -96,21 +98,29 @@ function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null
     child.stderr?.on("data", (d: string) => (stderr += d));
     child.on("error", (e) => {
       clearTimeout(timer);
-      resolve({ code: null, stdout, stderr: stderr || e.message });
+      resolve({ code: null, stdout, stderr: stderr || e.message, timedOut });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ code, stdout, stderr });
+      resolve({ code, stdout, stderr, timedOut });
     });
   });
 }
 
-async function getLocalPiVersion(): Promise<string | null> {
+/** 本机**契约运行时**（捆绑 pi，node + cli.js）的探测结论。今天渲染层要的
+ *  `current` 就是它的版本；漂移状态（runtime: "bundled"）也用它。 */
+async function probeLocalBundled(): Promise<PiProbeOutcome> {
   try {
-    const { stdout } = await runPi(["--version"], 20000);
-    return parseVersion(stdout.split(/\r?\n/)[0]);
-  } catch {
-    return null;
+    const { code, stdout, stderr, timedOut } = await runPi(["--version"], 20000);
+    if (timedOut) return { kind: "timeout" };
+    if (code === 0) return { kind: "version", version: parseVersion(stdout.split(/\r?\n/)[0]) };
+    // node 不在 / 捆绑的 cli.js 被删：二进制层面的缺失，与「跑不起来」不同。
+    if (/ENOENT|not recognized as an internal or external command/i.test(stderr)) return { kind: "absent" };
+    const detail = stderr.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
+      .find((l) => /error|cannot find|not found|denied/i.test(l)) ?? stderr.trim().split(/\r?\n/)[0] ?? "";
+    return { kind: "unrunnable", detail: detail.slice(0, 200) || `exit ${code ?? "?"}` };
+  } catch (e) {
+    return { kind: "unrunnable", detail: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200) };
   }
 }
 
@@ -271,16 +281,23 @@ export async function openAppUpdateDownload(url: string): Promise<boolean> {
 /** Check for a pi update (cached; async, never throws). */
 export async function checkPiUpdate(force = false): Promise<UpdateInfo> {
   if (!force && cached && Date.now() - lastCheckedAt < CHECK_TTL_MS) return cached;
-  const [current, latest, extensions] = await Promise.all([
-    getLocalPiVersion(),
+  const [bundledProbe, latest, extensions] = await Promise.all([
+    probeLocalBundled(),
     getLatestVersion(),
     getExtensionUpdates(),
   ]);
+  const current = bundledProbe.kind === "version" ? bundledProbe.version : null;
+  const bundled = bundledPiVersion();
   const info: UpdateInfo = {
     current,
     latest,
     extensions,
     hasUpdate: !!(current && latest && compareVersions(latest, current) > 0) || extensions.length > 0,
+    drift: classifyPiDrift({ bundled, runtime: "bundled", probe: bundledProbe }),
+    // 终端里那个 pi（全局命令）的版本顺手记下：它是**已经跑过一次**的探测
+    // （`localPi.probeOutcome()`，预热缓存命中时零 spawn），而在此之前它的版本
+    // 被直接丢掉了——于是「终端跑着一个非契约 pi」这件事无名可叫。
+    terminalDrift: classifyPiDrift({ bundled, runtime: "global", probe: probeOutcome() }),
   };
   if (!latest) info.error = "无法连接 npm registry";
   cached = info;
@@ -370,16 +387,37 @@ export function remoteProbeFailureText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function buildRemoteInfo(target: Target | undefined, current: string | null, bundled: string | null, probeStderr: string): RemoteUpdateInfo {
+function buildRemoteInfo(target: Target | undefined, current: string | null, bundled: string | null, probe: PiProbeOutcome, probeStderr: string): RemoteUpdateInfo {
   const info: RemoteUpdateInfo = {
     target: target ? { kind: targetKind(target), label: targetLabel(target) } : { kind: "ssh", label: "未知目标" },
     current, latest: bundled,
     hasUpdate: !!(current && bundled && current !== bundled),
     extensions: [],
+    // runtime 固定为 "remote"：这个函数只在「目标机上的 pi」这条路上被调用。
+    // 下面两个退化分支（无标签 / 本机标签）在 UI 上不可达（4a 之后只对远程
+    // 标签页调 checkTarget），它们的 `unverified` 总是分类为 unknown。
+    drift: classifyPiDrift({ bundled, runtime: "remote", probe }),
   };
   if (!bundled) info.error = "无法确定应用配套的 pi 版本";
   else if (!current) info.error = friendlyRemoteProbeError(probeStderr);
   return info;
+}
+
+/** 远程探测失败 → 探测结论（状态说话，文案另算）。
+ *
+ * 顺序重要：传输层失败（连都没连上 / 认证不过）**不是**「目标上没有 pi」——
+ * 那时候我们连目标上有什么都还没学到，所以只能算 `unverified`（→ unknown）。
+ *
+ * 导出只为测试（同 `remoteProbeFailureText` 的先例）。 */
+export function remoteProbeOutcome(e: unknown): PiProbeOutcome {
+  if (!(e instanceof PiCommandError)) return { kind: "unverified" };
+  if (e.kind === "timeout") return { kind: "timeout" };
+  const text = `${e.stderr}\n${e.detail ?? ""}`;
+  if (/ssh not found|wsl not found|permission denied|authentication|host key|connection (closed|refused|reset)|could not resolve|no route to host|spawn failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|timed out/i.test(text)) {
+    return { kind: "unverified" };
+  }
+  if (/command not found|not found/i.test(text)) return { kind: "absent" };
+  return { kind: "unrunnable", detail: friendlyRemoteProbeError(e.stderr) };
 }
 
 /** 一个 Target 的 pi 端点（ADR 0007）：免密 ssh / 密码 ssh2 / WSL 都接在同一个
@@ -425,16 +463,20 @@ function targetKind(target: Target): "ssh" | "wsl" | "local" {
 export async function checkRemotePiUpdate(target: Target | undefined): Promise<RemoteUpdateInfo> {
   const bundled = bundledPiVersion();
   const port = target && portForTarget(target);
-  if (!target) return buildRemoteInfo(target, null, bundled, "目标标签不存在");
-  if (!port) return buildRemoteInfo(target, null, bundled, "本机标签不适用远程 pi 检查");
+  if (!target) return buildRemoteInfo(target, null, bundled, { kind: "unverified" }, "目标标签不存在");
+  if (!port) return buildRemoteInfo(target, null, bundled, { kind: "unverified" }, "本机标签不适用远程 pi 检查");
   let current: string | null = null;
   let probeStderr = "";
+  let outcome: PiProbeOutcome = { kind: "unverified" };
   try {
-    current = (await cachedProbe(port)).version;
+    const result = await cachedProbe(port);
+    current = result.version;
+    outcome = { kind: "version", version: result.version };
   } catch (e) {
     probeStderr = remoteProbeFailureText(e);
+    outcome = remoteProbeOutcome(e);
   }
-  const info = buildRemoteInfo(target, current, bundled, probeStderr);
+  const info = buildRemoteInfo(target, current, bundled, outcome, probeStderr);
   console.log(`[update] ${targetLabel(target)} pi ${current ?? "?"} → bundled ${bundled ?? "?"}${info.hasUpdate ? " (version mismatch)" : ""}${info.error ? ` error=${info.error.slice(0, 80)}` : ""}`);
   return info;
 }

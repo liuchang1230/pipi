@@ -12,6 +12,7 @@ import Markdown from "../Markdown";
 import { useChatStore, exitBannerText, type ChatBlock, type ChatMessage } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useUiStore } from "../stores/uiStore";
+import { updateBannerText } from "../pi-drift-text";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
 import {
   QuestionnaireDialog,
@@ -440,11 +441,7 @@ function ChatNotices() {
           <span className="chat-notice-text">
             {piUpdating
               ? "正在更新 pi agent 和扩展包…"
-              : updateInfo.targetLabel
-                ? `${updateInfo.targetLabel} pi agent 版本（${updateInfo.current ?? "?"}）与应用配套版本（${updateInfo.latest ?? "?"}）不一致；更新将对齐版本并同步扩展包`
-                : updateInfo.latest
-                  ? `pi agent 有新版本：${updateInfo.current ?? "?"} → ${updateInfo.latest}${updateInfo.extensions.length ? `；扩展包也有更新：${updateInfo.extensions.join("、")}` : ""}`
-                  : `pi 扩展包有更新：${updateInfo.extensions.join("、")}`}
+              : updateBannerText(updateInfo)}
           </span>
           <button
             className="btn btn-primary chat-notice-btn"

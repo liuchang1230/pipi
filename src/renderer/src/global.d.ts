@@ -1,5 +1,6 @@
 // Type bridge exposed by preload via contextBridge.
 import type { ApprovalSettings } from "../../shared/approval";
+import type { PiDrift } from "../../shared/pi-drift";
 
 export {};
 
@@ -214,8 +215,8 @@ declare global {
         download: (url: string) => Promise<boolean>;
       };
       update: {
-        check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
-        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl" | "local"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; error?: string }>;
+        check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; terminalDrift?: PiDrift; error?: string }>;
+        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl" | "local"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; error?: string }>;
         runTarget: (tabId: string) => Promise<{ ok: boolean; output: string; error?: string }>;
         run: () => Promise<{ ok: boolean; output: string; error?: string }>;
         /** App-bundled extensions re-shipped at startup (content changed), pull-once. */
@@ -228,7 +229,7 @@ declare global {
         onBegin: (callback: () => void) => () => void;
         onProgress: (callback: (p: { stage: string }) => void) => () => void;
         onResult: (callback: (r: { ok: boolean; error?: string; cancelled?: boolean }) => void) => () => void;
-        onNotice: (callback: (n: { backend: string }) => void) => () => void;
+        onNotice: (callback: (n: { backend: string; presence?: "absent" | "unrunnable"; detail?: string }) => void) => () => void;
       };
       diff: {
         list: (tabId: string) => Promise<{ isGit: boolean; initialized?: boolean; files: { status: string; path: string; additions: number; deletions: number }[]; error?: string }>;
