@@ -236,12 +236,9 @@ const api = {
     download: (url: string): Promise<boolean> => ipcRenderer.invoke("app-update:download", url),
   },
   update: {
-    check: (force?: boolean): Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; terminalDrift?: PiDrift; error?: string }> =>
-      ipcRenderer.invoke("update:check", force),
-    checkTarget: (tabId: string): Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; error?: string }> =>
+    checkTarget: (tabId: string): Promise<{ target: { kind: "ssh" | "wsl"; label: string }; current: string | null; hasUpdate: boolean; drift: PiDrift; error?: string }> =>
       ipcRenderer.invoke("update:check-target", tabId),
     runTarget: (tabId: string): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run-target", tabId),
-    run: (): Promise<{ ok: boolean; output: string; error?: string }> => ipcRenderer.invoke("update:run"),
     getExtensionSynced: (): Promise<{ files: string[] }> => ipcRenderer.invoke("update:extensions-synced"),
   },
   /** pi agent: main streams begin/progress/result; renderer shows the

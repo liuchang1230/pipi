@@ -3291,7 +3291,7 @@ textarea:focus-visible,
   color: var(--text);
 }
 /* Update-result states: success (ok) vs failure (err), shown in both the
-   chat notice bar and the global banner after "立即更新". */
+   chat notice bar and the global banner after "对齐版本". */
 .chat-notice.update.ok {
   border-color: #4caf72;
 }

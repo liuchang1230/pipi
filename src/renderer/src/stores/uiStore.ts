@@ -14,18 +14,13 @@ import type { PiDrift } from "../../../shared/pi-drift";
 export type ToastType = "ok" | "err";
 
 export interface UpdateNoticeInfo {
-  current: string | null;
-  latest: string | null;
-  extensions: string[];
-  /** 契约版本与实际会跑的那个 pi 的关系（ADR 0008）：横幅读它说话，不再自己
-   *  拼「版本不一致」的判定。 */
+  /** 目标机上那个 pi 的漂移（ADR 0008）：横幅读它说话，不再自己拼
+   *  「版本不一致」的判定。只有目标机（SSH/WSL）会有这项 —— 本机的升级提示
+   *  在 ADR 0009 删掉了，本机 pi 坏掉由 `PiPresence` 那条路说。 */
   drift: PiDrift;
-  /** 本机终端 TUI 真正启动的那个 pi（全局 `pi` 命令）的漂移。远程目标没有
-   *  这一项——那时 `drift` 说的就是目标机上那个 pi。 */
-  terminalDrift?: PiDrift;
-  /** Omitted for the local agent; present when the checked pi runs on SSH/WSL. */
+  /** 目标机标签（`label` 形如 `user@host` 或 WSL 发行版名）。 */
   targetLabel?: string;
-  /** Authoritative tab id used to execute a remote update in that exact target. */
+  /** Authoritative tab id used to align the pi on that exact target. */
   targetTabId?: string;
 }
 
@@ -40,9 +35,10 @@ export interface ExtensionNoticeInfo {
   files: string[];
 }
 
-/** Outcome of running the pi (agent) update, surfaced as a success/failure
- *  notice in both the chat notice bar and the global banner — so after
- *  "立即更新" the user sees 更新中… then 更新成功（到哪个版本）or 更新失败. */
+/** Outcome of aligning a target machine's pi to the app's bundled pin,
+ *  surfaced as a success/failure notice in both the chat notice bar and the
+ *  global banner — so after "对齐版本" the user sees 对齐中… then 已对齐（到哪
+ *  个版本）or 对齐失败. */
 export interface PiUpdateResult {
   ok: boolean;
   /** Version it updated to (ok only). */
@@ -67,15 +63,16 @@ interface UiState {
   /** pi (and its extension packages) has a newer version available. */
   updateInfo: UpdateNoticeInfo | null;
   setUpdateInfo: (info: UpdateNoticeInfo | null) => void;
-  /** Result of the last pi update attempt (shown instead of the offer once set). */
+  /** Result of the last target align attempt (shown instead of the offer once set). */
   updateResult: PiUpdateResult | null;
   setUpdateResult: (r: PiUpdateResult | null) => void;
-  /** A pi update is in flight (shared by chat notice bar + global banner so
-   *  both consistently show "更新中…" and a second click is prevented). */
-  piUpdating: boolean;
-  setPiUpdating: (updating: boolean) => void;
-  /** Runs the complete update workflow once for every renderer presentation. */
-  runPiUpdate: () => Promise<void>;
+  /** An align is in flight (shared by chat notice bar + global banner so both
+   *  consistently show "对齐中…" and a second click is prevented). */
+  piAligning: boolean;
+  /** Aligns the active target's pi to the bundled pin once for every renderer
+   *  presentation. Local pi is not aligned by us (ADR 0009) — without a target
+   *  tab there is nothing to do. */
+  runPiAlign: () => Promise<void>;
   /** App-bundled pi extensions were re-shipped at startup with new content. */
   extNotice: ExtensionNoticeInfo | null;
   setExtNotice: (info: ExtensionNoticeInfo | null) => void;
@@ -121,51 +118,49 @@ export const useUiStore = create<UiState>()((set) => ({
   setUpdateInfo: (updateInfo) => set({ updateInfo }),
   updateResult: null,
   setUpdateResult: (updateResult) => set({ updateResult }),
-  piUpdating: false,
-  setPiUpdating: (piUpdating) => set({ piUpdating }),
-  runPiUpdate: async () => {
+  piAligning: false,
+  runPiAlign: async () => {
     // The main process remains the cross-window authority; this guard avoids
     // duplicate work from the two renderer presentations in this window.
-    if (useUiStore.getState().piUpdating) return;
-    set({ piUpdating: true });
+    if (useUiStore.getState().piAligning) return;
+    const target = useUiStore.getState().updateInfo;
+    // 对齐只对目标机有意义：本机那个 pi 由 app 安装/修复（ADR 0009），没有
+    // 「对齐」这个动作。没有目标标签就没什么可做 —— 按钮也只在这种情况下出现。
+    if (!target?.targetTabId) return;
+    set({ piAligning: true });
     try {
-      const target = useUiStore.getState().updateInfo;
-      const result = target?.targetTabId
-        ? await window.api.update.runTarget(target.targetTabId)
-        : await window.api.update.run();
+      const result = await window.api.update.runTarget(target.targetTabId);
       if (!result.ok) {
         set({
           updateInfo: null,
           updateResult: { ok: false, error: result.error ?? result.output.slice(0, 120) },
         });
-        useUiStore.getState().showToast("更新失败", "err");
+        useUiStore.getState().showToast("对齐失败", "err");
         return;
       }
 
-      // Do not claim the version offered before update: npm may resolve a
+      // Do not claim the version offered before the align: npm may resolve a
       // different release. Force a fresh check after main invalidates its cache.
       try {
-        const verified = target?.targetTabId
-          ? await window.api.update.checkTarget(target.targetTabId)
-          : await window.api.update.check(true);
+        const verified = await window.api.update.checkTarget(target.targetTabId);
         set({
           updateInfo: null,
           updateResult: { ok: true, version: verified.current ?? undefined },
         });
       } catch {
-        // The update itself succeeded; verification is best-effort and must
+        // The align itself succeeded; verification is best-effort and must
         // not rewrite that outcome as a failure because IPC/network died.
         set({ updateInfo: null, updateResult: { ok: true } });
       }
-      useUiStore.getState().showToast("更新完成，请重启标签页生效", "ok");
+      useUiStore.getState().showToast("已对齐，请重启标签页生效", "ok");
     } catch (error) {
       set({
         updateInfo: null,
         updateResult: { ok: false, error: error instanceof Error ? error.message : String(error) },
       });
-      useUiStore.getState().showToast("更新失败", "err");
+      useUiStore.getState().showToast("对齐失败", "err");
     } finally {
-      set({ piUpdating: false });
+      set({ piAligning: false });
     }
   },
   extNotice: null,

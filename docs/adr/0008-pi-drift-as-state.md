@@ -2,6 +2,8 @@
 
 Status: **accepted**（2026-10-05）
 
+Superseded in part by `docs/adr/0009-no-chase-latest.md`（同日）：本 ADR 决策 2 的 `runtime` 三元组、决策 8 的「本机横幅先状态再原建议」、以及 `driftRecordText` 都被 0009 删掉了（本机不再有升级提示，漂移只剩目标机一个消费者）。六态分类、`PiPresence` 四态、「漂移不是失败」保留。
+
 ## 动机
 
 「版本对不对」这件事今天**没有名字**，于是每个消费者各自拼一个判定：

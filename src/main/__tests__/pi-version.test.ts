@@ -198,9 +198,12 @@ describe("buildRemoteAlignCommand", () => {
     }
   });
 
-  it("keeps extension update best-effort with a failure guard", () => {
+  it("installs ONLY the pinned version — no `pi update --extensions` tail (ADR 0009)", () => {
+    // 用户自己配的扩展包不是 app 的事：对齐只保证目标机跑的是契约版本。
     const cmd = buildRemoteAlignCommand("0.84.4");
-    expect(cmd).toContain("pi update --extensions 2>/dev/null || true");
+    expect(cmd).not.toContain("pi update");
+    expect(cmd).not.toContain("extensions");
+    expect(cmd.endsWith("esac")).toBe(true);
   });
 });
 

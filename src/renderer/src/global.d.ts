@@ -215,10 +215,8 @@ declare global {
         download: (url: string) => Promise<boolean>;
       };
       update: {
-        check: (force?: boolean) => Promise<{ current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; terminalDrift?: PiDrift; error?: string }>;
-        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl" | "local"; label: string }; current: string | null; latest: string | null; extensions: string[]; hasUpdate: boolean; drift: PiDrift; error?: string }>;
+        checkTarget: (tabId: string) => Promise<{ target: { kind: "ssh" | "wsl" | "local"; label: string }; current: string | null; hasUpdate: boolean; drift: PiDrift; error?: string }>;
         runTarget: (tabId: string) => Promise<{ ok: boolean; output: string; error?: string }>;
-        run: () => Promise<{ ok: boolean; output: string; error?: string }>;
         /** App-bundled extensions re-shipped at startup (content changed), pull-once. */
         getExtensionSynced: () => Promise<{ files: string[] }>;
       };

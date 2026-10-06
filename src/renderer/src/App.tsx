@@ -38,7 +38,7 @@ import { useSessionsStore } from "./stores/sessionsStore";
 import { useTreeStore } from "./stores/treeStore";
 import { useViewerStore } from "./stores/viewerStore";
 import { useUiStore } from "./stores/uiStore";
-import { driftRecordText, updateBannerText } from "./pi-drift-text";
+import { updateBannerText } from "./pi-drift-text";
 import { FailureCenter } from "./components/FailureCenter";
 import { useLayoutStore } from "./stores/layoutStore";
 import type { RemoteServerGroup, SessionItem, RemoteHistoryItem } from "./stores/types";
@@ -128,7 +128,7 @@ function UpdateBanner() {
   const appUpdateInfo = useUiStore((s) => s.appUpdateInfo);
   const updateInfo = useUiStore((s) => s.updateInfo);
   const updateResult = useUiStore((s) => s.updateResult);
-  const piUpdating = useUiStore((s) => s.piUpdating);
+  const piAligning = useUiStore((s) => s.piAligning);
   const extNotice = useUiStore((s) => s.extNotice);
   const tabs = useTabsStore((s) => s.tabs);
   const activeTab = useTabsStore((s) => s.activeTab);
@@ -167,24 +167,24 @@ function UpdateBanner() {
         <div className={`update-banner-row${updateResult.ok ? " ok" : " err"}`}>
           <span>
             {updateResult.ok
-              ? `pi agent 更新成功：已更新到 ${updateResult.version ?? "最新版"}，请重启标签页生效`
-              : `pi agent 更新失败：${updateResult.error ?? "未知错误"}`}
+              ? `已对齐到配套版本 ${updateResult.version ?? "?"}，请重启标签页生效`
+              : `对齐失败：${updateResult.error ?? "未知错误"}`}
           </span>
           <button className="update-banner-close" onClick={() => useUiStore.getState().setUpdateResult(null)} title="关闭">×</button>
         </div>
       ) : updateInfo ? (
         <div className="update-banner-row">
           <span>
-            {piUpdating
-              ? "正在更新 pi agent 和扩展包…"
+            {piAligning
+              ? "正在对齐目标机上的 pi…"
               : updateBannerText(updateInfo)}
           </span>
           <button
             className="btn btn-primary update-banner-btn"
-            disabled={piUpdating}
-            onClick={() => void useUiStore.getState().runPiUpdate()}
+            disabled={piAligning}
+            onClick={() => void useUiStore.getState().runPiAlign()}
           >
-            {piUpdating ? "更新中…" : "立即更新"}
+            {piAligning ? "对齐中…" : "对齐版本"}
           </button>
           <button className="update-banner-close" onClick={() => useUiStore.getState().setUpdateInfo(null)} title="关闭">×</button>
         </div>
@@ -252,34 +252,13 @@ export default function App() {
       }
     })();
     window.api.remote.listHistory().then((list) => useSessionsStore.getState().setRemoteHistory(list)).catch(() => {});
-    // Update notices (chat page + global banner share uiStore):
-    // 1) pi itself / its extension packages have a newer version;
-    // 2) app-bundled pi extensions were re-shipped at startup (content changed).
+    // Update notices (chat page + global banner share uiStore): app-bundled pi
+    // extensions were re-shipped at startup (content changed). pi itself is no
+    // longer chased (ADR 0009): the pi we ship arrives with the app installer,
+    // and a target machine's drift is checked per remote tab below.
     window.api.appUpdate.check().then((r) => {
       if (r.hasUpdate && r.latest) {
         useUiStore.getState().setAppUpdateInfo({ current: r.current, latest: r.latest, downloadUrl: r.downloadUrl, notes: r.notes });
-      }
-    }).catch(() => {});
-    window.api.update.check().then((r) => {
-      const tabsState = useTabsStore.getState();
-      const active = tabsState.tabs.find((t) => t.id === tabsState.activeTab);
-      // A slow startup-local check must never replace a notice for a remote
-      // execution target selected while the check was in flight. When tabs
-      // already exist but activeTab is not hydrated yet, defer to onActiveTab.
-      if (active?.isRemote || (tabsState.tabs.length > 0 && !active)) return;
-      if (r.hasUpdate) {
-        useUiStore.getState().setUpdateResult(null);
-        useUiStore.getState().setUpdateInfo({ current: r.current, latest: r.latest, extensions: r.extensions ?? [], drift: r.drift, terminalDrift: r.terminalDrift });
-      }
-      // 本机那个 pi 坏掉时要说清是「没装」还是「装了跑不起来」（ADR 0008）：
-      // 每次会话每个状态记一次，不让每回启动都重生一条。
-      for (const d of [r.drift, r.terminalDrift]) {
-        const record = d && driftRecordText(d);
-        const key = d ? `${d.runtime}:${d.state}` : "";
-        if (record && !probeErrorShownRef.current.has(key)) {
-          probeErrorShownRef.current.add(key);
-          useUiStore.getState().showToast(record.text, "err", { failure: true, cause: record.cause });
-        }
       }
     }).catch(() => {});
     window.api.update.getExtensionSynced().then((r) => {
@@ -324,7 +303,7 @@ export default function App() {
         window.api.update.checkTarget(id).then((info) => {
           if (activeTabRef.current !== id) return;
           if (info.hasUpdate) {
-            useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions ?? [], targetLabel: info.target.label, targetTabId: id, drift: info.drift });
+            useUiStore.getState().setUpdateInfo({ drift: info.drift, targetLabel: info.target.label, targetTabId: id });
             return;
           }
           // The remote pi probe failed (missing pi / runtime too old / …):
@@ -336,12 +315,9 @@ export default function App() {
           }
         }).catch(() => {});
       } else if (id && !r) {
+        // 本机标签：只说目标机的事（ADR 0009 —— app 不再提示升级本机 pi）。
         useUiStore.getState().setUpdateInfo(null);
         useUiStore.getState().setUpdateResult(null);
-        window.api.update.check().then((info) => {
-          if (activeTabRef.current !== id || !info.hasUpdate) return;
-          useUiStore.getState().setUpdateInfo({ current: info.current, latest: info.latest, extensions: info.extensions, drift: info.drift, terminalDrift: info.terminalDrift });
-        }).catch(() => {});
       }
       activeTabRef.current = id;
       if (!id) {

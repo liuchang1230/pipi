@@ -1,13 +1,16 @@
 // 漂移分类的真值表：契约版本 × 探测结论 → 状态。ADR 0008 的全部语义都在这里，
 // 所以每条规则都是一个断言（这也是「接口即测试面」的那一层）。
+//
+// 只服务目标机（ADR 0009 之后本机不分类漂移：本机那个 pi 在不在/好不好由
+// `local-pi` 的 `PiPresence` 回答）。
 import { describe, expect, it } from "vitest";
-import { classifyPiDrift, piDriftNeedsRecord, type PiProbeOutcome } from "../pi-drift";
+import { classifyPiDrift, type PiProbeOutcome } from "../pi-drift";
 import { compareVersions } from "../version-compare";
 
 const bundled = "0.85.1";
 
-function classify(probe: PiProbeOutcome, runtime: "bundled" | "global" | "remote" = "remote", b: string | null = bundled) {
-  return classifyPiDrift({ bundled: b, runtime, probe });
+function classify(probe: PiProbeOutcome, b: string | null = bundled) {
+  return classifyPiDrift({ bundled: b, probe });
 }
 
 describe("classifyPiDrift", () => {
@@ -15,20 +18,23 @@ describe("classifyPiDrift", () => {
     expect(classify({ kind: "version", version: "0.85.1" }).state).toBe("pinned");
   });
 
-  it("separates newer from older (决策 36 的两条自由不是一件事)", () => {
+  it("separates newer from older (对齐的提议要看方向)", () => {
     expect(classify({ kind: "version", version: "0.90.0" }).state).toBe("drifted-newer");
     expect(classify({ kind: "version", version: "0.84.2" }).state).toBe("drifted-older");
     // 数字段比较，不是字符串比较。
     expect(classify({ kind: "version", version: "0.85.10" }).state).toBe("drifted-newer");
   });
 
-  it("keeps the runtime label of the pi it is talking about", () => {
-    expect(classify({ kind: "version", version: "0.90.0" }, "global").runtime).toBe("global");
-    expect(classifyPiDrift({ bundled, runtime: "bundled", probe: { kind: "version", version: bundled } })).toEqual({
+  it("reports the facts it classified on (渲染层只读它，不再自己拼判定)", () => {
+    expect(classify({ kind: "version", version: bundled })).toEqual({
       state: "pinned",
-      runtime: "bundled",
       bundled,
       found: bundled,
+    });
+    expect(classify({ kind: "version", version: "0.84.2" })).toEqual({
+      state: "drifted-older",
+      bundled,
+      found: "0.84.2",
     });
   });
 
@@ -50,30 +56,8 @@ describe("classifyPiDrift", () => {
   });
 
   it("is unknown when even the contract version cannot be read", () => {
-    expect(classify({ kind: "version", version: "0.90.0" }, "remote", null).state).toBe("unknown");
-    expect(classify({ kind: "absent" }, "remote", null).state).toBe("unknown");
-  });
-
-  it("reports the facts it classified on (渲染层只读它，不再自己拼判定)", () => {
-    expect(classify({ kind: "version", version: "0.84.2" }, "global")).toEqual({
-      state: "drifted-older",
-      runtime: "global",
-      bundled,
-      found: "0.84.2",
-    });
-  });
-});
-
-describe("piDriftNeedsRecord", () => {
-  it("records breakage, not the drift 决策 36 allows", () => {
-    expect(piDriftNeedsRecord("absent")).toBe(true);
-    expect(piDriftNeedsRecord("unrunnable")).toBe(true);
-    // 漂移不是失败：把「比契约新」报进故障中心就是把特性说成 bug。
-    expect(piDriftNeedsRecord("drifted-newer")).toBe(false);
-    expect(piDriftNeedsRecord("drifted-older")).toBe(false);
-    expect(piDriftNeedsRecord("pinned")).toBe(false);
-    // 没探明不是失败（传输层失败由调用方按 info.error 另行留痕，避免记两遍）。
-    expect(piDriftNeedsRecord("unknown")).toBe(false);
+    expect(classify({ kind: "version", version: "0.90.0" }, null).state).toBe("unknown");
+    expect(classify({ kind: "absent" }, null).state).toBe("unknown");
   });
 });
 

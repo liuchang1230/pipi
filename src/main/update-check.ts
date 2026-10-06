@@ -1,16 +1,17 @@
 /**
- * pi 及扩展更新检查（RPC 聊天模式没有 TUI 的 "Update Available" 横幅，
- * 由 app 层补齐）：启动时异步对比本地版本与 npm registry 最新版，
- * 有新版则提示；一键执行 `pi update`（pi 自身 + 扩展包一起更新）。
+ * 更新检查：**只剩两件事** ——（1）app 自己的新版本（GitHub Releases，它是捆绑
+ * pi 的唯一到手路径）；（2）目标机（SSH/WSL）上的 pi 是否等于应用配套的契约版本，
+ * 不等就提议对齐（ADR 0008 的状态、ADR 0009 的范围）。
+ *
+ * ADR 0009 删掉了三条「追最新」的路：本机 pi 不再跟 npm registry 比、不再提示
+ * 「pi agent 有新版本」、不再替用户升级自己配的扩展包（`pi update --all`），远程
+ * 对齐命令也不再顺手 `pi update --extensions`。本机那个 pi 是用户自己的，追新是
+ * 他能做的选择，app 不该拿它当待办事项催；我们要保证的只是「目标机跑的是我们钉住
+ * 的那个协议版本」。
  */
 import { app, shell } from "electron";
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
-import { homedir } from "node:os";
-import { pathToFileURL } from "node:url";
 import { buildRemoteKey, findSshBin, findWslBin } from "./pty";
-import { bundledPiVersion, bundledPiPackagePath, localPiSpawnPlan, probeOutcome, resolveLocal } from "./local-pi";
+import { bundledPiVersion } from "./local-pi";
 import { classifyPiDrift, type PiDrift, type PiProbeOutcome } from "../shared/pi-drift";
 import { compareVersions } from "../shared/version-compare";
 import type { Target } from "./target-fs";
@@ -19,23 +20,7 @@ import { runSsh2Command } from "./ssh2-exec";
 import { runWslCommand } from "./wsl-exec";
 import { align, cachedProbe, parseVersion, PiCommandError, type PiPort } from "./pi-version";
 
-const REGISTRY_URL = "https://registry.npmjs.org/@earendil-works%2fpi-coding-agent/latest";
 const APP_RELEASES_URL = "https://api.github.com/repos/liuchang1230/pipi/releases/latest";
-
-export interface UpdateInfo {
-  current: string | null;
-  latest: string | null;
-  /** Configured npm/git pi packages with newer versions available. */
-  extensions: string[];
-  hasUpdate: boolean;
-  /** 契约版本（捆绑 pi）与实际会跑的那个 pi 的关系。`hasUpdate` 说的只是
-   *  「npm 上有更新的版本」，漂移说的是「是不是契约版本」——两件事。 */
-  drift: PiDrift;
-  /** 本机终端 TUI 真正启动的那个 pi（全局 `pi` 命令）的漂移。远程目标没有
-   *  这一项；本机聊天/更新走的是契约版本（`drift`）。 */
-  terminalDrift?: PiDrift;
-  error?: string;
-}
 
 export interface UpdateRunResult {
   ok: boolean;
@@ -47,12 +32,9 @@ export interface RemoteUpdateInfo {
   /** Sanitized target identity; credentials never cross back to the renderer. */
   target: { kind: "ssh" | "wsl" | "local"; label: string };
   current: string | null;
-  latest: string | null;
   hasUpdate: boolean;
-  /** pi update --all also updates configured extension packages. */
-  extensions: string[];
   /** 目标机上那个 pi 的漂移（ADR 0008）：与契约不一致、不在、跑不起来，
-   *  是四种不同的事。 */
+   *  是四种不同的事。`drift.bundled` 就是提议对齐的目标版本。 */
   drift: PiDrift;
   error?: string;
 }
@@ -68,163 +50,9 @@ export interface AppUpdateInfo {
   error?: string;
 }
 
-let cached: UpdateInfo | null = null;
-let lastCheckedAt = 0;
-let updateInFlight = false;
 let cachedApp: AppUpdateInfo | null = null;
 let appLastCheckedAt = 0;
 const CHECK_TTL_MS = 6 * 60 * 60 * 1000; // re-check at most every 6h
-
-function runPi(args: string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
-  return new Promise((resolve) => {
-    // node-vs-shim 的分支与本地 RPC 启动共用一条（`localPiSpawnPlan`）：
-    // 两边都偏好 node + cli.js，因为那是终端里跑 `pi` 的同一件事。
-    const plan = localPiSpawnPlan(args);
-    const child = spawn(plan.file, plan.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        child.kill();
-      } catch {
-        /* */
-      }
-    }, timeoutMs);
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (d: string) => (stdout += d));
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (d: string) => (stderr += d));
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve({ code: null, stdout, stderr: stderr || e.message, timedOut });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr, timedOut });
-    });
-  });
-}
-
-/** 本机**契约运行时**（捆绑 pi，node + cli.js）的探测结论。今天渲染层要的
- *  `current` 就是它的版本；漂移状态（runtime: "bundled"）也用它。 */
-async function probeLocalBundled(): Promise<PiProbeOutcome> {
-  try {
-    const { code, stdout, stderr, timedOut } = await runPi(["--version"], 20000);
-    if (timedOut) return { kind: "timeout" };
-    if (code === 0) return { kind: "version", version: parseVersion(stdout.split(/\r?\n/)[0]) };
-    // node 不在 / 捆绑的 cli.js 被删：二进制层面的缺失，与「跑不起来」不同。
-    if (/ENOENT|not recognized as an internal or external command/i.test(stderr)) return { kind: "absent" };
-    const detail = stderr.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
-      .find((l) => /error|cannot find|not found|denied/i.test(l)) ?? stderr.trim().split(/\r?\n/)[0] ?? "";
-    return { kind: "unrunnable", detail: detail.slice(0, 200) || `exit ${code ?? "?"}` };
-  } catch (e) {
-    return { kind: "unrunnable", detail: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200) };
-  }
-}
-
-async function getLatestVersion(): Promise<string | null> {
-  try {
-    const res = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { version?: string };
-    return parseVersion(data.version);
-  } catch {
-    return null;
-  }
-}
-
-/** Resolve pi's package entry file for the standalone checker child.
- *
- * Order:
- *  1. global npm install (real files on disk — works in the packaged app too,
- *     and is the install that `pi update` actually maintains);
- *  2. the app's own node_modules (dev); paths inside app.asar are skipped
- *     because a standalone node process cannot read asar archives.
- */
-function resolvePiPackageEntry(): string | null {
-  const piBin = resolveLocal().piBin;
-  if (piBin) {
-    const globalEntry = join(dirname(piBin), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
-    if (existsSync(globalEntry)) return globalEntry;
-  }
-  try {
-    const appEntry = join(app.getAppPath(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
-    if (existsSync(appEntry) && !appEntry.includes("app.asar")) return appEntry;
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
-
-/** Ask pi's package manager which configured extensions have updates.
- *
- * This must run in a standalone Node process. Electron's embedded Node can be
- * older/different from the Node version supported by pi's transitive undici
- * dependency (which may use newer webidl APIs) — importing the package in the
- * Electron main process would crash the whole app at startup.
- *
- * The script text deliberately avoids static `import ... from` statements:
- * electron-vite injects its CJS shims right after the last static import it
- * can regex-find in the bundle, and a lookalike import inside this string
- * would make the shim (including `__dirname`) land inside the string, breaking
- * the whole main process. Dynamic `import()` is used instead.
- */
-async function getExtensionUpdates(): Promise<string[]> {
-  const nodeBin = resolveLocal().nodeBin;
-  const piEntry = resolvePiPackageEntry();
-  if (!nodeBin || !piEntry) return [];
-  const cwd = process.cwd();
-  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-  const script = `
-    const { DefaultPackageManager, SettingsManager } = await import(${JSON.stringify(pathToFileURL(piEntry).href)});
-    const manager = new DefaultPackageManager({
-      cwd: ${JSON.stringify(cwd)},
-      agentDir: ${JSON.stringify(agentDir)},
-      settingsManager: SettingsManager.create(${JSON.stringify(cwd)}, ${JSON.stringify(agentDir)})
-    });
-    const updates = await manager.checkForAvailableUpdates();
-    process.stdout.write(JSON.stringify(updates.map((update) => update.displayName)));
-  `;
-  return new Promise((resolve) => {
-    const child = spawn(nodeBin, ["--input-type=module", "-e", script], {
-      cwd,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      try { child.kill(); } catch { /* best effort */ }
-      resolve([]);
-    }, 20000);
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (data: string) => { stdout += data; });
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (data: string) => { stderr += data; });
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      console.warn("[update] extension check failed:", error.message);
-      resolve([]);
-    });
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        console.warn("[update] extension check failed:", stderr.trim().slice(-500));
-        resolve([]);
-        return;
-      }
-      try {
-        const updates = JSON.parse(stdout.trim());
-        resolve(Array.isArray(updates) ? updates.filter((x): x is string => typeof x === "string") : []);
-      } catch {
-        resolve([]);
-      }
-    });
-  });
-}
 
 /** Check the public GitHub release for an application update. The small
  * Interface is intentionally just check/open: the installer remains the
@@ -276,34 +104,6 @@ export async function openAppUpdateDownload(url: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/** Check for a pi update (cached; async, never throws). */
-export async function checkPiUpdate(force = false): Promise<UpdateInfo> {
-  if (!force && cached && Date.now() - lastCheckedAt < CHECK_TTL_MS) return cached;
-  const [bundledProbe, latest, extensions] = await Promise.all([
-    probeLocalBundled(),
-    getLatestVersion(),
-    getExtensionUpdates(),
-  ]);
-  const current = bundledProbe.kind === "version" ? bundledProbe.version : null;
-  const bundled = bundledPiVersion();
-  const info: UpdateInfo = {
-    current,
-    latest,
-    extensions,
-    hasUpdate: !!(current && latest && compareVersions(latest, current) > 0) || extensions.length > 0,
-    drift: classifyPiDrift({ bundled, runtime: "bundled", probe: bundledProbe }),
-    // 终端里那个 pi（全局命令）的版本顺手记下：它是**已经跑过一次**的探测
-    // （`localPi.probeOutcome()`，预热缓存命中时零 spawn），而在此之前它的版本
-    // 被直接丢掉了——于是「终端跑着一个非契约 pi」这件事无名可叫。
-    terminalDrift: classifyPiDrift({ bundled, runtime: "global", probe: probeOutcome() }),
-  };
-  if (!latest) info.error = "无法连接 npm registry";
-  cached = info;
-  lastCheckedAt = Date.now();
-  console.log(`[update] pi ${current ?? "?"} → latest ${latest ?? "?"}${info.hasUpdate ? " (update available)" : ""}`);
-  return info;
 }
 
 /** Drop the noise `bash -ic` prints WITHOUT a controlling tty (ioctl / job
@@ -390,13 +190,11 @@ export function remoteProbeFailureText(e: unknown): string {
 function buildRemoteInfo(target: Target | undefined, current: string | null, bundled: string | null, probe: PiProbeOutcome, probeStderr: string): RemoteUpdateInfo {
   const info: RemoteUpdateInfo = {
     target: target ? { kind: targetKind(target), label: targetLabel(target) } : { kind: "ssh", label: "未知目标" },
-    current, latest: bundled,
+    current,
     hasUpdate: !!(current && bundled && current !== bundled),
-    extensions: [],
-    // runtime 固定为 "remote"：这个函数只在「目标机上的 pi」这条路上被调用。
-    // 下面两个退化分支（无标签 / 本机标签）在 UI 上不可达（4a 之后只对远程
-    // 标签页调 checkTarget），它们的 `unverified` 总是分类为 unknown。
-    drift: classifyPiDrift({ bundled, runtime: "remote", probe }),
+    // 下面两个退化分支（无标签 / 本机标签）在 UI 上不可达（只对远程标签页调
+    // checkTarget），它们的 `unverified` 总是分类为 unknown。
+    drift: classifyPiDrift({ bundled, probe }),
   };
   if (!bundled) info.error = "无法确定应用配套的 pi 版本";
   else if (!current) info.error = friendlyRemoteProbeError(probeStderr);
@@ -483,14 +281,14 @@ export async function checkRemotePiUpdate(target: Target | undefined): Promise<R
 
 /** Align the remote/WSL pi to the app's bundled version (not npm latest).
  * Detects the remote install method (bun vs npm) so the pin lands in the
- * same location `pi` currently resolves from; extensions are updated
- * best-effort afterwards. The renderer only supplies a tab id. */
+ * same location `pi` currently resolves from. The renderer only supplies a
+ * tab id. */
 export async function runRemotePiUpdate(target: Target | undefined): Promise<UpdateRunResult> {
   const bundled = bundledPiVersion();
   if (!bundled) return { ok: false, output: "", error: "无法确定应用配套的 pi 版本" };
   if (!target) return { ok: false, output: "", error: "目标标签不存在" };
   const port = portForTarget(target);
-  if (!port) return { ok: false, output: "", error: "本机标签不适用远程 pi 更新" };
+  if (!port) return { ok: false, output: "", error: "本机标签不适用：对齐只对目标机有意义" };
   try {
     const { output, version } = await align(port, bundled);
     // Post-install verification: the newest bundle needs undici's
@@ -510,25 +308,5 @@ export async function runRemotePiUpdate(target: Target | undefined): Promise<Upd
     const cleaned = stripShellNoise(raw);
     const hint = friendlyRemoteInstallError(raw, bundled);
     return { ok: false, output: "", error: `远程安装失败：${cleaned}${hint ? `\n${hint}` : ""}` };
-  }
-}
-
-/** Run `pi update` (pi itself + extension packages). Rejects concurrent
- * runs: the update UI exists in both the chat page and the global banner,
- * each with its own busy state, so the main process must be the guard. */
-export async function runPiUpdate(): Promise<UpdateRunResult> {
-  if (updateInFlight) return { ok: false, output: "", error: "更新已在进行中" };
-  updateInFlight = true;
-  try {
-    const { code, stdout, stderr } = await runPi(["update", "--all"], 300000);
-    const output = (stdout + "\n" + stderr).trim();
-    const ok = code === 0;
-    // Invalidate the cached check so the next check reflects the new version.
-    cached = null;
-    return { ok, output: output.slice(-2000) };
-  } catch (e) {
-    return { ok: false, output: "", error: e instanceof Error ? e.message : String(e) };
-  } finally {
-    updateInFlight = false;
   }
 }

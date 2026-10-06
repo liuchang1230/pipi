@@ -81,7 +81,7 @@ import {
   ensureSdkWorkerStarted,
   setUiRequestHandler as setSdkUiRequestHandler,
 } from "./chat-backend/sdk-host";
-import { checkAppUpdate, checkPiUpdate, checkRemotePiUpdate, openAppUpdateDownload, runPiUpdate, runRemotePiUpdate } from "./update-check";
+import { checkAppUpdate, checkRemotePiUpdate, openAppUpdateDownload, runRemotePiUpdate } from "./update-check";
 import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileContent, listGitCommits, getFileAt, type FileVersionEvent } from "./diff-session";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
@@ -2386,8 +2386,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
   ipcMain.handle("diff:commits", (_e, tabId: string, path: string) => listGitCommits(tabId, path));
   ipcMain.handle("diff:at", (_e, tabId: string, path: string, rev?: string) => getFileAt(tabId, path, rev));
 
-  // --- pi / extension updates (RPC chat has no TUI update banner) ---
-  ipcMain.handle("update:check", (_e, force?: boolean) => checkPiUpdate(force));
+  // --- 目标机 pi 对齐 + app 自身更新（本机不再追最新：ADR 0009）---
   ipcMain.handle("update:check-target", (_e, tabId: string) => {
     const tab = getTab(tabId);
     // ADR 0001 的那条规矩：不再就地问「这个 tab 是哪类目标」——`targetFromTab`
@@ -2399,7 +2398,6 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     const tab = getTab(tabId);
     return runRemotePiUpdate(tab ? targetFromTab(tab) : undefined);
   });
-  ipcMain.handle("update:run", () => runPiUpdate());
   ipcMain.handle("app-update:check", (_e, force?: boolean) => checkAppUpdate(force));
   ipcMain.handle("app-update:download", (_e, url: string) => openAppUpdateDownload(url));
   // App-bundled extensions that were actually re-shipped at startup (content

@@ -392,13 +392,13 @@ const MessageView = memo(function MessageView({ message }: { message: ChatMessag
   );
 });
 
-/** 聊天页更新通知条：pi 更新 + 内置扩展更新。与全局 UpdateBanner 读同一
- * uiStore（更新成功/关闭在任意一处生效，两处同步消失）。 */
+/** 聊天页通知条：app 更新 + 目标机 pi 对齐 + 内置扩展更新。与全局 UpdateBanner 读同一
+ * uiStore（对齐成功/关闭在任意一处生效，两处同步消失）。 */
 function ChatNotices() {
   const appUpdateInfo = useUiStore((s) => s.appUpdateInfo);
   const updateInfo = useUiStore((s) => s.updateInfo);
   const updateResult = useUiStore((s) => s.updateResult);
-  const piUpdating = useUiStore((s) => s.piUpdating);
+  const piAligning = useUiStore((s) => s.piAligning);
   const extNotice = useUiStore((s) => s.extNotice);
   if (!appUpdateInfo && !updateInfo && !extNotice && !updateResult) return null;
   return (
@@ -431,24 +431,24 @@ function ChatNotices() {
         <div className={`chat-notice update${updateResult.ok ? " ok" : " err"}`}>
           <span className="chat-notice-text">
             {updateResult.ok
-              ? `pi agent 更新成功：已更新到 ${updateResult.version ?? "最新版"}，请重启标签页生效`
-              : `pi agent 更新失败：${updateResult.error ?? "未知错误"}`}
+              ? `已对齐到配套版本 ${updateResult.version ?? "?"}，请重启标签页生效`
+              : `对齐失败：${updateResult.error ?? "未知错误"}`}
           </span>
           <button className="chat-notice-close" onClick={() => useUiStore.getState().setUpdateResult(null)} title="关闭">×</button>
         </div>
       ) : updateInfo ? (
         <div className="chat-notice update">
           <span className="chat-notice-text">
-            {piUpdating
-              ? "正在更新 pi agent 和扩展包…"
+            {piAligning
+              ? "正在对齐目标机上的 pi…"
               : updateBannerText(updateInfo)}
           </span>
           <button
             className="btn btn-primary chat-notice-btn"
-            disabled={piUpdating}
-            onClick={() => void useUiStore.getState().runPiUpdate()}
+            disabled={piAligning}
+            onClick={() => void useUiStore.getState().runPiAlign()}
           >
-            {piUpdating ? "更新中…" : "立即更新"}
+            {piAligning ? "对齐中…" : "对齐版本"}
           </button>
           <button className="chat-notice-close" onClick={() => useUiStore.getState().setUpdateInfo(null)} title="关闭">×</button>
         </div>

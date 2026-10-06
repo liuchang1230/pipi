@@ -114,6 +114,7 @@ export function targetPiCommand(target: PiTarget | undefined, command: string): 
 
 /** Build the remote align command. No single quotes (it nests inside
  * `bash -ic '…'`) and no shell metacharacters from inputs.
+ * 只装我们钉住的那个版本：用户自己配的扩展包不是 app 的事（ADR 0009）。
  * When withRegistryFallback is set, npm falls back to npmmirror in the SAME
  * command: the official registry is frequently unreachable from China
  * servers (direct egress), and when npm can't reach a registry it may serve
@@ -129,7 +130,7 @@ export function buildRemoteAlignCommand(version: string, withRegistryFallback = 
   const npmFlags = "--fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000";
   const npmInstall = `npm install -g ${npmFlags} @earendil-works/pi-coding-agent@${version}`;
   const npmSpec = withRegistryFallback ? `${npmInstall} || ${npmInstall} --registry=https://registry.npmmirror.com` : npmInstall;
-  return `P=$(command -v pi || true); case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac && (pi update --extensions 2>/dev/null || true)`;
+  return `P=$(command -v pi || true); case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac`;
 }
 
 /** 把一行 POSIX 脚本放进登录交互 shell。脚本自身**不能含单引号**（会提前
