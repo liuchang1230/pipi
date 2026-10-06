@@ -32,13 +32,18 @@ beforeEach(() => {
 });
 
 describe("wslArgv", () => {
-  it("selects the distro, ends wsl's own options, and uses a login interactive shell", () => {
-    expect(wslArgv("Debian", "pi --version")).toEqual(["-d", "Debian", "--", "bash", "-ic", "pi --version"]);
+  it("selects the distro, bypasses wsl.exe's $VAR pre-expansion, and uses a login interactive shell", () => {
+    // --exec（而非 --）+ PATH 清洗：预展开会把 $VAR 展开成空（Windows 侧环境），
+    // 清洗则让宿主 npm shim 不再透过 /mnt/* 赢 —— 两者都实测过。
+    expect(wslArgv("Debian", "pi --version")).toEqual([
+      "-d", "Debian", "--exec", "/bin/bash", "-ic",
+      'PATH=$(printf %s "$PATH" | tr ":" "\\n" | grep -v "^/mnt/" | paste -sd:) && export PATH && pi --version',
+    ]);
   });
 
   it("passes the command as the last argument and never grows with a payload", () => {
     const argv = wslArgv("Debian", `bash -ic '${"QUJD".repeat(50_000)}'`);
-    expect(argv.slice(0, 5)).toEqual(["-d", "Debian", "--", "bash", "-ic"]);
+    expect(argv.slice(0, 5)).toEqual(["-d", "Debian", "--exec", "/bin/bash", "-ic"]);
     expect(argv).toHaveLength(6);
   });
 });

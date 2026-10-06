@@ -25,6 +25,7 @@ import { Client as SshClient } from "ssh2";
 import { debugLog, debugLogDebug, debugLogWarn } from "./debug-log";
 import { isSshAuthError } from "./sftp-failure";
 import { piEnv, piShellPrefix } from "./pi-env";
+import { wslInnerCommand } from "./wsl-shell";
 import {
   closeTab, createTab, getTab, linkTabSession, markTabRemoteDown, markTabRemoteReady, registerExternalTab, setTabTitle, unregisterExternalTab,
   type CreateTabOptions, type RemoteOpts, type TabInfo, type WslOpts,
@@ -405,11 +406,13 @@ export class RpcSession {
         ? sessionArg(wslSessionToLinux(opts.wsl.distro, opts.sessionPath))
         : `${piShellPrefix()}pi --mode rpc`;
       const wslBin = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "wsl.exe");
-      const wslCmd = `cd ${cdArg(opts.wsl.path || "~")} && ${inner}`;
+      // --exec 绕开 wsl.exe 的 $VAR 预展开（详情见 wsl-shell.ts）；
+      // PATH 清洗让聊天跑的是发行版自己的 pi（ADR 0010）。
+      const wslCmd = wslInnerCommand(`cd ${cdArg(opts.wsl.path || "~")} && ${inner}`);
       debugLog("rpc", `tab ${id} CMD wsl=${opts.wsl.distro} ${JSON.stringify(wslCmd)}`);
       this.transport = new ChildProcessTransport(
         existsSync(wslBin) ? wslBin : "wsl.exe",
-        ["-d", opts.wsl.distro, "--", "bash", "-ic", wslCmd],
+        ["-d", opts.wsl.distro, "--exec", "/bin/bash", "-ic", wslCmd],
         process.cwd(),
         label
       );

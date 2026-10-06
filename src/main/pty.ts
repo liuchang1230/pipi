@@ -20,6 +20,7 @@ import { sessionDirFor } from "./session-list";
 import { debugLog } from "./debug-log";
 import { piEnv, piShellPrefix } from "./pi-env";
 import { parseWslDistroList, type WslDistro } from "./wsl";
+import { wslInnerCommand } from "./wsl-shell";
 import { themeEnv } from "./theme-sync";
 import { TERMINAL_THEMES, type ThemeMode } from "../shared/terminal-theme";
 
@@ -1461,10 +1462,13 @@ function createWslTab(id: string, opts: CreateTabOptions): string {
     : `if command -v pi >/dev/null 2>&1; then ${piShellPrefix()}pi; else echo [\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u68c0\u6d4b\u5230pi-agent\uff0c\u5df2\u5207\u6362\u5230\u666e\u901ashell]; fi; exec bash -i`;
 
   const wslBin = findWslBin();
+  // --exec 绕开 wsl.exe 的 $VAR 预展开（见 wsl-shell.ts）；PATH 清洗与探针/
+  // 聊天同一规则（ADR 0010）：终端里的 pi 也是发行版自己的，否则探针说「没装」、
+  // 终端却启动了宿主 pi —— 两处真相。
   const wslArgs = [
     "-d", w.distro,
-    "--", "bash", "-ic",
-    `cd ${cdArg(wslPath)} && ${modeEnv} ${inner}`,
+    "--exec", "/bin/bash", "-ic",
+    wslInnerCommand(`cd ${cdArg(wslPath)} && ${modeEnv} ${inner}`),
   ];
 
   const sessionBase = sessionTitleFromFile(opts.sessionPath ?? "")
