@@ -64,7 +64,10 @@ try {
   await sleepMs(5000);
 
   console.log("chat-pane:", await evaluate(ws, "!!document.querySelector('.chat-pane')"));
-  console.log("booted placeholder gone:", await evaluate(ws, `!document.querySelector('.chat-placeholder')`));
+  // The transcript area legitimately still shows a wait line at 5s on a WSL/remote
+  // tab (the transcript crosses SFTP after pi is already ready), so log WHICH
+  // line it is instead of asking whether the area is empty.
+  console.log("transcript wait line:", JSON.stringify(await evaluate(ws, `document.querySelector('.chat-placeholder')?.textContent ?? null`)));
   console.log("model shown:", await evaluate(ws, `document.querySelector('.chat-header-model')?.textContent`));
   console.log("tab summary:", JSON.stringify(await evaluate(ws, `window.api.tab.list().then(ts => ts.find(t => t.id === ${JSON.stringify(id)}))`, true)));
 
@@ -79,7 +82,7 @@ try {
   }
   console.log("settled:", settled, "| reply:", JSON.stringify(text.slice(0, 60)));
   console.log("model after settle:", await evaluate(ws, `document.querySelector('.chat-header-model')?.textContent`));
-  console.log("booted after settle:", await evaluate(ws, `!document.querySelector('.chat-placeholder')`));
+  console.log("transcript wait line after settle:", JSON.stringify(await evaluate(ws, `document.querySelector('.chat-placeholder')?.textContent ?? null`)));
 
   await evaluate(ws, `window.api.tab.close(${JSON.stringify(id)})`, true);
   console.log("DONE");

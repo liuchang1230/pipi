@@ -8,11 +8,24 @@
  */
 import { create } from "zustand";
 import { isCancelledTurnMessage } from "../../../shared/abort-message";
+import { compactionSummaryOf } from "../../../shared/transcript";
 
 /** Bash prints these for EVERY `bash -ic` exec without a pty. They say the
  *  command had no tty, not that anything failed, so they must never be shown
  *  as the reason a tab ended. */
 const SHELL_NOISE = /cannot set terminal process group|no job control in this shell/i;
+
+/** pi's closing advice when extensions fail to load. It is advice, never a
+ *  cause: pi prints its `Error:` diagnostics FIRST and this hint LAST (see the
+ *  EXTENSION_LOAD_FAILURE_HINT block in pi's main.js), so "the last useful
+ *  line" surfaced the hint and threw the cause away. A real remote tab went
+ *  through this and could only report "start without extensions" — advice for
+ *  a machine that cannot start. */
+const PI_CLOSING_ADVICE = /^Hint: Start without extensions/i;
+
+/** pi's diagnostic prefix — `reportDiagnostics` prints every failed extension
+ *  as `Error: <message>`, naming the file and the clash. */
+const PI_ERROR_LINE = /^Error: /;
 
 /** Pick the useful line from a failed pi process's stderr for the exit banner.
  * `bash -i` without a TTY prints job-control noise first; pi's own error (the
@@ -20,7 +33,12 @@ const SHELL_NOISE = /cannot set terminal process group|no job control in this sh
 export function pickExitErrorLine(stderr: string | undefined): string | null {
   const lines = (stderr ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
   if (lines.length === 0) return null;
-  return [...lines].reverse().find((l) => !SHELL_NOISE.test(l)) ?? lines[0]!;
+  const useful = lines.filter((l) => !SHELL_NOISE.test(l) && !PI_CLOSING_ADVICE.test(l));
+  // pi's own diagnostics outrank the "last line" heuristic: when the process
+  // died because it could not load something, the cause is the first Error.
+  const diagnostic = useful.find((l) => PI_ERROR_LINE.test(l));
+  if (diagnostic) return diagnostic;
+  return [...useful].reverse()[0] ?? lines[0]!;
 }
 
 /** Transport-level death, as opposed to pi itself failing: our own ssh2/ssh.exe
@@ -74,9 +92,16 @@ export type ChatBlock =
 
 export interface ChatMessage {
   id: string;
-  role: "user" | "assistant";
+  /**
+   * `summary` is pi's compaction summary (see shared/transcript.ts): a context
+   * artifact, NOT something the user typed — it is neither a user bubble nor an
+   * assistant reply, so it gets its own row and its own renderer.
+   */
+  role: "user" | "assistant" | "summary";
   status: "streaming" | "done";
   blocks: ChatBlock[];
+  /** For role "summary": pi's context size before the compaction (header). */
+  tokensBefore?: number;
   /** Model stream error on this message (e.g. "Provider finish_reason: error"). */
   error?: string;
   /**
@@ -115,6 +140,11 @@ export type TurnPhase =
   | "cancelled"
   | "completed"
   | "failed"
+  /** The transport died under a remote session and main is re-opening it (see
+   *  rpc-session.ts RECONNECT_DELAYS_MS). Not terminal: the tab comes back by
+   *  itself, so this must NOT read as an error and must not be in
+   *  pendingTurnPhases (state_ready clears it to "ready"). */
+  | "reconnecting"
   | "exited";
 
 export interface TurnStatus {
@@ -172,8 +202,21 @@ export interface ChatTabState {
    *  WHILE compacting, because "which context am I summarizing" is the honest
    *  explanation for a long-running compaction. */
   contextTokens?: number;
-  /** Result of the last compaction (for the "压缩完成" toast/banner). */
-  lastCompactionSummary?: { before: number; after: number | null };
+  /** Result of the last completed compaction — the timeline's 「压缩完成」 notice.
+   *  `summary` is what pi's own TUI renders after a compaction (and what the
+   *  model now sees); dropping it left the chat view unable to say anything but
+   *  "compressing", which is why a finished /compact looked stuck. */
+  lastCompactionSummary?: {
+    /** Context tokens before compaction (pi's `tokensBefore`). */
+    before: number;
+    /** pi's estimate after compaction; null when pi reported none. */
+    after: number | null;
+    /** pi's summary text — the thing the model context now starts with. */
+    summary?: string;
+    reason?: "manual" | "threshold" | "overflow";
+    /** When it finished (also the notice's identity, for dismissal). */
+    at: number;
+  };
   /** Monotonic turn counter. A prompt that STARTS a turn increments it; a steer
    *  into the running turn keeps it. Assistant messages are tagged with it so a
    *  late event cannot mutate a newer turn's bubble. */
@@ -669,9 +712,9 @@ function attachToolResults(messages: ChatMessage[], toolResults: ToolResultLike[
   }
 }
 
-function messageOf(raw: unknown): { id?: string; role?: string; content?: unknown } | null {
+function messageOf(raw: unknown): { id?: string; role?: string; content?: unknown; summary?: unknown; tokensBefore?: number } | null {
   if (!raw || typeof raw !== "object") return null;
-  const m = raw as { id?: string; role?: string; content?: unknown };
+  const m = raw as { id?: string; role?: string; content?: unknown; summary?: unknown; tokensBefore?: number };
   return m;
 }
 
@@ -754,6 +797,27 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     for (const raw of messages) {
       const m = messageOf(raw);
       if (!m) continue;
+      // A compaction summary is a context artifact, never a bubble the user or
+      // the model wrote: pi inlines it as a user message in the live context
+      // (`get_messages` on a local tab) and as a `compactionSummary` message on
+      // the file path. Rendering the first as a user bubble and DROPPING the
+      // second are both wrong for the same reason (see shared/transcript.ts).
+      const summary =
+        m.role === "compactionSummary"
+          ? compactionSummaryOf(m.role, typeof m.summary === "string" ? m.summary : "")
+          : m.role === "user"
+            ? compactionSummaryOf(m.role, textOf(m.content))
+            : undefined;
+      if (summary !== undefined) {
+        chatMessages.push({
+          id: m.id ?? `hist-${chatMessages.length}`,
+          role: "summary",
+          status: "done",
+          blocks: [{ kind: "text", contentIndex: 0, text: summary, done: true }],
+          tokensBefore: typeof m.tokensBefore === "number" ? m.tokensBefore : undefined,
+        });
+        continue;
+      }
       if (m.role === "user") {
         chatMessages.push({
           id: m.id ?? `hist-${chatMessages.length}`,
@@ -795,6 +859,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
           messages: merged,
           booted: true,
           historyLoaded: true,
+          // The 「压缩完成」 notice is TRANSIENT: it exists only until a fresh
+          // snapshot arrives (mount / switch back from the terminal view / `/new`
+          // / fork / navigation). From then on the snapshot is authoritative —
+          // a compaction still in effect shows up as its own 上下文摘要 row, and
+          // one the user navigated away from (or `/new` dropped) must NOT keep
+          // claiming the context was compacted.
+          lastCompactionSummary: undefined,
           // A history reload must not clear live output that arrived after
           // the request was sent. The ChatView request generation decides
           // whether this snapshot is still current before calling here.
@@ -841,6 +912,30 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         states: { ...s.states, [tabId]: { ...s.states[tabId]!, messages: fn(s.states[tabId]!.messages) } },
       }));
 
+    if (type === "rpc_reconnecting") {
+      // Main lost the SSH transport and is re-opening the SAME tab: pi is gone,
+      // so whatever turn was running is over — say that instead of leaving
+      // "正在回复…" spinning on a pane nothing will ever answer.
+      const attempt = typeof event.attempt === "number" ? event.attempt : 1;
+      const maxAttempts = typeof event.maxAttempts === "number" ? event.maxAttempts : 5;
+      const seconds = Math.max(1, Math.round((typeof event.delayMs === "number" ? event.delayMs : 0) / 1000));
+      const cause = typeof event.detail === "string" && event.detail.trim() ? `（${event.detail.trim().slice(0, 80)}）` : "";
+      patch({
+        isStreaming: false,
+        lastError: undefined,
+        // The transcript on screen is from before the drop, but the session file
+        // on the server is canonical (pi may have flushed more of the dead turn
+        // than we saw). Force the next state_ready — the reconnected pi's own
+        // boot frame — to re-read it.
+        historyLoaded: false,
+        turn: {
+          phase: "reconnecting",
+          lastActivityAt: Date.now(),
+          detail: `与服务器的连接已断开${cause}，正在自动重连（第 ${attempt}/${maxAttempts} 次，${seconds}s 后）`,
+        },
+      });
+      return;
+    }
     if (type === "app_phase") {
       const phase = event.phase;
       if (phase === "connecting" || phase === "starting" || phase === "ready") {
@@ -981,20 +1076,50 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
       return;
     }
     if (type === "compaction_end") {
-      const result = event.result as { tokensBefore?: number; estimatedTokensAfter?: number } | null | undefined;
+      const result = event.result as
+        | { tokensBefore?: number; estimatedTokensAfter?: number; summary?: string }
+        | null
+        | undefined;
+      const failed = !!(event.errorMessage && !event.aborted);
+      const aborted = !!event.aborted;
+      const reason = event.reason === "manual" || event.reason === "threshold" || event.reason === "overflow" ? event.reason : undefined;
       patch({
         compacting: false,
         compactionNote: undefined,
         compactionStartedAt: undefined,
         lastCompactionSummary:
-          result && typeof result.tokensBefore === "number"
-            ? { before: result.tokensBefore, after: result.estimatedTokensAfter ?? null }
-            : undefined,
+          !failed && result && typeof result.tokensBefore === "number"
+            ? {
+                before: result.tokensBefore,
+                after: result.estimatedTokensAfter ?? null,
+                summary: typeof result.summary === "string" && result.summary.length > 0 ? result.summary : undefined,
+                reason,
+                at: Date.now(),
+              }
+            : st.lastCompactionSummary,
         // Failed compaction is the terminal state for this turn.
-        lastError: event.errorMessage && !event.aborted ? (event.errorMessage as string) : undefined,
-        turn: event.errorMessage && !event.aborted
+        lastError: failed ? (event.errorMessage as string) : undefined,
+        abortResolved: aborted ? true : st.abortResolved,
+        turn: failed
           ? { phase: "failed", lastActivityAt: Date.now(), detail: event.errorMessage as string }
-          : st.turn,
+          : aborted
+            // The user's 停止 landed on the compaction. Nothing will settle
+            // afterwards (no agent run), and `abortOutstanding` gates the NEXT
+            // prompt into `deferredPrompts` until a settle arrives — so the abort
+            // has to be closed HERE, or the message typed right after cancelling a
+            // compaction waits for a settle that can never come.
+            ? { phase: "cancelled", lastActivityAt: Date.now(), detail: "已取消压缩" }
+            : st.isStreaming
+              // Auto-compaction happens INSIDE a live run (overflow) and the agent
+              // continues right after it: the turn is still pi's, so a terminal
+              // phase here would flash 「✓ Agent 已完成」 mid-turn.
+              ? { phase: "thinking", lastActivityAt: Date.now(), detail: "摘要已生成，继续本轮" }
+              // `/compact` is not an agent run — no agent_settled follows to move
+              // the phase, and `state_ready` preserves pending phases (compacting
+              // is one), so compaction_end is the ONLY exit. Leaving `st.turn`
+              // here is what left the status bar spinning 「正在压缩上下文…」 after
+              // the compaction had already finished.
+              : { phase: "completed", completedAt: Date.now(), lastActivityAt: Date.now(), detail: "上下文已压缩" },
       });
       return;
     }
@@ -1375,6 +1500,24 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     get().ensure(tabId);
     const st = get().states[tabId]!;
     if (st.exited) return;
+    // A reconnect is in flight: the transport under this tab is dead, so a
+    // prompt written now would vanish. Refuse it WITH the reason (the generic
+    // "send failed" came too late and blamed the wrong thing) and put the
+    // draft back — but keep the "正在自动重连" phase instead of letting
+    // rejectPrompt relabel the turn "failed".
+    if (st.turn.phase === "reconnecting") {
+      set((s) => {
+        const cur = s.states[tabId];
+        if (!cur) return {};
+        return {
+          states: {
+            ...s.states,
+            [tabId]: { ...cur, lastError: "连接已断开，正在自动重连（无需手动操作），请稍候再发送。", restoreInput: displayText },
+          },
+        };
+      });
+      return;
+    }
     const id = `local-${++localSeq}`;
     // pi answers every prompt command with a response frame carrying this id:
     // success = preflight passed (the turn starts), failure = pi refused the

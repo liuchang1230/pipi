@@ -17,6 +17,8 @@
 | `get_state` 的 steeringMode / followUpMode / autoCompactionEnabled 不展示 | — | UI 层没消费 |
 | 树导航靠桥扩展 | RPC 无 `navigate_tree`，SDK 原生 `session.navigateTree()` | 协议缺能力 |
 
+**已补（2026-10-04）**：上表「UI 层没消费」那一类里的扩展 UI 声明（`setStatus` / `setWidget` / `setTitle`）不再是丢弃的帧——它们成了**扩展界面面**（按 tab 存活、权威状态住主进程、两台后端形状一致），见 `docs/adr/0006-extension-ui-surface.md`。对话框那一半（select/confirm/input/editor）仍走 `UiDialog`；`extension_error` 不清面是已知限制（写在同一个 ADR）。
+
 关键洞察（决定方案形态）：
 
 1. **RPC 协议面 = SDK 会话能力的序列化形态**。`runRpcMode` 内部就是 `session.bindExtensions({ uiContext })` + 把扩展 UI 请求转成 `extension_ui_request` 帧；SDK 事件（message_update / tool_execution_* / agent_settled / queue_update）与 RPC 帧同构。因此"事件归一化"几乎是免费的：SDK backend 直接把 SDK 事件转发成 RPC 帧形状即可，**渲染层事件处理零改动**。

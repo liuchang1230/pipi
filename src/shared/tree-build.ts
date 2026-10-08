@@ -55,6 +55,15 @@ export interface TreeNode {
  * elsewhere (a ring like A→B→A) is promoted to a root instead of creating a
  * circular children reference (which is what made the previous nested-tree
  * transport explode in contextBridge).
+ *
+ * "Cycle-safe" also means a DUPLICATE id cannot close a ring: each id is
+ * attached once, from its FIRST occurrence, so the node object and the parentId
+ * the ring check reads always come from the same occurrence. Attaching every
+ * occurrence while checking only the LAST parentId is exactly how a duplicate id
+ * with a divergent parentId slipped past the check and handed the renderer a
+ * cyclic tree, which hangs `flattenTree` forever (docs/diagnosis/2026-10-07.md).
+ * pi ids are unique per session; a repeat is a rewritten file or a stale cursor
+ * batch, and the first occurrence is as truthful as the last.
  */
 export function buildTreeFromEntries(entries: TreeEntry[]): { tree: TreeNode[] } {
   // Resolve label entries first (only truthy label strings set a label).
@@ -67,6 +76,7 @@ export function buildTreeFromEntries(entries: TreeEntry[]): { tree: TreeNode[] }
   }
   const nodeMap = new Map<string, TreeNode>();
   for (const e of entries) {
+    if (nodeMap.has(e.id)) continue; // first occurrence wins (see the note above)
     nodeMap.set(e.id, { entry: e, children: [] });
   }
   // Cycle detection must not walk the parent chain once PER ENTRY: on a linear
@@ -75,7 +85,9 @@ export function buildTreeFromEntries(entries: TreeEntry[]): { tree: TreeNode[] }
   // main thread, i.e. exactly the "打开分支有点卡顿" the user reported. Instead
   // the chains are coloured once with memoization, so the total work is O(n).
   const parentOf = new Map<string, string | null>();
-  for (const e of entries) parentOf.set(e.id, e.parentId ?? null);
+  for (const e of entries) {
+    if (!parentOf.has(e.id)) parentOf.set(e.id, e.parentId ?? null);
+  }
   const UNKNOWN = 0;
   const VISITING = 1;
   const CLEAN = 2; // provably not on a cycle (may lead into one)
@@ -114,9 +126,15 @@ export function buildTreeFromEntries(entries: TreeEntry[]): { tree: TreeNode[] }
   };
 
   const roots: TreeNode[] = [];
+  // Each id is attached exactly once: a duplicate occurrence must not push the same
+  // node into a second parent's children (that is the ring hole), nor push it into
+  // `roots` twice (a row rendered twice).
+  const attachedIds = new Set<string>();
   for (const e of entries) {
     const node = nodeMap.get(e.id);
     if (!node) continue;
+    if (attachedIds.has(e.id)) continue;
+    attachedIds.add(e.id);
     const l = labels.get(e.id);
     if (l) {
       if (l.label !== undefined) node.label = l.label;

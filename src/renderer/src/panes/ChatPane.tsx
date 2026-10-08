@@ -11,6 +11,7 @@ import { useShallow } from "zustand/react/shallow";
 import Markdown from "../Markdown";
 import { useChatStore, exitBannerText, type ChatBlock, type ChatMessage } from "../stores/chatStore";
 import { useTabsStore } from "../stores/tabsStore";
+import { useTasksStore, useTask } from "../stores/tasksStore";
 import { useUiStore } from "../stores/uiStore";
 import { updateBannerText } from "../pi-drift-text";
 import { UiDialog, handleFireAndForget, type UiRequest } from "../dialogs/UiDialog";
@@ -33,17 +34,32 @@ import {
 } from "../components/tool-summary";
 import { SlashMenu } from "../components/SlashMenu";
 import { SkillChips } from "../components/SkillChips";
+import { ExtensionStatusChips, ExtensionUiZone } from "../components/ExtensionUiZone";
+import { useExtensionUi } from "../stores/extensionUiStore";
+import { editorTextAction, titleOf } from "../stores/extension-ui-view";
 import { FileMentionMenu } from "../components/FileMentionMenu";
 import { Icon } from "../components/Icon";
 import { fileMentionPaths, fileMentionTokenAt, filterFileMentions, replaceFileMention, type FileMention } from "../file-mentions";
 import { modelSyncAppliesTo } from "../model-sync";
 import { projectLabelForTab } from "../project-label";
 import { createHistoryGate } from "./history-gate";
-import { INTERNAL_RPC_ID_PREFIX } from "../../../shared/transcript";
+import {
+  HISTORY_TASK_LABEL,
+  HISTORY_TASK_POLICY,
+  deriveTranscriptWait,
+  historyTaskKey,
+} from "./chat-transcript-wait";
+import { INITIAL_JUMP_STATE, nextJumpToNewest } from "./chat-scroll";
+import { isInternalProbeId } from "../../../shared/transcript";
 
 /** "65" → "1m 5s" (running-time display). */
 function fmtElapsed(s: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+/** Context sizes in the compaction notice: 150000 → "150k". */
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
 }
 
 /** Await `p`, or resolve `null` if it takes longer than `ms` (and map a
@@ -102,13 +118,93 @@ import {
 
 // --- Block renderers --------------------------------------------------------
 
+/** Inline budget for a FINISHED thinking block. Streaming text is never
+ *  truncated: the tail is what the reader is watching grow. */
+const THINKING_INLINE_MAX_CHARS = 3000;
+/** A streaming thinking block grows one token at a time, and re-running the
+ *  Markdown pipeline (+ highlight.js) per token costs far more than the paint —
+ *  the same trade-off the assistant text block makes below. Rich text therefore
+ *  refreshes on a timer while the block streams, and exactly once when it ends. */
+const THINKING_MD_THROTTLE_MS = 400;
+
+/**
+ * Leading + trailing throttle: the first delta paints immediately (thinking must
+ * not look dead when it starts) and the last one always lands, so the rendered
+ * text can never lag the model by more than THINKING_MD_THROTTLE_MS. `done` is
+ * passed through exactly — the final render has to be byte-faithful.
+ */
+function useThrottledText(text: string, done: boolean): string {
+  const [shown, setShown] = useState(text);
+  // The trailing timer fires outside React's render, so it reads the newest text
+  // through a ref rather than closing over the text of the render that armed it.
+  // Synced in an effect (declared first, so it runs before the throttle effect of
+  // the same commit) rather than during render.
+  const latestRef = useRef(text);
+  const lastAtRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    latestRef.current = text;
+  }, [text]);
+
+  useEffect(() => {
+    if (done) {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
+      setShown(text);
+      return;
+    }
+    const elapsed = Date.now() - lastAtRef.current;
+    if (elapsed >= THINKING_MD_THROTTLE_MS) {
+      lastAtRef.current = Date.now();
+      setShown(text);
+      return;
+    }
+    if (timerRef.current) return; // a trailing update is already scheduled
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      lastAtRef.current = Date.now();
+      setShown(latestRef.current);
+    }, THINKING_MD_THROTTLE_MS - elapsed);
+  }, [text, done]);
+
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  return done ? text : shown;
+}
+
 function ThinkingBlock({ block }: { block: Extract<ChatBlock, { kind: "thinking" }> }) {
-  const [open, setOpen] = useState(false);
+  // Expanded by default: the reasoning is content, not noise, and the summary
+  // line stays on as the collapse affordance.
+  const [open, setOpen] = useState(true);
+  const [showFull, setShowFull] = useState(false);
   const streaming = !block.done;
+  const rich = useThrottledText(block.text, block.done);
+  // Truncate only a FINISHED block — cutting a live stream short would hide the
+  // newest reasoning, which is exactly the part being read.
+  const truncated = block.done && !showFull && block.text.length > THINKING_INLINE_MAX_CHARS;
+  const body = truncated ? block.text.slice(0, THINKING_INLINE_MAX_CHARS) : rich;
   return (
     <details className="chat-thinking" open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
-      <summary>{streaming ? "思考中…" : `思考过程${open ? "" : `（${block.text.length} 字）`}`}</summary>
-      <pre className="chat-thinking-body">{block.text}</pre>
+      <summary>{streaming ? "思考中…" : `思考过程 · ${block.text.length.toLocaleString()} 字`}</summary>
+      {/* Mounted only while expanded: a collapsed `<details>` still mounts and
+          (under react-markdown) parses its children, so a transcript full of
+          collapsed thinking blocks would pay for all of them. */}
+      {open && body.trim().length > 0 && (
+        <div className="chat-thinking-body">
+          <Markdown content={body} plainCode={block.text.length > CHAT_MARKDOWN_MAX_CHARS} disableStrikeThrough />
+        </div>
+      )}
+      {open && truncated && (
+        <button className="chat-expand-output" onClick={() => setShowFull(true)}>
+          展开完整思考（{block.text.length.toLocaleString()} 字）
+        </button>
+      )}
+      {open && block.done && showFull && block.text.length > THINKING_INLINE_MAX_CHARS && (
+        <button className="chat-expand-output" onClick={() => setShowFull(false)}>
+          收起
+        </button>
+      )}
     </details>
   );
 }
@@ -370,6 +466,26 @@ const AssistantBlocks = memo(function AssistantBlocks({ blocks }: { blocks: Chat
 });
 
 const MessageView = memo(function MessageView({ message }: { message: ChatMessage }) {
+  if (message.role === "summary") {
+    // pi's compaction summary is a CONTEXT artifact: it was never typed by the
+    // user and never written by the model. Collapsed by default (a real summary
+    // is thousands of characters), and emphatically not a user bubble — see
+    // shared/transcript.ts for the two shapes this arrives in.
+    const text = message.blocks[0]?.kind === "text" ? message.blocks[0].text : "";
+    return (
+      <details className="chat-msg summary">
+        <summary>
+          上下文摘要
+          {typeof message.tokensBefore === "number" ? `（压缩前约 ${fmtTokens(message.tokensBefore)} tokens）` : ""}
+          {" "}
+          <span className="chat-msg-summary-hint">点开查看</span>
+        </summary>
+        <div className="chat-msg-md">
+          <Markdown content={text} plainCode={text.length > CHAT_MARKDOWN_MAX_CHARS} disableStrikeThrough />
+        </div>
+      </details>
+    );
+  }
   if (message.role === "user") {
     const text = message.blocks[0]?.kind === "text" ? message.blocks[0].text : "";
     return (
@@ -476,13 +592,29 @@ const HIDDEN_TIMELINE = {
   compacting: false,
   compactionNote: undefined as string | undefined,
   compactionStartedAt: undefined as number | undefined,
+  lastCompactionSummary: undefined as
+    | { before: number; after: number | null; summary?: string; reason?: "manual" | "threshold" | "overflow"; at: number }
+    | undefined,
   retryInfo: null,
   steeringQueue: [] as string[],
   followUpQueue: [] as string[],
   lastError: undefined as string | undefined,
+  historyLoaded: false,
+  exited: false,
 };
 
-const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeoutDetail }: { tabId: string; bootTimedOut: boolean; bootTimeoutDetail?: string | null }) {
+const ChatTimeline = memo(function ChatTimeline({
+  tabId,
+  bootTimedOut,
+  bootTimeoutDetail,
+  onRetryHistory,
+}: {
+  tabId: string;
+  bootTimedOut: boolean;
+  bootTimeoutDetail?: string | null;
+  /** Re-request the transcript (the task's own retry is preferred when registered). */
+  onRetryHistory: () => void;
+}) {
   const timeline = useChatStore(useShallow((s) => {
     const st = s.states[tabId];
     // Zustand selectors must return a stable snapshot while the async session
@@ -498,13 +630,48 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       compacting: !!st.compacting,
       compactionNote: st.compactionNote,
       compactionStartedAt: st.compactionStartedAt,
+      lastCompactionSummary: st.lastCompactionSummary,
       retryInfo: st.retryInfo ?? null,
       steeringQueue: st.steeringQueue ?? HIDDEN_TIMELINE.steeringQueue,
       followUpQueue: st.followUpQueue ?? HIDDEN_TIMELINE.followUpQueue,
       lastError: st.lastError,
+      historyLoaded: !!st.historyLoaded,
+      exited: !!st.exited,
     };
   }));
   const { messages, isStreaming } = timeline;
+  /**
+   * What the transcript area shows while there is nothing to read yet. All of
+   * it is decided in chat-transcript-wait.ts (pure + unit-tested): the boot
+   * line, the still-downloading line with its own elapsed clock, the terminal
+   * failure with a retry, and the empty-session hint. Deriving it here from the
+   * live task (not a local flag) is what keeps "loading" and "cleared" from
+   * drifting apart — the drift that used to drop the boot line onto a blank
+   * area while the transcript was still crossing the link.
+   */
+  const historyTask = useTask(historyTaskKey(tabId));
+  const [, tickWait] = useState(0);
+  const wait = deriveTranscriptWait({
+    booted: timeline.booted,
+    bootStage: timeline.bootStage,
+    bootTimedOut,
+    exited: timeline.exited,
+    messageCount: messages.length,
+    historyLoaded: timeline.historyLoaded,
+    historyPhase: historyTask?.phase,
+    historyStartedAt: historyTask?.startedAt,
+    historyError: historyTask?.error,
+    historyDetail: historyTask?.detail,
+  });
+  const waitingForTranscript = wait.kind === "history" || wait.kind === "history-failed";
+  useEffect(() => {
+    // A frozen 「已等待 12s」 is the same lie as a frozen spinner: tick it while
+    // the wait lasts (the task's own sweep only fires at the phase boundaries).
+    if (!waitingForTranscript) return;
+    const timer = setInterval(() => tickWait((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, [waitingForTranscript]);
+  const retryWait = historyTask?.retry ?? onRetryHistory;
   // Scroll state. Windowing (below) needs the element + stickiness refs, and the
   // reveal-anchor machinery keeps "load older" from jumping the viewport.
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -512,6 +679,15 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
   const revealAnchorRef = useRef<{ height: number; top: number } | null>(null);
   const revealLockedRef = useRef(false);
   const scrollFrameRef = useRef<number | null>(null);
+  /**
+   * "Open at the newest message" — see chat-scroll.ts for why a landed snapshot
+   * owes one jump and when that debt is dropped instead of spent. `mountedCount`
+   * is the message count as of the previous pass, i.e. whether there was already
+   * a position worth keeping (it is deliberately read BEFORE this pass updates
+   * it, so a snapshot landing on a fresh container still jumps).
+   */
+  const jumpRef = useRef(INITIAL_JUMP_STATE);
+  const mountedCountRef = useRef(0);
   /**
    * How many of the newest messages are mounted. The list is TAIL-ANCHORED:
    * `slice(-visibleCount)` plus an explicit "load older" step — deliberately NOT a
@@ -543,6 +719,33 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
+    const next = nextJumpToNewest(jumpRef.current, {
+      historyLoaded: timeline.historyLoaded,
+      clientHeight: el?.clientHeight ?? 0,
+      hadContent: mountedCountRef.current > 0,
+      atBottom: stickToBottom.current,
+    });
+    jumpRef.current = next.state;
+    mountedCountRef.current = messages.length;
+    if (!next.jump || !el) return;
+    // The jump itself re-arms stickiness: after it, the reader IS at the bottom.
+    stickToBottom.current = true;
+    el.scrollTop = el.scrollHeight;
+    // One late re-pin. Rows can grow AFTER this layout pass (an attached image
+    // decodes, a lazily-shaped block settles), which would leave the viewport
+    // short of the newest message with no further store event to correct it —
+    // i.e. still "opening slightly above the bottom". Guarded by the same
+    // stickiness the live follow uses, so it can never fight a reader who has
+    // scrolled away in that frame (or a "load older" that is mid-flight).
+    requestAnimationFrame(() => {
+      if (!stickToBottom.current || revealLockedRef.current) return;
+      const current = scrollRef.current;
+      if (current) current.scrollTop = current.scrollHeight;
+    });
+  }, [messages, timeline.historyLoaded]);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
     if (!el) return;
     const anchor = revealAnchorRef.current;
     if (anchor) {
@@ -551,7 +754,7 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
       requestAnimationFrame(() => { revealLockedRef.current = false; });
       return;
     }
-    if (!isStreaming) return; // no live content → the browser owns the position
+    if (!isStreaming) return; // no live content → the browser owns the position (the snapshot jump above already positioned the list)
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     if (distanceFromBottom > 60 || scrollFrameRef.current !== null) return;
     scrollFrameRef.current = requestAnimationFrame(() => {
@@ -585,6 +788,20 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
     return () => clearInterval(timer);
   }, [timeline.compactionStartedAt]);
 
+  /**
+   * The 「压缩完成」 notice. `/compact` used to end in silence: the progress
+   * banner was cleared, nothing was said about the outcome, and (before the
+   * store fix) the status bar still claimed to be compressing. The notice
+   * reports the outcome AND pi's summary — the same thing pi's own TUI renders
+   * after a compaction — so "it finished" is verifiable instead of inferred.
+   *
+   * Dismissal is keyed by the compaction's timestamp (a set, not a single flag:
+   * one notice per compaction, per tab).
+   */
+  const compaction = timeline.lastCompactionSummary;
+  const [openSummaryAt, setOpenSummaryAt] = useState<number | null>(null);
+  const [dismissedAt, setDismissedAt] = useState<readonly number[]>([]);
+
   const revealOlder = () => {
     const el = scrollRef.current;
     if (!el || revealLockedRef.current || hiddenCount <= 0) return;
@@ -597,14 +814,29 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
     <div className="chat-scroll" ref={scrollRef} onScroll={onScrollPosition} onWheel={(e) => {
       if (e.deltaY < 0 && e.currentTarget.scrollTop < 80) revealOlder();
     }}>
-      {!timeline.booted && !bootTimedOut && <div className="chat-placeholder">{timeline.bootStage === "connecting" ? "正在连接远程 Pi…" : "正在启动 Pi…"}</div>}
-      {!timeline.booted && bootTimedOut && (
+      {wait.kind === "boot-connecting" || wait.kind === "boot-starting" || wait.kind === "empty" ? (
+        <div className="chat-placeholder">{wait.text}</div>
+      ) : null}
+      {wait.kind === "history" && (
+        <div className="chat-placeholder chat-wait">
+          <div>{wait.text}</div>
+          {wait.retry && <button className="chat-btn" onClick={retryWait}>重试</button>}
+        </div>
+      )}
+      {wait.kind === "boot-timeout" && (
         <div className="chat-error-banner">
-          pi 启动超时（远程服务器可能未安装 pi，或连接失败）。可切换到终端视图排查。
+          {wait.text}
           {bootTimeoutDetail && <div className="chat-error-detail">远程输出：{bootTimeoutDetail}</div>}
         </div>
       )}
-      {messages.length === 0 && timeline.booted && <div className="chat-placeholder">输入问题开始对话（鼠标可直接点击、选中、编辑输入内容）</div>}
+      {wait.kind === "history-failed" && (
+        <div className="chat-error-banner">
+          <div>{wait.text}</div>
+          {wait.detail && <div className="chat-error-detail">原因：{wait.detail}</div>}
+          {wait.hint && <div className="chat-error-detail">建议：{wait.hint}</div>}
+          <button className="chat-btn" onClick={retryWait}>重新读取</button>
+        </div>
+      )}
       {hiddenCount > 0 && <div className="chat-load-older" onClick={revealOlder}>↑ 更早的消息已折叠（还有 {hiddenCount} 条）— 点击或滚动到顶部加载</div>}
       {visibleMessages.map((message) => <MessageView key={message.id} message={message} />)}
       {timeline.compacting && (
@@ -617,6 +849,38 @@ const ChatTimeline = memo(function ChatTimeline({ tabId, bootTimedOut, bootTimeo
         </div>
       )}
       {timeline.retryInfo && <div className="chat-retry-banner">模型错误：{timeline.retryInfo.errorMessage} — 正在重试 {timeline.retryInfo.attempt}/{timeline.retryInfo.maxAttempts}（退避等待）…</div>}
+      {compaction && !dismissedAt.includes(compaction.at) && (
+        <div className="chat-compaction-done">
+          <div className="chat-compaction-done-head">
+            <span>
+              ✓ 上下文已压缩：{fmtTokens(compaction.before)}
+              {compaction.after !== null ? ` → ${fmtTokens(compaction.after)}` : ""} tokens
+              {compaction.reason === "overflow" ? "（上下文溢出触发）" : compaction.reason === "threshold" ? "（接近上限触发）" : ""}
+            </span>
+            {compaction.summary ? (
+              <button
+                className="chat-btn"
+                onClick={() => setOpenSummaryAt((cur) => (cur === compaction.at ? null : compaction.at))}
+              >
+                {openSummaryAt === compaction.at ? "收起摘要" : "查看摘要"}
+              </button>
+            ) : null}
+            <button className="chat-btn" onClick={() => setDismissedAt((cur) => [...cur, compaction.at])}>
+              知道了
+            </button>
+          </div>
+          {openSummaryAt === compaction.at && compaction.summary ? (
+            <div className="chat-compaction-done-body">
+              {/* pi 生成的摘要原文：模型接下来的上下文就以它为开头 */}
+              <Markdown
+                content={compaction.summary}
+                plainCode={compaction.summary.length > CHAT_MARKDOWN_MAX_CHARS}
+                disableStrikeThrough
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
       {timeline.steeringQueue.length > 0 && <div className="chat-queue-banner">⏳ 排队（当前回合后发送）：{timeline.steeringQueue.join(" · ")}</div>}
       {timeline.followUpQueue.length > 0 && <div className="chat-queue-banner">⏳ 排队（agent 完成后发送）：{timeline.followUpQueue.join(" · ")}</div>}
       {timeline.lastError && <div className="chat-error-banner">{timeline.lastError}</div>}
@@ -680,6 +944,21 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
   }));
   const activeTab = useTabsStore((s) => s.activeTab);
   const [input, setInput] = useState("");
+  /** Mirror of `input` for callbacks registered once (extension_ui_request):
+   *  an extension's set_editor_text arrives long after the commit that opened
+   *  the frame, so reading the state variable inside that closure would test a
+   *  stale draft. */
+  const inputRef = useRef("");
+  useEffect(() => {
+    inputRef.current = input;
+  }, [input]);
+  /** Text an extension wanted to put in the composer while a draft was there.
+   *  Kept as a one-click hint instead of overwriting what the user typed. */
+  const [pendingEditorText, setPendingEditorText] = useState<string | null>(null);
+  /** pi's extension UI surface for this tab (title / status / widgets), mirrored
+   *  from main. Attached by the tab list, not by this mount. */
+  const extensionSurface = useExtensionUi(tabId);
+  const extensionTitle = titleOf(extensionSurface);
   const [uiReq, setUiReq] = useState<UiRequest | null>(null);
   // Full multi-question UI for ask_user_question (parity with the TUI): the
   // first walker dialog is held unanswered while the user fills the
@@ -839,9 +1118,27 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     const seq = ++historyRequestSeq.current;
     historyLoadedRef.current = false;
     useChatStore.getState().markHistoryLoading(tabId);
+    // The wait is a TASK, not a boolean (invariants #2): the transcript is the
+    // slow half of opening a session (file-first over SFTP/SSH), and while it
+    // is in flight the transcript area must say so — the boot placeholder used
+    // to vanish the moment pi answered `state_ready`, leaving a blank area that
+    // read as "卡住了". The task also makes the wait BOUNDED: T1 turns it into
+    // "已等待 Ns · 重试", and the terminal phase plus `settle(error)` below is
+    // the honest end for a download that never arrives.
+    const taskKey = historyTaskKey(tabId);
+    useTasksStore.getState().begin(taskKey, {
+      label: HISTORY_TASK_LABEL,
+      policy: HISTORY_TASK_POLICY,
+      // Required: the coalesced re-run path below starts a new attempt while
+      // the previous attempt's task is still `running`.
+      restart: true,
+      retry: () => requestHistoryRef.current({ preferRpc: true }),
+    });
+    let applied = false;
 
     const apply = (messages: unknown[] | undefined, tailOf?: { total: number }) => {
       if (seq !== historyRequestSeq.current || !messages) return;
+      applied = true;
       historyLoadedRef.current = true;
       useChatStore.getState().initMessages(tabId, messages, tailOf);
     };
@@ -883,8 +1180,16 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         // A trigger that arrived mid-flight still needs a snapshot (it may be
         // a branch navigation, whose payload the settled request predates).
         // Triggers are event-driven — mount / state_ready / navigation, never
-        // a timer — so this adds at most one download per burst.
-        if (rerun) requestHistoryRef.current(opts);
+        // a timer — so this adds at most one download per burst. The re-run
+        // restarts the task itself, so this attempt must not settle it.
+        if (rerun) {
+          requestHistoryRef.current(opts);
+          return;
+        }
+        // Both paths are exhausted (the file attempt is bounded, and so is the
+        // RPC one). Nothing will arrive on its own: the wait must end in a
+        // visible failure with a retry, never as an eternal 正在读取 line.
+        useTasksStore.getState().settle(taskKey, applied ? undefined : { error: new Error("pi 未返回会话历史（get_messages 无响应）") });
       });
   }, [tabId]);
   requestHistoryRef.current = requestHistory;
@@ -970,10 +1275,11 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
       lastEventAtRef.current = Date.now();
       if (unresponsiveRef.current) flagUnresponsive(null);
       // Responses to MAIN's internal probes (the transcript provider's
-      // get_state) are not this component's requests. Letting one reach the
-      // `state_ready` branch below would re-enter requestHistory → probe → …
-      // (a self-feeding loop), so they are dropped here.
-      if (typeof event.id === "string" && event.id.startsWith(INTERNAL_RPC_ID_PREFIX)) return;
+      // get_state and its `get_entries {since}` tip probe) are not this
+      // component's requests. Letting one reach the `state_ready` branch below
+      // would re-enter requestHistory → probe → … (a self-feeding loop), so
+      // they are dropped here (shared isInternalProbeId).
+      if (isInternalProbeId(event.id)) return;
       if (event.type === "rpc_unresponsive") {
         // Main's post-boot silence watchdog: a command was written and not a
         // single byte came back — the pipe is gone (silently dropped SSH flow,
@@ -1111,6 +1417,16 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
         }
         return;
       }
+      if (event.type === "state_ready" && event.reconnected === true) {
+        // Main's boot handshake (rpc-session.ts probeState) carrying the
+        // reconnect flag: a dropped SSH transport was just re-opened under this
+        // SAME tab, so the transcript on screen is the one we had BEFORE the
+        // drop while the session file on the server is canonical (pi may have
+        // flushed more of the dead turn than we saw). Re-read it, then fall
+        // through so the store still gets this frame's model/booted/phase.
+        requestHistory();
+        void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
+      }
       if (event.type === "agent_settled") {
         // Refresh stats after a turn completes.
         void window.api.tab.rpcSend(tabId, { type: "get_session_stats" });
@@ -1124,8 +1440,23 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     const offUi = window.api.onRpcUiRequest(tabId, (raw) => {
       const req = raw as unknown as UiRequest;
       const consumed = handleFireAndForget(req, (text) => {
-        setInput(text);
+        // An extension's set_editor_text must never destroy a draft the user is
+        // typing: fill only an EMPTY composer (the same contract
+        // chatStore.restoreInput follows); otherwise keep the draft and leave a
+        // clickable hint so the text is not silently thrown away.
+        const action = editorTextAction(inputRef.current, text);
+        if (!action) return;
+        if (action.kind === "hint") {
+          setPendingEditorText(action.text);
+          return;
+        }
+        setPendingEditorText(null);
+        setInput(action.text);
+        // Grow AFTER the commit: the textarea is sized by measurement, so
+        // growing now would measure the previous draft and clip a multi-line
+        // fill until the user's next keystroke.
         requestAnimationFrame(() => {
+          grow();
           taRef.current?.focus();
         });
       });
@@ -1399,8 +1730,11 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     queued: state?.turn.detail ?? "消息已排队",
     cancelling: "正在停止…",
     cancelled: "■ 已停止",
-    completed: "✓ Agent 已完成",
+    completed: state?.turn.detail ?? "✓ Agent 已完成",
     failed: state?.turn.detail ?? "本轮出现错误",
+    // Auto-reconnect (rpc-session.ts): the tab re-opens itself, so this line
+    // carries the attempt count and the backoff instead of a dead banner.
+    reconnecting: state?.turn.detail ?? "连接已断开，正在自动重连…",
     exited: "Pi 已退出",
   };
   const phaseActive = !["ready", "completed", "failed", "exited", "cancelled"].includes(phase);
@@ -1730,6 +2064,9 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
     // the expanded <file> context, matching the native TUI's UX.
     useChatStore.getState().sendPrompt(tabId, `${text}${attachments.join("")}`, images.length ? images : undefined, text);
     setInput((current) => current === input ? "" : current);
+    // The extension's awaited text was about the draft that just went out;
+    // keeping the hint up offers to paste it into an empty box for no reason.
+    setPendingEditorText(null);
     setSlashOpen(false);
     setMentionOpen(false);
     } catch (error) {
@@ -2016,6 +2353,17 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
               <Icon name="folder" /> {project.short}
             </button>
           )}
+          {/* pi's setTitle (an extension declaring "which session am I in",
+              e.g. pi-rewind's checkpoint marker). It goes in the LEFT group
+              next to the project, not in the header's right side
+              (tree/terminal buttons): everything on the right is an action.
+              Rendered only when an extension declared one — an always-present
+              empty element would be a hole in the header. */}
+          {extensionTitle && (
+            <span className="chat-ext-title" title={extensionTitle}>
+              {extensionTitle}
+            </span>
+          )}
           <span className="chat-model-switch-wrap">
             <button
               className="chat-header-btn chat-model-btn"
@@ -2226,7 +2574,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
 
       <ChatNotices />
 
-      <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} bootTimeoutDetail={bootTimeoutDetail} />
+      <ChatTimeline tabId={tabId} bootTimedOut={bootTimedOut} bootTimeoutDetail={bootTimeoutDetail} onRetryHistory={requestHistory} />
 
       {exited && (() => {
         const banner = exitBannerText(state?.exitCode, state?.exitDetail);
@@ -2284,6 +2632,32 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
           />
         )}
         <SkillChips skills={skillCommands} onInsert={insertSkill} />
+        <ExtensionUiZone surface={extensionSurface} placement="aboveEditor" />
+        {/* An extension called setEditorText while a draft was in the box: the
+            draft won, and this is the one-click way to still get the text. */}
+        {pendingEditorText !== null && (
+          <div className="chat-ext-editor-hint">
+            <span className="chat-ext-editor-hint-text">扩展提供了输入内容，未覆盖你的草稿</span>
+            <button
+              className="chat-btn"
+              onClick={() => {
+                setInput(pendingEditorText);
+                setPendingEditorText(null);
+                // Same as the fill path above: grow() measures, so it has to run
+                // after React committed the new value.
+                requestAnimationFrame(() => {
+                  grow();
+                  taRef.current?.focus();
+                });
+              }}
+            >
+              替换
+            </button>
+            <button className="chat-btn" onClick={() => setPendingEditorText(null)}>
+              忽略
+            </button>
+          </div>
+        )}
         <textarea
           ref={taRef}
           className="chat-textarea"
@@ -2336,6 +2710,9 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
                 })()
               : "用量将在首轮对话后显示"}
           </span>
+          {/* 扩展声明的 status 紧跟用量：两者都是本会话的事实（◆ 3 checkpoints 与
+              ↑…↓… · 缓存… · 26.5% 是一句话的两半）。 */}
+          <ExtensionStatusChips surface={extensionSurface} />
           <span className="chat-input-hint">
             {phase === "cancelling" ? "正在停止…" : isStreaming ? "Enter 排队（steer）· Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行 · @ 引用文件 · / 命令"}
           </span>
@@ -2348,6 +2725,7 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
             发送
           </button>
         </div>
+        <ExtensionUiZone surface={extensionSurface} placement="belowEditor" />
       </div>
       {uiReq && <UiDialog tabId={tabId} req={uiReq} onClose={() => setUiReq(null)} />}
       {questionnaire && (
@@ -2381,7 +2759,12 @@ export const ChatView = memo(function ChatView({ tabId, active = true }: { tabId
             void window.api.tab.rpcSend(tabId, { type: "get_state" });
             setInput(editorText ?? "");
             if (editorText) {
-              requestAnimationFrame(() => taRef.current?.focus());
+              // grow() measures the textarea, so it has to run after the commit
+              // (same as the extension set_editor_text path above).
+              requestAnimationFrame(() => {
+                grow();
+                taRef.current?.focus();
+              });
             }
           }}
         />

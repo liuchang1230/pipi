@@ -2,7 +2,7 @@
 // Shared by the main process (file parsing) and the renderer (RPC
 // get_entries responses). No SDK / Electron runtime needed.
 import { describe, expect, it } from "vitest";
-import { buildTreeFromEntries, type TreeEntry } from "../tree-build";
+import { buildTreeFromEntries, type TreeEntry, type TreeNode } from "../tree-build";
 
 function entries(...objs: Array<Record<string, unknown>>): TreeEntry[] {
   return objs.map((o) => ({ type: "message", parentId: null, ...o }) as unknown as TreeEntry);
@@ -52,6 +52,35 @@ describe("buildTreeFromEntries", () => {
       stack.push(...n.children);
     }
     expect(nodes).toBe(2);
+  });
+
+  it("never creates circular children references when a DUPLICATE id disagrees about parentId", () => {
+    // Not the A→B→A ring above: the same id appears twice, and the LAST occurrence
+    // is the harmless one. Because the old build attached EVERY occurrence while the
+    // ring check read only the LAST parentId per id, this closed a real cycle in the
+    // returned tree (a→b and b→a) — which hangs flattenTree forever in the renderer.
+    const es = entries(
+      { id: "a", parentId: "b" },   // non-last a: an edge a→b
+      { id: "b", parentId: "a" },   // b→a
+      { id: "a", parentId: null },  // last a: the parentId the ring check sees
+    );
+    const { tree } = buildTreeFromEntries(es);
+    // A depth-first walk that refuses to revisit a node on its own path: a cycle
+    // makes it fail instead of hanging the test run.
+    const onPath = new Set<TreeNode>();
+    const visited: string[] = [];
+    const walk = (nodes: TreeNode[]): void => {
+      for (const n of nodes) {
+        expect(onPath.has(n)).toBe(false); // circular children reference
+        onPath.add(n);
+        visited.push(n.entry.id);
+        walk(n.children);
+        onPath.delete(n);
+      }
+    };
+    walk(tree);
+    // Each id is attached exactly once — no row rendered twice.
+    expect(visited.slice().sort()).toEqual(["a", "b"]);
   });
 
   it("resolves labels, clears on falsy/empty, keeps on truthy", () => {

@@ -64,6 +64,34 @@ export function ancestorIds(entries: readonly TreeEntry[], nodeId: string): stri
 }
 
 /**
+ * The nearest ANCESTOR of `startId` (starting from its parent) that `isVisible` accepts,
+ * or `null` when the chain runs out.
+ *
+ * Bounded: a malformed parentId RING (A→B→A) must not spin forever. The branch
+ * dialog's "move the selection to a still-visible ancestor" effect used to walk the
+ * chain with no bound, so a ring among rows the filter HIDES froze the renderer —
+ * no crash screen, no error, just a window that stops answering (docs/diagnosis/
+ * 2026-10-07.md). Every other parent-chain walk in the codebase is already bounded
+ * this way (`ancestorIds`, `foldedAwayIds`, the transcript builder).
+ */
+export function nearestVisibleAncestor(
+  parentOf: ReadonlyMap<string, string | null>,
+  startId: string,
+  isVisible: (id: string) => boolean,
+): string | null {
+  const seen = new Set<string>();
+  let current = parentOf.get(startId) ?? null;
+  while (current !== null) {
+    // Probe each id at most once: an unbounded walk cycles forever on a ring.
+    if (seen.has(current)) return null;
+    seen.add(current);
+    if (isVisible(current)) return current;
+    current = parentOf.get(current) ?? null;
+  }
+  return null;
+}
+
+/**
  * Is `targetId` the current position, or an ancestor of it?
  *
  * This is "the session is now sitting at/under the node I clicked". Checking

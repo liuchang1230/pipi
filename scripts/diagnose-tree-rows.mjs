@@ -186,6 +186,30 @@ try {
   console.log("open dialog:", opened);
   await sleep(3000);
 
+  // Entry paging (docs/adr/0011-session-entry-paging.md): the dialog now opens on the
+  // NEWEST page of the session file, and its older pages arrive on demand. This harness
+  // asserts on the session HEAD (where its two forks are seeded), so load the rest first —
+  // exactly what a user does by scrolling up. Without this the head is not even mounted and
+  // the branch-mark check below would pass/fail on the wrong rows.
+  const loaded = await evaluateNamed(ws, "load-all-pages", `(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    let clicks = 0;
+    // The button is disabled WHILE a page is loading too, so only its absence means "no more
+    // pages" — breaking on a disabled one would stop after a single page on a slow target.
+    for (let i = 0; i < 25; i += 1) {
+      const btn = document.querySelector('.tree-dialog .tree-earlier-btn');
+      if (!btn) break;
+      if (!btn.disabled) {
+        btn.click();
+        clicks += 1;
+      }
+      await wait(1200);
+    }
+    return { clicks, rows: document.querySelectorAll('.tree-dialog .tree-scroll .tree-row').length, stillLoading: !!document.querySelector('.tree-dialog .tree-earlier-btn') };
+  })()`, true);
+  console.log("loaded older pages:", JSON.stringify(loaded));
+  await sleep(500);
+
   /** Measure row geometry at the current scroll position. */
   const measure = `(() => {
     const el = document.querySelector('.tree-dialog .tree-scroll');

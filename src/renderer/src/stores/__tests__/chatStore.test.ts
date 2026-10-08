@@ -532,6 +532,36 @@ describe("pickExitErrorLine", () => {
     expect(pickExitErrorLine(stderr)).toBe("TypeError: webidl.util.markAsUncloneable is not a function");
   });
 
+  // Captured verbatim from a real remote tab (pipi-debug.log, code 1): pi
+  // refuses to start when two extensions register the same tool name, prints
+  // one `Error:` per failed extension, and ENDS with an advisory hint. Taking
+  // the last line showed the user only "start without extensions" — advice for
+  // a machine that cannot start, with nothing to act on.
+  const PI_STARTUP_FAILURE_STDERR = [
+    "[pi-web-access] Dynamic tool activation requires Pi 0.86.0 or newer; web tools remain eagerly available.",
+    'Error: Failed to load extension "/home/crscu/.pi/agent/extensions/delegation/index.ts": Tool "analyst" conflicts with /home/crscu/.pi/agent/extensions/analyst/index.ts',
+    'Error: Failed to load extension "/home/crscu/.pi/agent/extensions/reviewer/index.ts": Tool "reviewer" conflicts with /home/crscu/.pi/agent/extensions/delegation/index.ts',
+    'Error: Failed to load extension "/home/crscu/.pi/agent/extensions/scout/index.ts": Tool "scout" conflicts with /home/crscu/.pi/agent/extensions/delegation/index.ts',
+    'Hint: Start without extensions using "pi -ne".',
+  ].join("\n");
+
+  it("surfaces pi's own Error: line, not its trailing advisory hint", async () => {
+    const { pickExitErrorLine } = await import("../chatStore");
+    const line = pickExitErrorLine(PI_STARTUP_FAILURE_STDERR);
+    expect(line).toContain('Tool "analyst" conflicts');
+    expect(line).not.toContain("pi -ne");
+    // The extension's own version warning is not the reason pi died.
+    expect(line).not.toContain("pi-web-access");
+  });
+
+  it("reports a name clash as an abnormal pi exit with the clashing tool named", async () => {
+    const { exitBannerText, pickExitErrorLine } = await import("../chatStore");
+    const banner = exitBannerText(1, pickExitErrorLine(PI_STARTUP_FAILURE_STDERR));
+    expect(banner.kind).toBe("crash");
+    expect(banner.headline).toContain("异常退出");
+    expect(banner.detail).toContain('Tool "analyst" conflicts');
+  });
+
   it("returns the only line when there is no noise", () => {
     return import("../chatStore").then(({ pickExitErrorLine }) => {
       expect(pickExitErrorLine("pi: command not found")).toBe("pi: command not found");
@@ -1222,7 +1252,8 @@ describe("compaction progress", () => {
     expect(st.compacting).toBe(false);
     expect(st.compactionStartedAt).toBeUndefined();
     expect(st.compactionNote).toBeUndefined();
-    expect(st.lastCompactionSummary).toEqual({ before: 150000, after: 32000 });
+    expect(st.lastCompactionSummary).toMatchObject({ before: 150000, after: 32000, summary: "s", reason: "manual" });
+    expect(st.lastCompactionSummary?.at).toBeGreaterThan(0);
   });
 
   it("a cancelled compaction is not a failure", () => {
@@ -1233,5 +1264,114 @@ describe("compaction progress", () => {
     const st = useChatStore.getState().states[T]!;
     expect(st.compacting).toBe(false);
     expect(st.lastError).toBeUndefined();
+  });
+
+  /**
+   * 「/compact 其实已经压缩好了，但一直显示『正在压缩上下文』」.
+   *
+   * `/compact` is NOT an agent run: pi emits compaction_start/compaction_end and
+   * never agent_start/agent_settled, so nothing else ever moves the turn off the
+   * phase compaction_start set. `state_ready` deliberately preserves pending
+   * phases ("compacting" is one), so not even a get_state snapshot rescues it —
+   * ChatPane's `phaseActive` kept the spinner and its 「已运行 Xs」 clock running
+   * until the user happened to send the next message.
+   */
+  it("a finished compaction lands the turn instead of leaving it on compacting", () => {
+    apply([
+      { type: "compaction_start", reason: "manual" },
+      { type: "compaction_end", reason: "manual", result: { summary: "s", tokensBefore: 150000, estimatedTokensAfter: 32000 } },
+    ]);
+    expect(useChatStore.getState().states[T]!.turn.phase).toBe("completed");
+  });
+
+  it("a cancelled compaction lands on cancelled, not on compacting", () => {
+    apply([
+      { type: "compaction_start", reason: "manual" },
+      { type: "compaction_end", reason: "manual", aborted: true },
+    ]);
+    expect(useChatStore.getState().states[T]!.turn.phase).toBe("cancelled");
+  });
+
+  it("a compaction inside a live turn keeps the turn running", () => {
+    // pi's overflow compaction happens mid-run and the agent continues right
+    // after it (willRetry): a terminal phase here would flash 「✓ Agent 已完成」
+    // in the middle of a turn that is still streaming.
+    apply([
+      { type: "agent_start" },
+      { type: "compaction_start", reason: "overflow" },
+      { type: "compaction_end", reason: "overflow", willRetry: true, result: { summary: "s", tokensBefore: 150000, estimatedTokensAfter: 32000 } },
+    ]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.isStreaming).toBe(true);
+    expect(st.turn.phase).toBe("thinking");
+  });
+
+  it("cancelling a compaction closes the abort it was cancelled by", () => {
+    // The user pressed 停止 while pi was summarizing. No agent_settled follows
+    // (no agent run), and `abortOutstanding` routes the NEXT prompt into
+    // deferredPrompts until a settle arrives — so compaction_end is the only
+    // place that can close the abort. Otherwise the message typed right after
+    // cancelling a compaction is held back waiting for a settle that cannot come.
+    (globalThis as { window?: { api?: unknown } }).window = {
+      api: { tab: { rpcSend: vi.fn().mockResolvedValue(true) } },
+    };
+    apply([{ type: "compaction_start", reason: "manual" }]);
+    useChatStore.getState().abort(T);
+    apply([{ type: "compaction_end", reason: "manual", aborted: true }]);
+    const st = useChatStore.getState().states[T]!;
+    expect(st.turn.phase).toBe("cancelled");
+    expect(st.abortResolved).toBe(true);
+  });
+});
+
+/**
+ * pi's compaction summary reaches the chat view in TWO shapes, and neither is
+ * something the user typed:
+ *
+ *  - session-file path (remote/WSL): a `compactionSummary` message
+ *    (shared/transcript.ts) — which `initMessages` used to DROP silently, so a
+ *    compacted remote session showed no sign of the compaction at all;
+ *  - live `get_messages` (local SDK tabs): the same summary wrapped by pi into a
+ *    USER message ("The conversation history before this point was compacted
+ *    into the following summary:\n\n<summary>…</summary>") — which rendered as a
+ *    wall of English inside a user bubble.
+ */
+describe("compaction summary in the transcript", () => {
+  it("renders the file path's compactionSummary entry as a summary", () => {
+    useChatStore.getState().initMessages(T, [
+      { role: "compactionSummary", summary: "早期对话摘要", tokensBefore: 150000, timestamp: 1 },
+      { role: "user", content: [{ type: "text", text: "接下来做什么" }], timestamp: 2 },
+    ]);
+    const messages = useChatStore.getState().states[T]!.messages;
+    expect(messages.map((m) => m.role)).toEqual(["summary", "user"]);
+    expect(messages[0]!.blocks[0]).toMatchObject({ kind: "text", text: "早期对话摘要" });
+    expect(messages[0]!.tokensBefore).toBe(150000);
+    expect(messages[1]!.blocks[0]).toMatchObject({ kind: "text", text: "接下来做什么" });
+  });
+
+  it("unwraps the <summary> envelope a live get_messages returns", () => {
+    const wrapped =
+      "The conversation history before this point was compacted into the following summary:\n\n<summary>\n" +
+      "· 用户在修 /compact 的进度显示\n</summary>";
+    useChatStore.getState().initMessages(T, [
+      { role: "user", content: [{ type: "text", text: wrapped }], timestamp: 1 },
+    ]);
+    const messages = useChatStore.getState().states[T]!.messages;
+    expect(messages.map((m) => m.role)).toEqual(["summary"]);
+    expect(messages[0]!.blocks[0]).toMatchObject({ kind: "text", text: "· 用户在修 /compact 的进度显示" });
+  });
+
+  it("a fresh snapshot retires the transient notice", () => {
+    // The notice is what /compact has to show IMMEDIATELY (no history refresh
+    // follows a compaction on purpose). Once a snapshot does arrive it owns the
+    // truth: a compaction still in effect is a 上下文摘要 row, and one the user
+    // navigated away from (`/new`, fork) must stop claiming the context was cut.
+    apply([
+      { type: "compaction_start", reason: "manual" },
+      { type: "compaction_end", reason: "manual", result: { summary: "s", tokensBefore: 150000, estimatedTokensAfter: 32000 } },
+    ]);
+    expect(useChatStore.getState().states[T]!.lastCompactionSummary).toMatchObject({ before: 150000, after: 32000 });
+    useChatStore.getState().initMessages(T, []);
+    expect(useChatStore.getState().states[T]!.lastCompactionSummary).toBeUndefined();
   });
 });

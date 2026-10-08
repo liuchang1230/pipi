@@ -42,12 +42,16 @@
  * "（无匹配）". Identical snapshots (same entries + leaf) are dropped
  * instead of re-rendering — the poll costs nothing while nothing changes.
  */
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useUiStore } from "../stores/uiStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useChatStore } from "../stores/chatStore";
 import { buildTreeFromEntries, type TreeEntry, type TreeNode } from "../../../shared/tree-build";
-import { flattenTree, isAlreadyAtTarget, isNavigationSettled, type TreeFlatRow, type TreeRowMarker } from "../../../shared/tree-layout";
+import { indexToolCalls } from "../../../shared/tree-index";
+import { projectEntry, type SessionPageCursor, type SessionPageDegradation } from "../../../shared/session-page";
+import { restoreScrollTop, type ScrollAnchor } from "../../../shared/scroll-anchor";
+import { isInternalProbeId } from "../../../shared/transcript";
+import { flattenTree, isAlreadyAtTarget, isNavigationSettled, nearestVisibleAncestor, type TreeFlatRow, type TreeRowMarker } from "../../../shared/tree-layout";
 import { activeFolds, applyVisibility, foldedAwayIds, formatEntryTime, type TreeFilterMode } from "../../../shared/tree-view";
 import { createEntriesSlot, ENTRIES_STALL_MS } from "./tree-poll-guard";
 import { parseEditArgs } from "../components/DiffView";
@@ -110,6 +114,36 @@ function formatToolCall(name: string, args: unknown): string {
 
 /** Tools that mutate files — their nodes are rollback checkpoints. */
 const EDIT_TOOLS = new Set(["edit", "apply_patch", "write_file", "write"]);
+
+/** RPC `get_entries` batches arrive as raw pi entries; the dialog only ever renders
+ *  projected ones (see shared/session-page.ts), so both sources agree on one shape. */
+function projectEntries(raw: readonly unknown[]): TreeEntry[] {
+  const out: TreeEntry[] = [];
+  for (const record of raw) {
+    const entry = projectEntry(record);
+    if (entry) out.push(entry);
+  }
+  return out;
+}
+
+/** A session-file read that never answers must not leave the dialog empty (or the paging
+ *  bar stuck disabled) forever: on both paths we degrade to something visible instead —
+ *  the RPC full load for the first page, and a re-enabled bar for a later one. Invariant #1
+ *  (stalls are bounded and visible) is what this deadline buys. */
+const PAGE_READ_TIMEOUT_MS = 20_000;
+
+function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label}超时（${Math.round(ms / 1000)}s）`)), ms);
+      promise.then(
+        () => clearTimeout(timer),
+        () => clearTimeout(timer),
+      );
+    }),
+  ]);
+}
 
 function isEditToolCall(tc: { name: string; args: unknown } | undefined): { path?: string } | null {
   if (!tc || !EDIT_TOOLS.has(tc.name)) return null;
@@ -370,6 +404,38 @@ export function TreeDialog({
    *  path not linked yet, pi still booting) is worth retrying; a real read
    *  failure would just repeat the same SFTP/ssh cost. */
   const fileAttemptRef = useRef<{ error: string; at: number }>({ error: "", at: 0 });
+  /**
+   * The OLDER end of what we hold: where the next page continues, whether there is
+   * one, and whether this link could serve it cheaply.
+   *
+   * Why pages at all: reading the whole session file (and shipping every entry) is
+   * what made opening the branch dialog on a long session freeze the app — 8 MB for a
+   * 2763-entry session, and the remote one that reported it was 10-50x that. The file
+   * is append-only, so the RECENT conversation is one ranged read away and the rest is
+   * fetched only when the user asks for it (docs/adr/0011-session-entry-paging.md).
+   */
+  const [earlierPage, setEarlierPage] = useState<{ cursor: SessionPageCursor | null; eof: boolean; degraded: SessionPageDegradation | null }>({ cursor: null, eof: true, degraded: null });
+  const earlierPageRef = useRef(earlierPage);
+  earlierPageRef.current = earlierPage;
+  const [earlierLoading, setEarlierLoading] = useState(false);
+  const loadingEarlierRef = useRef(false);
+  /** The row the reader is looking at when a page prepend is in flight, plus where the list
+   *  sat: the viewport must stay on IT (see shared/scroll-anchor.ts), or loading earlier
+   *  history jumps. */
+  const anchorRef = useRef<ScrollAnchor | null>(null);
+  /** Armed once per prepend so the restoring layout effect runs even when the page added no
+   *  VISIBLE row (active search / folded subtree) — a stale anchor would then fire on some
+   *  later list change and yank the reader back. */
+  const [prependSeq, setPrependSeq] = useState(0);
+  const prevVisibleCountRef = useRef(0);
+  /** Bumped when the loaded entries are known to belong to a DIFFERENT session (pi rejected
+   *  our cursor: /new, session switch, rewind). An older-page read that started before that
+   *  must not be spliced onto the new session's entries — its ids are all "unknown" again. */
+  const sessionGenRef = useRef(0);
+  const loadEarlierRef = useRef<() => void>(() => {});
+  /** Mirrors the load effect's `applyEarlier` (recreated per tab) so `loadEarlier`, which
+   *  lives in component scope, can update the cursor ref and the state together. */
+  const applyEarlierPageRef = useRef<(next: { cursor: SessionPageCursor | null; eof: boolean; degraded: SessionPageDegradation | null }) => void>(() => {});
 
   useEffect(() => {
     // Initial fetch + auto-refresh loop. get_tree answers may be delayed
@@ -377,7 +443,18 @@ export function TreeDialog({
     // loop re-asks every 3s while the dialog is open (paused during
     // navigation — the navigation poll owns get_tree then) and surfaces an
     // explicit error when rpcSend reports the tab is gone.
+    //
+    // Gated on the session-file page: a poll that fires first would ask pi for the WHOLE
+    // session (the payload a page exists to avoid). `tryFileSnapshot` sends the first
+    // refresh itself, right after it either applied a page or gave up on one.
+    const applyEarlier = (next: { cursor: SessionPageCursor | null; eof: boolean; degraded: SessionPageDegradation | null }) => {
+      earlierPageRef.current = next;
+      setEarlierPage(next);
+    };
+    applyEarlierPageRef.current = applyEarlier;
+    let baseSettled = false;
     const sendRefresh = () => {
+      if (!baseSettled) return;
       // get_entries (flat) instead of get_tree (nested): Electron's
       // contextBridge rejects trees nested deeper than 1000 levels, which a
       // long linear session is. The renderer rebuilds the tree from entries.
@@ -421,7 +498,10 @@ export function TreeDialog({
       }
       return true;
     };
-    const applySnapshot = (batch: TreeEntry[], nextLeaf: string | null, mode: "replace" | "append") => {
+    const applySnapshot = (rawBatch: unknown[], nextLeaf: string | null, mode: "replace" | "append") => {
+      // Projected here too: the RPC delta arrives as raw pi entries, and every consumer
+      // below (tree build, rows, search) must see the same shape the file page produces.
+      const batch = projectEntries(rawBatch);
       const prev = lastSnapshotRef.current;
       let entries: TreeEntry[];
       if (mode === "append" && prev) {
@@ -435,6 +515,10 @@ export function TreeDialog({
         // array identity: every useMemo below keys on it.
         entries = prev && sameEntries(prev.entries, batch) ? prev.entries : batch;
         knownEntryIdsRef.current = new Set(batch.map((e) => e.id));
+        // A full answer from pi contains the whole session, so there is nothing older to
+        // page in — and after a rewind/rollback the file itself was rewritten, so the byte
+        // cursor we held is no longer trustworthy either.
+        applyEarlier({ cursor: null, eof: true, degraded: null });
       }
       const lastId = entries.length ? entries[entries.length - 1]!.id : null;
       // Advance the cursor for the next poll (never move it backwards).
@@ -475,18 +559,31 @@ export function TreeDialog({
       setTreeStatus("ready");
       setSlowTicks(0);
     };
-    sendRefresh();
+    /**
+     * The BASE of the tree: the newest page of the session file. Every later poll is a
+     * delta after it (`get_entries {since}`), so opening the dialog costs one bounded read
+     * instead of the whole session — and a remote pi still booting (or dead) cannot hold
+     * the recent conversation hostage, because pi is not on this path at all.
+     */
     const tryFileSnapshot = () => {
-      void window.api.tree.fromFile(tabId)
+      void withDeadline(window.api.tree.fromFile(tabId), PAGE_READ_TIMEOUT_MS, "会话文件读取")
         .then((res) => {
-          window.api.debug.log(`TreeDialog(${tabId}) fromFile ok=${res.ok} ${res.error ?? ""} entries=${Array.isArray(res.entries) ? res.entries.length : "?"}`);
+          window.api.debug.log(
+            `TreeDialog(${tabId}) fromFile tail ok=${res.ok} ${res.ok ? "" : res.error} entries=${res.ok ? res.entries.length : "?"}` +
+              `${res.ok ? ` cursor=${res.cursor?.byteOffset ?? "-"} eof=${res.eof}${res.degraded ? ` degraded=${res.degraded}` : ""}` : ""}`,
+          );
           fileAttemptRef.current = { error: res.ok ? "" : String(res.error ?? ""), at: Date.now() };
-          // Skip when live data already arrived, OR while a navigation is in
-          // flight — the snapshot's stale leaf must not trip the navigation
+          baseSettled = true;
+          // Skip when live data already arrived (a full RPC answer is a superset of a page),
+          // OR while a navigation is in flight — a page's leaf must not trip the navigation
           // completion detector (which fires on leafId change + navigatingId).
-          if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current && Array.isArray(res.entries)) {
-            const entries = res.entries as TreeEntry[];
+          if (res.ok && !rpcTreeArrivedRef.current && !pendingNavRequestId.current) {
+            const entries = projectEntries(res.entries);
             lastSnapshotRef.current = { entries, leafId: res.leafId ?? null };
+            knownEntryIdsRef.current = new Set(entries.map((e) => e.id));
+            // Continue from the newest entry we hold, so the next poll is a delta.
+            entriesCursorRef.current = entries[entries.length - 1]?.id ?? null;
+            applyEarlier({ cursor: res.cursor, eof: res.eof, degraded: res.degraded ?? null });
             setTree(buildTreeFromEntries(entries).tree);
             setLeafId(res.leafId ?? null);
             setError(null);
@@ -494,17 +591,18 @@ export function TreeDialog({
             setSlowTicks(0);
             setFileSnapshot(true);
           }
+          sendRefresh();
         })
         .catch((err) => {
           window.api.debug.log(`TreeDialog(${tabId}) fromFile REJECTED ${err instanceof Error ? err.message : String(err)}`, "error");
           fileAttemptRef.current = { error: "", at: Date.now() };
-          // File read unavailable (session not yet linked, transient SFTP
-          // failure) — the RPC path below is the fallback.
+          baseSettled = true;
+          // No page (session not linked yet, transient SFTP failure): the RPC path is the
+          // fallback. It can only ask for everything (pi has no backwards paging), which is
+          // exactly why it is the fallback and not the default.
+          sendRefresh();
         });
     };
-    // Fast first paint from the session file — no pi round-trip, so a
-    // remote pi still booting (or dead) can't hold the tree hostage. The
-    // RPC get_tree refresh below then corrects leaf/streaming state.
     tryFileSnapshot();
     // First-response boost: a dropped/late first request should not leave
     // the dialog spinning for a full 3s interval; re-ask once shortly after
@@ -602,6 +700,11 @@ export function TreeDialog({
         return;
       }
       if (event.type !== "response" || event.command !== "get_entries") return;
+      // A response to MAIN's internal probes (the chat transcript provider's tip probe) is
+      // not this dialog's request: an unknown id would default to "replace" and swap the
+      // tree for that handful of entries — and it must not free our single-flight slot
+      // either. Same doctrine as ChatPane's `state_ready` guard.
+      if (isInternalProbeId(event.id)) return;
       lastResponseAtRef.current = Date.now();
       // Any get_entries response — refresh poll or navigation poll — frees the
       // single-flight slot. Done BEFORE the navigation filter below: a late
@@ -619,7 +722,7 @@ export function TreeDialog({
         rpcTreeArrivedRef.current = true;
         setFileSnapshot(false);
         window.api.debug.log(`TreeDialog(${tabId}) get_entries RESPONSE mode=${mode} entries=${data.entries.length} leaf=${data.leafId ?? "null"}`, "debug");
-        applySnapshot(data.entries as TreeEntry[], data.leafId ?? null, mode);
+        applySnapshot(data.entries, data.leafId ?? null, mode);
       } else if (entriesCursorRef.current) {
         // The cursor no longer exists (session replaced: /new, switch, rewind
         // rewrite). Drop it and ask for the whole list once.
@@ -627,6 +730,10 @@ export function TreeDialog({
         entriesCursorRef.current = null;
         lastSnapshotRef.current = null;
         knownEntryIdsRef.current = new Set();
+        // The list our byte cursor was minted for is gone: stop offering to page back into
+        // it, and stamp the generation so a page read still in flight is discarded.
+        sessionGenRef.current += 1;
+        applyEarlier({ cursor: null, eof: true, degraded: null });
         sendRefresh();
       } else {
         setTreeStatus("error");
@@ -650,26 +757,13 @@ export function TreeDialog({
   /** pi process reported exited (e.g. RPC auth failed on a password remote). */
   const exited = useChatStore((s) => s.states[tabId]?.exited ?? false);
 
-  // Tool-call lookup for toolResult rows.
-  const toolCalls = useMemo(() => {
-    const map = new Map<string, { name: string; args: unknown }>();
-    const walk = (nodes: TreeNode[]) => {
-      for (const n of nodes) {
-        if (n.entry.type === "message" && n.entry.message?.role === "assistant") {
-          const content = n.entry.message.content;
-          if (Array.isArray(content)) {
-            for (const b of content) {
-              const block = b as { type?: string; id?: string; name?: string; arguments?: unknown };
-              if (block.type === "toolCall" && block.id) map.set(block.id, { name: block.name ?? "tool", args: block.arguments });
-            }
-          }
-        }
-        walk(n.children);
-      }
-    };
-    walk(tree);
-    return map;
-  }, [tree]);
+  // Tool-call lookup for toolResult rows. The traversal lives in
+  // src/shared/tree-index.ts (iterative, unit-tested): pi chains every entry onto
+  // the previous one, so this walk runs over a chain as deep as the session is
+  // long, and a recursive version here blew the render stack at ~3500 entries
+  // (「界面渲染出错，已阻止白屏 / RangeError: Maximum call stack size exceeded」,
+  // docs/diagnosis/2026-10-07.md).
+  const toolCalls = useMemo(() => indexToolCalls(tree), [tree]);
 
   // ONE layout: the full entry tree, laid out by CONVERSATION level (prompt /
   // reply / plumbing — see conversationLevel in src/shared/tree-layout.ts), so
@@ -736,6 +830,78 @@ export function TreeDialog({
     });
   }, []);
 
+  /**
+   * Fetch the page before what we hold and PREPEND it (the tree keeps its leaf, its
+   * selection and its fold state — this only grows the past).
+   *
+   * Nothing here talks to pi: history is the session file's job (the same split the chat
+   * transcript already uses). A page that yields no entry we lack ends the walk instead of
+   * looping — that is what a rewritten file looks like from here.
+   */
+  /** The row at the viewport's top edge, its index and the current scroll offset — enough to
+   *  put it back exactly after a page prepend (see the layout effect below). */
+  const captureAnchor = useCallback((): ScrollAnchor | null => {
+    const el = scrollRef.current;
+    if (!el) return null;
+    const box = el.getBoundingClientRect();
+    for (const row of el.querySelectorAll(".tree-row")) {
+      const r = row.getBoundingClientRect();
+      if (r.bottom > box.top + 1) {
+        const id = row.getAttribute("data-row-id");
+        const index = id ? filtered.findIndex((f) => f.node.entry.id === id) : -1;
+        return id && index >= 0 ? { id, index, scrollTop: el.scrollTop } : null;
+      }
+    }
+    return null;
+  }, [filtered]);
+
+  const loadEarlier = useCallback(() => {
+    const { cursor, eof } = earlierPageRef.current;
+    if (!cursor || eof || loadingEarlierRef.current) return;
+    loadingEarlierRef.current = true;
+    setEarlierLoading(true);
+    const gen = sessionGenRef.current; // the page belongs to THIS session's list
+    void withDeadline(window.api.tree.fromFile(tabId, { before: cursor }), PAGE_READ_TIMEOUT_MS, "读取更早的对话")
+      .then((res) => {
+        if (gen !== sessionGenRef.current) {
+          window.api.debug.log(`TreeDialog(${tabId}) fromFile before DROPPED (session replaced)`, "warn");
+          return;
+        }
+        if (!res.ok) {
+          window.api.debug.log(`TreeDialog(${tabId}) fromFile before FAILED ${res.error}`, "warn");
+          applyEarlierPageRef.current({ cursor: null, eof: true, degraded: null });
+          useUiStore.getState().showToast(`加载更早的对话失败：${res.error}`, "err");
+          return;
+        }
+        const fresh = projectEntries(res.entries).filter((e) => !knownEntryIdsRef.current.has(e.id));
+        if (fresh.length === 0) {
+          applyEarlierPageRef.current({ cursor: null, eof: true, degraded: res.degraded ?? null });
+          return;
+        }
+        for (const e of fresh) knownEntryIdsRef.current.add(e.id);
+        const prev = lastSnapshotRef.current;
+        const entries = [...fresh, ...(prev?.entries ?? [])];
+        anchorRef.current = captureAnchor(); // keep the reader's place once the rows are in
+        setPrependSeq((n) => n + 1); // …and make the restoring effect run even if nothing shows
+        lastSnapshotRef.current = { entries, leafId: prev?.leafId ?? null };
+        applyEarlierPageRef.current({ cursor: res.cursor ?? null, eof: res.eof, degraded: res.degraded ?? null });
+        setTree(buildTreeFromEntries(entries).tree);
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        window.api.debug.log(`TreeDialog(${tabId}) fromFile before REJECTED ${message}`, "error");
+        // Stop offering to page back (a retry loop from the scroll handler would just hammer
+        // a failing channel) but SAY so: a timeout must not look like "nothing more to load".
+        applyEarlierPageRef.current({ cursor: null, eof: true, degraded: null });
+        useUiStore.getState().showToast(`加载更早的对话失败：${message}`, "err");
+      })
+      .finally(() => {
+        loadingEarlierRef.current = false;
+        setEarlierLoading(false);
+      });
+  }, [tabId, captureAnchor]);
+  loadEarlierRef.current = loadEarlier;
+
   // Windowed rows: only entries within WINDOW_MARGIN of the viewport mount.
   const scrollRef = useRef<HTMLDivElement>(null);
   const [win, setWin] = useState({ start: 0, end: 80 });
@@ -761,6 +927,11 @@ export function TreeDialog({
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = null;
       recomputeWindow();
+      // Reaching the top asks for the previous page (the button is the discoverable
+      // path, this is the gesture). `loadEarlier` is idempotent while a page is in
+      // flight, stops at EOF, and anchors the viewport — so it cannot run away.
+      const el = scrollRef.current;
+      if (el && el.scrollTop <= 0) loadEarlierRef.current();
     });
   }, [recomputeWindow]);
   /**
@@ -814,6 +985,37 @@ export function TreeDialog({
       rafRef.current = null;
     };
   }, [recomputeWindow, onScroll]);
+
+  /**
+   * Keep the reader's place when a page is prepended: N new rows above the viewport move
+   * everything down by N × ROW_H, so the scroll offset must follow. Layout effect (before
+   * paint) — anchoring on the next frame would flash the jump.
+   */
+  useLayoutEffect(() => {
+    const before = prevVisibleCountRef.current;
+    prevVisibleCountRef.current = filtered.length;
+    const anchor = anchorRef.current;
+    // Cleared on every run: the anchor is armed for exactly one render (`prependSeq`). If the
+    // prepended rows all landed in a filtered-out subtree the row count never changes, and a
+    // left-over anchor would later fire on an unrelated list change — after the reader had
+    // scrolled somewhere else.
+    anchorRef.current = null;
+    if (!anchor) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const index = filtered.findIndex((f) => f.node.entry.id === anchor.id);
+    if (index >= 0) {
+      // Exact for every tree shape (shared/scroll-anchor.ts): the row keeps its pixel offset
+      // from the viewport top, whether the new rows landed above it or below it.
+      el.scrollTop = restoreScrollTop(anchor, index, ROW_H);
+    } else if (filtered.length > before) {
+      // The anchored row is not visible any more (search/fold swallowed it): approximate by
+      // the number of rows that appeared. Only a fallback — it can over-correct when an
+      // unrelated append lands in the same render.
+      el.scrollTop += (filtered.length - before) * ROW_H;
+    }
+    recomputeWindow();
+  }, [prependSeq, filtered, recomputeWindow]);
   // Clamp the window when the list size changes (filter switch, tree update).
   useEffect(() => {
     setWin((w) => ({
@@ -1173,14 +1375,16 @@ export function TreeDialog({
   }, [flat]);
 
   // Selection fallback: if the selected row is filtered/folded out, move to
-  // the nearest still-visible ancestor (mirrors the TUI's findNearestVisible).
+  // the nearest still-visible ancestor (mirrors the TUI's findNearestVisible). The
+  // walk is BOUNDED — a parentId ring among filtered-out rows used to spin here and
+  // freeze the whole renderer (see nearestVisibleAncestor).
   useEffect(() => {
     if (!selectedId || filtered.some((f) => f.node.entry.id === selectedId)) return;
     const parentById = new Map<string, string | null>();
     for (const f of flat) parentById.set(f.node.entry.id, f.node.entry.parentId);
-    let cur: string | null = parentById.get(selectedId) ?? null;
-    while (cur && !filtered.some((f) => f.node.entry.id === cur)) cur = parentById.get(cur) ?? null;
-    setSelectedId(cur ?? filtered[filtered.length - 1]?.node.entry.id ?? null);
+    const visibleIds = new Set(filtered.map((f) => f.node.entry.id));
+    const nearest = nearestVisibleAncestor(parentById, selectedId, (id) => visibleIds.has(id));
+    setSelectedId(nearest ?? filtered[filtered.length - 1]?.node.entry.id ?? null);
   }, [filtered, flat, selectedId]);
 
   // Keyboard: ↑/↓ move, Home/End jump, Enter navigates, Shift+Enter offers the
@@ -1308,6 +1512,21 @@ export function TreeDialog({
               </button>
             )}
           </div>
+          {(!earlierPage.eof || earlierPage.degraded !== null) && (
+            <div className="tree-earlier">
+              <button
+                type="button"
+                className="tree-earlier-btn"
+                onClick={loadEarlier}
+                disabled={earlierLoading || earlierPage.cursor === null}
+                title="从会话文件读取更早的一页（滚到最顶也会自动加载）"
+              >
+                {earlierLoading ? "加载更早的对话…" : `↑ 加载更早的对话（已有 ${flat.length} 条）`}
+              </button>
+              {earlierPage.degraded === "whole-file-read" && <span className="tree-earlier-note">该连接不支持分段读取，每次会整份读取会话文件</span>}
+              {earlierPage.degraded === "window-too-large" && <span className="tree-earlier-note">更早处无法继续分段读取（超大条目，或读取期间会话文件被改写）</span>}
+            </div>
+          )}
           <div className="tree-scroll" ref={scrollRef}>
             {exited && filtered.length === 0 && (
               <div className="tree-empty">
@@ -1397,7 +1616,9 @@ export function TreeDialog({
             {folds.size > 0 && " · 有折叠"} · ↑↓ 选择 · Enter 导航 · Esc 关闭
           </div>
           {fileSnapshot && (
-            <div className="tree-snapshot-note">树来自会话文件快照 · 正在同步实时状态（远程 pi 未就绪时先显示存档数据）</div>
+            <div className="tree-snapshot-note">
+              树来自会话文件快照（最近 {flat.length} 条{earlierPage.eof ? "" : "，可向上加载更早"}）· 正在同步实时状态（远程 pi 未就绪时先显示存档数据）
+            </div>
           )}
 
           {selected && navPhase === "idle" && (

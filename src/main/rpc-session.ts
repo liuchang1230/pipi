@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { BrowserWindow } from "electron";
 import { Client as SshClient } from "ssh2";
 import { debugLog, debugLogDebug, debugLogWarn } from "./debug-log";
+import { clearUiSurface } from "./extension-ui";
 import { isSshAuthError } from "./sftp-failure";
 import { piEnv, piShellPrefix } from "./pi-env";
 import { wslInnerCommand } from "./wsl-shell";
@@ -99,6 +100,12 @@ class Ssh2Transport implements RpcTransport {
   private exitCb: ((code: number) => void) | null = null;
   private stderrCb: ((chunk: string) => void) | null = null;
   private exitReported = false;
+  /** Set by kill(): the app is tearing this transport down on purpose, so the
+   *  `end`/`close`/error that follows is NOT a connection drop. Without this,
+   *  closing a tab, quitting the app and switching RPC→terminal all wrote
+   *  "SSH 连接已断开（对端关闭）" into the log — ~25 of the ~60 "drops" in the
+   *  2026-10-05 diagnosis were that artifact, and they buried the real ones. */
+  private closing = false;
 
   private reportExit(code: number | undefined): void {
     if (this.exitReported) return;
@@ -142,6 +149,11 @@ class Ssh2Transport implements RpcTransport {
       finish((remote.password ? [remote.password] : []) as string[]);
     });
     this.conn.on("error", (err) => {
+      if (this.closing) {
+        debugLog("rpc", `${label} ssh closed by app (${err.message})`);
+        this.reportExit(-1);
+        return;
+      }
       console.error(`[rpc] ${label} ssh error:`, err.message);
       if (isSshAuthError(err)) onAuthFailure?.(err.message);
       this.stderrCb?.(`SSH 连接错误：${err.message}\n`);
@@ -154,6 +166,13 @@ class Ssh2Transport implements RpcTransport {
     // prompt vanished into the void.
     const reportDropped = (why: string) => {
       if (this.exitReported) return;
+      // App-initiated teardown: expected, so it must not be dressed up as a
+      // drop (no stderr line for the exit banner to quote, no "error" log).
+      if (this.closing) {
+        debugLog("rpc", `${label} closed by app (${why})`);
+        this.reportExit(-1);
+        return;
+      }
       console.error(`[rpc] ${label} ssh ${why}`);
       this.stderrCb?.(`SSH 连接已断开（${why}）\n`);
       this.reportExit(-1);
@@ -181,6 +200,7 @@ class Ssh2Transport implements RpcTransport {
   }
 
   kill(): void {
+    this.closing = true;
     this.input.end();
     try {
       this.conn.end();
@@ -290,6 +310,39 @@ export const UI_REPLY_METHODS = new Set(["confirm", "select", "input", "editor"]
 const SLOW_RESPONSE_MS = 3000;
 
 /**
+ * Auto-reconnect budget for a dropped REMOTE transport (see
+ * RpcSession.scheduleReconnect). A transport death is not a pi crash: the
+ * session file, the transcript and the remote working tree all survive, so the
+ * tab re-opens itself instead of leaving the user on a dead pane. The delays
+ * are cumulative-ish (≈62s to give up) because the underlying cause we measured
+ * is bursty — three tabs died within 31ms on 2026-10-03, then nothing for 10h —
+ * and a fast retry storm would only add load to an already saturated link.
+ */
+export const RECONNECT_DELAYS_MS = [1000, 3000, 8000, 20000, 30000];
+export const RECONNECT_MAX_ATTEMPTS = RECONNECT_DELAYS_MS.length;
+
+/** Backoff for the Nth reconnect attempt (1-based); the last delay repeats. */
+export function reconnectDelayMs(attempt: number): number {
+  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1) - 1, RECONNECT_DELAYS_MS.length - 1)]!;
+}
+
+/**
+ * Should this transport death be revived without the user? Pure policy, so the
+ * truth table is testable without a transport (rpc-reconnect-policy.test.ts) —
+ * the same reason SilenceWatchdog is a separate class.
+ *
+ * `code === -1` is our own transport's synthesized "the pipe is gone" (pi never
+ * reports it): a LOCAL/WSL pi that exited with a real code is a bug the user
+ * must see, and a rejected password needs the login dialog, not a retry loop.
+ */
+export function shouldAutoReconnect(
+  code: number,
+  state: { remote: boolean; authFailed: boolean; exited: boolean; attempt: number }
+): boolean {
+  return code === -1 && state.remote && !state.authFailed && !state.exited && state.attempt < RECONNECT_MAX_ATTEMPTS;
+}
+
+/**
  * "Wrote a command, nothing came back" clock. Pure state machine: the timer
  * only polls it, so the policy is unit-testable without a transport.
  * `take` disarms, so one silence window produces exactly ONE report — a dead
@@ -390,6 +443,18 @@ export class RpcSession {
    *  later get_state timeout does not overwrite the more specific
    *  "需要登录" state with a generic "failed". */
   authFailed = false;
+  /** The tab's own options — a reconnect rebuilds the same remote command
+   *  from them (see scheduleReconnect). */
+  private readonly opts: CreateTabOptions;
+  /** Deliberate teardown: user closed the tab, mode switch, app quit. */
+  private expectedClose = false;
+  /** Transports already auto-reconnected for this tab (see RECONNECT_DELAYS_MS). */
+  private reconnectAttempt: number;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The session file pi reported at boot — the handle a reconnect continues.
+   *  Seeded from the tab's own sessionPath so even a drop that lands before
+   *  the first get_state answers resumes the right conversation. */
+  private sessionFile: string | null = null;
 
   private reportAuthFailure(remote: RemoteOpts | undefined, message: string): void {
     if (!remote || this.authFailed) return;
@@ -397,8 +462,11 @@ export class RpcSession {
     emitRemoteState(remote, "disconnected", true, message || "认证失败：需要密码或密钥未授权");
   }
 
-  constructor(id: string, opts: CreateTabOptions) {
+  constructor(id: string, opts: CreateTabOptions, reconnectAttempt = 0) {
     this.id = id;
+    this.opts = opts;
+    this.reconnectAttempt = reconnectAttempt;
+    this.sessionFile = opts.sessionPath ?? null;
     const label = `${opts.remote ? `${opts.remote.user}@${opts.remote.host}` : opts.wsl ? `wsl:${opts.wsl.distro}` : "local"} tab ${id}`;
 
     if (opts.wsl) {
@@ -466,33 +534,7 @@ export class RpcSession {
       this.noteBytes();
       this.onChunk(chunk);
     });
-    this.transport.onExit((code) => {
-      // The connection proved by get_state is gone: the tab's server must stop
-      // reading "connected" in the sidebar immediately.
-      if (opts.remote) {
-        // Only announce a failure for a genuine drop. A user-initiated close
-        // unregisters the tab first, so the sidebar re-derives "disconnected"
-        // from the now-empty tab set — do not paint that server red.
-        const stillRegistered = !!getTab(id);
-        markTabRemoteDown(id);
-        if (stillRegistered) {
-          emitRemoteState(opts.remote, "failed", false, "连接已断开（远程会话结束或网络中断）");
-        }
-      }
-      // A key-auth ssh.exe (BatchMode) that failed auth exits non-zero with no
-      // stdout and "Permission denied" on stderr — surface it as "需要登录"
-      // too, or the tab would just die while the sidebar stayed "连接中".
-      if (opts.remote && !this.sawOutput && /permission denied|publickey|no supported authentication/i.test(this.lastStderr)) {
-        this.reportAuthFailure(opts.remote, "认证失败：需要密码或密钥未授权");
-      }
-      console.log(`[rpc] tab ${id} exited: ${code}`);
-      debugLogWarn("rpc", `tab ${id} EXIT ${code} stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-600))}`);
-      if (this.noOutputTimer) {
-        clearTimeout(this.noOutputTimer);
-        this.noOutputTimer = null;
-      }
-      this.emitExit(code);
-    });
+    this.transport.onExit((code) => this.handleTransportExit(code));
     this.transport.onStderr((chunk) => {
       if (!chunk.trim()) return;
       this.lastStderr = (this.lastStderr + chunk).slice(-4000);
@@ -527,6 +569,183 @@ export class RpcSession {
       forwardEvent(id, { type: "rpc_stalled", sawOutput: this.sawOutput, junkLines: this.junkLines });
     }, 60000);
     debugLog("rpc", `tab ${id} SPAWNED ${label} (password=${!!opts.remote?.password} wsl=${!!opts.wsl} sessionPath=${opts.sessionPath ?? "-"})`);
+  }
+
+  /**
+   * The transport is gone. Three cases, and confusing them is what made the
+   * 2026-10-05 diagnosis expensive:
+   *   1. we killed it (tab close / mode switch / app quit) — say nothing;
+   *   2. it dropped under a remote session (`code === -1` is synthesized by our
+   *      transport, never by pi) — the reported "特别容易掉线". Re-open the SAME
+   *      tab with backoff instead of stranding the user on a dead pane;
+   *   3. anything else (local/WSL pi crash, pi's own exit, retries exhausted) —
+   *      the exit banner, as before.
+   */
+  private handleTransportExit(code: number): void {
+    const remote = this.opts.remote;
+    const revivable = this.shouldReconnect(code);
+    // The connection proved by get_state is gone: the tab's server must stop
+    // reading "connected" in the sidebar. Only a FINAL drop paints it red — a
+    // reconnect in flight would flash red for a second, then green again.
+    if (remote) {
+      const stillRegistered = !!getTab(this.id);
+      markTabRemoteDown(this.id);
+      if (stillRegistered && !revivable) {
+        emitRemoteState(remote, "failed", false, "连接已断开（远程会话结束或网络中断）");
+      }
+    }
+    // A key-auth ssh.exe (BatchMode) that failed auth exits non-zero with no
+    // stdout and "Permission denied" on stderr — surface it as "需要登录"
+    // too, or the tab would just die while the sidebar stayed "连接中".
+    if (remote && !this.sawOutput && /permission denied|publickey|no supported authentication/i.test(this.lastStderr)) {
+      this.reportAuthFailure(remote, "认证失败：需要密码或密钥未授权");
+    }
+    if (this.noOutputTimer) {
+      clearTimeout(this.noOutputTimer);
+      this.noOutputTimer = null;
+    }
+    if (this.expectedClose) {
+      debugLog("rpc", `tab ${this.id} closed by app (code ${code})`);
+      return;
+    }
+    debugLogWarn(
+      "rpc",
+      `tab ${this.id} EXIT ${code}${revivable ? ` (auto-reconnect #${this.reconnectAttempt + 1})` : ""} stderr=${JSON.stringify(this.lastStderr.trimEnd().slice(-600))}`
+    );
+    if (revivable) {
+      this.scheduleReconnect();
+      return;
+    }
+    debugLogWarn("rpc", `tab ${this.id} exited: ${code}`);
+    this.emitExit(code);  }
+
+  /**
+   * Can this death be revived without the user? Only a REMOTE session whose
+   * transport died: `code === -1` is our own transport's synthesized "the pipe
+   * is gone" (pi itself never reports it), a local/WSL pi that really crashed
+   * is a bug the user must see, and a rejected password needs the login dialog
+   * rather than a retry loop.
+   */
+  private shouldReconnect(code: number): boolean {
+    return shouldAutoReconnect(code, {
+      remote: !!this.opts.remote,
+      authFailed: this.authFailed,
+      exited: this.exited,
+      attempt: this.reconnectAttempt,
+    });
+  }
+
+  /** Wait out the backoff, then hand the tab to a fresh session object. */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    const attempt = this.reconnectAttempt + 1;
+    const delayMs = reconnectDelayMs(attempt);
+    debugLogWarn("rpc", `tab ${this.id} transport dropped — reconnecting in ${delayMs}ms (attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS})`);
+    debugLogWarn("rpc", `tab ${this.id} RECONNECT #${attempt} in ${delayMs}ms`);
+    forwardEvent(this.id, {
+      type: "rpc_reconnecting",
+      attempt,
+      maxAttempts: RECONNECT_MAX_ATTEMPTS,
+      delayMs,
+      detail: this.lastStderr.trimEnd().split("\n").filter((l) => l.trim()).slice(-1)[0]?.slice(0, 160),
+    });
+    forwardEvent(this.id, { type: "app_phase", phase: "connecting" });
+    const opts = this.opts;
+    const learned = this.sessionFile;
+    this.quietDispose();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      // The user may have closed the tab, or replaced it, while we waited:
+      // never resurrect a tab that is gone or already has a live session.
+      if (!getTab(this.id) || sessions.get(this.id) !== this) return;
+      replaceRpcSession(this.id, learned ? { ...opts, sessionPath: learned } : opts, attempt);
+    }, delayMs);
+  }
+
+  /**
+   * Stop watching this transport WITHOUT telling the renderer it exited — used
+   * when a reconnect replaces this session object. Leaving the zero-output /
+   * stall / silence watchdogs armed would fire "rpc_unresponsive" at the new
+   * tab a minute later, and emitExit would paint the drop banner over it.
+   */
+  private quietDispose(): void {
+    this.exited = true; // blocks emitExit + every watchdog report
+    if (this.noOutputTimer) clearTimeout(this.noOutputTimer);
+    if (this.stallTimer) clearTimeout(this.stallTimer);
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    this.noOutputTimer = null;
+    this.stallTimer = null;
+    this.silenceTimer = null;
+    this.silence.noteBytes();
+    try {
+      this.transport.kill();
+    } catch {
+      /* already dead */
+    }
+  }
+
+  /**
+   * Ask pi who it is. The answer is what turns "a tab exists" into "connected"
+   * (see emitRemoteState), links the session file, and — after a reconnect — is
+   * what makes the renderer re-request the transcript (state_ready).
+   */
+  probeState(): void {
+    const id = this.id;
+    const remote = this.opts.remote;
+    const tab = getTab(id);
+    this.request<{ sessionFile?: string; sessionName?: string; thinkingLevel?: string | null; model?: { id?: string; name?: string; provider?: string } | null }>(
+      { type: "get_state" },
+      // WSL/remote pi boots slowly (wsl.exe chain + pi startup). Measured p50
+      // 3.5s / max 16.2s; the budget below is the ceiling, not the expectation.
+      // Note: a pi that never answers may be blocked in an extension's startup
+      // work rather than in SSH — check for child processes of pi (see
+      // docs/adr/0002-remote-rpc-process-pool.md §结案).
+      remote || this.opts.wsl ? 40000 : 15000
+    ).then((res) => {
+      const data = res.data;
+      if (!res.success || !data) {
+        console.warn(`[rpc] tab ${id} get_state failed:`, res.error ?? "no data");
+        if (remote && !this.authFailed) {
+          // A reconnect that cannot even boot is a FAILED attempt, not a dead
+          // server: try the next backoff step before giving up on the user.
+          if (this.reconnectAttempt > 0 && this.shouldReconnect(-1)) {
+            this.scheduleReconnect();
+            return;
+          }
+          // The transport already reported auth failure when that was the
+          // cause; otherwise the server is reachable but pi did not answer.
+          emitRemoteState(remote, "failed", false, "pi 未响应（未安装、启动失败或命令超时）");
+        }
+        return;
+      }
+      if (data.sessionFile) {
+        // Remote/WSL included: pi's reported session file lives on the SERVER
+        // (or inside the distro) — that path is exactly what the SFTP / ssh /
+        // UNC file-read paths need (tree:from-file). The local file watcher is
+        // a no-op for remote/wsl tabs, so linking is safe there.
+        this.sessionFile = data.sessionFile;
+        if (!tab?.sessionPath) linkTabSession(id, data.sessionFile);
+      }
+      if (data.sessionName) setTabTitle(id, data.sessionName);
+      forwardEvent(id, { type: "app_phase", phase: "ready" });
+      // Genuine connectivity proof: pi booted and answered. Flipping this tab
+      // (and its server node) from "connecting" to "connected".
+      if (remote) {
+        markTabRemoteReady(id);
+        emitRemoteState(remote, "connected");
+      }
+      forwardEvent(id, {
+        type: "state_ready",
+        model: data.model ?? null,
+        sessionName: data.sessionName ?? null,
+        thinkingLevel: data.thinkingLevel ?? null,
+        // A reconnect re-opens a session the renderer already has on screen:
+        // the pane re-reads the transcript only when it knows this boot was
+        // one (main can tell; the renderer cannot — see chatStore
+        // rpc_reconnecting + ChatPane's state_ready branch).
+        reconnected: this.reconnectAttempt > 0,
+      });
+    });
   }
 
   /** Send a command (JSONL to stdin). Returns false if the process is gone. */
@@ -609,6 +828,12 @@ export class RpcSession {
   }
 
   kill(): void {
+    this.expectedClose = true;
+    // A pending auto-reconnect must not fire after the user closed the tab.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.exited) return;
     this.exited = true;
     this.transport.kill();
@@ -694,6 +919,10 @@ export class RpcSession {
     if (this.exited) return;
     this.exited = true;
     this.noteBytes(); // a dead session must not also fire the silence report
+    // The extensions went with the process: their declarations are no longer
+    // true, and nothing will ever clear them (the surface is fed by frames from
+    // a pi that no longer exists).
+    clearUiSurface(this.id, "pi exited");
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:rpc-exit:${this.id}`, { code, stderr: this.lastStderr.trimEnd().slice(-2000) });
     }
@@ -780,53 +1009,29 @@ export function createRpcTab(opts: CreateTabOptions): string {
 
   const session = new RpcSession(id, opts);
   sessions.set(id, session);
-
-  // Link the session file pi created/loaded so title/sidebar stay in sync.
-  // Local only: remote session files live on the remote side (SFTP sync owns
-  // the sidebar list there); the watcher is a no-op for remote/wsl tabs.
-  session.request<{ sessionFile?: string; sessionName?: string; thinkingLevel?: string | null; model?: { id?: string; name?: string; provider?: string } | null }>(
-    { type: "get_state" },
-    // WSL/remote pi boots slowly (wsl.exe chain + pi startup). Measured p50
-    // 3.5s / max 16.2s; the budget below is the ceiling, not the expectation.
-    // Note: a pi that never answers may be blocked in an extension's startup
-    // work rather than in SSH — check for child processes of pi (see
-    // docs/adr/0002-remote-rpc-process-pool.md §结案).
-    remote || wsl ? 40000 : 15000
-  ).then((res) => {
-    const data = res.data;
-    if (!res.success || !data) {
-      console.warn(`[rpc] tab ${id} get_state failed:`, res.error ?? "no data");
-      // The transport already reported auth failure when that was the cause;
-      // otherwise the server is reachable but pi did not answer — red dot.
-      if (remote && !session.authFailed) {
-        emitRemoteState(remote, "failed", false, "pi 未响应（未安装、启动失败或命令超时）");
-      }
-      return;
-    }
-    if (data.sessionFile && !tab.sessionPath) {
-      // Remote/WSL included: pi's reported session file lives on the SERVER
-      // (or inside the distro) — that path is exactly what the SFTP / ssh /
-      // UNC file-read paths need (tree:from-file). The local file watcher is
-      // a no-op for remote/wsl tabs, so linking is safe there.
-      linkTabSession(id, data.sessionFile);
-    }
-    if (data.sessionName) setTabTitle(id, data.sessionName);
-    forwardEvent(id, { type: "app_phase", phase: "ready" });
-    // Genuine connectivity proof: pi booted and answered. Flipping this tab
-    // (and its server node) from "connecting" to "connected".
-    if (remote) {
-      markTabRemoteReady(id);
-      emitRemoteState(remote, "connected");
-    }
-    forwardEvent(id, {
-      type: "state_ready",
-      model: data.model ?? null,
-      sessionName: data.sessionName ?? null,
-      thinkingLevel: data.thinkingLevel ?? null,
-    });
-  });
+  // The boot handshake lives on the session (probeState) so a reconnect can
+  // run the exact same one under the SAME tab id.
+  session.probeState();
 
   return id;
+}
+
+/**
+ * Replace a dropped tab's session with a fresh transport, keeping its id.
+ *
+ * RpcSession is built around ONE transport (its watchdogs, pending responses
+ * and exit reporting all describe that pipe), so a reconnect builds a new
+ * instance instead of mutating the dead one; the tab record, its title, its
+ * session file and the renderer's pane are untouched. `reconnectAttempt` is
+ * carried over so the backoff keeps escalating across generations.
+ */
+function replaceRpcSession(id: string, opts: CreateTabOptions, reconnectAttempt: number): void {
+  // The caller verified `sessions.get(id)` is the dying instance (which has
+  // already disposed itself), so this only swaps in the new transport.
+  const session = new RpcSession(id, opts, reconnectAttempt);
+  sessions.set(id, session);
+  debugLog("rpc", `tab ${id} RECONNECTED transport #${reconnectAttempt} (session=${opts.sessionPath ?? "-"})`);
+  session.probeState();
 }
 
 /** Close an RPC tab: kill the transport and drop both registries. */

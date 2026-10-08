@@ -136,9 +136,11 @@ try {
 
   const boot = await evaluateNamed(ws, 'boot', `(() => {
     const el = document.querySelector('.chat-scroll');
-    return el ? { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, count: document.querySelectorAll('.chat-msg').length } : null;
+    return el ? { scrollTop: Math.round(el.scrollTop), scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, distanceFromBottom: Math.round(el.scrollHeight - el.scrollTop - el.clientHeight), count: document.querySelectorAll('.chat-msg').length } : null;
   })()`, true);
-  console.log("timeline after open:", JSON.stringify(boot));
+  // distanceFromBottom must be ~0: opening a session lands on the NEWEST message
+  // (chat-scroll.ts). The wheel steps below start from that position on purpose.
+  console.log("timeline after open (expect distanceFromBottom ~0):", JSON.stringify(boot));
   // Windowing mounts only ~24 rows regardless of session size — that is the point.
   // What matters: does the scroll position HOLD when the user wheels upward?
 

@@ -27,6 +27,7 @@ import { useUiStore } from "../stores/uiStore";
 import { useLayoutStore } from "../stores/layoutStore";
 import { Icon, type IconName } from "../components/Icon";
 import { useOverlayDismiss } from "../components/overlay-dismiss";
+import { frameFor, readSavedSplit, splitFromPointer, SPLIT_DEFAULT, type SplitFrame } from "./sidebar-split";
 import type {
   FileNode,
   ProjectGroup,
@@ -108,13 +109,23 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
   // --- Local state owned by this pane ---
   const [sidebarSplit, setSidebarSplit] = useState(() => {
     try {
-      const saved = Number(localStorage.getItem("pipi-sidebar-split"));
-      return Number.isFinite(saved) ? Math.max(20, Math.min(80, saved)) : 55;
+      return readSavedSplit(localStorage.getItem("pipi-sidebar-split"));
     } catch {
-      return 55;
+      return SPLIT_DEFAULT;
     }
-  }); // % for file tree
+  }); // % for the session list (the file tree gets the rest)
+  // 当前项目文件 collapsed to its label row. Pane-local like the split, and
+  // persisted for the same reason: a layout the user chose outlives the window.
+  const [treeCollapsed, setTreeCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("pipi-tree-collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const sideTopRef = useRef<HTMLDivElement>(null);
+  const sideBottomRef = useRef<HTMLDivElement>(null);
   const [treeCtx, setTreeCtx] = useState<{ x: number; y: number; node: FileNode | null } | null>(null);
   const [filePrompt, setFilePrompt] = useState<{ kind: "file" | "dir" | "rename"; title: string; node: FileNode | null } | null>(null);
   const [fileConfirm, setFileConfirm] = useState<{ node: FileNode } | null>(null);
@@ -210,41 +221,70 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 
   // --- Sidebar vertical resizer (sidebarSplit is this pane's local state) ---
   const sidebarDragRef = useRef(false);
+  const sidebarFrameRef = useRef<SplitFrame | null>(null);
   const sidebarSplitRef = useRef(sidebarSplit);
   const sidebarSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const onSidebarResizerDown = useCallback(() => { sidebarDragRef.current = true; }, []);
+  const onSidebarResizerDown = useCallback((e: React.MouseEvent) => {
+    // preventDefault() is load-bearing, not tidiness: without it the browser
+    // treats the press as the start of a text selection and then tracks the
+    // pointer over whatever the cursor happens to be above — which is session
+    // rows, because the handle sits just below the cursor. See
+    // docs/diagnosis/2026-09-30.md ("分界线拖动会选中文字").
+    e.preventDefault();
+    const top = sideTopRef.current;
+    const bottom = sideBottomRef.current;
+    if (!top || !bottom) return;
+    sidebarFrameRef.current = frameFor(top.getBoundingClientRect(), bottom.getBoundingClientRect(), e.clientY);
+    sidebarDragRef.current = true;
+    document.body.classList.add("is-row-resizing");
+  }, []);
+  const toggleTreeCollapsed = useCallback(() => setTreeCollapsed((prev) => !prev), []);
   useEffect(() => {
     sidebarSplitRef.current = sidebarSplit;
   }, [sidebarSplit]);
   useEffect(() => {
+    try { localStorage.setItem("pipi-tree-collapsed", treeCollapsed ? "1" : "0"); } catch { /* best effort */ }
+  }, [treeCollapsed]);
+  useEffect(() => {
     return () => {
       if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
+      document.body.classList.remove("is-row-resizing");
     };
   }, []);
   useEffect(() => {
+    const endDrag = () => {
+      if (!sidebarDragRef.current) return;
+      sidebarDragRef.current = false;
+      sidebarFrameRef.current = null;
+      document.body.classList.remove("is-row-resizing");
+      if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
+      try { localStorage.setItem("pipi-sidebar-split", String(Math.round(sidebarSplitRef.current))); } catch { /* best effort */ }
+    };
     const onMove = (e: MouseEvent) => {
-      if (sidebarDragRef.current && sidebarRef.current) {
-        const rect = sidebarRef.current.getBoundingClientRect();
-        const pct = ((e.clientY - rect.top) / rect.height) * 100;
-        const next = Math.max(20, Math.min(80, pct));
-        setSidebarSplit(next);
+      // A release outside the window never reaches `mouseup` in here; without
+      // this the drag — and with it the document-wide `user-select: none` —
+      // would stick until the next click. buttons === 0 on a move means no
+      // mouse button is down any more.
+      if (sidebarDragRef.current && e.buttons === 0) {
+        endDrag();
+        return;
+      }
+      const frame = sidebarFrameRef.current;
+      if (sidebarDragRef.current && frame) {
+        setSidebarSplit(splitFromPointer(frame, e.clientY));
         if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
         sidebarSaveTimerRef.current = setTimeout(() => {
           try { localStorage.setItem("pipi-sidebar-split", String(Math.round(sidebarSplitRef.current))); } catch { /* best effort */ }
         }, 160);
       }
     };
-    const onUp = () => {
-      if (!sidebarDragRef.current) return;
-      sidebarDragRef.current = false;
-      if (sidebarSaveTimerRef.current) clearTimeout(sidebarSaveTimerRef.current);
-      try { localStorage.setItem("pipi-sidebar-split", String(Math.round(sidebarSplitRef.current))); } catch { /* best effort */ }
-    };
     window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mouseup", endDrag);
+    window.addEventListener("blur", endDrag);
     return () => {
       window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("mouseup", endDrag);
+      window.removeEventListener("blur", endDrag);
     };
   }, []);
 
@@ -644,7 +684,11 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
       <Sidebar
         leftWidth={leftWidth}
         sidebarRef={sidebarRef}
+        sideTopRef={sideTopRef}
+        sideBottomRef={sideBottomRef}
         sidebarSplit={sidebarSplit}
+        treeCollapsed={treeCollapsed}
+        onToggleTreeCollapsed={toggleTreeCollapsed}
         theme={theme}
         toggleTheme={toggleTheme}
         selectedSessions={selectedSessions}
@@ -787,7 +831,11 @@ export function SidebarPane({ theme, toggleTheme, onNewLocalProject, onAddRemote
 interface SidebarProps {
   leftWidth: number;
   sidebarRef: React.RefObject<HTMLDivElement>;
+  sideTopRef: React.RefObject<HTMLDivElement>;
+  sideBottomRef: React.RefObject<HTMLDivElement>;
   sidebarSplit: number;
+  treeCollapsed: boolean;
+  onToggleTreeCollapsed: () => void;
   theme: "dark" | "light";
   toggleTheme: () => void;
   selectedSessions: Set<string>;
@@ -810,7 +858,7 @@ interface SidebarProps {
   remoteHydration: RemoteHydrationState;
   fileTreeStatus: "idle" | "loading" | "refreshing" | "error";
   fileTreeError: string | null;
-  onSidebarResizerDown: () => void;
+  onSidebarResizerDown: (e: React.MouseEvent) => void;
   onToggleProject: (project: ProjectGroup) => void;
   onNewLocalProject: () => void;
   onDeleteProject: (project: ProjectGroup) => void;
@@ -832,7 +880,11 @@ interface SidebarProps {
 const Sidebar = memo(function Sidebar({
   leftWidth,
   sidebarRef,
+  sideTopRef,
+  sideBottomRef,
   sidebarSplit,
+  treeCollapsed,
+  onToggleTreeCollapsed,
   theme,
   toggleTheme,
   selectedSessions,
@@ -884,7 +936,7 @@ const Sidebar = memo(function Sidebar({
     [activeTab, activeSessionPath],
   );
   return (
-    <aside className="sidebar" ref={sidebarRef} style={{ width: leftWidth, flex: "0 0 auto" }}>
+    <aside className={`sidebar${treeCollapsed ? " tree-collapsed" : ""}`} ref={sidebarRef} style={{ width: leftWidth, flex: "0 0 auto" }}>
       <div className="sidebar-header">
         <span className="sidebar-title" title={isRemote && remoteDir ? remoteDir : cwd}>项目与会话</span>
         <div className="sidebar-actions">
@@ -893,7 +945,10 @@ const Sidebar = memo(function Sidebar({
           </button>
         </div>
       </div>
-      <div className="sidebar-top" style={{ height: `${sidebarSplit}%` }}>
+      {/* Collapsed 当前项目文件: the panes take their height from CSS (top pane
+          fills, bottom pane hugs its label) and the divider is unmounted — a
+          handle that cannot move anything is worse than no handle. */}
+      <div className="sidebar-top" ref={sideTopRef} style={treeCollapsed ? undefined : { height: `${sidebarSplit}%` }}>
         <div className="panel-label">项目 / 会话</div>
         {selectedSessions.size > 0 && (
           <div className="batch-bar">
@@ -970,8 +1025,8 @@ const Sidebar = memo(function Sidebar({
           />
         </div>
       </div>
-      <div className="sidebar-resizer" onMouseDown={onSidebarResizerDown} />
-      <div className="sidebar-bottom" style={{ height: `${100 - sidebarSplit}%` }}>
+      {treeCollapsed ? null : <div className="sidebar-resizer" onMouseDown={onSidebarResizerDown} />}
+      <div className="sidebar-bottom" ref={sideBottomRef} style={treeCollapsed ? undefined : { height: `${100 - sidebarSplit}%` }}>
         <div className="panel-label">
           当前项目文件
           {/* A background re-list of an ALREADY visible tree is not a state the
@@ -983,6 +1038,15 @@ const Sidebar = memo(function Sidebar({
               刷新中…
             </span>
           ) : null}
+          <button
+            className="panel-toggle-btn"
+            onClick={onToggleTreeCollapsed}
+            title={treeCollapsed ? "展开「当前项目文件」" : "收起「当前项目文件」"}
+            aria-label={treeCollapsed ? "展开当前项目文件" : "收起当前项目文件"}
+            aria-expanded={!treeCollapsed}
+          >
+            <Icon name="chevron-down" />
+          </button>
         </div>
         {(isRemote ? remoteDir : cwd) ? (
           <div className="tree-path" title={isRemote ? remoteDir! : cwd}>

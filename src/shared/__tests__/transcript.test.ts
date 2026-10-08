@@ -11,7 +11,7 @@
 // against pi lives in transcript-pi-parity.test.ts. These tests pin our own
 // behaviour on shapes that synthetic fixture does not cover.
 import { describe, expect, it } from "vitest";
-import { sessionContextMessages, type TranscriptEntry } from "../transcript";
+import { compactionClosesContext, isInternalProbeId, sessionContextMessages, type TranscriptEntry } from "../transcript";
 
 /** `{type,id,parentId,message}` — the real file's shape. */
 const msg = (id: string, parentId: string | null, role: string, text = id): TranscriptEntry => ({
@@ -102,5 +102,69 @@ describe("sessionContextMessages", () => {
   it("skips a message-typed entry with no body (hardening over pi)", () => {
     const entries: TranscriptEntry[] = [msg("a", null, "user", "hi"), { type: "message", id: "b", parentId: "a" }];
     expect(texts(sessionContextMessages(entries, "b"))).toEqual(["hi"]);
+  });
+});
+
+describe("compactionClosesContext", () => {
+  // The windowed transcript reader asks this predicate "is my window the whole context?".
+  // It must ask the resolver's own question — the kept entry has to be ON the leaf path,
+  // BEFORE the compaction — because an id that merely exists in the entry set (a side branch,
+  // or an entry behind the window) would let the resolver drop in-window entries while the
+  // reader calls the result "complete".
+  const chain = (ids: string[]): TranscriptEntry[] =>
+    ids.map((id, i) => ({ type: "message", id, parentId: i === 0 ? null : ids[i - 1]!, message: { role: "user", content: id } }));
+  const compaction = (id: string, parentId: string, kept: string): TranscriptEntry => ({ type: "compaction", id, parentId, summary: "s", firstKeptEntryId: kept });
+
+  it("is false without a compaction", () => {
+    const entries: TranscriptEntry[] = chain(["e1", "e2", "e3"]);
+    expect(compactionClosesContext(entries, "e3")).toBe(false);
+  });
+
+  it("is true when the kept entry is on the leaf path before the compaction", () => {
+    const entries: TranscriptEntry[] = [...chain(["a", "b", "c"]), compaction("c1", "c", "a"), ...chain(["d"])];
+    entries[entries.length - 1]!.parentId = "c1";
+    expect(compactionClosesContext(entries, "d")).toBe(true);
+  });
+
+  it("is false when the kept entry exists but sits on a SIDE branch", () => {
+    // `side` is in the entry set and named by the compaction, but it is not an ancestor of
+    // the leaf — the resolver drops the same entries either way, so this is not "complete".
+    const entries: TranscriptEntry[] = [...chain(["a", "b", "c"])];
+    entries.push({ type: "message", id: "side", parentId: "a", message: { role: "user", content: "side" } });
+    entries.push(compaction("c1", "c", "side"));
+    entries.push({ type: "message", id: "d", parentId: "c1", message: { role: "user", content: "d" } });
+    expect(compactionClosesContext(entries, "d")).toBe(false);
+  });
+
+  it("is false when the kept entry is not in the entry set at all", () => {
+    const entries: TranscriptEntry[] = [...chain(["a", "b"]), compaction("c1", "b", "outside"), { type: "message", id: "d", parentId: "c1", message: { role: "user", content: "d" } }];
+    expect(compactionClosesContext(entries, "d")).toBe(false);
+  });
+
+  it("judges the LAST compaction on the path", () => {
+    const entries: TranscriptEntry[] = [
+      ...chain(["a", "b", "c"]),
+      compaction("c1", "c", "a"),
+      { type: "message", id: "d", parentId: "c1", message: { role: "user", content: "d" } },
+      compaction("c2", "d", "b"), // kept entry ('b') is on the path, before c2
+      { type: "message", id: "e", parentId: "c2", message: { role: "user", content: "e" } },
+    ];
+    expect(compactionClosesContext(entries, "e")).toBe(true);
+  });
+});
+
+describe("isInternalProbeId", () => {
+  // Every consumer of the RPC event stream must drop these ids: they belong to MAIN's probes
+  // (`get_state` + the transcript tip probe), and an unrecognised `get_entries` response would
+  // otherwise be treated as a full snapshot by the tree dialog.
+  it("recognises main's probe ids, with or without a suffix", () => {
+    expect(isInternalProbeId("pipi-internal-get_state")).toBe(true);
+    expect(isInternalProbeId("pipi-internal-get_entries:7")).toBe(true);
+  });
+
+  it("leaves renderer request ids alone", () => {
+    for (const id of ["tree-poll-3", "tree-nav-1", "r1759-abc123", "pipi-internal", "", undefined, 42]) {
+      expect(isInternalProbeId(id)).toBe(false);
+    }
   });
 });

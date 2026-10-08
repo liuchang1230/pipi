@@ -67,6 +67,17 @@ const smokeSession = (() => {
   const tool = () => { const t = next(); put(t, "assistant", [{ type: "toolCall", id: "tc1", name: "read", arguments: { path: "a.ts" } }]); parent = t; const r = next(); put(r, "toolResult", [{ type: "text", text: "ok" }], { toolCallId: "tc1" }); parent = r; };
   ask("烟雾测试问题一");
   reply("烟雾测试回答一");
+  // Two thinking blocks for the "expanded by default + rich text" checks below:
+  // one short one carrying real Markdown syntax, and one past ChatPane's
+  // THINKING_INLINE_MAX_CHARS (3000) so the expand button is exercised.
+  const think = (text, more = "") => {
+    const id = next();
+    put(id, "assistant", [{ type: "thinking", thinking: text }, ...(more ? [{ type: "text", text: more }] : [])], { stopReason: "stop" });
+    parent = id;
+    return id;
+  };
+  think("**先想一步**\n\n- 要点一\n- 要点二\n\n`inline-code`", "带思考的回答");
+  think("很长的一段思考。".repeat(400));
   tool();
   // fork: two prompts under one entry
   const fork = parent;
@@ -223,6 +234,45 @@ try {
   await sleep(4000);
   const alive = await evaluate(ws, `window.api.tab.alive(${JSON.stringify(tabId)})`, true);
   check("tab.alive after creation (no crash on spawn)", alive === true, String(alive));
+
+  // Thinking blocks: expanded by default and rendered as rich text. The
+  // transcript arrives from the session file asynchronously, so poll for the
+  // blocks rather than trusting a fixed sleep — a vacuous "0 blocks" pass would
+  // hide the whole feature.
+  for (let i = 0; i < 20 && !(await evaluate(ws, `document.querySelectorAll('.chat-thinking').length > 0`, true)); i += 1) {
+    await sleep(300);
+  }
+  const thinkingInfo = await evaluate(
+    ws,
+    `(() => {
+       const blocks = [...document.querySelectorAll('.chat-thinking')];
+       const expanded = blocks.filter((b) => b.hasAttribute('open')).length;
+       const rich = blocks.filter((b) => b.querySelector('.chat-thinking-body .markdown-body')).length;
+       const bold = blocks.filter((b) => b.querySelector('.chat-thinking-body .markdown-body strong')).length;
+       const bullets = blocks.filter((b) => b.querySelector('.chat-thinking-body .markdown-body li')).length;
+       const expandBtn = [...document.querySelectorAll('.chat-thinking .chat-expand-output')].map((b) => b.textContent.trim());
+       // Any surviving '**' is Markdown that was displayed raw instead of parsed.
+       const rawMd = blocks.filter((b) => b.textContent.includes('**')).length;
+       return { blocks: blocks.length, expanded, rich, bold, bullets, expandBtn, rawMd, summaries: blocks.map((b) => b.querySelector('summary')?.textContent) };
+     })() `,
+    true,
+  );
+  check("thinking blocks are present in the seeded session", (thinkingInfo?.blocks ?? 0) >= 2, JSON.stringify({ blocks: thinkingInfo?.blocks }));
+  check(
+    "thinking is expanded by default",
+    (thinkingInfo?.blocks ?? 0) > 0 && thinkingInfo.expanded === thinkingInfo.blocks,
+    JSON.stringify({ blocks: thinkingInfo?.blocks, expanded: thinkingInfo?.expanded }),
+  );
+  check(
+    "thinking renders as rich text (Markdown parsed inside the block)",
+    (thinkingInfo?.rich ?? 0) >= 2 && (thinkingInfo?.bold ?? 0) >= 1 && (thinkingInfo?.bullets ?? 0) >= 1 && (thinkingInfo?.rawMd ?? 1) === 0,
+    JSON.stringify({ rich: thinkingInfo?.rich, bold: thinkingInfo?.bold, bullets: thinkingInfo?.bullets, rawMd: thinkingInfo?.rawMd }),
+  );
+  check(
+    "an over-budget thinking block offers 展开完整思考",
+    (thinkingInfo?.expandBtn ?? []).some((t) => /展开完整思考/.test(t)),
+    JSON.stringify(thinkingInfo?.expandBtn),
+  );
   // Branch-tree dialog: opening it must work on a real session and must keep the
   // virtualized list self-consistent — the row window is mounted between two
   // spacers whose heights must add up to the full list height, otherwise the

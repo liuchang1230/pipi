@@ -10,10 +10,18 @@
 // made to pass, the wait is unbounded and that is the bug.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionsStore } from "../stores/sessionsStore";
-import { useTasksStore } from "../stores/tasksStore";
+import { stopTaskTimerForTests, useTasksStore } from "../stores/tasksStore";
 import { useTabsStore } from "../stores/tabsStore";
 import { useTreeStore } from "../stores/treeStore";
 import { useViewerStore, VIEWER_TASK } from "../stores/viewerStore";
+import {
+  HISTORY_TASK_LABEL,
+  HISTORY_TASK_POLICY,
+  HISTORY_TASK_STALL_MS,
+  deriveTranscriptWait,
+  historyTaskKey,
+  type TranscriptWaitInput,
+} from "../panes/chat-transcript-wait";
 
 /** A promise that never settles — the only honest way to model a hang. */
 function never<T>(): Promise<T> {
@@ -45,6 +53,7 @@ beforeEach(() => {
   vi.useFakeTimers();
 });
 afterEach(() => {
+  stopTaskTimerForTests();
   vi.useRealTimers();
 });
 
@@ -123,5 +132,42 @@ describe("no user-visible wait can be endless", () => {
     await vi.advanceTimersByTimeAsync(31_000);
     expect(finished).toBe(true);
     expect(api.file.list).toHaveBeenCalled();
+  });
+
+  it("chat transcript: a download that never lands becomes a visible failure with a retry", async () => {
+    // The wait the chat view registers while it reads a session's transcript
+    // (file-first over SFTP/SSH — 17–45s measured on a slow link, and the reason
+    // 「正在启动 Pi…」 used to vanish onto a blank area). Off-link or wedged, it
+    // must NOT become 「正在读取会话历史…」 forever: T1 says how long it has been,
+    // and the terminal phase is a failure the user can act on.
+    const key = historyTaskKey("t1");
+    const retry = vi.fn();
+    useTasksStore.getState().begin(key, { label: HISTORY_TASK_LABEL, policy: HISTORY_TASK_POLICY, retry });
+    const waitInput = (): TranscriptWaitInput => {
+      const task = useTasksStore.getState().tasks[key]!;
+      return {
+        booted: true, // pi answered state_ready long before the transcript arrived
+        bootTimedOut: false,
+        exited: false,
+        messageCount: 0,
+        historyLoaded: false,
+        historyPhase: task.phase,
+        historyStartedAt: task.startedAt,
+        historyError: task.error,
+      };
+    };
+
+    await vi.advanceTimersByTimeAsync(HISTORY_TASK_STALL_MS + 1_000);
+    const stalled = deriveTranscriptWait(waitInput());
+    expect(stalled.kind).toBe("history");
+    expect(stalled.kind === "history" && stalled.text).toMatch(/已等待 \d+s/);
+    expect(stalled.kind === "history" && stalled.retry).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(HISTORY_TASK_POLICY.failMs);
+    expect(useTasksStore.getState().tasks[key]!.phase).toBe("error");
+    const failed = deriveTranscriptWait(waitInput());
+    expect(failed.kind).toBe("history-failed");
+    expect(failed.kind === "history-failed" && failed.retry).toBe(true);
+    expect(useTasksStore.getState().tasks[key]!.retry).toBeTypeOf("function");
   });
 });

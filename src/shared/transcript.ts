@@ -40,6 +40,14 @@
  */
 export const INTERNAL_RPC_ID_PREFIX = "pipi-internal-";
 
+/** Whether an RPC response id belongs to an INTERNAL probe (main's `get_state` / the
+ *  transcript tip probe) rather than to a renderer request. Every consumer of the RPC event
+ *  stream must drop those: they are not its requests, and a `get_entries` response with an
+ *  id nobody recognises would otherwise be treated as a full snapshot. */
+export function isInternalProbeId(id: unknown): boolean {
+  return typeof id === "string" && id.startsWith(INTERNAL_RPC_ID_PREFIX);
+}
+
 /** One parsed session-file line. Mirrors pi's `SessionEntry`/`FileEntry` union
  *  loosely (fields are read defensively; the file is parsed, not validated). */
 export interface TranscriptEntry {
@@ -82,6 +90,40 @@ function branchSummaryMessage(e: TranscriptEntry): unknown {
     fromId: e.fromId,
     timestamp: new Date(e.timestamp as string).getTime(),
   };
+}
+
+/**
+ * pi `COMPACTION_SUMMARY_PREFIX` (dist/core/messages.js): how a compaction
+ * summary enters the MODEL context — as a USER message wrapped in this
+ * envelope, not as a `compactionSummary` message.
+ *
+ * Both shapes therefore reach the chat view: the session-file path below emits
+ * the unwrapped `compactionSummary` message, while a live `get_messages` (local
+ * SDK tabs, whose `state.messages` IS the model context) returns the wrapped
+ * user message. Neither is something the user typed, so the chat view has to
+ * recognize both — treating the wrapped one as a normal user bubble put a wall
+ * of English above the conversation.
+ */
+export const COMPACTION_SUMMARY_MARKER =
+  "The conversation history before this point was compacted into the following summary:";
+
+/**
+ * The summary text inside a compaction message, or `undefined` when this is not
+ * one. `role` disambiguates pi's two shapes; `text` is the message's text (for
+ * a `compactionSummary` message that is its `summary` field).
+ */
+export function compactionSummaryOf(role: string | undefined, text: string): string | undefined {
+  if (role === "compactionSummary") {
+    const summary = text.trim();
+    return summary.length > 0 ? summary : undefined;
+  }
+  if (!text.startsWith(COMPACTION_SUMMARY_MARKER)) return undefined;
+  const summary = text
+    .slice(COMPACTION_SUMMARY_MARKER.length)
+    .replace(/^\s*<summary>\s*/, "")
+    .replace(/\s*<\/summary>\s*$/, "")
+    .trim();
+  return summary.length > 0 ? summary : undefined;
 }
 
 /** pi `createCompactionSummaryMessage` */
@@ -136,23 +178,19 @@ function contextEntries(path: TranscriptEntry[]): TranscriptEntry[] {
   return out;
 }
 
-/**
- * The `messages` array pi's `get_messages` returns for this session file.
- *
- * Leaf resolution mirrors pi's `buildSessionPath`: `null` means "no leaf" ([]),
- * an unknown id falls back to the LAST entry by position (append order), and a
- * broken parent chain ends the walk. Returns `[]` rather than throwing, so a
- * caller can fall back to the RPC path on an empty result.
- */
-export function sessionContextMessages(
-  entries: readonly TranscriptEntry[],
-  leafId: string | null,
-): unknown[] {
-  if (leafId === null) return [];
+/** `id → entry` for a set of entries (first occurrence wins, like `parseTreeEntries`). */
+function indexById(entries: readonly TranscriptEntry[]): Map<string, TranscriptEntry> {
   const index = new Map<string, TranscriptEntry>();
   for (const e of entries) {
-    if (e && typeof e.id === "string") index.set(e.id, e);
+    if (e && typeof e.id === "string" && !index.has(e.id)) index.set(e.id, e);
   }
+  return index;
+}
+
+/** The root→leaf path within `entries` (leaf resolution mirrors pi's `buildSessionPath`:
+ *  an unknown id falls back to the LAST entry by position; a broken parent chain ends the
+ *  walk; a ring terminates). `[]` only when there is nothing to walk. */
+function leafPath(entries: readonly TranscriptEntry[], index: Map<string, TranscriptEntry>, leafId: string | null): TranscriptEntry[] {
   let leaf: TranscriptEntry | undefined;
   if (leafId) leaf = index.get(leafId);
   leaf ??= entries[entries.length - 1];
@@ -169,6 +207,47 @@ export function sessionContextMessages(
     current = parentId ? index.get(parentId) : undefined;
   }
   path.reverse(); // root → leaf
+  return path;
+}
 
+/**
+ * Whether the LAST compaction on this leaf path kept entries that are ON that path — the
+ * exact `foundFirstKept` condition in pi's `buildContextEntries`. When it holds, the
+ * resolver drops nothing the path still needs, so resolving these entries yields the whole
+ * context rather than a suffix of it.
+ *
+ * Why it exists: a windowed reader (main/transcript-from-file.ts) must know whether its
+ * window is the whole context, and "a compaction appears somewhere in the window" is NOT
+ * enough — the kept entry id could belong to a side branch, or lie outside the window, in
+ * which case the resolver silently drops the in-window pre-compaction entries and the
+ * result is a post-compaction suffix, not the context.
+ */
+export function compactionClosesContext(entries: readonly TranscriptEntry[], leafId: string | null): boolean {
+  const index = indexById(entries);
+  const path = leafPath(entries, index, leafId);
+  let compaction: TranscriptEntry | null = null;
+  for (const e of path) {
+    if (e.type === "compaction" && typeof e.firstKeptEntryId === "string") compaction = e;
+  }
+  if (!compaction) return false;
+  const idx = path.findIndex((e) => e.id === compaction!.id);
+  return path.slice(0, idx).some((e) => e.id === compaction!.firstKeptEntryId);
+}
+
+/**
+ * The `messages` array pi's `get_messages` returns for this session file.
+ *
+ * Leaf resolution mirrors pi's `buildSessionPath`: `null` means "no leaf" ([]),
+ * an unknown id falls back to the LAST entry by position (append order), and a
+ * broken parent chain ends the walk. Returns `[]` rather than throwing, so a
+ * caller can fall back to the RPC path on an empty result.
+ */
+export function sessionContextMessages(
+  entries: readonly TranscriptEntry[],
+  leafId: string | null,
+): unknown[] {
+  if (leafId === null) return [];
+  const path = leafPath(entries, indexById(entries), leafId);
+  if (path.length === 0) return [];
   return contextEntries(path).flatMap(entryToMessages);
 }

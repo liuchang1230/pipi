@@ -11,6 +11,7 @@ import {
   isNavigationSettled,
   isOnLeafPath,
   navigateLeafId,
+  nearestVisibleAncestor,
 } from "../tree-layout";
 
 /** A session with a branch: r → a → b → leaf, plus a sibling branch r → x. */
@@ -366,5 +367,55 @@ describe("navigateLeafId (where pi actually lands)", () => {
     // …and pi itself no-ops when the user message IS the leaf.
     expect(isAlreadyAtTarget(CHAT, "u2", "u2")).toBe(true);
     expect(isAlreadyAtTarget(CHAT, "a1", "a2")).toBe(false);
+  });
+});
+
+describe("nearestVisibleAncestor (where the selection moves when its row is hidden)", () => {
+  const chain = new Map<string, string | null>([
+    ["a", null],
+    ["b", "a"],
+    ["c", "b"],
+    ["d", "c"],
+  ]);
+
+  it("returns the nearest ancestor the predicate accepts", () => {
+    expect(nearestVisibleAncestor(chain, "d", (id) => id === "b")).toBe("b");
+  });
+
+  it("accepts the immediate parent without walking further", () => {
+    expect(nearestVisibleAncestor(chain, "d", () => true)).toBe("c");
+  });
+
+  it("returns null when the chain ends without a visible ancestor", () => {
+    expect(nearestVisibleAncestor(chain, "d", () => false)).toBeNull();
+    expect(nearestVisibleAncestor(chain, "a", () => true)).toBeNull(); // root has no parent
+  });
+
+  it("does not spin when the hidden chain is a parentId RING", () => {
+    // The shape that froze the branch dialog: the leaf is an appended settings entry
+    // (hidden by the default filter) and its ancestors are a ring nobody can see, so
+    // an unbounded walk cycles forever (docs/diagnosis/2026-10-07.md).
+    const ring = new Map<string, string | null>([
+      ["leaf", "x"],
+      ["x", "y"],
+      ["y", "x"],
+    ]);
+    let calls = 0;
+    const verdict = nearestVisibleAncestor(ring, "leaf", () => {
+      calls += 1;
+      return false;
+    });
+    expect(verdict).toBeNull();
+    // Bounded by the ring, not by a timeout: an unbounded walk never returns.
+    expect(calls).toBeLessThanOrEqual(2);
+  });
+
+  it("finds a visible ancestor past a ring it is not part of", () => {
+    const mixed = new Map<string, string | null>([
+      ["leaf", "x"],
+      ["x", "root"],
+      ["root", null],
+    ]);
+    expect(nearestVisibleAncestor(mixed, "leaf", (id) => id === "root")).toBe("root");
   });
 });

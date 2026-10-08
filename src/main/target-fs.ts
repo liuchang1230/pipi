@@ -323,6 +323,12 @@ export interface TargetFs {
   readPreview(relPath: string): Promise<PreviewPayload>;
   /** Whole-file UTF-8 read at a channel-native path (session JSONL). */
   readText(path: string): Promise<string>;
+  /** Size of a channel-native file, `null` when it is not there. */
+  size(path: string): Promise<number | null>;
+  /** Bytes `[start, start + length)` of a channel-native file. The one primitive the
+   *  session-page reader needs to serve the recent conversation without reading the
+   *  whole file; `transport` where the channel cannot range-read (key-auth ssh). */
+  readBytes(path: string, start: number, length: number): Promise<Buffer>;
   /** Mutations refresh the cache themselves (see `invalidate`). */
   writeText(relPath: string, content: string): Promise<void>;
   mkdir(relPath: string): Promise<void>;
@@ -423,6 +429,20 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
     }
   }
 
+  /** Session paths arrive already native for WSL (`\\wsl$\…`) and remote
+   *  (`/…`), so they must not be pushed through the dialect mapper again — and a
+   *  relative path must not be silently resolved against the process CWD, which is
+   *  what a bare `readAll` would do. A `~` or dialect-absolute path is unambiguous,
+   *  so it is expanded and mapped instead. ONE definition: `readText`, `readBytes`
+   *  and `size` must not disagree about which file a session path names. */
+  async function nativeSessionPath(path: string): Promise<string> {
+    if (binding.isNative(path)) return path;
+    if (!dialect.isAbsolute(path)) {
+      throw new TargetFsError("escape", `expected an absolute path: ${path}`);
+    }
+    return binding.toNative(dialect.normalize(dialect.expandUser(path, await home())));
+  }
+
   return {
     target,
 
@@ -460,20 +480,27 @@ export function createTargetFs(target: Target, deps: TargetFsDeps): TargetFs {
     },
 
     async readText(path: string): Promise<string> {
-      // Session paths arrive already native for WSL (`\\wsl$\…`) and remote
-      // (`/…`), so they must not be pushed through the dialect mapper again —
-      // and a relative path must not be silently resolved against the process
-      // CWD, which is what a bare `readAll` would do. A `~` or dialect-absolute
-      // path is unambiguous, so it is expanded and mapped instead.
-      let native = path;
-      if (!binding.isNative(path)) {
-        if (!dialect.isAbsolute(path)) {
-          throw new TargetFsError("escape", `expected an absolute path: ${path}`);
-        }
-        native = binding.toNative(dialect.normalize(dialect.expandUser(path, await home())));
-      }
+      const native = await nativeSessionPath(path);
       const buf = await viaChannel(native, () => binding.channel.readAll(native));
       return buf.toString("utf8");
+    },
+
+    /** Size of a channel-native file, `null` when absent. Session paging asks for it to
+     *  anchor a tail read. A channel that cannot stat (key-auth ssh) throws a `transport`
+     *  error, which the page reader turns into a whole-file read — so a `null` here means
+     *  "the file is not there", not "this channel cannot tell". */
+    async size(path: string): Promise<number | null> {
+      const native = await nativeSessionPath(path);
+      const st = await statOrNull(binding.channel, native);
+      return st?.size ?? null;
+    },
+
+    /** Bytes `[start, start + length)` of a channel-native file. Throws a `transport`
+     *  TargetFsError where the channel has no ranged read (key-auth ssh) — callers that
+     *  can degrade catch it, everyone else sees an honest failure. */
+    async readBytes(path: string, start: number, length: number): Promise<Buffer> {
+      const native = await nativeSessionPath(path);
+      return viaChannel(native, () => binding.channel.readRange(native, Math.max(0, start), Math.max(0, length)));
     },
 
     async writeText(relPath: string, content: string): Promise<void> {
