@@ -612,10 +612,37 @@ export default function App() {
     if (pending.left !== undefined) layout.setLeftWidth(pending.left);
     if (pending.right !== undefined && !layout.viewerCollapsed) layout.setRightWidth(pending.right);
   }, []);
-  const onLeftPaneResizerDown = useCallback(() => { leftPaneDragRef.current = true; }, []);
-  const onRightPaneResizerDown = useCallback(() => { rightPaneDragRef.current = true; }, []);
+  const onLeftPaneResizerDown = useCallback((e: React.MouseEvent) => {
+    // Same reason as the sidebar divider: a mousedown on a divider must not
+    // become a text selection dragged across the pane next to it.
+    e.preventDefault();
+    leftPaneDragRef.current = true;
+    document.body.classList.add("is-col-resizing");
+  }, []);
+  const onRightPaneResizerDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    rightPaneDragRef.current = true;
+    document.body.classList.add("is-col-resizing");
+  }, []);
   useEffect(() => {
+    const endDrag = () => {
+      if (!leftPaneDragRef.current && !rightPaneDragRef.current) return;
+      leftPaneDragRef.current = false;
+      rightPaneDragRef.current = false;
+      document.body.classList.remove("is-col-resizing");
+      if (paneResizeFrameRef.current !== null) {
+        cancelAnimationFrame(paneResizeFrameRef.current);
+        paneResizeFrameRef.current = null;
+      }
+      flushPaneResize(); // commit the final pointer position immediately
+    };
     const onMove = (e: MouseEvent) => {
+      // Released outside the window: no `mouseup` reaches us, so the drag — and
+      // with it the document-wide `user-select: none` — would stay stuck.
+      if ((leftPaneDragRef.current || rightPaneDragRef.current) && e.buttons === 0) {
+        endDrag();
+        return;
+      }
       if (leftPaneDragRef.current) pendingPaneWidthsRef.current.left = Math.max(190, Math.min(520, e.clientX));
       if (rightPaneDragRef.current && !useLayoutStore.getState().viewerCollapsed) {
         pendingPaneWidthsRef.current.right = Math.max(320, Math.min(900, window.innerWidth - e.clientX));
@@ -627,20 +654,14 @@ export default function App() {
         paneResizeFrameRef.current = requestAnimationFrame(flushPaneResize);
       }
     };
-    const onUp = () => {
-      leftPaneDragRef.current = false;
-      rightPaneDragRef.current = false;
-      if (paneResizeFrameRef.current !== null) {
-        cancelAnimationFrame(paneResizeFrameRef.current);
-        paneResizeFrameRef.current = null;
-      }
-      flushPaneResize(); // commit the final pointer position immediately
-    };
     window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mouseup", endDrag);
+    window.addEventListener("blur", endDrag);
     return () => {
       window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("mouseup", endDrag);
+      window.removeEventListener("blur", endDrag);
+      document.body.classList.remove("is-col-resizing");
       if (paneResizeFrameRef.current !== null) cancelAnimationFrame(paneResizeFrameRef.current);
     };
   }, [flushPaneResize]);

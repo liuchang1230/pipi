@@ -30,6 +30,8 @@ import {
   type WslOpts,
 } from "../pty";
 import type { ExtensionUiRequest } from "../rpc-session";
+import { clearUiSurface } from "../extension-ui";
+import { debugLog } from "../debug-log";
 import { piEnv } from "../pi-env";
 
 interface PendingRequest {
@@ -136,6 +138,11 @@ function ensureWorker(): Worker {
       case "evt":
         forwardEvent(msg.tabId, msg.event);
         return;
+      case "log":
+        // Worker-side degradation (an extension calling a member we do not
+        // honour): the worker cannot reach the app debug log itself.
+        debugLog(msg.tag, msg.msg);
+        return;
       case "resp": {
         const req = pendingRequests.get(msg.resp.id);
         if (req) {
@@ -186,6 +193,8 @@ function markExited(tabId: string, code: number): void {
   const tab = tabs.get(tabId);
   if (!tab || tab.exited) return;
   tab.exited = true;
+  // Extensions died with the session; see the twin call in RpcSession.emitExit.
+  clearUiSurface(tabId, "pi exited");
   // Mirror RpcSession.emitExit so the renderer marks the tab exited (input
   // disabled, "pi 已退出" banner) and tab:alive goes false.
   for (const win of BrowserWindow.getAllWindows()) {
@@ -228,11 +237,11 @@ export function openSdkSession(opts: CreateTabOptions & { id?: string; agentDir:
     agentDir: opts.agentDir,
     sessionPath: opts.sessionPath,
     continueRecent: opts.continueRecent,
-    // Worker threads get their own env copy, and the worker is long-lived
-    // across setting changes — so the subagent model travels WITH each open
-    // and the worker applies it to its own process.env (see sdk-worker.ts).
-    // Absent = follow the main model (the object is empty).
-    subagentEnv: piEnv(),
+    // Worker threads get their own env copy, so the approval policy travels
+    // WITH each open and the worker applies it to its own process.env. (The
+    // sub-agent model pin used to travel here too; it lives in pi's own
+    // settings.json now — ADR 0013.)
+    policyEnv: piEnv(),
   });
   return id;
 }

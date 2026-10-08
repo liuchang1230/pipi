@@ -18,6 +18,7 @@
  *     { kind: "evt",   tabId, event }           // RPC-shaped event frame
  *     { kind: "resp",  tabId, resp }            // RPC response frame
  *     { kind: "ui",    tabId, req }             // extension_ui_request
+ *     { kind: "log",   tag, msg }               // main process debug log
  *     { kind: "closed", tabId }
  *
  * Command handling mirrors upstream `runRpcMode`'s handleCommand switch
@@ -29,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { decideCmdRouting, queueAtCapacity } from "./sdk-queue";
+import { DEGRADED_UI_MEMBERS, type ExtensionUiFrameSpec } from "../../shared/extension-ui";
 
 // --- Undici worker polyfill ------------------------------------------------
 // undici 8.x (a pi-coding-agent dep) reads `markAsUncloneable` off
@@ -118,9 +120,9 @@ interface OpenRequest {
   agentDir: string;
   sessionPath?: string;
   continueRecent?: boolean;
-  /** App-level subagent-model env (PI_PROVIDER/PI_MODEL), applied to this
-   *  worker's own process.env by openTab. Empty = follow the main model. */
-  subagentEnv?: Record<string, string>;
+  /** App-level approval policy for this worker's own process.env, applied by
+   *  openTab (the pipi-approval-gate extension reads it there). */
+  policyEnv?: Record<string, string>;
 }
 interface CmdRequest {
   kind: "cmd";
@@ -206,12 +208,35 @@ const tabs = new Map<string, TabSession>();
  *  answers "Tab session not found" and the first prompt is silently lost. */
 const openingCmds = new Map<string, HostMessage[]>();
 
+/** Degraded members already reported. Module scope, not per bound context:
+ *  a rebind (reload / switch_session) rebuilds the UI context, and re-logging
+ *  the same member every reload is noise, not information. One line per member
+ *  per worker process is what docs/adr/0006 promises. */
+const announcedDegraded = new Set<string>();
+
 function post(m: unknown): void {
   parentPort?.postMessage(m);
 }
 
 /** Replicate upstream createExtensionUIContext (rpc-mode.js). */
 function createExtensionUIContext(ts: TabSession) {
+  // Degraded members (docs/adr/0006-extension-ui-surface.md) are no-ops on BOTH
+  // backends: the remote one is the user's own `pi --mode rpc`, which does not
+  // transport them either. Say so once per member per process instead of
+  // pretending the extension's call did something — this is the only place
+  // where "we silently dropped it" can be observed at all.
+  const degraded = (name: string, why?: string) => {
+    if (announcedDegraded.has(name)) return;
+    announcedDegraded.add(name);
+    const member = DEGRADED_UI_MEMBERS.find((m) => m.name === name);
+    post({ kind: "log", tag: "extension-ui", msg: `degraded ui.${name}: ${why ?? member?.why ?? "not supported"}` });
+  };
+  /** One extension-UI frame. Field names are pinned by shared/extension-ui.ts
+   *  so both backends produce the identical shape (a local tab's widget used to
+   *  arrive as `widgetContent` and was dropped silently on remote). */
+  const postUi = (spec: ExtensionUiFrameSpec) => {
+    post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), ...spec } });
+  };
   const dialog = (opts: { signal?: AbortSignal; timeout?: number } | undefined, defaultValue: unknown, request: Record<string, unknown>, parse: (r: Record<string, unknown>) => unknown) => {
     if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
     const id = randomUUID();
@@ -268,43 +293,70 @@ function createExtensionUIContext(ts: TabSession) {
       dialog(opts, undefined, { method: "input", title, placeholder, timeout: opts?.timeout }, (r) =>
         "cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
       ),
-    notify: (message: string, type?: string) => {
-      post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), method: "notify", message, notifyType: type } });
+    notify: (message: string, type?: "info" | "warning" | "error") => {
+      postUi({ method: "notify", message, notifyType: type });
     },
-    onTerminalInput: () => () => {},
-    setStatus: (key: string, text: string) => {
-      post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), method: "setStatus", statusKey: key, statusText: text } });
+    onTerminalInput: () => {
+      degraded("onTerminalInput");
+      return () => {};
+    },
+    setStatus: (key: string, text: string | undefined) => {
+      postUi({ method: "setStatus", statusKey: key, statusText: text });
     },
     setTitle: (title: string) => {
-      post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), method: "setTitle", title } });
+      postUi({ method: "setTitle", title });
     },
     editor: (title: string, prefill: string) =>
       dialog(undefined, undefined, { method: "editor", title, prefill }, (r) =>
         "cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
       ),
     setEditorText: (text: string) => {
-      post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), method: "set_editor_text", text } });
+      postUi({ method: "set_editor_text", text });
     },
     pasteToEditor: (text: string) => {
-      post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), method: "set_editor_text", text } });
+      // Same fallback as upstream rpc-mode: paste handling is TUI-only.
+      postUi({ method: "set_editor_text", text });
     },
-    getEditorText: () => "",
-    custom: async () => undefined,
-    setWorkingMessage: () => {},
-    setWorkingVisible: () => {},
-    setWorkingIndicator: () => {},
-    setHiddenThinkingLabel: () => {},
-    setWidget: (key: string, content: unknown, options?: Record<string, unknown>) => {
+    getEditorText: () => {
+      degraded("getEditorText");
+      return "";
+    },
+    custom: async () => {
+      degraded("custom");
+      return undefined;
+    },
+    setWorkingMessage: () => degraded("setWorkingMessage"),
+    setWorkingVisible: () => degraded("setWorkingVisible"),
+    setWorkingIndicator: () => degraded("setWorkingIndicator"),
+    setHiddenThinkingLabel: () => degraded("setHiddenThinkingLabel"),
+    setWidget: (key: string, content: unknown, options?: { placement?: "aboveEditor" | "belowEditor" }) => {
+      // Only string arrays cross the JSON seam; a component factory is a
+      // function and cannot. Placement defaults to aboveEditor, like pi.
       if (content === undefined || Array.isArray(content)) {
-        post({ kind: "ui", tabId: ts.tabId, req: { type: "extension_ui_request", id: randomUUID(), method: "setWidget", widgetKey: key, widgetContent: content, ...(options ?? {}) } });
+        const lines = content as string[] | undefined;
+        postUi({ method: "setWidget", widgetKey: key, widgetLines: lines, widgetPlacement: options?.placement });
+      } else {
+        // Not a member name (setWidget IS supported) but a variant of it: the
+        // factory overload cannot cross the seam either, so say which one.
+        degraded("setWidget(component)", "组件工厂：跨 JSON seam 送不过去（只有字符串数组能过）");
       }
     },
     setToolStatus: () => {},
     setToolsExpanded: () => {},
     getToolsExpanded: () => false,
-    addAutocompleteProvider: () => {},
-    setEditorComponent: () => {},
-    getEditorComponent: () => undefined,
+    // setFooter/setHeader: upstream rpc-mode implements them as silent no-ops
+    // (rpc-mode.js:137,140) and the runner does NOT fill missing members from
+    // noOpUIContext (runner.js:270) — omitting them here made the extension
+    // handler THROW, which skips the rest of that handler (so the setStatus on
+    // the next line never ran) while the remote tab was merely quiet.
+    setFooter: () => degraded("setFooter"),
+    setHeader: () => degraded("setHeader"),
+    addAutocompleteProvider: () => degraded("addAutocompleteProvider"),
+    setEditorComponent: () => degraded("setEditorComponent"),
+    getEditorComponent: () => {
+      degraded("getEditorComponent");
+      return undefined;
+    },
   };
 }
 
@@ -601,13 +653,11 @@ async function openTab(req: OpenRequest): Promise<void> {
   const inflight = { cancelled: false };
   opening.set(req.tabId, inflight);
   // The worker is long-lived and process.env is a per-thread copy: apply the
-  // app's subagent-model setting on every open so a change takes effect for
-  // new sessions without respawning the worker (delegated-agent extensions
-  // spawn their subagent pi from THIS env). Clearing first is what makes
-  // "back to follow-main" actually remove a previously injected model.
-  delete process.env.PI_PROVIDER;
-  delete process.env.PI_MODEL;
-  if (req.subagentEnv) Object.assign(process.env, req.subagentEnv);
+  // approval policy on every open so a settings change takes effect for new
+  // sessions without respawning the worker. The sub-agent model pin and the
+  // official packages no longer travel here — they live in pi's own
+  // settings.json, which the SDK reads itself (ADR 0013).
+  if (req.policyEnv) Object.assign(process.env, req.policyEnv);
   try {
     const infraStartedAt = performance.now();
     await ensureSharedInfra(req.agentDir);

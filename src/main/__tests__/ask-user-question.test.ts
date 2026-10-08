@@ -412,14 +412,26 @@ describe("registration — defer to an existing provider", () => {
 
 // 真 pi-ai 校验器（pi 运行时用的那份）：我们 schema 的第一条防线是它在 pi 里
 // 真的生效。pi-ai 的 exports map 全锁（且 typebox 不可从仓库根解析），所以用
-// createRequire 从 pi 包内图加载 —— 布局变了这里会加载失败，那也是信号。
+// createRequire 沿相对路径加载（相对路径绕过 exports map）。布局随 pi 版本变：
+// ≤0.85 把 @earendil-works/* 嵌套在 pi-coding-agent 内，1.0.4 起提升到仓库根 ——
+// 两种都试，全失败才是真信号。
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
 const requireFromPi = createRequire(join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "index.js"));
-const { validateToolArguments } = requireFromPi("./node_modules/@earendil-works/pi-ai/dist/utils/validation.js") as {
+const requireFromApp = createRequire(join(process.cwd(), "package.json"));
+const PI_AI_VALIDATION = "./node_modules/@earendil-works/pi-ai/dist/utils/validation.js";
+
+function loadPiValidator(): {
   validateToolArguments: (tool: { name: string; parameters: unknown }, call: { name?: string; arguments: unknown }) => unknown;
-};
+} {
+  try {
+    return requireFromPi(PI_AI_VALIDATION); // ≤0.85：嵌套布局
+  } catch {
+    return requireFromApp(PI_AI_VALIDATION); // 1.0.4+：提升布局
+  }
+}
+const { validateToolArguments } = loadPiValidator();
 
 const schemaTool = { name: "ask_user_question", parameters: ASK_USER_QUESTION_SCHEMA };
 

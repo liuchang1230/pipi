@@ -107,6 +107,8 @@ html, body, #root {
   transition: background 0.15s ease;
   position: relative;
   touch-action: none;
+  /* A divider drag must never select the text it is passing over. */
+  user-select: none;
 }
 /* Collapsed viewer: expand affordance floats at the window's right edge
    (the right resizer is the last element once the viewer collapses to 0).
@@ -229,7 +231,46 @@ html, body, #root {
   padding: 8px 12px 5px;
   font-weight: 600;
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
+/* The 当前项目文件 collapse affordance: the same weight as the label it sits on
+   (a ghost chevron whose background only appears on hover), and it turns around
+   from `.sidebar.tree-collapsed`. */
+.panel-toggle-btn {
+  margin-left: auto;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  /* line-height: 0 + a 1px box keeps the button (14px) no taller than the
+     10px label's line box, so adding it does not change the panel label row. */
+  padding: 1px 3px;
+  border-radius: 4px;
+  line-height: 0;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.panel-toggle-btn:hover { color: var(--accent); background: var(--hover-strong); }
+.panel-toggle-btn:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.panel-toggle-btn .icon { transition: transform 0.18s ease; }
+.sidebar.tree-collapsed .panel-toggle-btn .icon { transform: rotate(180deg); }
+/* Collapsed 当前项目文件: the pane hugs its label row, the listing is hidden
+   (display:none, so nothing sits clipped behind the label) and the top pane
+   takes the space the divider used to arbitrate. */
+.sidebar.tree-collapsed .sidebar-top { height: auto; flex: 1 1 auto; }
+.sidebar.tree-collapsed .sidebar-bottom {
+  height: auto;
+  flex: 0 0 auto;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+.sidebar.tree-collapsed .sidebar-bottom .tree-path,
+.sidebar.tree-collapsed .sidebar-bottom .tree-scroll { display: none; }
 /* Inline "refreshing" hint on the 当前项目文件 label. Deliberately NOT a
    placeholder row inside the tree: a background re-list must not move the
    listing or look like a state the user has to wait for. */
@@ -265,9 +306,20 @@ html, body, #root {
   touch-action: none;
   opacity: 0.65;
   transition: opacity 0.15s ease, background 0.15s ease;
+  /* A divider drag must never select the session/tree rows it is passing over. */
+  user-select: none;
 }
 .sidebar-resizer:hover,
 .sidebar-resizer:active { background: var(--accent); opacity: 1; }
+/* Active pane-resize drag. The pointer may be over any element (the divider
+   lags the cursor by design), so the whole document suppresses selection and
+   shows one cursor for the duration. `cursor: inherit` on descendants is what
+   beats the per-element cursors (row `pointer`, tree `text`) without
+   `!important`. */
+body.is-col-resizing { user-select: none; cursor: col-resize; }
+body.is-col-resizing * { cursor: inherit; }
+body.is-row-resizing { user-select: none; cursor: ns-resize; }
+body.is-row-resizing * { cursor: inherit; }
 
 /* File tree rows */
 .tree-row {
@@ -1881,6 +1933,17 @@ textarea:focus-visible,
   font-size: 13px;
   user-select: none;
 }
+/* The transcript is still downloading: not an error, so not red — but it says
+   how long it has been waiting and offers a retry (chat-transcript-wait.ts). */
+.chat-wait {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.chat-error-banner .chat-btn {
+  margin-top: 8px;
+}
 .chat-error-banner {
   margin: 8px 0;
   padding: 8px 12px;
@@ -1913,6 +1976,59 @@ textarea:focus-visible,
   50% {
     opacity: 0.55;
   }
+}
+/* 「压缩完成」 notice: the terminal state of /compact. Deliberately STEADY (no
+   pulse) — the pulsing retry banner above it is the "still working" style, and
+   a finished compaction must not look like one. */
+.chat-compaction-done {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.chat-compaction-done-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-compaction-done-head > span:first-child {
+  flex: 1;
+  min-width: 0;
+}
+.chat-compaction-done-body {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  max-height: 320px;
+  overflow: auto;
+  color: var(--text);
+}
+/* A compaction summary in the transcript: a context artifact, so it reads as a
+   document (bordered, inset) rather than as a chat bubble. */
+.chat-msg.summary {
+  margin: 8px 0;
+}
+.chat-msg.summary > summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.chat-msg-summary-hint {
+  opacity: 0.7;
+}
+.chat-msg.summary > .chat-msg-md {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 420px;
+  overflow: auto;
 }
 .chat-msg-error {
   margin-top: 8px;
@@ -1985,13 +2101,13 @@ textarea:focus-visible,
 }
 .chat-thinking {
   margin: 4px 0;
-  font-size: 12px;
 }
 .chat-thinking summary {
   cursor: pointer;
   color: var(--text-dim);
   user-select: none;
   list-style: none;
+  font-size: 12px;
 }
 .chat-thinking summary::before {
   content: "▸ ";
@@ -1999,16 +2115,52 @@ textarea:focus-visible,
 .chat-thinking[open] summary::before {
   content: "▾ ";
 }
+/* The thinking voice (2026-10-02): proportional prose, not a <pre>. The data
+   said thinking is sentences, lists and inline code — monospace CJK is tiring to
+   read — so the block is rendered dimmer, with a rail, at body-text size. No
+   italics (fake obliques wreck CJK), and no max-height: the body is bounded by
+   THINKING_INLINE_MAX_CHARS in ChatPane, never by a nested scrollbar. */
 .chat-thinking-body {
   margin: 6px 0 6px 12px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   border-left: 2px solid var(--border);
   color: var(--text-dim);
-  white-space: pre-wrap;
+  font-size: 12.5px;
+  line-height: 1.75;
   word-break: break-word;
-  max-height: 220px;
-  overflow-y: auto;
+}
+/* The shared Markdown renderer is tuned for the ANSWER (13px, --text); inside a
+   thinking note it must inherit the dimmer voice instead of re-declaring it.
+   Scoped to .chat-thinking-body so the viewer's .markdown-body is untouched. */
+.chat-thinking-body .markdown-body {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+.chat-thinking-body .markdown-body code,
+.chat-thinking-body .markdown-body pre {
+  font-family: var(--mono);
+}
+/* Inline code is normally 0.9em of 13px body text; here the prose is 12.5px and
+   0.9em would undershoot the agreed 12px, so the size is pinned instead. */
+.chat-thinking-body .markdown-body code {
   font-size: 12px;
+}
+.chat-thinking-body .markdown-body p {
+  margin: 6px 0;
+}
+.chat-thinking-body .markdown-body ul,
+.chat-thinking-body .markdown-body ol {
+  margin: 6px 0;
+  padding-left: 24px;
+}
+.chat-thinking-body .markdown-body pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+}
+.chat-thinking .chat-expand-output {
+  margin: 0 0 4px 12px;
+  width: calc(100% - 12px);
 }
 .chat-tool {
   margin: 6px 0;
@@ -2195,6 +2347,71 @@ textarea:focus-visible,
   font-size: 12px;
 }
 .chat-turn-status.completed { color: #4caf72; }
+/* Extension UI surface (docs/adr/0006-extension-ui-surface.md): the widgets an
+   extension declared, and the status chips that ride in the input bar next to
+   the usage stats. For the widgets, the left hairline is what tells "declared by
+   an extension" apart from "said by pi itself". */
+.chat-ext-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 6px;
+  padding-left: 7px;
+  border-left: 2px solid var(--border);
+}
+.chat-ext-zone-belowEditor { margin: 6px 0 0; }
+/* 输入栏里的 status 条（紧跟 .chat-input-stats）：一行、可收缩、从不换行——换行会
+   把发送按钮挤下去。窄的时候整个组和各条一起省略。 */
+.chat-ext-status {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  flex-wrap: nowrap;
+  gap: 10px;
+  max-width: 34%;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.chat-ext-status-item {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.chat-ext-widget {
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.chat-ext-widget-line { min-height: 1.5em; }
+.chat-ext-widget-more {
+  display: block;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.chat-ext-widget-more:hover { color: var(--accent); background: var(--hover-faint); }
+.chat-ext-widget-note { padding: 2px 6px; color: var(--text-dim); font-size: 11px; font-style: italic; }
+.chat-ext-editor-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  padding: 5px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.chat-ext-editor-hint-text { flex: 1; }
 /* Merged running status lives above the input; the elapsed clock makes a
    long think/tool run obviously alive instead of hung. */
 .chat-turn-elapsed {
@@ -2289,6 +2506,12 @@ textarea:focus-visible,
   text-overflow: ellipsis;
   text-align: right;
 }
+/* 主操作按钮不参与收缩：窄面板下该让步的是 stats / status / hint（都有省略号），
+   不是「发送」。 */
+.chat-input-bar .chat-btn {
+  flex: none;
+  white-space: nowrap;
+}
 .chat-btn {
   border: 1px solid var(--border);
   background: var(--bg-input);
@@ -2338,6 +2561,19 @@ textarea:focus-visible,
   min-width: 0;
   /* No overflow:hidden here — the model menu is absolutely positioned below
      the header and would be clipped ("clicking 模型 does nothing"). */
+}
+/* pi's setTitle: read-only text, so it must not look like the neighbouring
+   header buttons (which are all clickable). Bounded, full text in the title. */
+.chat-ext-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-style: italic;
 }
 .chat-header-right {
   flex: 0 0 auto;
@@ -2888,6 +3124,36 @@ textarea:focus-visible,
 .tree-chip-action {
   margin-left: auto;
   border-style: dashed;
+}
+.tree-earlier {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.tree-earlier-btn {
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: background 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+.tree-earlier-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+  border-color: var(--accent);
+}
+.tree-earlier-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.tree-earlier-note {
+  opacity: 0.8;
 }
 .tree-scroll {
   max-height: 46vh;

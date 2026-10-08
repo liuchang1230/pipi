@@ -193,13 +193,21 @@ function gitCore(segment: string): string {
 }
 
 /**
- * `rm` 的风险判定。问的是三类：
- *   - 递归删除（`-r` / `-R`）—— 经典灾难，且不可枚举
- *   - 通配 / 目录（`*`、`build/`、`.`、`~`）或 /tmp 之外的绝对路径
- *   - 根目录 `/`
- * 放过的：`rm 某个文件`、`rm -f /tmp/中间的产物` —— 那是 agent 的日常动作，
- * 而且可恢复。误报比漏报更快让用户把这个功能关掉，所以这条线划得窄。
- * 想更严就把 policy 设成 all。
+ * `rm` 的风险判定（2026-10-06 收窄，ADR 0003 §修订）。
+ *
+ * 问的 —— 删完就没了、且位置不在项目可核对范围内：
+ *   - 项目之外的绝对路径（`/tmp` 除外）与 `~` 下的一切
+ *   - `/`、`.`、`..`，以及相对路径里爬出项目的 `..` 段（`rm -rf ../sibling`）
+ *   - 顶层通配（`rm *`、`rm *.log`、`rm ./*`）—— 作用域没有目录限定
+ *   - 有递归旗标却没有目标（`xargs rm -rf`）—— 删什么取决于管道，无法核对
+ * 放过的 —— agent 的日常动作，且位置可核对：
+ *   - 项目内的相对路径，**含递归**（`rm -rf build`、`rm -fr ./dist`）
+ *   - 带目录前缀的通配（`rm build/*.png`）
+ *   - `rm 某个文件`、`rm -f /tmp/中间产物`
+ *
+ * 原先「递归就问」把 41 次 rm 弹窗的大头（递归删项目内子目录）全弹给了用户，
+ * 把用户训练到了关掉整扇门的边缘 —— 误报比漏报更快杀死这个功能。想更严就把
+ * 策略设成 all。这条线是判断，不是定律。
  */
 export function riskyRm(segment: string): boolean {
   const m = /^rm\s+(.+)$/.exec(segment.trim());
@@ -208,11 +216,18 @@ export function riskyRm(segment: string): boolean {
   const flags = tokens.filter((t) => t.startsWith("-"));
   const targets = tokens.filter((t) => !t.startsWith("-"));
   // 长选项 `--preserve-root` 不在此列：`--` 后紧跟的不是字母，故不匹配。
-  if (flags.some((f) => /^-[a-zA-Z]*[rR]/.test(f) || f === "--recursive")) return true;
+  const recursive = flags.some((f) => /^-[a-zA-Z]*[rR]/.test(f) || f === "--recursive");
+  if (targets.length === 0) return recursive;
   return targets.some((t) => {
-    if (/[*?]/.test(t)) return true;
-    if (t === "/" || t === "." || t === ".." || t === "~" || t.endsWith("/") || t.startsWith("~")) return true;
+    if (t === "/" || t === "." || t === "..") return true;
+    if (t.startsWith("~")) return true;
     if (t.startsWith("/")) return !(t === "/tmp" || t.startsWith("/tmp/"));
+    // 相对路径里的 `..` 段会爬出项目（与 escapesProject 的 write 侧同一判断）。
+    if (t.split("/").includes("..")) return true;
+    // `./` 前缀不改变作用域：`rm ./*` 等价于 `rm *`，剥掉再判通配。
+    const norm = t.replace(/^(?:\.\/)+/, "");
+    if (!norm) return true; // `./` 本身就是当前目录
+    if (/[*?]/.test(norm)) return !norm.includes("/");
     return false;
   });
 }
@@ -251,13 +266,26 @@ export function bashDangers(command: string, depth = 0): Danger[] {
     if (riskyRm(core)) {
       push({
         rule: "rm-risky",
-        what: "删除文件或目录（rm 递归 / 强制 / 通配）",
+        what: "删除文件或目录（rm 到项目之外 / 顶层通配）",
         why: "删掉的内容不在 git 里，恢复不了",
       });
     }
   }
   return [...found.values()];
 }
+
+/**
+ * 写进这些地方不问：pipi 自己的「内容」目录。技能与提示模板是纯文本，且「让 AI
+ * 给我装个技能 / 写个模板」是日常用法 —— 对它们弹窗纯属噪音（远程会话里几乎
+ * 每次装技能都会弹一次，见 2026-10-06 的诊断）。**extensions/ 不在列**：扩展是
+ * 代码，写进去会在之后的每个会话里执行 —— 那是代码执行面，必须继续问。
+ * settings.json / auth 同理不在列。
+ *
+ * home 在运行时解析（pi 进程自己的 HOME/USERPROFILE）：本地、WSL、远程各自的
+ * home 不一样，而扩展跑在哪个进程里就该用谁的 home。解析不出来就不豁免
+ * （fail-closed，退回「问一句」）。
+ */
+const QUIET_WRITE_BASES = ["skills", "prompts"];
 
 /**
  * 写/改「项目目录之外」的文件。纯字符串判断，不做路径规范化 —— 保守方向是
@@ -275,6 +303,16 @@ export function escapesProject(path: unknown, cwd: string): boolean {
   if (root && (p === root || p.startsWith(`${root}/`))) return false;
   // 临时目录是正常用法（跑测试、写中间产物），不该问。
   if (p === "/tmp" || p.startsWith("/tmp/")) return false;
+  // pipi 自己的内容目录（见 QUIET_WRITE_BASES）：写技能/模板不该问。
+  const home = (process.env.HOME ?? process.env.USERPROFILE ?? "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  if (home) {
+    for (const base of QUIET_WRITE_BASES) {
+      const dir = `${home}/.pi/agent/${base}`;
+      if (p === dir || p.startsWith(`${dir}/`)) return false;
+    }
+  }
   return true;
 }
 

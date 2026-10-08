@@ -31,7 +31,8 @@ export type IconName =
   | "search"
   | "clipboard"
   | "image"
-  | "external-link";
+  | "external-link"
+  | "chevron-down";
 
 const PATHS: Record<IconName, ReactNode> = {
   // Lucide "folder"
@@ -190,6 +191,9 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
     </>
   ),
+  // Lucide "chevron-down" — rotated 180° by CSS for the collapsed state, so the
+  // one glyph animates between "收起" and "展开".
+  "chevron-down": <path d="m6 9 6 6 6-6" />,
 };
 
 interface IconProps {

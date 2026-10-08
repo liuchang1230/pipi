@@ -1,11 +1,17 @@
 /**
  * Native dialog for pi's extension UI sub-protocol (select/confirm/input/
  * editor). Rendered per-tab inside ChatPane; answers flow back through
- * window.api.rpcUiResponse. Fire-and-forget methods (notify, setStatus,
- * setWidget, setTitle, set_editor_text) are handled by the caller.
+ * window.api.rpcUiResponse.
+ *
+ * The fire-and-forget members are not dialogs: `notify` and `set_editor_text`
+ * are handled by `handleFireAndForget` below, and `setStatus` / `setWidget` /
+ * `setTitle` never reach the renderer as frames at all — main turns them into
+ * surface STATE (stores/extensionUiStore.ts, docs/adr/0006).
  */
 import { useEffect, useRef, useState } from "react";
 import { splitConfirmMessage } from "../../../shared/confirm-detail";
+import { isDialogUiMethod } from "../../../shared/extension-ui";
+import { stripAnsi } from "../../../shared/ansi";
 import { useUiStore } from "../stores/uiStore";
 import { useOverlayDismiss } from "../components/overlay-dismiss";
 
@@ -30,7 +36,8 @@ export interface UiRequest {
  * from anywhere else has no marker and renders exactly as before.
  */
 function ConfirmMessage({ req, title }: { req: UiRequest; title: string }) {
-  const { headline, detail } = splitConfirmMessage(req.message ?? title);
+  // 扩展的文案可以带主题颜色（pi 的 TUI 会渲染它，我们只剥掉转义码）。
+  const { headline, detail } = splitConfirmMessage(stripAnsi(req.message ?? title));
   // 用户反馈：「用户不需要知道你执行什么命令，只需要知道你要干什么」。So the plain
   // sentence IS the dialog — big, centred, first. The exact command/diff stays one
   // click away, for the times you DO want to verify before allowing.
@@ -124,13 +131,13 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
     }
   };
 
-  const title = req.title || "pi";
+  const title = stripAnsi(req.title || "pi");
   // A structured confirm is OUR OWN (the extension marks it, see
   // shared/confirm-detail.ts): it gets the purpose-first layout and 允许/不允许
   // wording. Anything else keeps 确定/取消 — "允许" would be nonsense for e.g.
   // "Continue with the summarized branch?".
   const structuredConfirm =
-    req.method === "confirm" && splitConfirmMessage(req.message ?? "").detail !== undefined;
+    req.method === "confirm" && splitConfirmMessage(stripAnsi(req.message ?? "")).detail !== undefined;
 
   return (
     <div className={`dialog-overlay ui-dialog-overlay${minimized ? " minimized" : ""}`} {...overlayDismiss}>
@@ -160,7 +167,7 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
                   onMouseEnter={() => setSelected(i)}
                   onClick={() => respond({ value: opt })}
                 >
-                  {opt}
+                  {stripAnsi(opt)}
                 </div>
               ))}
               {!req.options?.length && <div className="ui-select-empty">（无选项）</div>}
@@ -225,19 +232,37 @@ export function UiDialog({ tabId, req, onClose }: { tabId: string; req: UiReques
   );
 }
 
-/** Handle fire-and-forget extension UI methods. Returns true if consumed. */
+/**
+ * The renderer's half of pi's fire-and-forget extension UI frames (UiDialog's
+ * half is the dialogs: select/confirm/input/editor, which are NOT consumed
+ * here so ChatPane can paint them).
+ *
+ * Only two of them are the renderer's business:
+ *   - `notify` → toast;
+ *   - `set_editor_text` → the composer, guarded by the caller.
+ * `setStatus` / `setWidget` / `setTitle` are represented by the surface state
+ * main holds (stores/extensionUiStore.ts) and no longer arrive here at all.
+ *
+ * Everything else — including a member a future pi adds — is CONSUMED and
+ * logged rather than returned false: the dialog renderer would otherwise paint
+ * an empty question out of a frame that asks nothing (the throwaway `
+ * "M2: displayed by chat UI in later milestones" branch used to do exactly
+ * that, silently, for these three methods).
+ */
 export function handleFireAndForget(req: UiRequest, onSetEditorText?: (text: string) => void): boolean {
   if (req.method === "notify") {
     const type = req.notifyType === "error" ? "err" : "ok";
-    useUiStore.getState().showToast(String(req.message ?? ""), type);
+    // `theme.fg(...)` 的颜色码在 toast 里同样只会是乱码。
+    useUiStore.getState().showToast(stripAnsi(String(req.message ?? "")), type);
     return true;
   }
-  if (req.method === "set_editor_text" && typeof req.text === "string") {
-    onSetEditorText?.(req.text);
+  if (req.method === "set_editor_text") {
+    if (typeof req.text === "string") onSetEditorText?.(req.text);
     return true;
   }
-  if (req.method === "setStatus" || req.method === "setWidget" || req.method === "setTitle" || req.method === "set_editor_text") {
-    return true; // M2: displayed by chat UI in later milestones
+  if (isDialogUiMethod(req.method)) {
+    return false; // a real question: ChatPane renders the dialog
   }
-  return false;
+  window.api.debug.log(`ui: consumed unsupported extension_ui_request method=${String(req.method)}`, "warn");
+  return true;
 }

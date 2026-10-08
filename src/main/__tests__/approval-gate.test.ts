@@ -77,16 +77,16 @@ describe("readTimeoutMs", () => {
 
 describe("bashDangers — must ask", () => {
   const cases: Array<[string, string]> = [
-    ["rm -rf build", "rm-risky"],
-    ["rm -fr ./dist", "rm-risky"],
     ["cd /data && rm -rf *", "rm-risky"],
+    ["rm *", "rm-risky"],
+    ["rm ./*.log", "rm-risky"],
     ["rm ~/notes", "rm-risky"],
     ["rm /etc/hosts", "rm-risky"],
-    ["rm build/", "rm-risky"],
     ["xargs rm -rf", "rm-risky"],
     ["nohup rm -rf /data/x", "rm-risky"],
-    ["env FOO=1 rm -rf x", "rm-risky"],
-    ["bash -c 'rm -rf /tmp/x'", "rm-risky"],
+    ["env FOO=1 rm -rf /data/x", "rm-risky"],
+    ["rm -rf ../outside", "rm-risky"],
+    ["rm ../sibling/x", "rm-risky"],
     // Every -c payload counts, not just the first: the dangerous one is last here.
     ["bash -c 'ls' && bash -c 'rm -rf /'", "rm-risky"],
     ["sh -c 'true'; sh -c 'git clean -fdx'", "git-clean"],
@@ -152,6 +152,14 @@ describe("bashDangers — must NOT ask (false positives are how this gets switch
     "rm one-file.txt",
     "rm -f /tmp/build-output.log",
     "rm src/old-module.ts",
+    // Recursion INSIDE the project is the agent's everyday cleanup (2026-10-06
+    // narrowing): the tree is inspectable and the paths are relative, so quiet.
+    "rm -rf build",
+    "rm -fr ./dist",
+    "rm build/",
+    "rm build/*.png",
+    "rm -rf node_modules dist",
+    "rm -rf /tmp/scratch",
     // Read-only / harmless git.
     "git status",
     "git push origin main",
@@ -209,11 +217,19 @@ describe("bashDangers — must NOT ask (false positives are how this gets switch
 });
 
 describe("riskyRm", () => {
-  it("is recursive or not, per flag cluster", () => {
-    expect(gate.riskyRm("rm -rf x")).toBe(true);
-    expect(gate.riskyRm("rm -fr x")).toBe(true);
-    expect(gate.riskyRm("rm -r x")).toBe(true);
-    expect(gate.riskyRm("rm --recursive x")).toBe(true);
+  it("asks about recursion aimed OUTSIDE the project, not inside it", () => {
+    // In-project recursion is everyday cleanup; the paths are checkable.
+    expect(gate.riskyRm("rm -rf x")).toBe(false);
+    expect(gate.riskyRm("rm -fr x")).toBe(false);
+    expect(gate.riskyRm("rm -r x")).toBe(false);
+    expect(gate.riskyRm("rm --recursive x")).toBe(false);
+    // Outside the project the tree is not inspectable — ask.
+    expect(gate.riskyRm("rm -rf /data/x")).toBe(true);
+    expect(gate.riskyRm("rm -r ~/notes")).toBe(true);
+  });
+
+  it("still asks for plain files outside the project", () => {
+    expect(gate.riskyRm("rm /data/x")).toBe(true);
     expect(gate.riskyRm("rm -f x")).toBe(false);
     expect(gate.riskyRm("rm x")).toBe(false);
   });
@@ -224,7 +240,27 @@ describe("riskyRm", () => {
 
   it("treats /tmp as scratch space, and everything else absolute as a project escape", () => {
     expect(gate.riskyRm("rm /tmp/x")).toBe(false);
+    expect(gate.riskyRm("rm -rf /tmp/x")).toBe(false);
     expect(gate.riskyRm("rm /data/x")).toBe(true);
+  });
+
+  it("asks when the wildcard has no directory scoping it", () => {
+    expect(gate.riskyRm("rm *")).toBe(true);
+    expect(gate.riskyRm("rm *.log")).toBe(true);
+    expect(gate.riskyRm("rm ./*")).toBe(true);
+    // A directory prefix scopes the glob to something checkable.
+    expect(gate.riskyRm("rm build/*.png")).toBe(false);
+  });
+
+  it("asks when a relative path climbs out of the project", () => {
+    expect(gate.riskyRm("rm -rf ../sibling")).toBe(true);
+    expect(gate.riskyRm("rm ../x")).toBe(true);
+    expect(gate.riskyRm("rm -rf .")).toBe(true);
+  });
+
+  it("asks when there are no targets to inspect (xargs rm -rf)", () => {
+    expect(gate.riskyRm("rm -rf")).toBe(true);
+    expect(gate.riskyRm("rm")).toBe(false);
   });
 });
 
@@ -261,6 +297,27 @@ describe("escapesProject", () => {
     expect(gate.escapesProject("/etc/hosts", "")).toBe(false);
     expect(gate.escapesProject(undefined, cwd)).toBe(false);
   });
+
+  it("quietly allows pipi's own content dirs under home, but not code or settings", () => {
+    // HOME is resolved at call time; pin it so the test does not depend on the
+    // machine it runs on. Save/restore so the rest of the suite is unaffected.
+    const saved = process.env.HOME;
+    process.env.HOME = "/home/tester";
+    try {
+      expect(gate.escapesProject("/home/tester/.pi/agent/skills/grill-me/SKILL.md", cwd)).toBe(false);
+      expect(gate.escapesProject("/home/tester/.pi/agent/skills", cwd)).toBe(false);
+      expect(gate.escapesProject("/home/tester/.pi/agent/prompts/x.md", cwd)).toBe(false);
+      // Extensions are code that will run in every future session — still ask.
+      expect(gate.escapesProject("/home/tester/.pi/agent/extensions/gate.ts", cwd)).toBe(true);
+      // Settings and credentials are configuration, not content — still ask.
+      expect(gate.escapesProject("/home/tester/.pi/agent/settings.json", cwd)).toBe(true);
+      // A lookalike sibling must not inherit the exemption.
+      expect(gate.escapesProject("/home/tester/.pi/agent/skills2/x.md", cwd)).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.HOME;
+      else process.env.HOME = saved;
+    }
+  });
 });
 
 describe("collectDangers — policy decides the breadth", () => {
@@ -273,7 +330,9 @@ describe("collectDangers — policy decides the breadth", () => {
 
   it("destructive asks only about the named risks", () => {
     expect(gate.collectDangers("destructive", "bash", { command: "ls" }, cwd)).toEqual([]);
-    expect(gate.collectDangers("destructive", "bash", { command: "rm -rf x" }, cwd)).toHaveLength(1);
+    // In-project recursion is quiet since the 2026-10-06 narrowing.
+    expect(gate.collectDangers("destructive", "bash", { command: "rm -rf x" }, cwd)).toEqual([]);
+    expect(gate.collectDangers("destructive", "bash", { command: "rm -rf /data/x" }, cwd)).toHaveLength(1);
   });
 
   it("all asks before every mutating tool call, and never about read-only ones", () => {
@@ -293,11 +352,27 @@ describe("collectDangers — policy decides the breadth", () => {
     const found = gate.collectDangers("destructive", "write", { path: "/etc/profile" }, cwd);
     expect(found.map((d) => d.rule)).toEqual(["outside-project"]);
   });
+
+  it("stays quiet for skill/prompt content under home, but not for extensions", () => {
+    const saved = process.env.HOME;
+    process.env.HOME = "/home/tester";
+    try {
+      const skills = "/home/tester/.pi/agent/skills/new-skill/SKILL.md";
+      expect(gate.collectDangers("destructive", "write", { path: skills }, cwd)).toEqual([]);
+      const ext = "/home/tester/.pi/agent/extensions/new-ext.ts";
+      expect(gate.collectDangers("destructive", "write", { path: ext }, cwd).map((d) => d.rule)).toEqual([
+        "outside-project",
+      ]);
+    } finally {
+      if (saved === undefined) delete process.env.HOME;
+      else process.env.HOME = saved;
+    }
+  });
 });
 
 describe("composeMessage", () => {
   it("leads with one plain sentence, lists the consequences, and hides the raw material after the marker", () => {
-    const dangers = gate.collectDangers("destructive", "bash", { command: "rm -rf build" }, "/data/project");
+    const dangers = gate.collectDangers("destructive", "bash", { command: "rm -rf /data/elsewhere" }, "/data/project");
     const message = gate.composeMessage(dangers, "/data/project", 120000);
     const [headline, detail] = message.split(gate.DETAIL_MARKER);
     expect(headline.split("\n")[0]).toContain("删除文件或目录");
@@ -381,7 +456,7 @@ describe("the gate itself (pi.on tool_call)", () => {
     return harness;
   }
 
-  const dangerous = { toolName: "bash", input: { command: "rm -rf x" } };
+  const dangerous = { toolName: "bash", input: { command: "rm -rf /data/x" } };
 
   it("registers no hook at all when the policy is off", () => {
     expect(setup("off").registered()).toBe(0);
@@ -582,12 +657,21 @@ describe("piEnv / piShellPrefix — one choke point for everything pi is told", 
     });
 
     it("leaves no spawn site calling a feature module directly", () => {
-      // pi-env.ts is the ONLY place allowed to know about them. A direct call
-      // elsewhere would skip whatever gets added next.
-      expect(callers("subagentEnv(")).toEqual(["pi-env.ts", "subagent-model.ts"]);
-      expect(callers("subagentShellPrefix(")).toEqual(["pi-env.ts", "subagent-model.ts"]);
+      // pi-env.ts is the ONLY place allowed to know about the env-injected
+      // features. A direct call elsewhere would skip whatever gets added next.
       expect(callers("approvalEnv(")).toEqual(["approval-env.ts", "pi-env.ts"]);
       expect(callers("approvalShellPrefix(")).toEqual(["approval-env.ts", "pi-env.ts"]);
+      // The sub-agent model pin is NOT in this class any more (ADR 0013): it
+      // travels in pi's own settings.json, so no spawn site may inject it (that
+      // was PI_MODEL/PI_PROVIDER, which only the retired hand-written engine
+      // read). pi-settings.ts owns the write; index.ts is its only caller.
+      expect(callers("subagentEnv(")).toEqual([]);
+      expect(callers("subagentShellPrefix(")).toEqual([]);
+      // No env assignment left anywhere (prose about the retired mechanism is
+      // fine; an assignment or a shell export is not).
+      expect(callers("PI_MODEL:")).toEqual([]);
+      expect(callers("export PI_MODEL")).toEqual([]);
+      expect(callers("ensureSubagentModel(")).toEqual(["index.ts", "pi-settings.ts"]);
     });
   });
 });

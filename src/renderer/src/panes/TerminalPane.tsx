@@ -17,6 +17,7 @@ import { attachImeHeuristic } from "../xterm-ime-anchor";
 import { useTabsStore } from "../stores/tabsStore";
 import { useViewerStore } from "../stores/viewerStore";
 import { useChatStore } from "../stores/chatStore";
+import { useExtensionUiStore } from "../stores/extensionUiStore";
 import { projectLabelForTab, tabHoverInfo } from "../project-label";
 import { useUiStore } from "../stores/uiStore";
 import type { TabInfo } from "../stores/types";
@@ -263,6 +264,17 @@ interface TerminalHostProps {
 }
 
 const TerminalHost = memo(function TerminalHost({ visibleTabs, activeTab, theme }: TerminalHostProps) {
+  // The extension UI surface is bound to the TAB's lifetime, not to a view's
+  // mount: a tab in terminal mode renders TerminalView (ChatView unmounts) and
+  // pi's setStatus/setWidget frames are one-shot, so a view-owned subscription
+  // would lose them permanently. Main owns the state; this subscribes per open
+  // tab and pulls the snapshot once (see stores/extensionUiStore.ts).
+  const syncAttached = useExtensionUiStore((s) => s.syncAttached);
+  const tabIds = visibleTabs.map((t) => t.id).join("\u0000");
+  useEffect(() => {
+    syncAttached(tabIds ? tabIds.split("\u0000") : []);
+  }, [tabIds, syncAttached]);
+
   // A tab is "painted" when it is the active one. All tabs stay mounted
   // (hidden ones too) — a connection tab's terminal is the SSH pty, so it
   // must never unmount or the remote disconnects. Only the active tab is

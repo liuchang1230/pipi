@@ -8,6 +8,11 @@
  * every member here must match the real package (checked against pi
  * 0.85.1's dist/core/extensions/types.d.ts), and a member that is no longer
  * used by any shipped extension should be removed, not kept "just in case".
+ *
+ * Members we deliberately do NOT honour are marked **降级成员** and listed in
+ * `DEGRADED_UI_MEMBERS` (src/shared/extension-ui.ts) + docs/adr/0006; the full
+ * list is not repeated here because this stub only carries members an actually
+ * shipped extension touches.
  */
 declare module "@earendil-works/pi-coding-agent" {
   export interface WorkingIndicatorOptions {
@@ -21,6 +26,11 @@ declare module "@earendil-works/pi-coding-agent" {
      *  the approval gate to spot a write that leaves the project. */
     cwd: string;
     ui: {
+      /** **降级成员**（`DEGRADED_UI_MEMBERS`，见 docs/adr/0006）：rpc 后端
+       *  结构性不传输（需 TUI loader 访问），聊天视图里我们自己的转圈是
+       *  DOM/CSS、无闪烁可言。保留它的唯一理由是终端视图：那里跑的是真 TUI，
+       *  pipi-static-indicator 靠它把 spinner 换成单帧静态点（实测防闪烁）。
+       *  在聊天视图里它是无声 no-op——这是刻意的，不是缺陷。 */
       setWorkingIndicator(options?: WorkingIndicatorOptions): void;
       notify(message: string, type?: "info" | "warning" | "error"): Promise<void>;
       /** Dialogs resolve via the extension_ui sub-protocol (rpc.md).
@@ -38,6 +48,10 @@ declare module "@earendil-works/pi-coding-agent" {
       editor(title: string, prefill?: string): Promise<string | undefined>;
       setStatus(key: string, text: string | undefined): void;
       setWidget(key: string, content: string[] | undefined): void;
+      /** 主题：返回的是**带 ANSI 转义序列**的字符串（pi 的 TUI 解释它）。
+       *  聊天视图会把转义码剥掉再上屏（`src/shared/ansi.ts`，ADR 0006 决策 9），
+       *  所以颜色不会被恢复——给 status/widget 传文本时别指望颜色能过去，
+       *  但**写了也不会出乱码**（以前会：DOM 把 `\u001b[38;5;241m` 当字面显示）。 */
       theme: {
         fg(color: string, text: string): string;
         strikethrough(text: string): string;
