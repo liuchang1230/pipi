@@ -11,8 +11,8 @@
  * A file may opt out of the third rule with `policy: "overwrite"` — for
  * app-owned code the user is not invited to edit (the extension sources in
  * extensions/), where an out-of-date copy is the bug and a diverged copy is an
- * unsupported state. Text the user is expected to tune (skills, agent
- * definitions, the delegation extension) keeps the default, `preserve`.
+ * unsupported state. Text the user is expected to tune (skills, agent briefs)
+ * keeps the default, `preserve`.
  *
  * "Did the user edit it" needs memory, which is what the journal (`.pipi.json`,
  * written next to the installed content) provides: it records the hash of the
@@ -67,7 +67,7 @@ export const TMP_SUFFIX = ".pipi-tmp";
 
 export interface ShippedFile {
   /** Path inside the target root, e.g. "engineering/wizard/SKILL.md" or
-   *  "delegation/index.ts". Always /-separated. */
+   *  "reviewer.md". Always /-separated. */
   relPath: string;
   content: string;
   /** `overwrite` (app-owned code): always write ours, never call it a

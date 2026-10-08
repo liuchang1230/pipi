@@ -5,24 +5,30 @@
  *
  * Two destinations, two ownership postures (both live in content-sync.ts):
  *
- *   - extensions/: the 6 app-owned extension sources are code WE maintain and
- *     the user is not invited to edit, so they are shipped with
+ *   - extensions/: the app-owned extension sources are code WE maintain and the
+ *     user is not invited to edit, so they are shipped with
  *     `policy: "overwrite"` — an out-of-date copy is a bug, and a diverged copy
  *     is an unsupported state.
- *   - extensions/delegation/ + agents/: the delegation capability layer
- *     (analyst / reviewer / scout) is text the user is expected to tune, so it
- *     keeps the default `preserve` policy: their edits win, are logged, and are
- *     never overwritten. It needs a journal for the same reason the skills tree
- *     does — see content-sync.ts.
+ *   - agents/: the sub-agent briefs are text the user is expected to tune, so
+ *     they keep the default `preserve` policy: their edits win, are logged, and
+ *     are never overwritten. They need a journal for the same reason the skills
+ *     tree does — see content-sync.ts.
  *
- * Why the delegation layer ships at all (ADR 0005): the shipped `code-review`
- * skill tells the model to run both axes as one `reviewer` call with two
- * `tasks`, and pi core deliberately ships no sub-agents — the app would
- * otherwise hand every user a skill whose step 4 cannot run, silently, in one
- * context. The skill text no longer assumes it WILL run (ADR 0004 补记四): it
- * names the mechanism, states what to do without it, and requires the report to
- * say which mode ran, so a machine that never got this sync degrades out loud.
+ * The hand-written delegation extension (extensions/delegation/*.ts) shipped
+ * here with them until ADR 0013, and is now RETIRED: the official `pi-subagents`
+ * package runs the same three agents and does not lose their results when a
+ * call is aborted — so the app ensures that package (index.ts) instead of
+ * maintaining its own engine. The five files are in RETIRED_FILES below because
+ * pi auto-loads every .ts under extensions/: merely not shipping them would
+ * leave the old engine running on every machine that already had it.
  *
+ * Only the `analyst` brief still ships. `reviewer` / `scout` are the official
+ * package's own, richer briefs, and shipping ours on top of them silently
+ * shadowed upstream's copy (a user-scope agent wins over a builtin) — so
+ * RETIRED_FILES removes them. The shipped `code-review` skill still names those
+ * two: they resolve to the package's briefs, and the skill states what to do when
+ * no sub-agent tool exists at all (ADR 0004 补记四) — a machine without the
+ * package degrades out loud instead of silently reviewing both axes in one context. *
  * RPC-backed remote/WSL chat tabs navigate the session tree through the
  * pipi-tree-nav extension command (upstream pi's rpc-mode has no native
  * `navigate_tree` RPC), so the extension must exist on the machine that runs
@@ -38,8 +44,8 @@
  */
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { existsSync, readFileSync, rmdirSync, rmSync } from "node:fs";
 import type SftpClient from "ssh2-sftp-client";
 import { remoteAgentDir } from "./pty";
 import {
@@ -51,20 +57,13 @@ import {
   type ShippedFile,
 } from "./content-sync";
 import type { CommandRunner } from "./runner";
+import { buildOfficialPackagesClause } from "./pi-settings";
 import staticIndicatorSource from "./extensions/pipi-static-indicator.ts?raw";
 import treeNavSource from "./extensions/pipi-tree-nav.ts?raw";
 import modelSyncSource from "./extensions/pipi-model-sync.ts?raw";
-import subagentModelSource from "./extensions/pipi-subagent-model.ts?raw";
 import approvalGateSource from "./extensions/pipi-approval-gate.ts?raw";
 import askUserQuestionSource from "./extensions/pipi-ask-user-question.ts?raw";
-import delegationIndexSource from "./extensions/delegation/index.ts?raw";
-import delegationAgentsSource from "./extensions/delegation/agents.ts?raw";
-import delegationDeclarationsSource from "./extensions/delegation/declarations.ts?raw";
-import delegationEngineSource from "./extensions/delegation/engine.ts?raw";
-import delegationRenderSource from "./extensions/delegation/render.ts?raw";
 import analystAgentSource from "./agents/analyst.md?raw";
-import reviewerAgentSource from "./agents/reviewer.md?raw";
-import scoutAgentSource from "./agents/scout.md?raw";
 
 const AGENT_HOME = join(homedir(), ".pi", "agent");
 export const EXTENSIONS_DIR = join(AGENT_HOME, "extensions");
@@ -84,34 +83,24 @@ export const SHIPPED_EXTENSIONS: ShippedExtension[] = [
   { fileName: "pipi-static-indicator.ts", content: staticIndicatorSource },
   { fileName: "pipi-tree-nav.ts", content: treeNavSource },
   { fileName: "pipi-model-sync.ts", content: modelSyncSource },
-  { fileName: "pipi-subagent-model.ts", content: subagentModelSource },
   { fileName: "pipi-approval-gate.ts", content: approvalGateSource },
   { fileName: "pipi-ask-user-question.ts", content: askUserQuestionSource },
 ];
 
-/** The delegation capability layer, as `extensions/delegation/*.ts` — pi's
- *  discovery rule for a directory extension is `extensions/<name>/index.ts`. */
-const DELEGATION_FILES: ShippedFile[] = [
-  { relPath: "delegation/index.ts", content: delegationIndexSource },
-  { relPath: "delegation/agents.ts", content: delegationAgentsSource },
-  { relPath: "delegation/declarations.ts", content: delegationDeclarationsSource },
-  { relPath: "delegation/engine.ts", content: delegationEngineSource },
-  { relPath: "delegation/render.ts", content: delegationRenderSource },
-];
-
-/** Everything the app installs into <agentHome>/extensions: our own single-file
- *  extensions (overwrite) plus the delegation tree (preserve). */
+/** Everything the app installs into <agentHome>/extensions: our own extension
+ *  sources, all `overwrite`. The delegation tree that used to be appended here
+ *  is retired (ADR 0013) — see RETIRED_FILES. */
 export const SHIPPED_EXTENSION_FILES: ShippedFile[] = [
   ...SHIPPED_EXTENSIONS.map(({ fileName, content }) => ({ relPath: fileName, content, policy: "overwrite" as const })),
-  ...DELEGATION_FILES,
 ];
 
-/** Everything the app installs into <agentHome>/agents. Agent definitions are
- *  prompts the user tunes (or replaces) → preserve. */
+/** Everything the app installs into <agentHome>/agents. Agent briefs are prompts
+ *  people tune → `preserve`. Only `analyst` ships: the official `pi-subagents`
+ *  package brings its own (richer, maintained) `reviewer`/`scout` briefs, and
+ *  shipping ours on top of them only meant silently shadowing upstream's — the
+ *  duplication ADR 0013 removed. `analyst` has no counterpart there. */
 export const SHIPPED_AGENT_FILES: ShippedFile[] = [
   { relPath: "analyst.md", content: analystAgentSource },
-  { relPath: "reviewer.md", content: reviewerAgentSource },
-  { relPath: "scout.md", content: scoutAgentSource },
 ];
 
 /**
@@ -138,6 +127,69 @@ export interface RetiredFile {
 }
 
 export const RETIRED_FILES: RetiredFile[] = [
+  // ADR 0013: the sub-agent briefs the official `pi-subagents` package ships
+  // itself. Ours shadowed them silently (a user-scope agent wins over a builtin),
+  // so an install kept running a five-day-old copy of a prompt upstream maintains
+  // — and ours granted `bash` to a read-only reviewer, which is how such a run
+  // ends up blocked on a command until its deadline. A tuned copy is removed too
+  // ("READ-ONLY" + "EXACTLY" are our markers); a file that never was ours is left
+  // alone. `analyst` has no upstream counterpart and keeps shipping.
+  {
+    dir: "agents",
+    fileName: "reviewer.md",
+    sha256: "4f3027ba9fffdde90b0542c07943530dfac5e1242c5acd35fedf80b4c893b341",
+    markers: ["READ-ONLY", "EXACTLY"],
+  },
+  {
+    dir: "agents",
+    fileName: "scout.md",
+    sha256: "89b409fc783801fbabd1a83ad97d63086763918fca56699bdec86d70392ff484",
+    markers: ["READ-ONLY", "EXACTLY"],
+  },
+  // ADR 0013: the extension that kept PI_MODEL/PI_PROVIDER equal to the live
+  // session model. Only the retired hand-written delegation engine ever read
+  // those, and the app no longer injects them — the official package inherits the
+  // session model natively and resolves a pinned one from pi's own settings.
+  {
+    dir: "extensions",
+    fileName: "pipi-subagent-model.ts",
+    sha256: "be7904bffbe884261e44301e7820a632e8e381e4d744ac734ee9c197413fad06",
+    markers: ["PIPI_SUBAGENT_MODEL_PINNED", "syncSubagentModelEnv"],
+  },
+  // ADR 0013: the hand-written delegation engine, replaced by the official
+  // `pi-subagents` package. Markers match what we shipped, so a user's own edit
+  // of one of these files is still recognized as ours and removed; a file that
+  // never was ours is left alone (see the interface comment above).
+  {
+    dir: "extensions",
+    fileName: "delegation/index.ts",
+    sha256: "9138c8460de068f21c1e4f949110d046021fcec5ff1f9dabdd6728a38240d104",
+    markers: ["registerDelegationTool", "DECLARATIONS"],
+  },
+  {
+    dir: "extensions",
+    fileName: "delegation/agents.ts",
+    sha256: "f2bc9ee6c848b83a5f2815f2e2da1571ad3cda9a97f3eed77c09978692e05478",
+    markers: ["discoverAgents", "AgentScope"],
+  },
+  {
+    dir: "extensions",
+    fileName: "delegation/declarations.ts",
+    sha256: "2a8c700cafebae1ceb1708aaae4424c8b749ef0f704de96d6060ff3a77aadc2a",
+    markers: ["paramDescriptions", "MAX_PARALLEL_TASKS"],
+  },
+  {
+    dir: "extensions",
+    fileName: "delegation/engine.ts",
+    sha256: "875c0f9435f0d2a2c138888d755955eb97326743ff9b708b74f447fa14469d8d",
+    markers: ["runSingleAgent", "COLLAPSED_ITEM_COUNT"],
+  },
+  {
+    dir: "extensions",
+    fileName: "delegation/render.ts",
+    sha256: "23eaeb455aa5e8d3a76c9169fcfb4ee585199a61f9577f885b44cf95f9639a47",
+    markers: ["makeRenderer", "DelegationRenderer"],
+  },
   {
     dir: "extensions",
     fileName: "pipi-mode-switch.ts",
@@ -182,6 +234,17 @@ export function retireShippedFiles(agentHome = AGENT_HOME): string[] {
       }
       rmSync(target, { force: true });
       removed.push(target);
+      // A retired directory extension (extensions/<name>/*.ts) leaves an empty
+      // directory behind: a trap for the next reader, and for pi's discovery
+      // walk. rmdir only succeeds when it is empty, so a file of theirs inside
+      // keeps it — and a top-level file never has a parent of ours to remove.
+      if (spec.fileName.includes("/")) {
+        try {
+          rmdirSync(dirname(target));
+        } catch {
+          /* not empty → theirs */
+        }
+      }
       console.log(`[extensions] retired ${target}`);
     } catch (e) {
       console.error(`[extensions] failed to retire ${spec.fileName}:`, e instanceof Error ? e.message : String(e));
@@ -192,9 +255,9 @@ export function retireShippedFiles(agentHome = AGENT_HOME): string[] {
 
 /**
  * Best-effort sync of the shipped extensions (see content-sync.ts for the
- * policy: our own sources are overwritten, the delegation tree the user edited
- * is kept). `dir` is overridable for tests. Returns the rel paths actually
- * written, so the caller can surface a chat-page notice.
+ * policy: our own sources are overwritten). `dir` is overridable for tests.
+ * Returns the rel paths actually written, so the caller can surface a
+ * chat-page notice.
  */
 export function ensureShippedExtensions(dir = EXTENSIONS_DIR): string[] {
   return ensureContent(dir, SHIPPED_EXTENSION_FILES, "extensions").written;
@@ -206,7 +269,7 @@ export function ensureShippedAgents(dir = AGENTS_DIR): string[] {
 }
 
 export interface AgentHomeSyncResult {
-  /** Rel paths written, e.g. "pipi-tree-nav.ts", "delegation/index.ts". */
+  /** Rel paths written, e.g. "pipi-tree-nav.ts", "reviewer.md". */
   extensions: string[];
   agents: string[];
   /** Kept because the user edited them (never overwritten). */
@@ -261,14 +324,23 @@ export function buildSshInstallCommand(): string {
  * (markers travel base64-encoded, and they contain no spaces) and each clause
  * is wrapped in a subshell that always succeeds, so a retire miss can never
  * fail the install.
+ *
+ * The official packages (pi-settings.ts) ride the same trip for the same
+ * reason: the remote's settings.json is the one file we never carry (ADR 0009),
+ * so `pi install` run over there is the only way it learns about them.
  */
 export function buildSshRetireTrailer(agentHome = "$HOME/.pi/agent"): string {
   return `${RETIRED_FILES.map(({ dir, fileName, markers }) => {
     const path = `${agentHome}/${dir}/${fileName}`;
+    // Only for a nested file (extensions/<name>/index.ts): the directory we
+    // emptied goes too, but only when empty — rmdir refuses otherwise.
+    const parent = fileName.includes("/")
+      ? `${agentHome}/${dir}/${fileName.split("/").slice(0, -1).join("/")}`
+      : "";
     const probes = markers
       .map((m) => `grep -q $(echo ${Buffer.from(m, "utf8").toString("base64")} | base64 -d) ${path}`)
       .join(" && ");
-    return `( test -f ${path} && ${probes} && rm -f ${path} && echo retired ${path} || true )`;
+    return `( test -f ${path} && ${probes} && rm -f ${path} && echo retired ${path}${parent ? ` && rmdir ${parent} 2>/dev/null` : ""} || true )`;
   }).join("\n")}\n`;
 }
 
@@ -292,7 +364,7 @@ export async function syncAgentHomeViaSsh(
       remoteRoot: REMOTE_EXTENSIONS_DIR,
       label: "extensions",
       displayRoot: "~/.pi/agent/extensions",
-      trailer: buildSshRetireTrailer(),
+      trailer: buildSshRetireTrailer() + buildOfficialPackagesClause(),
     },
     SHIPPED_EXTENSION_FILES,
     timeoutMs,
@@ -326,9 +398,8 @@ export interface RemoteExtensionsSyncResult {
 /**
  * Upload the shipped content to a remote server's agent home over an
  * already-connected sftp session (mirrors syncThemesViaSftp in theme-sync.ts).
- * Both roots go through the same journal rules as the local sync, so a
- * delegation file or agent definition the user tuned ON THE SERVER is kept
- * rather than clobbered. The whole upload is wrapped in one try/catch (any
+ * Both roots go through the same journal rules as the local sync, so an agent
+ * definition the user tuned ON THE SERVER is kept rather than clobbered. The whole upload is wrapped in one try/catch (any
  * failure returns ok:false with the paths uploaded so far), matching the theme
  * sync's failure contract.
  */
@@ -357,6 +428,18 @@ export async function syncExtensionsViaSftp(
         // noErrorOK: a concurrent delete must not fail the whole sync.
         await client.delete(remotePath, true);
         retired.push(remotePath);
+        if (spec.fileName.includes("/")) {
+          // The directory the retired tree lived in, if we emptied it. rmdir
+          // (not rm -r) is the point: a file of theirs inside keeps it alive.
+          const parent = `${base}/${spec.dir}/${spec.fileName.split("/").slice(0, -1).join("/")}`;
+          try {
+            // NOT recursive: the user's own files in that directory outrank
+            // tidiness, and a non-empty rmdir simply fails.
+            await client.rmdir(parent, false);
+          } catch {
+            /* not empty → theirs */
+          }
+        }
       } catch (error) {
         console.error(`[extensions] failed to retire ${remotePath}:`, error instanceof Error ? error.message : String(error));
       }

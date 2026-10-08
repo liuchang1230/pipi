@@ -1,6 +1,6 @@
 # ADR 0005：能力层随 app 分发（技能依赖的机制必须在软件里）
 
-Status: **accepted**（2026-09-30）
+Status: **accepted**（2026-09-30）。**部分被 `docs/adr/0013-retire-hand-written-delegation.md` 取代**（2026-10-07）：ADR 0013 退役了本 ADR 收编的 `extensions/delegation/*.ts`，改由官方 `pi-subagents` 包承担运行时，并由 app 确保该包在场；本 ADR 关于 skills 树与 `agents/*.md` 的两半**仍然有效**。
 
 ## 动机
 

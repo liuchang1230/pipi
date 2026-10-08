@@ -1420,8 +1420,8 @@ function sessionArg(sessionPath: string): string {
     // Same nested SSH quoting constraint as rpc-session.ts: base64 is safe
     // unquoted, while inner single quotes would terminate `bash -ic '…'`.
     ` export PIPI_S="$(printf %s ${b64} | base64 -d 2>/dev/null || printf %s ${b64} | base64 -D 2>/dev/null)";` +
-    // The subagent-model env must sit directly in front of `pi` (the agent
-    // extensions inherit the pi process env; ssh/WSL do not forward ours).
+    // The approval policy must sit directly in front of `pi` (the extension
+    // inherits the pi process env; ssh/WSL do not forward ours).
     ` ${piShellPrefix()}pi \${PIPI_S:+--session "$PIPI_S"}; exec bash -i`
   );
 }

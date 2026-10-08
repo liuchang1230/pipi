@@ -41,24 +41,37 @@ afterEach(() => {
 });
 
 describe("the shipped bundle", () => {
-  it("puts our 5 sources at the extension root and the delegation tree underneath", () => {
+  it("ships our own extension sources, and no delegation tree (retired by ADR 0013)", () => {
     const relPaths = SHIPPED_EXTENSION_FILES.map((f) => f.relPath);
-    expect(relPaths).toEqual(
-      expect.arrayContaining(["pipi-tree-nav.ts", "delegation/index.ts", "delegation/engine.ts"]),
-    );
-    // pi's discovery rule for a directory extension is extensions/<name>/index.ts,
-    // so the delegation tree has to be complete, not just present.
-    expect(relPaths.filter((p) => p.startsWith("delegation/"))).toHaveLength(5);
+    expect(relPaths).toEqual(expect.arrayContaining(["pipi-tree-nav.ts", "pipi-approval-gate.ts"]));
+    // The model-sync extension that served the retired env mechanism goes too.
+    expect(relPaths).not.toContain("pipi-subagent-model.ts");
+    expect(RETIRED_FILES.map((spec) => spec.fileName)).toContain("pipi-subagent-model.ts");
+    expect(relPaths).toHaveLength(SHIPPED_EXTENSIONS.length);
+    expect(relPaths.filter((p) => p.startsWith("delegation/"))).toEqual([]);
+    // Stopping the shipment is only half of it: pi loads any .ts under
+    // extensions/ from disk, so the old engine must be DELETED on upgrade — and
+    // all five files, since a directory extension is index.ts + its imports.
+    const retired = RETIRED_FILES.map((spec) => spec.fileName).filter((name) => name.startsWith("delegation/"));
+    expect(retired.sort()).toEqual([
+      "delegation/agents.ts",
+      "delegation/declarations.ts",
+      "delegation/engine.ts",
+      "delegation/index.ts",
+      "delegation/render.ts",
+    ]);
   });
 
-  it("marks our own sources overwrite and the user-tunable text preserve", () => {
+  it("marks our own sources overwrite and the user-tunable agent briefs preserve", () => {
     for (const file of SHIPPED_EXTENSION_FILES) {
       const ours = SHIPPED_EXTENSIONS.some((e) => e.fileName === file.relPath);
       expect(file.policy === "overwrite", file.relPath).toBe(ours);
     }
     // Agent definitions are prompts people tune → never overwritten.
     for (const file of SHIPPED_AGENT_FILES) expect(file.policy).toBeUndefined();
-    expect(SHIPPED_AGENT_FILES.map((f) => f.relPath)).toEqual(["analyst.md", "reviewer.md", "scout.md"]);
+    // Only the brief with no upstream counterpart: the official package ships
+    // its own reviewer/scout briefs (ADR 0013).
+    expect(SHIPPED_AGENT_FILES.map((f) => f.relPath)).toEqual(["analyst.md"]);
   });
 
   it("ships the same bytes the bundle carries, including CRLF", () => {
@@ -96,28 +109,14 @@ describe("ensureShippedExtensions", () => {
     expect(ensureShippedExtensions(dir)).toEqual([updated[0]]);
     expect(existsSync(target)).toBe(true);
   });
-
-  it("keeps a delegation file the user edited, and says so", () => {
-    const dir = tempDir();
-    ensureShippedExtensions(dir);
-    const tuned = join(dir, "delegation", "declarations.ts");
-    writeFileSync(tuned, "// my own declarations\n", "utf8");
-    // Their bytes stay (they are running that code) …
-    expect(ensureShippedExtensions(dir)).toEqual([]);
-    expect(readFileSync(tuned, "utf8")).toBe("// my own declarations\n");
-    // … and the divergence is an explicit state in the journal, not silence.
-    const journal = parseJournal(readFileSync(join(dir, JOURNAL_FILE), "utf8"));
-    expect(Object.keys(journal.diverged)).toEqual(["delegation/declarations.ts"]);
-    expect(journal.shipped["delegation/declarations.ts"]).toBeUndefined();
-  });
 });
 
 describe("ensureShippedAgents / ensureShippedAgentHome", () => {
   it("writes agent definitions into agents/, not into extensions/", () => {
     const home = tempDir();
     expect(ensureShippedAgents(join(home, "agents")).length).toBe(SHIPPED_AGENT_FILES.length);
-    expect(existsSync(join(home, "agents", "reviewer.md"))).toBe(true);
-    expect(existsSync(join(home, "extensions", "reviewer.md"))).toBe(false);
+    expect(existsSync(join(home, "agents", "analyst.md"))).toBe(true);
+    expect(existsSync(join(home, "extensions", "analyst.md"))).toBe(false);
   });
 
   it("provisions both roots and reports their journals separately", () => {
@@ -141,8 +140,11 @@ describe("ensureShippedAgents / ensureShippedAgentHome", () => {
     expect(again.agents).toEqual([]);
     expect(again.retired).toEqual([]);
     // A pre-journal file carrying our markers is removed by the same call.
+    // Looked up by name, not index: RETIRED_FILES grows, and a positional
+    // reference silently starts testing a different file (it did).
+    const planner = RETIRED_FILES.find((spec) => spec.dir === "agents" && spec.fileName === "planner.md")!;
     const legacy = join(home, "agents", "planner.md");
-    writeFileSync(legacy, RETIRED_FILES[1]!.markers.join("\n"), "utf8");
+    writeFileSync(legacy, planner.markers.join("\n"), "utf8");
     expect(ensureShippedAgentHome(home).retired).toEqual([legacy]);
     expect(existsSync(legacy)).toBe(false);
   });
@@ -180,9 +182,19 @@ describe("key-auth ssh transport (unit shape)", () => {
     // Probe then apply, and the two roots never share a trip: the probe has to
     // report the remote's own bytes for THIS root before the plan is made.
     expect(calls[0]!.stdin).toContain(".pi/agent/extensions");
+    // Shipped content is one of OUR sources; the delegation tree is not shipped
+    // any more (ADR 0013) and may only appear in the retire trailer below.
+    const trailer = buildSshRetireTrailer();
+    const apply = calls[1]!.stdin.replace(trailer, "");
+    expect(apply).toContain("pipi-tree-nav.ts");
+    expect(apply).not.toContain("delegation/");
     expect(calls[1]!.stdin).toContain("delegation/index.ts");
+    // The official packages ride the same apply: their settings.json is the one
+    // file the app never carries over (ADR 0009 + ADR 0013).
+    expect(calls[1]!.stdin).toContain("pi install npm:pi-subagents");
+    expect(calls[1]!.stdin).toContain("command -v pi");
     expect(calls[2]!.stdin).toContain(".pi/agent/agents");
-    expect(calls[3]!.stdin).toContain("reviewer.md");
+    expect(calls[3]!.stdin).toContain("analyst.md");
     // The pre-journal retire rides on the extensions apply (no extra round trip).
     expect(calls[1]!.stdin).toContain("pipi-mode-switch.ts");
     expect(calls[3]!.stdin).not.toContain("pipi-mode-switch.ts");
@@ -321,15 +333,20 @@ describe("syncExtensionsViaSftp", () => {
     // rename put them there (so they are complete files, never partial ones).
     for (const p of puts) expect(p.path).toMatch(/\.pipi-tmp$/);
     const installed = [...files.keys()];
-    expect(installed).toContain("/home/user/.pi/agent/extensions/delegation/index.ts");
-    expect(installed).toContain("/home/user/.pi/agent/agents/reviewer.md");
+    expect(installed).toContain("/home/user/.pi/agent/extensions/pipi-tree-nav.ts");
+    expect(installed).toContain("/home/user/.pi/agent/agents/analyst.md");
     expect(installed).toContain("/home/user/.pi/agent/extensions/.pipi.json");
     expect(installed).toContain("/home/user/.pi/agent/agents/.pipi.json");
     expect(installed).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length + 2);
     expect(mkdirs).toContain("/home/user/.pi/agent/extensions");
     expect(mkdirs).toContain("/home/user/.pi/agent/agents");
     expect(result.uploaded).toHaveLength(SHIPPED_EXTENSION_FILES.length + SHIPPED_AGENT_FILES.length);
-    expect(result.uploaded).toContain("/home/user/.pi/agent/extensions/delegation/index.ts");
+    expect(result.uploaded).toContain("/home/user/.pi/agent/extensions/pipi-tree-nav.ts");
+    // The retired delegation tree is not part of an upload (ADR 0013). sftp has
+    // no exec channel, so its remote half of the package ensure is a gap we
+    // document rather than fake.
+    expect(installed.some((p) => p.includes("/delegation/"))).toBe(false);
+    expect(result.uploaded.some((p) => p.includes("/delegation/"))).toBe(false);
   });
 
   it("honors an absolute agentDir override when computing the remote base", async () => {
@@ -358,28 +375,28 @@ describe("syncExtensionsViaSftp", () => {
     expect(second.uploaded).toEqual([]);
   });
 
-  it("re-uploads an app-owned extension that drifted, but keeps a tuned delegation file", async () => {
+  it("re-uploads an app-owned extension that drifted, but keeps a tuned agent brief", async () => {
     const files = new Map<string, string | Buffer>();
     const first = mockClient(files);
     await syncExtensionsViaSftp(first.client as never, "/home/user", undefined);
     first.renames.length = 0;
-    // The user tweaks the delegation code ON THE SERVER, and something else
-    // tampers with one of our own sources.
-    const tuned = "/home/user/.pi/agent/extensions/delegation/engine.ts";
+    // The user tunes an agent brief ON THE SERVER (the preserve class), and
+    // something else tampers with one of our own sources (overwrite).
+    const tuned = "/home/user/.pi/agent/agents/analyst.md";
     const ours = "/home/user/.pi/agent/extensions/pipi-tree-nav.ts";
-    files.set(tuned, "// my engine\n");
+    files.set(tuned, "// my analyst\n");
     files.set(ours, "// tampered\n");
     const second = await syncExtensionsViaSftp(first.client as never, "/home/user", undefined);
     expect(second.ok).toBe(true);
     const touched = first.renames.map((r) => r.to);
     expect(touched).toContain(ours);
     expect(touched).not.toContain(tuned);
-    expect(files.get(tuned)).toBe("// my engine\n");
+    expect(files.get(tuned)).toBe("// my analyst\n");
     expect(second.uploaded).not.toContain(tuned);
     // Whatever the server says about it, the journal records the divergence so
     // the next sync does not adopt their file as ours.
-    const journal = parseJournal(files.get("/home/user/.pi/agent/extensions/.pipi.json")!.toString());
-    expect(Object.keys(journal.diverged)).toContain("delegation/engine.ts");
+    const journal = parseJournal(files.get("/home/user/.pi/agent/agents/.pipi.json")!.toString());
+    expect(Object.keys(journal.diverged)).toContain("analyst.md");
   });
 
   it("reports a failure without throwing when mkdir rejects", async () => {
@@ -530,5 +547,46 @@ describe("retireShippedFiles", () => {
 
   it("is a no-op when the files are already gone", () => {
     expect(retireShippedFiles(mkdtempSync(join(tmpdir(), "retire-")))).toEqual([]);
+  });
+
+  it("removes the whole hand-written delegation tree an older version shipped", () => {
+    // ADR 0013. The old engine is a directory extension — index.ts plus the four
+    // files it imports — so a partial removal leaves pi loading a broken one.
+    const home = mkdtempSync(join(tmpdir(), "retire-"));
+    const dir = join(home, "extensions", "delegation");
+    mkdirSync(dir, { recursive: true });
+    const shipped: Record<string, string[]> = {
+      "index.ts": ["registerDelegationTool", "DECLARATIONS"],
+      "agents.ts": ["discoverAgents", "AgentScope"],
+      "declarations.ts": ["paramDescriptions", "MAX_PARALLEL_TASKS"],
+      "engine.ts": ["runSingleAgent", "COLLAPSED_ITEM_COUNT"],
+      "render.ts": ["makeRenderer", "DelegationRenderer"],
+    };
+    for (const [name, markers] of Object.entries(shipped)) writeFileSync(join(dir, name), markers.join("\n"), "utf8");
+    // A file we never shipped in that directory is not ours to delete.
+    const mine = join(dir, "my-notes.md");
+    writeFileSync(mine, "my own notes\n", "utf8");
+    const removed = retireShippedFiles(home);
+    expect(removed).toHaveLength(Object.keys(shipped).length);
+    for (const name of Object.keys(shipped)) {
+      expect(removed).toContain(join(dir, name));
+      expect(existsSync(join(dir, name))).toBe(false);
+    }
+    expect(existsSync(mine)).toBe(true);
+    // The user's file keeps the directory alive: the empty-dir cleanup must not
+    // take anything of theirs with it.
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it("removes the directory a retired tree lived in, once it is empty", () => {
+    // An empty extensions/<name>/ is a trap for pi's discovery walk (and for the
+    // next reader of the agent home), so retirement cleans it up — but only
+    // when nothing of the user's is left in there.
+    const home = mkdtempSync(join(tmpdir(), "retire-"));
+    const dir = join(home, "extensions", "delegation");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "index.ts"), "registerDelegationTool\nDECLARATIONS\n", "utf8");
+    expect(retireShippedFiles(home)).toHaveLength(1);
+    expect(existsSync(dir)).toBe(false);
   });
 });

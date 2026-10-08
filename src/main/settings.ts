@@ -15,6 +15,20 @@ import {
   normalizeApprovalPolicy,
   normalizeApprovalTimeoutSeconds,
 } from "../shared/approval";
+import { normalizePackageMirror, type PackageMirrorSettings } from "../shared/package-mirror";
+
+/** The configured sub-agent model pin, or null to follow the session's model.
+ *  Lives here rather than in pi-settings.ts so that module (whose pure parts are
+ *  unit-tested) stays free of electron. */
+export function getSubagentModelSetting(): SubagentModelSettings | null {
+  try {
+    return getSettings().subagents ?? null;
+  } catch {
+    // Reading settings must NEVER block a spawn or a startup step (app not
+    // ready, unreadable settings.json, …). Fall back to "follow the session".
+    return null;
+  }
+}
 
 // The shape lives in src/shared/approval.ts so preload + renderer can name it
 // without importing this module (which pulls in electron `app`).
@@ -27,9 +41,10 @@ export interface AutoFollowSettings {
 }
 
 /** Model used by delegated subagents (analyst / reviewer / scout). Absent =
- *  the subagent inherits the main session's model. Purely an app-side launch
- *  default: it is injected as PI_PROVIDER/PI_MODEL into every pi process the
- *  app spawns, which is exactly what the agent extensions read. */
+ *  the subagent inherits the main session's model. Written into pi's OWN
+ *  settings.json as `subagents.agentOverrides.<role>.model`, which is where the
+ *  official `pi-subagents` package resolves a child's model (ADR 0013 — it never
+ *  read PI_PROVIDER/PI_MODEL, the retired hand-written engine's contract). */
 export interface SubagentModelSettings {
   provider?: string;
   model: string;
@@ -47,6 +62,9 @@ export interface AppSettings {
    *  Absent in an old settings.json → the default policy, deliberately: the
    *  gate is the feature, so "unknown" must not mean "off". */
   approval: ApprovalSettings;
+  /** Mirror the user's locally-installed pi extension packages onto
+   *  remote/WSL targets. Absent = off (the ADR 0009 default, deliberately). */
+  packageMirror?: PackageMirrorSettings;
 }
 
 const DEFAULTS: AppSettings = {
@@ -82,6 +100,7 @@ export function getSettings(): AppSettings {
     subagents: normalizeSubagents(r.subagents),
     onboarding: r.onboarding,
     approval: normalizeApproval(r.approval),
+    packageMirror: normalizePackageMirror(r.packageMirror),
   };
 }
 
@@ -122,6 +141,7 @@ export function updateSettings(patch: Partial<AppSettings>): AppSettings {
     // Merged field-by-field so a partial patch cannot silently reset the
     // timeout to a default the user never chose.
     approval: normalizeApproval({ ...prev.approval, ...(patch.approval ?? {}) }),
+    packageMirror: normalizePackageMirror({ ...prev.packageMirror, ...(patch.packageMirror ?? {}) }),
   };
   writeJsonAtomic(settingsPath(), next);
   return next;

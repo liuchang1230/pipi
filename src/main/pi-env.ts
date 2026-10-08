@@ -10,18 +10,22 @@
  *                   `pi --mode rpc` child, in-process SDK worker thread)
  *   piShellPrefix() shell prefix for WSL / SSH, where no env crosses the
  *                   boundary and the values must be exported in front of the
- *                   command (see subagentShellPrefix for the quoting rules)
+ *                   command (see approvalShellPrefix for the quoting rules)
+ *
+ * One feature is left: the approval policy. The sub-agent model pin used to ride
+ * here too (PI_MODEL/PI_PROVIDER, which only the retired hand-written delegation
+ * engine ever read); it now lives in pi's own settings.json, where the official
+ * `pi-subagents` package resolves it (ADR 0013, see pi-settings.ts).
  */
 import { approvalEnv, approvalShellPrefix } from "./approval-env";
-import { subagentEnv, subagentShellPrefix } from "./subagent-model";
 
 /** Spread into a directly spawned pi child's env.
  *  NEVER into the app's own `process.env` — that would leak into unrelated children. */
 export function piEnv(): Record<string, string> {
-  return { ...subagentEnv(), ...approvalEnv() };
+  return { ...approvalEnv() };
 }
 
 /** Prefix a WSL/SSH command string so the far-side pi sees the same values. */
 export function piShellPrefix(): string {
-  return subagentShellPrefix() + approvalShellPrefix();
+  return approvalShellPrefix();
 }

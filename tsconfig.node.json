@@ -22,13 +22,9 @@
     "src/shared/**/*",
     "src/renderer/src/components/diff-utils.ts",
     "electron.vite.config.ts"
-  ],
-  // pi-extension sources we SHIP but do not compile: they are embedded as text
-  // (`?raw`) and loaded by pi itself, and they import pi's internal packages
-  // (@earendil-works/pi-agent-core / pi-ai / pi-tui / typebox) plus `.ts` module
-  // specifiers, neither of which the app depends on or supports. Their
-  // correctness is established by pi loading them at runtime, not by tsc.
-  "exclude": [
-    "src/main/extensions/delegation"
   ]
+  // No `exclude` any more: it only ever listed "src/main/extensions/delegation",
+  // the hand-written delegation engine retired by ADR 0013. The extension
+  // sources we still ship (src/main/extensions/pipi-*.ts) typecheck against
+  // pi-api-stub.d.ts; the `?raw` imports keep them out of the emitted bundle.
 }

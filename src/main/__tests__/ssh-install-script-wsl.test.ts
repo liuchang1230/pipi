@@ -97,7 +97,11 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
     const home = `/tmp/pipi-e2e-ext-${process.pid}-${Date.now()}`;
     const extensions = `${home}/.pi/agent/extensions`;
     const agents = `${home}/.pi/agent/agents`;
-    const spec = RETIRED_FILES[0]!;
+    // Looked up by name, not index: RETIRED_FILES grows, and a positional
+    // reference silently starts testing a different file (it did, twice).
+    const spec = RETIRED_FILES.find(
+      (entry) => entry.dir === "extensions" && entry.fileName === "pipi-subagent-model.ts",
+    )!;
     const retirePath = `${home}/.pi/agent/${spec.dir}/${spec.fileName}`;
     const authoredPath = `${home}/.pi/agent/${spec.dir}/keep-me.md`;
     const run = wslRunner(home);
@@ -127,20 +131,19 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
       const second = await syncAgentHomeViaSsh(run, 60_000);
       expect(second).toMatchObject({ ok: true, extensions: [], agents: [], diverged: [], retired: [] });
 
-      // 3. The user tunes the delegation code and an agent definition.
-      const tunedExtension = "delegation/declarations.ts";
-      const tunedAgent = "reviewer.md";
-      seed(`${extensions}/${tunedExtension}`, "// my declarations\n");
-      seed(`${agents}/${tunedAgent}`, "my reviewer\n");
+      // 3. The user tunes an agent brief — the preserve class (their text is a
+      // prompt, not our code). Only `analyst` is ours to ship (ADR 0013); the
+      // official package supplies the other two roles.
+      const tunedAgent = "analyst.md";
+      seed(`${agents}/${tunedAgent}`, "my analyst\n");
       const third = await syncAgentHomeViaSsh(run, 60_000);
       expect(third.ok).toBe(true);
-      expect(third.diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
-      expect(wsl(["cat", `${extensions}/${tunedExtension}`])).toBe("// my declarations\n");
-      expect(wsl(["cat", `${agents}/${tunedAgent}`])).toBe("my reviewer\n");
-      // …and both stay theirs after another sync: the journal did not adopt them,
+      expect(third.diverged).toEqual([tunedAgent]);
+      expect(wsl(["cat", `${agents}/${tunedAgent}`])).toBe("my analyst\n");
+      // …and it stays theirs after another sync: the journal did not adopt it,
       // which is what would otherwise lose the edit on the next app update.
-      expect((await syncAgentHomeViaSsh(run, 60_000)).diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
-      expect(wsl(["cat", `${extensions}/${tunedExtension}`])).toBe("// my declarations\n");
+      expect((await syncAgentHomeViaSsh(run, 60_000)).diverged).toEqual([tunedAgent]);
+      expect(wsl(["cat", `${agents}/${tunedAgent}`])).toBe("my analyst\n");
 
       // 4. Our OWN sources, in the same directory, are a different class: a
       // tampered copy is a bug, so it is restored rather than kept.
@@ -149,7 +152,7 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
       const oursContent = SHIPPED_EXTENSION_FILES.find((f) => f.relPath === ours)!.content;
       const fourth = await syncAgentHomeViaSsh(run, 60_000);
       expect(fourth.extensions).toEqual([ours]);
-      expect(fourth.diverged.sort()).toEqual([tunedExtension, tunedAgent].sort());
+      expect(fourth.diverged).toEqual([tunedAgent]);
       expect(wsl(["sha256sum", `${extensions}/${ours}`]).split(" ")[0]).toBe(sha256(oursContent));
       // Every write above went through a temp file and a real `mv`; a real disk
       // is the only place that proves the rename left nothing behind (an
@@ -160,26 +163,21 @@ describe.skipIf(!ENABLED || !DISTRO)("shipped content on real Linux (WSL)", () =
 
       // 5. Each root's journal records that split, so the next run is stable.
       const extJournal = parseJournal(wsl(["cat", `${extensions}/.pipi.json`]));
-      // The file the user tuned is theirs now: never in `shipped` (which would
-      // adopt it as ours and freeze it), always in `diverged`.
-      expect(Object.keys(extJournal.shipped).sort()).toEqual(
-        SHIPPED_EXTENSION_FILES.map((f) => f.relPath)
-          .filter((p) => p !== tunedExtension)
-          .sort(),
-      );
-      expect(Object.keys(extJournal.diverged)).toEqual([tunedExtension]);
+      // Nothing on the extensions root belongs to the user: every shipped source
+      // is ours (overwrite) and the delegation tree is gone (ADR 0013).
+      expect(Object.keys(extJournal.shipped).sort()).toEqual(SHIPPED_EXTENSION_FILES.map((f) => f.relPath).sort());
+      expect(Object.keys(extJournal.diverged)).toEqual([]);
       const agentJournal = parseJournal(wsl(["cat", `${agents}/.pipi.json`]));
-      expect(Object.keys(agentJournal.shipped).sort()).toEqual(
-        SHIPPED_AGENT_FILES.map((f) => f.relPath)
-          .filter((p) => p !== tunedAgent)
-          .sort(),
+      // The briefs the user tuned are theirs now: never in `shipped` (which would
+      // adopt them as ours and freeze them), always in `diverged`.
+      expect(Object.keys(agentJournal.shipped)).toEqual(
+        SHIPPED_AGENT_FILES.map((f) => f.relPath).filter((p) => p !== tunedAgent),
       );
       expect(Object.keys(agentJournal.diverged)).toEqual([tunedAgent]);
       // Nothing we installed is invisible to the journal: the extensions root
-      // holds our 5 sources, the delegation tree, the journal, and the file the
-      // user wrote — and nothing else.
+      // holds our sources, the journal, and the file the user wrote — nothing else.
       expect(wsl(["bash", "-c", `ls -1A ${extensions} | sort | tr '\\n' ' '`]).trim()).toBe(
-        ["keep-me.md", ".pipi.json", "delegation", ...SHIPPED_EXTENSION_FILES.map((f) => f.relPath.split("/")[0]!)]
+        ["keep-me.md", ".pipi.json", ...SHIPPED_EXTENSION_FILES.map((f) => f.relPath.split("/")[0]!)]
           .filter((v, i, all) => all.indexOf(v) === i)
           .sort()
           .join(" "),
