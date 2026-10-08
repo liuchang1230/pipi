@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { ModelEditorSpec, ProviderEditorConfig } from "../shared/model-config-types";
 import type { ApprovalSettings } from "../shared/approval";
 import type { PiDrift } from "../shared/pi-drift";
+import type { TreePageRequest, TreePageResult } from "../shared/session-page";
 
 export interface FileReadResult {
   content: string;
@@ -230,6 +231,22 @@ const api = {
   /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
   rpcUiResponse: (id: string, response: Record<string, unknown>): Promise<boolean> =>
     ipcRenderer.invoke("tab:rpc-ui-response", id, response),
+  /**
+   * Extension UI surface (setStatus / setWidget / setTitle): the authoritative
+   * state lives in main, so a tab's surface is PULLED once when the renderer
+   * attaches (tab:rpc-ui-snapshot) and then kept current by pushes
+   * (tab:rpc-ui-state). Frames are one-shot — pi never re-sends them — so the
+   * snapshot is not an optimisation, it is the only way the renderer can learn
+   * what the extensions declared before it was mounted.
+   */
+  rpcUiSnapshot: (id: string): Promise<{ seq: number; surface: Record<string, unknown> }> =>
+    ipcRenderer.invoke("tab:rpc-ui-snapshot", id),
+  onRpcUiState: (id: string, callback: (state: { seq: number; surface: Record<string, unknown> }) => void): (() => void) => {
+    const channel = `tab:rpc-ui-state:${id}`;
+    const handler = (_e: Electron.IpcRendererEvent, state: { seq: number; surface: Record<string, unknown> }) => callback(state);
+    ipcRenderer.on(channel, handler);
+    return () => ipcRenderer.removeListener(channel, handler);
+  },
   appUpdate: {
     check: (force?: boolean): Promise<{ current: string; latest: string | null; hasUpdate: boolean; downloadUrl?: string; releaseUrl?: string; notes?: string; error?: string }> =>
       ipcRenderer.invoke("app-update:check", force),
@@ -287,11 +304,12 @@ const api = {
       ipcRenderer.invoke("diff:at", tabId, path, rev),
   },
   tree: {
-    /** Session tree parsed straight from the session file — flat entries
-     *  (parentId chains) + leafId; the renderer rebuilds the nested tree.
-     *  Flat transport avoids contextBridge's 1000-level nesting limit. */
-    fromFile: (tabId: string): Promise<{ ok: boolean; entries?: unknown[]; leafId?: string | null; error?: string }> =>
-      ipcRenderer.invoke("tree:from-file", tabId),
+    /** One PAGE of the session tree, parsed straight from the session file: flat
+     *  entries (parentId chains) + the cursor for the page before it. Flat transport
+     *  avoids contextBridge's 1000-level nesting limit; a page avoids shipping (and
+     *  reading) the whole session — see docs/adr/0011-session-entry-paging.md. */
+    fromFile: (tabId: string, opts?: TreePageRequest): Promise<TreePageResult> =>
+      ipcRenderer.invoke("tree:from-file", tabId, opts),
   },
   debug: {
     /** Append a renderer-side diagnostic line to the main-process log file.

@@ -26,14 +26,19 @@ import type { ThemeMode } from "../shared/terminal-theme";
 import type { ModelEditorSpec, PiApi, ProviderEditorConfig } from "../shared/model-config-types";
 import { encodeCwd, listLocalProjects, parseSessionTextAsync, type SessionEntry } from "./session-list";
 import { parseTreeFileAsync } from "./tree-from-file";
-import { transcriptFromContent } from "./transcript-from-file";
+import { createSessionPages, targetFsByteSource } from "./session-pages";
+import type { TreePageRequest } from "../shared/session-page";
+import { resolveTranscriptAttempt, transcriptFromContent, transcriptTailFromSource, type RawTranscriptEntry, type TranscriptTip } from "./transcript-from-file";
+import { parseRawEntry, rawCodec } from "../shared/session-page";
 import { sameSessionPaths } from "../shared/session-paths";
 import { pickWslEventTab } from "./wsl-event-tab";
 import { wslToWinPath, parseWslDistroList } from "./wsl";
 import { SessionIndex, localTarget, wslTarget, type SessionTarget } from "./session-index";
 import { ensureShippedAgentHome, syncAgentHomeViaSsh, syncExtensionsViaSftp, SHIPPED_EXTENSION_FILES, SHIPPED_AGENT_FILES, buildSshCatCommand } from "./extension-sync";
+import { ensureOfficialPackages, ensureSubagentModel } from "./pi-settings";
 import { nodeContentIo, syncContent } from "./content-sync";
 import { runSshCommand } from "./ssh-exec";
+import { readLocalPackages, reconcilePackages } from "./package-mirror";
 import {
   ensureShippedSkills,
   nodeSkillsIo,
@@ -68,6 +73,8 @@ import {
   wslBinding,
 } from "./target-fs-channels";
 import { INTERNAL_RPC_ID_PREFIX } from "../shared/transcript";
+import { startsNewSessionIdentity } from "../shared/extension-ui";
+import { clearUiSurface, forgetUiSurface, getUiSurface, observeUiRequest } from "./extension-ui";
 import { isSftpMissingPathError } from "./sftp-errors";
 import { describeConnectFailure, isSftpPathError, isSshAuthError } from "./sftp-failure";
 import {
@@ -85,7 +92,7 @@ import { checkAppUpdate, checkRemotePiUpdate, openAppUpdateDownload, runRemotePi
 import { getFileDiff, listFileChanges, getFileHistory, diffTextOf, rollbackFileContent, listGitCommits, getFileAt, type FileVersionEvent } from "./diff-session";
 import { FileTreeIndex } from "./file-tree-index";
 import { startWatching, stopWatching, onFilePath, onStatus } from "./session-watcher";
-import { getSettings, updateSettings, type AppSettings } from "./settings";
+import { getSettings, getSubagentModelSetting, updateSettings, type AppSettings } from "./settings";
 import { addLocalProject, addRemoteProject, addWslProject, addModel, updateModel, deleteModel, deleteProject, listModels, listProjects, syncModelToPi, checkPiModelSync,
   verifyConfigFiles,
 } from "./projects";
@@ -237,6 +244,10 @@ const SFTP_IDLE_TTL_MS = 120_000;
  *  (hundreds of bytes), so it stays far below HISTORY_REQUEST_TIMEOUT_MS: if pi
  *  cannot answer even this, the RPC fallback would not fare better. */
 const TRANSCRIPT_STATE_TIMEOUT_MS = 12_000;
+
+/** Budget for the tail reader's `get_entries {since}` tip probe: a tiny response, but it
+ *  queues behind pi's boot on a fresh tab, so it gets the same budget as `get_state`. */
+const TRANSCRIPT_TIP_TIMEOUT_MS = 12_000;
 const REMOTE_SESSION_EAGER_PARSE_LIMIT = 0;
 const REMOTE_SESSION_HEAD_HYDRATE_LIMIT = 5;
 // Batch of 8 (up from 4): OpenSSH sftp-server serializes requests on one
@@ -832,6 +843,21 @@ function syncKeyAuthExtensions(remote: RemoteOpts): void {
     // Only a fully provisioned server is marked done, so a failed skills half
     // is retried on the next connect instead of being skipped forever.
     remoteKeyExtSyncHash.set(key, digest);
+    // User-package mirror (opt-in, src/main/package-mirror.ts): pin the user's
+    // locally-installed extension packages onto this server. Failed mirrors
+    // are retried by the next connect — but the provision digest above is
+    // already set, so mirror failures alone do not re-trigger the content
+    // half; they surface here every connect until they succeed.
+    if (getSettings().packageMirror?.enabled) {
+      const run: CommandRunner = (options) => runSshCommand({ remote, sshBin, ...options });
+      void reconcilePackages(run, readLocalPackages())
+        .then((r) => {
+          if (!r.ok) console.error(`[packages] key-auth mirror failed (${key}): ${r.error ?? "unknown"}`);
+          else if (r.installed.length || r.removed.length)
+            console.log(`[packages] key-auth mirror: installed ${r.installed.join(", ")}, removed ${r.removed.join(", ")} -> ${key}`);
+        })
+        .catch((e) => console.error(`[packages] key-auth mirror error (${key}):`, e));
+    }
   })();
 }
 
@@ -1113,6 +1139,21 @@ if (gotSingleInstanceLock) {
   // edited are kept and reported, and files we no longer ship are deleted.
   const shipped = ensureShippedAgentHome();
   pendingExtensionSync = [...shipped.extensions, ...shipped.agents];
+  // The packages the app itself needs (ADR 0013: the official `pi-subagents`,
+  // which replaced the retired hand-written delegation engine). One idempotent
+  // entry in pi's own settings.json, and pi's package manager installs it while
+  // it resolves settings at startup — so this has to land before any tab spawns
+  // pi. Best-effort: a settings.json we cannot parse is left alone.
+  const officialPackages = ensureOfficialPackages();
+  if (officialPackages.length > 0) {
+    console.log(`[packages] ensured: ${officialPackages.join(", ")}`);
+  }
+  // The 「子代理模型」 pin, in the same file and by the same rule (ADR 0013): the
+  // official pi-subagents package resolves a child's model from
+  // `subagents.agentOverrides.<role>.model`, and never from PI_MODEL/PI_PROVIDER.
+  if (ensureSubagentModel(getSubagentModelSetting())) {
+    console.log("[packages] subagent model pin written to pi settings");
+  }
   // Same contract for the skills tree (see skill-sync.ts): they must exist
   // before any tab can spawn pi. Policy is 只读订阅 + 偏离保留 — a skill the
   // user edited is kept (and reported), never overwritten, which needs the
@@ -1143,21 +1184,29 @@ if (gotSingleInstanceLock) {
     logMemory("startup");
   }
 
-  // Extension UI sub-protocol → forwarded to the renderer, which renders
-  // select/confirm/input/editor as native dialogs (UiDialog in ChatPane) and
-  // answers via tab:rpc-ui-response.
-  setUiRequestHandler((tabId, req) => {
+  // Extension UI sub-protocol. Two kinds of frames arrive on this one channel:
+  //   - the extension UI SURFACE (setStatus / setWidget / setTitle): owned by
+  //     main (extension-ui.ts) and delivered to the renderer as STATE
+  //     (tab:rpc-ui-state + tab:rpc-ui-snapshot), never as one-shot frames —
+  //     the frames are not re-sent by pi, and the renderer's receiver is
+  //     unmounted half the time;
+  //   - everything the renderer has to ACT on (dialogs, notify,
+  //     set_editor_text): forwarded as-is, rendered as native dialogs
+  //     (UiDialog in ChatPane) / written into the composer, answered via
+  //     tab:rpc-ui-response.
+  const forwardUiRequest = (tabId: string, req: Record<string, unknown>) => {
+    if (observeUiRequest(tabId, req)) return;
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(`tab:rpc-ui-request:${tabId}`, req);
     }
-  });
-  {
-    setSdkUiRequestHandler((tabId, req) => {
-      for (const win of BrowserWindow.getAllWindows()) {
-        win.webContents.send(`tab:rpc-ui-request:${tabId}`, req);
-      }
-    });
-  }
+  };
+  setUiRequestHandler(forwardUiRequest);
+  setSdkUiRequestHandler(forwardUiRequest);
+
+  // The renderer attaches to a tab's surface once (TerminalPane, per open tab)
+  // and pulls this snapshot: the frames it missed while detached are exactly the
+  // ones that cannot be re-requested from pi.
+  ipcMain.handle("tab:rpc-ui-snapshot", (_e, tabId: string) => getUiSurface(tabId));
 
   // Renderer answers for extension UI dialogs (value/confirmed/cancelled).
   ipcMain.handle("tab:rpc-ui-response", (_e, tabId: string, response: Record<string, unknown>) => {
@@ -1385,6 +1434,67 @@ if (gotSingleInstanceLock) {
               console.error(`[skills] remote sync failed (${syncKey}):`, skillResult.error ?? "unknown");
             }
           }
+          // User-package mirror (opt-in, src/main/package-mirror.ts). The sftp
+          // lease has file IO only, so commands go through a one-shot ssh2
+          // exec with the SAME auth material the lease used (password or
+          // discovered keys) — never a second password prompt.
+          if (getSettings().packageMirror?.enabled) {
+            try {
+              const auth: Record<string, unknown> = { readyTimeout: 15000 };
+              if (remote.password) auth.password = remote.password;
+              else {
+                const keys = await defaultPrivateKeys();
+                if (keys.length) auth.privateKey = keys;
+              }
+              const run: CommandRunner = (options) =>
+                new Promise((resolve, reject) => {
+                  const conn = new SshClient();
+                  conn
+                    .on("ready", () =>
+                      conn.exec(options.command, (err, stream) => {
+                        if (err) {
+                          conn.end();
+                          reject(err);
+                          return;
+                        }
+                        let stdout = "";
+                        let stderr = "";
+                        stream.setEncoding("utf8");
+                        stream.stderr?.setEncoding("utf8");
+                        if (options.stdin) stream.write(options.stdin);
+                        stream.end();
+                        stream.on("data", (d: string) => (stdout += d));
+                        stream.stderr?.on("data", (d: string) => (stderr += d));
+                        stream.on("close", (code: number | undefined) => {
+                          conn.end();
+                          const ok = code === 0;
+                          resolve({
+                            ok,
+                            code: code ?? null,
+                            stdout,
+                            stderr,
+                            error: ok ? undefined : `exit ${code ?? "?"}`,
+                          });
+                        });
+                      }),
+                    )
+                    .on("error", reject)
+                    .connect({ host: remote.host, port: remote.port ?? 22, username: remote.user, ...auth });
+                  setTimeout(() => {
+                    conn.end();
+                    reject(new Error("timeout"));
+                  }, options.timeoutMs ?? 600_000);
+                });
+              const result = await reconcilePackages(run, readLocalPackages());
+              if (!result.ok) console.error(`[packages] remote mirror failed (${syncKey}):`, result.error ?? "unknown");
+              else if (result.installed.length || result.removed.length)
+                console.log(
+                  `[packages] remote mirror: installed ${result.installed.join(", ")}, removed ${result.removed.join(", ")} -> ${syncKey}`,
+                );
+            } catch (e) {
+              console.error(`[packages] remote mirror error (${syncKey}):`, e instanceof Error ? e.message : e);
+            }
+          }
           lease.lastUsedAt = Date.now();
         } catch (error) {
           console.error(`[remote] provisioning failed (${syncKey}):`, error);
@@ -1429,6 +1539,9 @@ if (gotSingleInstanceLock) {
     // pty tabs by pty.ts.
     const tab = getTab(id);
     const remote = tab?.remote;
+    // The tab is about to stop existing: forget its surface entirely (a reused
+    // tabId must not inherit a stale snapshot).
+    forgetUiSurface(id);
     if (getSdkTab(id)) {
       closeSdkTab(id);
     } else if (getRpcSession(id)) {
@@ -2134,13 +2247,26 @@ if (gotSingleInstanceLock) {
     if (sdk) {
       const ok = sdkSend(tabId, cmd);
       logRpcSend(tabId, cmd, ok, "sdk");
+      if (ok) clearSurfaceOnSessionChange(tabId, cmd);
       return ok;
     }
     const session = getRpcSession(tabId);
     const ok = session ? session.send(cmd) : false;
     logRpcSend(tabId, cmd, ok, session ? "rpc" : "rpc (no session)");
+    if (ok) clearSurfaceOnSessionChange(tabId, cmd);
     return ok;
   });
+
+  /**
+   * Every renderer→pi command goes through tab:rpc-send (rpcRequest included),
+   * for BOTH backends. So "the session identity changed" is decided here once:
+   * the extension declarations from the previous session must not survive into
+   * the next one (the new session re-declares what it needs — pi emits
+   * session_start to the fresh runner on reload too).
+   */
+  function clearSurfaceOnSessionChange(tabId: string, cmd: Record<string, unknown>): void {
+    if (startsNewSessionIdentity(cmd.type)) clearUiSurface(tabId, `session identity: ${String(cmd.type)}`);
+  }
 
   /**
    * Renderer→pi command tracing. The renderer also polls on timers (tree
@@ -2240,7 +2366,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     return targetFsFor(target).readText(sessionPath);
   };
 
-  ipcMain.handle("tree:from-file", async (_e, tabId: string) => {
+  ipcMain.handle("tree:from-file", async (_e, tabId: string, opts?: TreePageRequest) => {
     const tab = getTab(tabId);
     let sessionPath: string | null | undefined = tab?.sessionPath;
     const pathSource = sessionPath ? "linked" : "missing";
@@ -2256,24 +2382,34 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
       debugLog("tree", `tab ${tabId} from-file FAILED (${pathSource})`);
       return { ok: false, error: "no session file" };
     }
-    debugLog("tree", `tab ${tabId} from-file start (${pathSource}) path=${sessionPath}`);
+    const target = targetFromTab(tab);
+    if (!target) return { ok: false, error: "no session file target" };
+    const which = opts?.before ? "before" : "tail";
+    const startedAt = Date.now();
     try {
-      // Channel selection (WSL UNC / SFTP-or-ssh / local) lives behind the
-      // TargetFs seam, not here: the tree dialog, the chat transcript and any
-      // future reader must not each re-derive it. Throws on failure → caught
-      // below, so a key-auth read failure still reports exactly
-      // "key-auth remote read failed".
-      const content = await readSessionFileText(tab, sessionPath);
-      const { entries, leafId } = await parseTreeFileAsync(content);
-      debugLog("tree", `tab ${tabId} from-file OK entries=${entries.length}`);
+      // Channel selection (WSL UNC / SFTP-or-ssh / local) lives behind the TargetFs
+      // seam, not here: the tree dialog, the chat transcript and any future reader must
+      // not each re-derive it. The page reader then turns that channel's byte ranges into
+      // ENTRIES — the dialog no longer reads the whole session to show the recent part
+      // (docs/adr/0011-session-entry-paging.md).
+      const pages = createSessionPages(targetFsByteSource(targetFsFor(target)));
+      const page = opts?.before ? await pages.before(sessionPath, opts.before) : await pages.tail(sessionPath);
+      const entries = page.entries;
+      // Only the NEWEST page knows where the session currently is.
+      const leafId = opts?.before ? null : (entries[entries.length - 1]?.id ?? null);
+      debugLog(
+        "tree",
+        `tab ${tabId} from-file ${which} entries=${entries.length} leaf=${leafId ?? "-"} cursor=${page.cursor?.byteOffset ?? "-"} eof=${page.eof}` +
+          `${page.degraded ? ` degraded=${page.degraded}` : ""} ${Date.now() - startedAt}ms`,
+      );
       // Flat entries (not a nested tree): a long linear session nests deeper
       // than Electron's contextBridge 1000-level limit when serialized as a
       // tree — the renderer rebuilds the tree from parentId (shared
       // buildTreeFromEntries).
-      return { ok: true, entries, leafId };
+      return { ok: true, entries, leafId, cursor: page.cursor, eof: page.eof, ...(page.degraded ? { degraded: page.degraded } : {}) };
     } catch (e) {
-      console.error(`[tree] from-file failed for tab ${tabId}:`, e instanceof Error ? e.message : String(e));
-      debugLog("tree", `tab ${tabId} from-file ERROR ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[tree] from-file ${which} failed for tab ${tabId}:`, e instanceof Error ? e.message : String(e));
+      debugLog("tree", `tab ${tabId} from-file ${which} ERROR ${e instanceof Error ? e.message : String(e)}`);
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
@@ -2297,7 +2433,18 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
    *  The result is deliberately a discriminated "attempt" rather than a
    *  transcript: the renderer falls back to `get_messages` whenever this cannot
    *  produce one, so a pi format change degrades to "slow but correct" instead
-   *  of blank chat (R4). */
+   *  of blank chat (R4).
+   *
+   *  WINDOW FIRST (docs/adr/0012-transcript-tail-window.md): the chat renders the
+   *  LAST `tail` messages, so the newest PAGE of the file is read instead of the
+   *  whole file (measured: a 62 MB / 900-message remote session spent 50 s of SFTP
+   *  time here, while its last 120 messages sit in the last ~2% of the bytes).
+   *  A window cannot be checked against `messageCount` — that count is the WHOLE
+   *  context — so the tip is proved differently: one bounded
+   *  `get_entries {since: <newest entry in window>}`, which both detects a file
+   *  that lags pi and repairs it (pi also answers its authoritative leaf id).
+   *  When the window DOES cover the whole context (short session, or a compaction
+   *  boundary inside it) the strict count check still runs, exactly as before. */
   /**
    * `tail`: open-without-parsing-twice. Opening a 684-message session used to
    * hand the renderer EVERY message across the bridge, and React then mounted
@@ -2307,6 +2454,7 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
    * The contract stays "ok:false on anything unusable" — a tail that cannot be
    * verified is a full dump, never a partial transcript presented as truth.
    */
+  let transcriptTipSeq = 0;
   ipcMain.handle(
     "session:transcript-from-file",
     async (_e, tabId: string, opts?: { tail?: number }) => {
@@ -2325,6 +2473,50 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     const sessionPath = state.data?.sessionFile || tab.sessionPath || (await findRecentSessionFile(tab));
     if (!sessionPath) return { ok: false, reason: "no session file" };
     try {
+      const target = targetFromTab(tab);
+      if (target) {
+        const pages = createSessionPages(targetFsByteSource(targetFsFor(target)), { codec: rawCodec, wholeFileUncapped: true });
+        const win = await transcriptTailFromSource(pages, sessionPath);
+        // ONE bounded probe for the tip: entries pi has after our newest one (usually
+        // none) + its authoritative leaf id. This is what a window read can still prove.
+        // It runs even for a window that looks complete: `complete` is judged with the FILE's
+        // newest entry as the leaf, so pi's leaf is what tells us the window is complete for
+        // the branch the user is actually on (and a leaf we do not hold is refused).
+        let tip: TranscriptTip | null = null;
+        if (win?.lastId) {
+          const res = await session.request<{ entries?: unknown[]; leafId?: string | null }>(
+            { type: "get_entries", since: win.lastId, id: `${INTERNAL_RPC_ID_PREFIX}get_entries:${(transcriptTipSeq += 1)}` },
+            TRANSCRIPT_TIP_TIMEOUT_MS,
+          );
+          if (res.success && Array.isArray(res.data?.entries)) {
+            const entries: RawTranscriptEntry[] = [];
+            for (const raw of res.data.entries) {
+              const e = parseRawEntry(raw);
+              if (e) entries.push(e);
+            }
+            tip = { entries, leafId: typeof res.data.leafId === "string" ? res.data.leafId : null };
+          } else {
+            debugLog("transcript", `tab ${tabId} tail window tip probe failed: ${String(res.error ?? "no entries")}`);
+          }
+        }
+        const attempt = resolveTranscriptAttempt({ window: win, tip, expected, tail: opts?.tail });
+        if (!attempt.ok && win?.complete && attempt.reason.startsWith("file behind pi state")) {
+          // The window WAS the whole context, so re-reading the file cannot change the
+          // resolve — the whole-file path would pay the full read (the 50s this change
+          // exists to remove) and reach the same verdict. Hand it to the RPC fallback.
+          debugLog("transcript", `tab ${tabId} tail window complete but pi disagrees: ${attempt.reason}`);
+          return attempt;
+        }
+        if (attempt.ok) {
+          debugLog(
+            "transcript",
+            `tab ${tabId} from-file tail OK messages=${attempt.messages.length} total=${attempt.total}` +
+              ` window=${win?.entries.length ?? 0} complete=${win?.complete ?? false} tip=${tip ? tip.entries.length : "-"}${win?.degraded ? ` degraded=${win.degraded}` : ""}`,
+          );
+          return attempt;
+        }
+        debugLog("transcript", `tab ${tabId} tail window not usable: ${attempt.reason}`);
+      }
       const content = await readSessionFileText(tab, sessionPath);
       const messages = await transcriptFromContent(content);
       if (!messages) return { ok: false, reason: "empty transcript" };
@@ -2351,6 +2543,10 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
     // RPC-backed (remote/WSL) chat tabs switch to their pty pi too.
     const ok = getSdkTab(tabId) ? switchSdkToTerminal(tabId, agentDir()) : switchRpcToTerminal(tabId);
     if (ok) {
+      // A different pi process now owns this tab (a real TUI in a pty) and we
+      // cannot see its extension declarations — the surface we hold describes
+      // the session we just killed.
+      clearUiSurface(tabId, "switched to terminal view");
       emitTabs();
       emitActive();
     }
@@ -2369,6 +2565,9 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
         ? switchTerminalToSdk(tabId, agentDir())
         : switchTerminalToRpc(tabId);
     if (ok) {
+      // Fresh session behind the same tab: start from an empty surface and let
+      // the extensions declare themselves again (their session_start fires now).
+      clearUiSurface(tabId, "switched to chat view");
       emitTabs();
       emitActive();
     }
@@ -2961,7 +3160,14 @@ async function findRecentSessionFile(tab: TabInfo): Promise<string | null> {
 
   // --- App settings (auto-follow preferences) ---
   ipcMain.handle("settings:get", () => getSettings());
-  ipcMain.handle("settings:set", (_e, patch: Partial<AppSettings>) => updateSettings(patch));
+  ipcMain.handle("settings:set", (_e, patch: Partial<AppSettings>) => {
+    const next = updateSettings(patch);
+    // A changed 「子代理模型」 must reach pi's own settings before the next
+    // subagent runs (the pin lives there now — see pi-settings.ts). Cheap and
+    // idempotent: no write when the pin is unchanged.
+    if (patch.subagents !== undefined) ensureSubagentModel(getSubagentModelSetting());
+    return next;
+  });
 
   // --- Remote file operations (SFTP) ---
   /**

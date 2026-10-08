@@ -1,6 +1,9 @@
 // Type bridge exposed by preload via contextBridge.
 import type { ApprovalSettings } from "../../shared/approval";
+import type { PackageMirrorSettings } from "../../shared/package-mirror";
+import type { ExtensionUiSurface } from "../../shared/extension-ui";
 import type { PiDrift } from "../../shared/pi-drift";
+import type { TreePageRequest, TreePageResult } from "../../shared/session-page";
 
 export {};
 
@@ -161,6 +164,9 @@ export interface AppSettings {
   /** Ask before irreversible tool calls. Always present: the main process
    *  normalizes a missing/corrupt value to the default, never to "off". */
   approval: ApprovalSettings;
+  /** Mirror locally-installed pi extension packages onto remote/WSL targets.
+   *  Absent = off (the ADR 0009 default). */
+  packageMirror?: PackageMirrorSettings;
 }
 
 export interface SubagentModelSettings {
@@ -210,6 +216,10 @@ declare global {
       onRpcUiRequest: (id: string, callback: (req: Record<string, unknown>) => void) => () => void;
       /** RPC chat: answer an extension UI dialog ({value} | {confirmed} | {cancelled}). */
       rpcUiResponse: (id: string, response: Record<string, unknown>) => Promise<boolean>;
+      /** Extension UI surface: pull the authoritative snapshot once on attach. */
+      rpcUiSnapshot: (id: string) => Promise<{ seq: number; surface: ExtensionUiSurface }>;
+      /** Extension UI surface: pushes after the snapshot (same channel as the snapshot's source). */
+      onRpcUiState: (id: string, callback: (state: { seq: number; surface: ExtensionUiSurface }) => void) => () => void;
       appUpdate: {
         check: (force?: boolean) => Promise<{ current: string; latest: string | null; hasUpdate: boolean; downloadUrl?: string; releaseUrl?: string; notes?: string; error?: string }>;
         download: (url: string) => Promise<boolean>;
@@ -239,10 +249,11 @@ declare global {
         at: (tabId: string, path: string, rev?: string) => Promise<{ content: string; error?: string }>;
       };
       tree: {
-        /** Session tree parsed straight from the session file — flat entries
-         *  (parentId chains) + leafId; the renderer rebuilds the nested tree.
-         *  Flat transport avoids contextBridge's 1000-level nesting limit. */
-        fromFile: (tabId: string) => Promise<{ ok: boolean; entries?: unknown[]; leafId?: string | null; error?: string }>;
+        /** One PAGE of the session tree, straight from the session file — flat, already
+         *  projected entries plus the cursor for the page before it. Flat transport avoids
+         *  contextBridge's 1000-level nesting limit; a page avoids reading and shipping the
+         *  whole session (docs/adr/0011-session-entry-paging.md). */
+        fromFile: (tabId: string, opts?: TreePageRequest) => Promise<TreePageResult>;
       };
       debug: {
         /** Append a renderer-side diagnostic line to the main-process log file.
