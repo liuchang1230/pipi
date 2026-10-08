@@ -23,12 +23,14 @@
     "skills:check": "node scripts/vendor-skills.mjs --check --from .upstream-skills",
     "skills:install": "node scripts/install-skills.mjs",
     "smoke:tree": "node scripts/diagnose-tree-rows.mjs",
+    "diagnose:tree-crash": "node scripts/diagnose-tree-crash.mjs",
     "test:scroll": "node scripts/diagnose-chat-scroll.mjs",
+    "test:sidebar-split": "node scripts/diagnose-sidebar-resizer.mjs",
     "tools": "node scripts/tools-inventory.mjs",
     "smoke:skills-wsl": "node scripts/smoke-skills-wsl.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-coding-agent": "1.0.4",
     "@silvia-odwyer/photon-node": "0.3.4",
     "@xterm/addon-fit": "^0.12.0-beta.292",
     "@xterm/xterm": "^6.1.0-beta.292",

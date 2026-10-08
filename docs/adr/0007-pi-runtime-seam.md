@@ -73,3 +73,15 @@ Status: **accepted**（2026-10-05）
 | app `package.json` 的 pin | `"@earendil-works/pi-coding-agent": "0.85.1"`（无 caret） |
 
 0.85.1 正是「Electron 36 的 Node 刚好等于 engines 下限」的那一版：`fs.globSync` 需要的 Node ≥22 **已经满足**，不是被违背。所以真规则不是「锁死在某个旧版本」，而是 —— **pin 必须满足 app 自带 Electron 的 Node 版本**（`bundledPiVersion()` 可以顺带断言 `semver.satisfies(process.versions.node, bundled.engines.node)`）。三处原本互相矛盾的记录（代码注释 / 决策 37 / `package.json`）按此收敛。
+
+## 修订（2026-10-07）：pin 0.85.1 → 1.0.4
+
+用户明确指示升级（「每次发布新版本 pipi，我会更新到最新的 pi agent 以及所有扩展」——升级节奏归用户，app 不提议不代劳的原则不变，见 ADR 0009）。上表事实随之更新：
+
+| 事实 | 值 |
+|---|---|
+| app 自带 pi | **1.0.4** |
+| 它的 `engines` | `node >= 22.19.0` |
+| Electron 36.9.5 | Node 22.19.0（**边界相等**，但已过 Electron 真环境端到端验证） |
+
+验证记录：变更日志逐版审阅（0.86.0→1.0.4，破坏面全部在 SDK 内部/自定义 provider 层，扩展表面与 RPC 均未破坏）；全量测试 1342 passed；`scripts/chat-sdk-smoke.mjs` PASS（真 Electron + SDK worker + 真 prompt 往返）。1.0.1 起 npm 包移除 `npm-shrinkwrap.json`，0.85.0「外层空壳/嵌套真身」的安装残缺形态不再出现（`docs/diagnosis/` 2026-10-06 的手工补 `pi-server` 记录随之作废）。后续每次升 pin 仍按决策 37 的清单：engines 对 Electron Node、Electron 真环境冒烟、RPC/SDK 面核对。

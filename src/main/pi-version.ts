@@ -130,7 +130,15 @@ export function buildRemoteAlignCommand(version: string, withRegistryFallback = 
   const npmFlags = "--fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000";
   const npmInstall = `npm install -g ${npmFlags} @earendil-works/pi-coding-agent@${version}`;
   const npmSpec = withRegistryFallback ? `${npmInstall} || ${npmInstall} --registry=https://registry.npmmirror.com` : npmInstall;
-  return `P=$(command -v pi || true); case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac`;
+  // 2026-10-07 事故守卫：若 PATH 上的 pi 来自 pi.dev 官方安装器的托管树
+  // （/root/.local/share/pi-node/node-*/bin/pi），`npm` 往往也解析到托管树
+  // 自带的 npm —— `npm install -g` 就会重写活着的托管树内部，升级到一半时
+  // 旧进程惰性加载 chunk 撞上「入口已换、部分文件未落地」的中间态，报
+  // Cannot find module …/openai-completions-*.js（实测 36.151.162.7）。
+  // 这种安装由 pi 自己的 `pi update` 管理，npm -g 对它永远是错位安装：
+  // 直接报错退出，让用户先 `pi update`（或卸载托管版换 npm 安装）。
+  const guard = `P=$(command -v pi || true); case "$P" in */pi-node/node-*/bin/*) echo "pipi-align-blocked: pi 来自 pi.dev 安装器（pi-node 托管树），请在目标机上用 pi 自带的升级命令更新，或卸载托管版后重试对齐" >&2; exit 3;; esac;`;
+  return `${guard} case "$P" in */.bun/*) ${npmInstall};; *) ${npmSpec};; esac`;
 }
 
 /** 把一行 POSIX 脚本放进登录交互 shell。脚本自身**不能含单引号**（会提前

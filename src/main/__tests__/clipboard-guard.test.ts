@@ -6,17 +6,23 @@ import { describe, expect, it } from "vitest";
 /**
  * Regression guard for the hard crash fixed on 2026-09-28.
  *
- * pi's SDK eager-requires the `@mariozechner/clipboard` N-API addon while it is
- * being imported. Inside electron.exe that DLL is a whole-app crash vector
- * (Windows Error Reporting: two 0xc0000005 access violations in
+ * pi's SDK (≤0.85.x) eager-required the `@mariozechner/clipboard` N-API addon
+ * while it was being imported. Inside electron.exe that DLL was a whole-app
+ * crash vector (Windows Error Reporting: two 0xc0000005 access violations in
  * `clipboard.win32-x64-msvc.node_unloaded`), so `sdk-worker.ts` flips
  * `TERMUX_VERSION` — pi's own documented "no clipboard" switch — around the
  * dynamic SDK import.
  *
+ * pi 0.86.0 replaced the external native clipboard dependency with bundled
+ * asynchronous macOS/Windows/X11 helpers (CHANGELOG 0.86.0), so the crash
+ * vector is GONE as of the 1.0.4 pin. The guard stays as defense-in-depth
+ * (a headless worker has no use for a clipboard anyway), and the former
+ * "control" test is now a canary: if the native addon ever reenters the
+ * dependency tree, it goes red here instead of as a mystery crash.
+ *
  * The behaviour is checked in a CHILD process (importing the SDK into the vitest
  * worker would load the very addon we are proving is absent, and would fight the
- * module cache), with a control run that shows the addon really is what this
- * guards against.
+ * module cache), with a control run that shows the SDK imports cleanly unguarded.
  */
 const sdkEntry = join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js");
 const probe = join(process.cwd(), "src", "main", "__tests__", "fixtures", "clipboard-guard-probe.mjs");
@@ -44,11 +50,26 @@ const available = existsSync(sdkEntry) && existsSync(probe);
 const PROBE_TIMEOUT_MS = 30_000;
 
 describe.skipIf(!available)("the SDK import must not load the clipboard native addon", () => {
-  it("loads the addon when nothing guards the import (the crash vector is real)", () => {
+  it("the native addon is gone from the pi 1.0.4 tree — canary: red means re-evaluate the TERMUX guard", () => {
+    // The crash vector this suite guards against was the external native
+    // clipboard dependency; pi 0.86.0 removed it. If it ever comes back
+    // (upstream revert, resolution quirk), this is where we find out — the
+    // guard must be re-checked against the REAL addon, not assumed.
+    const addonDir = join(
+      process.cwd(),
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+      "node_modules",
+      "@mariozechner",
+      "clipboard",
+    );
+    expect(existsSync(addonDir), "@mariozechner/clipboard reentered pi's tree").toBe(false);
+
+    // Control run: the SDK must still import cleanly with no guard at all.
     const result = runProbe("control");
     expect(result.error).toBeNull();
-    expect(result.loadedNative).toBe(true);
-    expect(result.clipboardModules.some((m) => m.includes("@mariozechner/clipboard"))).toBe(true);
+    expect(result.loadedNative).toBe(false);
   }, PROBE_TIMEOUT_MS);
 
   it("loads nothing from the clipboard package when TERMUX_VERSION guards the import", () => {

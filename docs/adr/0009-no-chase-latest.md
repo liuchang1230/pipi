@@ -43,3 +43,13 @@ Status: **accepted**（2026-10-05）
 - **诚实缺口 2**：`pty.ts` 的 `installGlobalPiFromBundled()` 仍然会在用户全局位置被覆盖安装（决策 4 的自动修复路径）。本切片只删「催升级」，不动「不可用时装我们那份」这个取舍；C（本机也跑捆绑 pi）会重新讨论它。
 - **与决策 36 的关系**：本机「允许用户追最新」这条自由**仍在**（我们不拦、也不动用户自己装的那份，除非它不可用），只是 app 不再提议、不再代劳；远程那半条（对齐 pin）不变。
 - **与 ADR 0008 的关系**：本切片覆盖了它三处结论（`runtime` 三元组、本机横幅「先状态再原建议」、`driftRecordText`），已在 0008 的 Status 里注记。六态分类本身、`PiPresence` 四态、以及「漂移不是失败」都保留。
+
+## 修订（2026-10-07）：用户包镜像 —— 「不代劳」收窄为「搬运但不决策」
+
+用户拍板要本机自装的扩展包（pi-rewind / rpiv-ask-user-question / pi-web-access / pi-subagents 等）自动上远程。决策 2 的「用户的扩展包永远由用户自己管」收窄为：
+
+- **app 只搬运，永不决定**：范围 = 本机 `packages` 清单 × 本机实际安装版本（`~/.pi/agent/npm/package.json` 解析），不查 registry、不追新；远程多出的自装包会被移除以跟随本机（双向收敛）。`pi update --extensions` 那条「替你追新」的通路**保持删除**——镜像的版本变化永远来自本机你自己的动作。
+- **默认关闭**（`settings.packageMirror.enabled`，模型配置对话框开关），不开 = 本 ADR 原行为。
+- **只动远程的 pi 包目录**（`pi install/remove`）：settings/auth/skills 永不过境；供应链责任转移给用户本人（他装的包、他选的版本、他开的开关）。
+
+实现：`src/main/package-mirror.ts`（probe → planMirror 纯函数 → apply 脚本 + PIPI_MIRROR_DONE 哨兵），CommandRunner 缝绑三种传输（key-auth ssh / ssh2 密码 exec / 本机验证）；幂等空跑；失败不重试，下次连接重算。

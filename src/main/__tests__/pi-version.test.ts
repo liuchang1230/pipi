@@ -166,11 +166,24 @@ describe("buildRemoteAlignCommand", () => {
   it("pins the exact bundled version and detects bun installs", () => {
     const cmd = buildRemoteAlignCommand("0.84.4");
     expect(cmd).toContain("@earendil-works/pi-coding-agent@0.84.4");
-    // Same npm install on the bun path (bun has no --registry flag; only the
-    // runtime differs). Fetch timeouts are clamped on every attempt so a
-    // black-holed registry cannot eat the whole 600s command budget.
     expect(cmd).toContain("*/.bun/*) npm install -g --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000 @earendil-works/pi-coding-agent@0.84.4;;");
     expect(cmd).toContain("*) npm install -g --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=10000 @earendil-works/pi-coding-agent@0.84.4;;");
+  });
+
+  it("refuses to npm-install over a pi.dev managed (pi-node) install — 2026-10-07 incident guard", () => {
+    // When PATH's pi lives under pi-node/node-*/bin, PATH's npm is usually the
+    // managed tree's own npm, and `npm install -g` rewrites the LIVE managed
+    // install in place: a running session lazily loading a chunk hits the
+    // half-written state and dies with `Cannot find module …/openai-completions-*.js`
+    // (measured on 36.151.162.7). The managed tree is upgraded by `pi update`,
+    // never by pipi's align — so the guard exits 3 before touching anything.
+    const cmd = buildRemoteAlignCommand("1.0.4", true);
+    expect(cmd).toContain("*/pi-node/node-*/bin/*)");
+    expect(cmd).toContain("pipi-align-blocked");
+    expect(cmd).toContain("exit 3");
+    expect(cmd).not.toContain("pi update"); // ADR 0009 守卫：对齐命令永不执行 pi update（提示文案也不借这个字面量）
+    // And the guard runs BEFORE the install case statement.
+    expect(cmd.indexOf("pipi-align-blocked")).toBeLessThan(cmd.indexOf("case \"$P\" in */.bun/*"));
   });
 
   it("registry fallback retries via npmmirror (China-reachable) on the npm path only", () => {
