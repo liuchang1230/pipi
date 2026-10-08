@@ -18,6 +18,7 @@
 - 跨 pane 动作必须收进 store action（`viewerStore.openFile` / `sessionsStore.openSession` 族 / `tabsStore.createTab` 族），容器不许把动作重新放回 App 回调；App 的 selector 订阅只覆盖对话框/编排真正读的 slice。
 - 对话框是自含模块：状态不回流到 App，App 只持打开标志；store 的 `set` 一律用函数式更新，循环内禁止用一次性快照（会互相覆盖）。
 - **投递里的「读不到」不等于「不存在」**：任何传输层（本机 fs / `\\wsl$` UNC / SFTP / 免密 ssh 脚本）读目标文件失败时，必须返回失败或哨兵（`UNREADABLE`），不得当空值继续 —— 空值会被写掉，而读不出来的那个文件可能正是用户的手改；账本（`.pipi.json`）读不出来则整次拒绝同步，绝不把空账本当新账本写回去。**当作「账本/播报」的 shell 脚本（`sh -s`）还必须 `set -e` 开头**，且写入与 rename 必须分成两条语句（`set -e` 在 `A && B` 左侧不生效）；账本写在最后。来由：`docs/diagnosis/2026-10-01.md`。
+- **传输死亡必须能自愈，而主动关闭不得伪装成掉线**：远端 RPC 传输以 `code === -1`（传输层自造的「管道没了」，pi 自己不会报它）死亡时，必须在**同一 tab 内**退避重建并带上原 `sessionFile`，UI 走「重连中」而不是终态；而 app 自己发起的关闭（关标签 / 结束会话 / 模式切换）必须走 `expectedClose`/`closing` 短路：不写掉线横幅、不落 `EXIT` 统计。真实退出码（pi 自己退出、认证失败）必须照旧报错，**不得复活**。为什么：旧代码把主动关闭与真掉线写进同一条 `reportDropped` 路径，于是「掉线率」这个指标被自己的关闭动作污染、无法区分（历史 52 次 `EXIT` 里有多少是真掉线根本看不出来）。守住：`src/main/rpc-session.ts` 的纯函数 `shouldAutoReconnect`/`reconnectDelayMs` + `src/main/__tests__/rpc-reconnect-policy.test.ts` + `src/renderer/src/stores/__tests__/chatStore-reconnect.test.ts`；实测证据：`docs/diagnosis/2026-10-05.md` §12.1 / §14。
 
 ## 稳定性契约 / Stability Contract（2026-09-24）
 
@@ -27,7 +28,7 @@
 | # | 规则 | 为什么（本仓库的复发证据） | 靠什么守住 |
 |---|---|---|---|
 | 1 | **跨进程/跨网络的调用必须有 deadline**，且 deadline 到期必须在 UI 上可见（停滞 → 终态） | `tree-poll-guard`（get_entries 12949 次）→ `history-gate`（get_messages 多 MB 重下）→ 本轮 `get_messages` 17–45s；同一个教训出现三次 | `src/main/op-guard.ts`（主进程，超时**必须**释放资源）、`src/shared/with-deadline.ts`（两侧共用）、`src/renderer/src/__tests__/no-eternal-spinner.test.ts` |
-| 2 | **loading 状态不得手写**：从任务注册表派生（置位必复位由构造保证） | 曾有 7 个手写标志分布在 4 个 store，靠"记得清" | `src/renderer/src/stores/tasksStore.ts`（T1 停滞/T2 终态）；`viewerStore` 已迁移，`treeStore`/`sessionsStore` 用 `withDeadline` 兜住 |
+| 2 | **loading 状态不得手写**：从任务注册表派生（置位必复位由构造保证） | 曾有 7 个手写标志分布在 4 个 store，靠"记得清" | `src/renderer/src/stores/tasksStore.ts`（T1 停滞/T2 终态）；`viewerStore` 已迁移，`treeStore`/`sessionsStore` 用 `withDeadline` 兜住；聊天的会话历史等待（`panes/chat-transcript-wait.ts`，T1 15s/T2 200s）已走任务 |
 | 3 | **interval / 事件驱动 + 大载荷 + 慢链路** 必须 single-flight + 失败退避 | 同 #1 的三次 | `tree-poll-guard.ts` / `history-gate.ts`（待合并为 shared 原语） |
 | 4 | **来自模型/网络/文件的渲染期数据 = 不受信**，在 store/纯函数边界归一化 | 畸形 edit args（`{"edits":[{"newText":…}]}` 缺 `oldText`）在渲染期抛错 → 白屏 | `components/diff-utils.ts` 的 `parseEditArgs`/`normalizeEdits` + 根级 `ErrorBoundary` |
 | 5 | **禁止裸 `catch {}`**：要么进 error 态，要么显式 best-effort | 多处 `.catch(() => undefined)` 把失败变成"没有反应" | 评审 + `failureStore`（失败必须留痕） |
