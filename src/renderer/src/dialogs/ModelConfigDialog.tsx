@@ -20,6 +20,7 @@ import {
   type ApprovalPolicy,
   type ApprovalSettings,
 } from "../../../shared/approval";
+import { PACKAGE_MIRROR_LABELS } from "../../../shared/package-mirror";
 import { Icon } from "../components/Icon";
 import { useOverlayDismiss } from "../components/overlay-dismiss";
 
@@ -139,6 +140,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [approvalTimeoutText, setApprovalTimeoutText] = useState(
     String(DEFAULT_APPROVAL_SETTINGS.timeoutSeconds),
   );
+  // User-package mirror: also a global setting (does not depend on the target).
+  const [packageMirror, setPackageMirror] = useState(false);
 
   const resetModelForm = useCallback(() => {
     setModelName("");
@@ -266,6 +269,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
           setApproval(settings.approval);
           setApprovalTimeoutText(String(settings.approval.timeoutSeconds));
         }
+        setPackageMirror(settings?.packageMirror?.enabled === true);
       } finally {
         setSubagentLoaded(true);
         setApprovalLoaded(true);
@@ -295,6 +299,24 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         showToast(`子代理模型：${provider ? `${provider}/` : ""}${model}（已固定，优先于会话模型）`, "ok");
       } catch (error) {
         showToast(`子代理模型保存失败：${error instanceof Error ? error.message : String(error)}`, "err");
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [busyAction],
+  );
+
+  /** Persist the package-mirror switch (global app setting). */
+  const handlePackageMirrorChange = useCallback(
+    async (enabled: boolean) => {
+      if (busyAction) return;
+      setBusyAction("packageMirror");
+      try {
+        const next = await window.api.settings.set({ packageMirror: { enabled } });
+        setPackageMirror(next.packageMirror?.enabled === true);
+        showToast(`扩展包镜像：${PACKAGE_MIRROR_LABELS[next.packageMirror?.enabled ? "on" : "off"]}`, "ok");
+      } catch (error) {
+        showToast(`扩展包镜像保存失败：${error instanceof Error ? error.message : String(error)}`, "err");
       } finally {
         setBusyAction(null);
       }
@@ -468,7 +490,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               )}
             </select>
             <span className="dialog-hint">
-              作用于被委派的子代理进程（本地/WSL/远程均适用）；改后对新开的会话生效，正在运行的标签需重开。
+              作用于被委派的子代理（写进本机 pi 的 settings：`subagents.agentOverrides`）；改后对新开的会话生效，正在运行的标签需重开。远程/WSL 的子代理跟随那台机器的会话模型。
             </span>
           </div>
 
@@ -514,6 +536,24 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
             <span className="dialog-hint">
               覆盖 bash / write / edit 三类工具调用（本地 / WSL / 远程均适用），改后对新开的会话生效。
               它挡不住扩展自己直接执行的命令（如 pi-rewind 的 git add），也不能替代沙箱 —— 是速度缓冲，不是安全边界。
+            </span>
+          </div>
+
+          {/* 用户扩展包镜像：全局开关（ADR 0009 的收窄版，默认关） */}
+          <div className="dialog-section">
+            <div className="section-title">扩展包镜像</div>
+            <label className="dialog-check">
+              <input
+                type="checkbox"
+                checked={packageMirror}
+                disabled={!approvalLoaded || busyAction !== null}
+                onChange={(e) => void handlePackageMirrorChange(e.target.checked)}
+              />
+              同步本机已装的扩展包到远程/WSL（pi-rewind、pi-web-access、pi-subagents 等）
+            </label>
+            <span className="dialog-hint">
+              {PACKAGE_MIRROR_LABELS[packageMirror ? "on" : "off"]}。版本取自本机（不追新）；远程上多余的自装包会被移除以跟随本机；
+              仅动远程的 pi 包目录，设置与凭据永不过境。新开远程会话时生效。
             </span>
           </div>
 
